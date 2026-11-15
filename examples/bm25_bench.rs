@@ -1,15 +1,11 @@
-//! v4-vs-v5 BM25 scorer benchmark (stage 1 of `docs/block-max.md`: the
-//! occurrence split, no skipping).
+//! Block-Max BM25 scorer benchmark (`docs/block-max.md`).
 //!
 //! Builds a synthetic corpus with a court-like shape (zipfian-ish term df
-//! distribution, one very-high-df term in ~45% of docs, avgdl ~200),
-//! writes BOTH a v4 file (via the bench-only v4 writers) and a v5 file,
-//! then times `bm25::top_k` for a few query shapes against the v4 reader
-//! and the v5 reader, printing per-query wall medians and — via a
-//! counting global allocator — allocations per query. The allocation
-//! number is the falsifiable proof: the v4 scored path allocates one
-//! offsets `Vec` per posting; the v5 path must not (expect ~1 per posting
-//! in v4 vs ~zero per posting in v5).
+//! distribution, one high-df term in ~45% of docs, avgdl ~200), writes a
+//! `.bm25` shard via [`SpillBuilder`], and times exhaustive, doc-run-only,
+//! unseeded pruned, and floor-seeded pruned `bm25` scorers against
+//! [`Bm25Reader`], printing wall medians, allocations per query, and skip
+//! counters while asserting bitwise hit parity across all four modes.
 //!
 //! Usage:
 //!
@@ -185,46 +181,151 @@ fn median(mut xs: Vec<f64>) -> f64 {
     xs[xs.len() / 2]
 }
 
-fn main() -> Result<(), String> {
-    let args = parse_args().map_err(|e| format!("bad args: {e}"))?;
+#[derive(Clone, Copy)]
+enum BenchMode {
+    Exhaustive,
+    Plain,
+    Pruned(&'static str, f64),
+}
+
+impl BenchMode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Exhaustive => "exhaustive",
+            Self::Plain => "doc-run",
+            Self::Pruned(name, _) => name,
+        }
+    }
+}
+
+fn ensure_bench_shard(args: &Args) -> Result<PathBuf, String> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/bm25-bench");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let stem = format!("d{}_v{}_s{}", args.docs, args.vocab, args.seed);
-    let v4_path = dir.join(format!("{stem}.v4.bm25"));
-    let v5_path = dir.join(format!("{stem}.v5.bm25"));
-
-    // Build (or reuse) both formats from the same deterministic corpus.
-    for (path, v4) in [(&v4_path, true), (&v5_path, false)] {
-        if path.exists() {
-            eprintln!("reusing {}", path.display());
-            continue;
-        }
-        let t = Instant::now();
-        eprintln!("building {} ...", path.display());
-        let spill_dir = dir.join(format!("{stem}.{}.spill", if v4 { "v4" } else { "v5" }));
-        let _ = std::fs::remove_dir_all(&spill_dir);
-        let mut builder = if v4 {
-            SpillBuilder::create_v4_for_bench(&spill_dir)
-        } else {
-            SpillBuilder::create(&spill_dir)
-        }
-        .map_err(|e| e.to_string())?;
-        generate(args.docs, args.vocab, args.seed, &mut builder).map_err(|e| e.to_string())?;
-        builder.finish(path).map_err(|e| e.to_string())?;
-        eprintln!(
-            "  done in {:.1}s, {:.1} MiB",
-            t.elapsed().as_secs_f64(),
-            path.metadata().map_err(|e| e.to_string())?.len() as f64 / 1e6
-        );
+    let path = dir.join(format!("{stem}.bm25"));
+    if path.exists() {
+        eprintln!("reusing {}", path.display());
+        return Ok(path);
     }
+    let t = Instant::now();
+    eprintln!("building {} ...", path.display());
+    let spill_dir = dir.join(format!("{stem}.spill"));
+    let _ = std::fs::remove_dir_all(&spill_dir);
+    let mut builder = SpillBuilder::create(&spill_dir).map_err(|e| e.to_string())?;
+    generate(args.docs, args.vocab, args.seed, &mut builder).map_err(|e| e.to_string())?;
+    builder.finish(&path).map_err(|e| e.to_string())?;
+    eprintln!(
+        "  done in {:.1}s, {:.1} MiB",
+        t.elapsed().as_secs_f64(),
+        path.metadata().map_err(|e| e.to_string())?.len() as f64 / 1e6
+    );
+    Ok(path)
+}
 
-    let v4r = Bm25Reader::open(&v4_path).map_err(|e| e.to_string())?;
-    let v5r = Bm25Reader::open(&v5_path).map_err(|e| e.to_string())?;
+fn bench_mode_row(
+    reader: &Bm25Reader,
+    query: (&str, &[String], &CorpusStats),
+    k: usize,
+    iters: usize,
+    mode: BenchMode,
+) -> Vec<(u32, u64)> {
+    let (label, terms, stats) = query;
+    let params = Bm25Params::default();
+    let run = |ps: &mut bm25::PruneStats| match mode {
+        BenchMode::Exhaustive => bm25::top_k_exhaustive(reader, terms, stats, params, k),
+        BenchMode::Plain => bm25::top_k(reader, terms, stats, params, k),
+        BenchMode::Pruned(_, floor) => {
+            bm25::top_k_pruned_stats(reader, terms, stats, params, k, floor, ps)
+        }
+    };
+    let mut last_stats = bm25::PruneStats::default();
+    for _ in 0..2 {
+        let _ = run(&mut last_stats);
+    }
+    let mut walls = Vec::new();
+    let mut allocs = Vec::new();
+    for _ in 0..iters.max(3) {
+        let mut ps = bm25::PruneStats::default();
+        let (a0, _) = alloc_snapshot();
+        let t = Instant::now();
+        let hits = run(&mut ps);
+        let wall = t.elapsed().as_secs_f64() * 1e3;
+        let (a1, _) = alloc_snapshot();
+        std::hint::black_box(&hits);
+        walls.push(wall);
+        allocs.push((a1 - a0) as f64);
+        last_stats = ps;
+    }
+    let postings: u64 = stats.dfs.iter().map(|&d| u64::from(d)).sum();
+    let skip_pct = if last_stats.blocks_total > 0 {
+        100.0 * last_stats.blocks_skipped as f64 / last_stats.blocks_total as f64
+    } else {
+        0.0
+    };
+    let evaluated = if matches!(mode, BenchMode::Pruned(..)) {
+        format!("{}", last_stats.candidates_evaluated)
+    } else {
+        "-".to_string()
+    };
+    println!(
+        "{:<24} {:>10} {:<12} {:>10.2} {:>10.0} {:>8.1} {:>8} {:>12}",
+        label,
+        postings,
+        mode.name(),
+        median(walls),
+        median(allocs),
+        skip_pct,
+        last_stats.l1_groups_skipped,
+        evaluated
+    );
+    run(&mut bm25::PruneStats::default())
+        .iter()
+        .map(|h| (h.doc_id, h.score.to_bits()))
+        .collect()
+}
 
-    // Query shapes: the 45%-df term alone, a multi-term mix, a mid-df
-    // term, and a rare term.
-    let rare = format!("t{}", args.vocab / 2);
-    let rarest = format!("t{}", args.vocab - 1);
+fn bench_query_shape(reader: &Bm25Reader, label: &str, terms: &[String], k: usize, iters: usize) {
+    let dfs: Vec<u32> = terms.iter().map(|t| reader.df(t)).collect();
+    let postings: u64 = dfs.iter().map(|&d| u64::from(d)).sum();
+    if postings == 0 {
+        println!("{label:<24} (no postings; skipped)");
+        return;
+    }
+    let stats = CorpusStats {
+        doc_count: reader.doc_count(),
+        total_doc_length: reader.total_doc_length(),
+        dfs,
+    };
+    let seed = bm25::top_k_pruned(
+        reader,
+        terms,
+        &stats,
+        Bm25Params::default(),
+        k,
+        f64::NEG_INFINITY,
+    )
+    .last()
+    .map_or(f64::NEG_INFINITY, |h| h.score);
+    let modes = [
+        BenchMode::Exhaustive,
+        BenchMode::Plain,
+        BenchMode::Pruned("pruned", f64::NEG_INFINITY),
+        BenchMode::Pruned("seeded", seed),
+    ];
+    let mut reference: Option<Vec<(u32, u64)>> = None;
+    for mode in modes {
+        let sig = bench_mode_row(reader, (label, terms, &stats), k, iters, mode);
+        match &reference {
+            None => reference = Some(sig),
+            Some(want) => assert_eq!(want, &sig, "{label}/{} diverged at k={k}", mode.name()),
+        }
+    }
+}
+
+fn main() -> Result<(), String> {
+    let args = parse_args().map_err(|e| format!("bad args: {e}"))?;
+    let path = ensure_bench_shard(&args)?;
+    let reader = Bm25Reader::open(&path).map_err(|e| e.to_string())?;
     let shapes: Vec<(&str, Vec<String>)> = vec![
         ("high-df [court]", vec![HIGH_DF_TERM.to_string()]),
         (
@@ -239,22 +340,9 @@ fn main() -> Result<(), String> {
             "mid [t0 t10 t100]",
             vec!["t0".to_string(), "t10".to_string(), "t100".to_string()],
         ),
-        ("rare", vec![rare]),
-        ("rarest", vec![rarest]),
+        ("rare", vec![format!("t{}", args.vocab / 2)]),
+        ("rarest", vec![format!("t{}", args.vocab - 1)]),
     ];
-
-    // One table per k. Configurations:
-    //   old-v4:      the pre-v5 exhaustive scorer on the v4 reader (the
-    //                "before" baseline: one offsets Vec per posting);
-    //   v4:          the occurrence-split scorer on the v4 reader;
-    //   v5:          the occurrence-split scorer on the v5 reader
-    //                (stage 1: doc run only, offsets for survivors);
-    //   v5-pruned:   block-max top_k_pruned, unseeded (stage 2+3:
-    //                level skips + MaxScore partition);
-    //   v5-seeded:   top_k_pruned seeded with the true k-th best — the
-    //                realistic coordinator case.
-    // Skip columns: level-0 blocks skipped (128 postings each) and
-    // level-1 groups leapt (4096 postings each).
     for &k in &args.ks {
         println!("\n== k={k}");
         println!(
@@ -269,104 +357,7 @@ fn main() -> Result<(), String> {
             "evaluated"
         );
         for (label, terms) in &shapes {
-            let dfs: Vec<u32> = terms.iter().map(|t| v5r.df(t)).collect();
-            let stats = CorpusStats {
-                doc_count: v5r.doc_count(),
-                total_doc_length: v5r.total_doc_length(),
-                dfs: dfs.clone(),
-            };
-            let postings: u64 = dfs.iter().map(|&d| u64::from(d)).sum();
-            if postings == 0 {
-                println!("{label:<24} (no postings; skipped)");
-                continue;
-            }
-            let params = Bm25Params::default();
-            // The seed for the floor variant: the true k-th best of the
-            // unseeded pruned run (exact f64, so ties survive).
-            let seed = bm25::top_k_pruned(&v5r, terms, &stats, params, k, f64::NEG_INFINITY)
-                .last()
-                .map(|h| h.score)
-                .unwrap_or(f64::NEG_INFINITY);
-
-            #[derive(Clone, Copy)]
-            enum Mode {
-                OldV4,
-                Plain(&'static str),
-                Pruned(&'static str, f64),
-            }
-            let modes = [
-                (Mode::OldV4, &v4r),
-                (Mode::Plain("v4"), &v4r),
-                (Mode::Plain("v5"), &v5r),
-                (Mode::Pruned("v5-pruned", f64::NEG_INFINITY), &v5r),
-                (Mode::Pruned("v5-seeded", seed), &v5r),
-            ];
-            let mut reference: Option<Vec<(u32, u64)>> = None;
-            for (mode, reader) in &modes {
-                let index: &dyn Bm25Index = *reader;
-                let (name, mut last_stats) = match mode {
-                    Mode::OldV4 => ("old-v4", bm25::PruneStats::default()),
-                    Mode::Plain(name) => (*name, bm25::PruneStats::default()),
-                    Mode::Pruned(name, _) => (*name, bm25::PruneStats::default()),
-                };
-                let run = |ps: &mut bm25::PruneStats| match mode {
-                    Mode::OldV4 => bm25::top_k_exhaustive(index, terms, &stats, params, k),
-                    Mode::Plain(_) => bm25::top_k(index, terms, &stats, params, k),
-                    Mode::Pruned(_, floor) => {
-                        bm25::top_k_pruned_stats(index, terms, &stats, params, k, *floor, ps)
-                    }
-                };
-                // Warm up (also faults the pages in for all alike).
-                for _ in 0..2 {
-                    let _ = run(&mut last_stats);
-                }
-                let mut walls = Vec::new();
-                let mut allocs = Vec::new();
-                for _ in 0..args.queries.max(3) {
-                    let mut ps = bm25::PruneStats::default();
-                    let (a0, _) = alloc_snapshot();
-                    let t = Instant::now();
-                    let hits = run(&mut ps);
-                    let wall = t.elapsed().as_secs_f64() * 1e3;
-                    let (a1, _) = alloc_snapshot();
-                    std::hint::black_box(&hits);
-                    walls.push(wall);
-                    allocs.push((a1 - a0) as f64);
-                    last_stats = ps;
-                }
-                // Correctness: identical hit signatures across all
-                // configurations (the seed is the exact k-th best, so
-                // the seeded result equals the unseeded one).
-                let sig: Vec<(u32, u64)> = run(&mut bm25::PruneStats::default())
-                    .iter()
-                    .map(|h| (h.doc_id, h.score.to_bits()))
-                    .collect();
-                match &reference {
-                    None => reference = Some(sig),
-                    Some(want) => assert_eq!(want, &sig, "{label}/{name} diverged at k={k}"),
-                }
-                let skip_pct = if last_stats.blocks_total > 0 {
-                    100.0 * last_stats.blocks_skipped as f64 / last_stats.blocks_total as f64
-                } else {
-                    0.0
-                };
-                let evaluated = if matches!(mode, Mode::Pruned(..)) {
-                    format!("{}", last_stats.candidates_evaluated)
-                } else {
-                    "-".to_string()
-                };
-                println!(
-                    "{:<24} {:>10} {:<12} {:>10.2} {:>10.0} {:>8.1} {:>8} {:>12}",
-                    label,
-                    postings,
-                    name,
-                    median(walls),
-                    median(allocs),
-                    skip_pct,
-                    last_stats.l1_groups_skipped,
-                    evaluated
-                );
-            }
+            bench_query_shape(&reader, label, terms, k, args.queries);
         }
     }
     Ok(())

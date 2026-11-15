@@ -4,32 +4,75 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::super::codec::{skip_run_size, write_skip_run, SkipRunBuilder};
-use super::super::format::{fsync_parent, write_str, write_u16, write_u32, write_u64, MAGIC_V4};
+use super::super::format::write_u32;
 use super::super::section_writer::{
-    save_v8_atomic, write_lineages, write_text_index_from_lens, write_v5_directory,
-    write_v6v7_payload, FieldSectionDesc, V6PayloadParams, V6SectionSource,
+    save_v8_atomic, write_block_max_directory, write_text_index_from_lens, write_v6v7_payload,
+    FieldSectionDesc, V6PayloadParams, V6SectionSource,
 };
 #[cfg(doc)]
 use super::super::Bm25Store;
-use super::{PostingDirectoryEntry, SpillBuilder};
+use super::{FieldSpill, PostingDirectoryEntry, SpillBuilder};
+
+fn build_field_desc<'a>(field: &'a FieldSpill, merged: &MergedFieldStage) -> FieldSectionDesc<'a> {
+    let directory_size = 4
+        + 34 * merged.directory.len() as u64
+        + merged
+            .directory
+            .iter()
+            .map(|(t, ..)| t.len() as u64)
+            .sum::<u64>();
+    FieldSectionDesc {
+        name: &field.name,
+        analysis_fingerprint: field.analysis_fingerprint,
+        total_length: field.total_length,
+        doc_lengths: &field.doc_lengths,
+        postings_size: 4 + merged.body_len,
+        directory_size,
+        n_terms: merged.directory.len() as u64,
+        positions_total: merged.positions.as_ref().map(|s| s.total),
+        sentences_total: field
+            .sentences
+            .then(|| field.sentence_stage.as_ref().map_or(0, |s| s.total)),
+        pos_lengths_total: merged.pos_lengths.as_ref().map(|s| s.total),
+        splade: field.splade.as_ref().filter(|s| !s.is_empty()),
+    }
+}
 
 impl SpillBuilder {
-    /// Merge the runs and assemble the file at `path` (atomically:
-    /// write tmp, rename). The spill directory is removed on success.
-    /// Writes v8-framed v6/v7, byte-identical to [`Bm25Store::save`] on the
-    /// same corpus, unless built with [`Self::create_v4_for_bench`].
+    /// Merge the runs and assemble the `.bm25` file at `path` (atomically:
+    /// write tmp, finalize v8 CRC integrity table, rename). The spill
+    /// directory is removed on success. Writes v8-framed v6/v7,
+    /// byte-identical to [`Bm25Store::save`] on the same corpus.
     pub fn finish(&mut self, path: &Path) -> io::Result<()> {
-        if self.v4_only {
-            if self.columns.binding.is_some() || self.columns.derived.is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "the v4 oracle format cannot carry a mapped-plan binding or a derived-column declaration",
-                ));
+        self.spill_run()?;
+        self.texts.flush()?;
+        for field in &mut self.fields {
+            if let Some(stage) = field.sentence_stage.as_mut() {
+                stage.writer.flush()?;
             }
-            self.finish_v4(path)
-        } else {
-            self.finish_v6(path)
         }
+        let merged_fields = self.merge_all_field_stages()?;
+        let field_descs: Vec<FieldSectionDesc<'_>> = self
+            .fields
+            .iter()
+            .zip(&merged_fields)
+            .map(|(field, merged)| build_field_desc(field, merged))
+            .collect();
+        let params = V6PayloadParams {
+            n_slots: self.fields[0].doc_lengths.len() as u64,
+            texts_size: self.texts_bytes,
+            lineages: &self.lineages,
+            fields: &field_descs,
+            columns: &self.columns,
+            sources: &self.sources,
+            byte_order: true,
+        };
+        let mut source = SpillSectionSource {
+            builder: self,
+            merged: &merged_fields,
+        };
+        save_v8_atomic(path, |w| write_v6v7_payload(w, &params, &mut source))?;
+        std::fs::remove_dir_all(&self.dir)
     }
 
     /// Merge one field's runs into a postings-section body file at `body_path`
@@ -131,197 +174,6 @@ impl SpillBuilder {
         }
         Ok(merged_fields)
     }
-
-    fn finish_v6(&mut self, path: &Path) -> io::Result<()> {
-        self.spill_run()?;
-        self.texts.flush()?;
-        for field in &mut self.fields {
-            if let Some(stage) = field.sentence_stage.as_mut() {
-                stage.writer.flush()?;
-            }
-        }
-        let merged_fields = self.merge_all_field_stages()?;
-        let field_descs: Vec<FieldSectionDesc<'_>> = self
-            .fields
-            .iter()
-            .zip(&merged_fields)
-            .map(|(field, merged)| {
-                let directory_size = 4
-                    + 34 * merged.directory.len() as u64
-                    + merged
-                        .directory
-                        .iter()
-                        .map(|(t, ..)| t.len() as u64)
-                        .sum::<u64>();
-                FieldSectionDesc {
-                    name: &field.name,
-                    analysis_fingerprint: field.analysis_fingerprint,
-                    total_length: field.total_length,
-                    doc_lengths: &field.doc_lengths,
-                    postings_size: 4 + merged.body_len,
-                    directory_size,
-                    n_terms: merged.directory.len() as u64,
-                    positions_total: merged.positions.as_ref().map(|s| s.total),
-                    sentences_total: field
-                        .sentences
-                        .then(|| field.sentence_stage.as_ref().map_or(0, |s| s.total)),
-                    pos_lengths_total: merged.pos_lengths.as_ref().map(|s| s.total),
-                    splade: field.splade.as_ref().filter(|s| !s.is_empty()),
-                }
-            })
-            .collect();
-        let params = V6PayloadParams {
-            n_slots: self.fields[0].doc_lengths.len() as u64,
-            texts_size: self.texts_bytes,
-            lineages: &self.lineages,
-            fields: &field_descs,
-            columns: &self.columns,
-            sources: &self.sources,
-            byte_order: true,
-        };
-        let mut source = SpillSectionSource {
-            builder: self,
-            merged: &merged_fields,
-        };
-        save_v8_atomic(path, |w| write_v6v7_payload(w, &params, &mut source))?;
-        std::fs::remove_dir_all(&self.dir)
-    }
-
-    fn merge_v4_runs(
-        runs: &[PathBuf],
-        postings_body: &Path,
-    ) -> io::Result<Vec<(String, u64, u32)>> {
-        let mut directory: Vec<(String, u64, u32)> = Vec::new();
-        let mut out = io::BufWriter::new(std::fs::File::create(postings_body)?);
-        let mut heads: Vec<RunHead> = Vec::new();
-        for run in runs {
-            if let Some(head) = RunHead::open(run, false)? {
-                heads.push(head);
-            }
-        }
-        let mut cursor = 0u64;
-        while !heads.is_empty() {
-            let term = heads
-                .iter()
-                .map(|h| h.term.clone())
-                .min()
-                .expect("nonempty heads");
-            let df: u32 = heads
-                .iter()
-                .filter(|h| h.term == term)
-                .map(|h| h.n_postings)
-                .sum();
-            write_str(&mut out, &term)?;
-            write_u32(&mut out, df)?;
-            directory.push((term.clone(), cursor, df));
-            cursor += 4 + term.len() as u64 + 4;
-            let mut idx = 0;
-            while idx < heads.len() {
-                if heads[idx].term == term {
-                    cursor += heads[idx].copy_postings(&mut out)?;
-                    if !heads[idx].advance()? {
-                        heads.remove(idx);
-                        continue;
-                    }
-                }
-                idx += 1;
-            }
-        }
-        out.flush()?;
-        Ok(directory)
-    }
-
-    fn validate_v4_spill(&self) -> io::Result<()> {
-        if !self.sources.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "legacy writer cannot preserve protobuf sources",
-            ));
-        }
-        if self.fields[0].positions {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "the v4 oracle format cannot carry token positions",
-            ));
-        }
-        if self.fields[0].sentences {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "the v4 oracle format cannot carry sentence spans",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Merge the runs and assemble the v4 file at `path` (benchmarking/migration only).
-    fn finish_v4(&mut self, path: &Path) -> io::Result<()> {
-        self.validate_v4_spill()?;
-        self.spill_run()?;
-        self.texts.flush()?;
-
-        let postings_body = self.dir.join("postings.body");
-        let directory = Self::merge_v4_runs(&self.fields[0].runs, &postings_body)?;
-        let postings_body_len = std::fs::metadata(&postings_body)?.len();
-
-        let field = &self.fields[0];
-        let n_slots = field.doc_lengths.len() as u64;
-        let header_size = 8 + 8 + 8 * 4 + 4;
-        let doc_lengths_off = header_size as u64;
-        let texts_off = doc_lengths_off + 4 * n_slots;
-        let text_index_off = texts_off + self.texts_bytes;
-        let lineages_off = text_index_off + 12 * n_slots;
-        let lineages_size: u64 = self
-            .lineages
-            .iter()
-            .map(|l| if l.is_some() { 25 } else { 1 })
-            .sum();
-        let postings_off = lineages_off + lineages_size;
-        let directory_off = postings_off + 4 + postings_body_len;
-
-        let tmp = path.with_extension("bm25tmp");
-        {
-            let mut w = io::BufWriter::new(std::fs::File::create(&tmp)?);
-            w.write_all(MAGIC_V4)?;
-            write_u64(&mut w, field.total_length)?;
-            write_u64(&mut w, texts_off)?;
-            write_u64(&mut w, lineages_off)?;
-            write_u64(&mut w, postings_off)?;
-            write_u64(&mut w, directory_off)?;
-            write_u32(&mut w, field.doc_lengths.len() as u32)?;
-            for &len in &field.doc_lengths {
-                write_u32(&mut w, len)?;
-            }
-            io::copy(
-                &mut std::fs::File::open(self.dir.join("texts.spill"))?,
-                &mut w,
-            )?;
-            write_text_index_from_lens(&mut w, texts_off, self.text_lens.iter().copied())?;
-            write_lineages(&mut w, &self.lineages)?;
-            write_u32(&mut w, directory.len() as u32)?;
-            io::copy(&mut std::fs::File::open(&postings_body)?, &mut w)?;
-            write_u32(&mut w, directory.len() as u32)?;
-            let mut blob_off = 0u64;
-            for (term, rel_off, df) in &directory {
-                write_u64(&mut w, postings_off + 4 + rel_off)?;
-                write_u32(&mut w, *df)?;
-                write_u32(
-                    &mut w,
-                    u32::try_from(blob_off).expect("term blob exceeds u32"),
-                )?;
-                write_u16(&mut w, term.len() as u16)?;
-                blob_off += term.len() as u64;
-            }
-            for (term, _, _) in &directory {
-                w.write_all(term.as_bytes())?;
-            }
-            w.flush()?;
-            w.get_ref().sync_all()?;
-        }
-        std::fs::rename(&tmp, path)?;
-        fsync_parent(path)?;
-        std::fs::remove_dir_all(&self.dir)?;
-        Ok(())
-    }
 }
 
 struct MergedFieldStage {
@@ -357,7 +209,7 @@ impl V6SectionSource for SpillSectionSource<'_> {
         write_u32(w, stage.directory.len() as u32)?;
         let mut body = std::fs::File::open(&stage.body_path)?;
         io::copy(&mut body, w)?;
-        write_v5_directory(
+        write_block_max_directory(
             w,
             stage.directory.len(),
             stage
@@ -513,27 +365,6 @@ impl RunHead {
         self.reader.read_exact(&mut n)?;
         self.n_postings = u32::from_le_bytes(n);
         Ok(true)
-    }
-
-    fn copy_postings<W: Write>(&mut self, out: &mut W) -> io::Result<u64> {
-        if self.positional {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "the v4 encoding cannot copy a positional run",
-            ));
-        }
-        let mut written = 0u64;
-        for _ in 0..self.n_postings {
-            let mut fixed = [0u8; 12];
-            self.reader.read_exact(&mut fixed)?;
-            out.write_all(&fixed)?;
-            let n_offsets = u32::from_le_bytes(fixed[8..12].try_into().expect("4 bytes"));
-            let mut offsets = vec![0u8; 8 * n_offsets as usize];
-            self.reader.read_exact(&mut offsets)?;
-            out.write_all(&offsets)?;
-            written += 12 + 8 * u64::from(n_offsets);
-        }
-        Ok(written)
     }
 
     fn next_posting_raw(&mut self) -> io::Result<RawSpillPosting> {

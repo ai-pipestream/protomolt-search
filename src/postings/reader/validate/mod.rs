@@ -1,15 +1,14 @@
 //! Structural and columnar validation for `.bm25` v6/v7 payloads.
 
 mod columns;
+mod directory;
 mod sections;
 mod tail_sections;
 
 use std::io;
 
+use self::directory::validate_block_max_directory;
 use super::super::format::u16_at;
-#[cfg(doc)]
-use super::validate_v5::validate_structure;
-use super::validate_v5::validate_v5_directory;
 
 fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
@@ -75,15 +74,13 @@ impl<'a> MapView<'a> {
 }
 
 /// Validate the text index: every present entry within the texts
-/// section, absent markers untouched. `entry_base` rebases stored
-/// offsets: the entries are absolute in v3/v4/v5 (base 0) and relative
-/// to the texts section start in v6 (base `texts_off`).
-pub(super) fn validate_text_index(
+/// section, absent markers untouched. Stored offsets are relative to
+/// `texts_off`.
+fn validate_text_index(
     map: &[u8],
     texts_off: u64,
     text_index_off: u64,
     n_slots: u64,
-    entry_base: u64,
 ) -> io::Result<()> {
     for slot in 0..n_slots {
         let e = (text_index_off + 12 * slot) as usize;
@@ -93,8 +90,10 @@ pub(super) fn validate_text_index(
         let offset = u64::from_le_bytes(b[..8].try_into().expect("8 bytes"));
         let len = u32::from_le_bytes(b[8..].try_into().expect("4 bytes"));
         if len != u32::MAX {
-            let abs = entry_base + offset;
-            if abs < texts_off + 4 || abs + u64::from(len) > text_index_off {
+            let abs = texts_off.checked_add(offset).ok_or_else(|| {
+                invalid(format!("text index entry {slot} out of the texts section"))
+            })?;
+            if abs < texts_off + 4 || abs.saturating_add(u64::from(len)) > text_index_off {
                 return Err(invalid(format!(
                     "text index entry {slot} out of the texts section"
                 )));
@@ -106,7 +105,7 @@ pub(super) fn validate_text_index(
 
 /// Walk the variable-stride lineage section (1 B absent, 25 B present)
 /// and return the offset one past its last entry.
-pub(super) fn lineage_section_end(map: &[u8], lineages_off: u64, n_slots: u64) -> io::Result<u64> {
+fn lineage_section_end(map: &[u8], lineages_off: u64, n_slots: u64) -> io::Result<u64> {
     let mut cur = lineages_off;
     for _ in 0..n_slots {
         let flag = *map
@@ -203,7 +202,6 @@ fn validate_shared_sections(
         header.texts_off,
         header.text_index_off,
         header.n_slots,
-        header.texts_off,
     )?;
     lineage_section_end(view.as_slice(), header.lineages_off, header.n_slots)
 }
@@ -242,28 +240,19 @@ fn validate_field_sections(
                 "field {i}: total_length != sum of doc lengths"
             )));
         }
-        validate_v5_directory(
-            view.as_slice(),
-            field.postings_off,
-            field.directory_off,
-            section_end,
-            field.postings_off,
-        )?;
+        validate_block_max_directory(view, field.postings_off, field.directory_off, section_end)?;
         expected_start = section_end;
     }
     Ok(expected_start)
 }
 
-/// Full structural validation of a v6 or v7 file
-/// (`docs/multi-field.md`; v7 adds facet columns), same
-/// error-not-panic contract as [`validate_structure`]: the header,
-/// field table, and (v7) facet table, shared-section geometry
-/// (contiguous, in order), the text index and lineage walk, per field
-/// the doc_lengths sum against the field table's total plus the full
-/// v5-shaped directory and skip-run walk, and per facet the dict walk
-/// and an ords scan (every ordinal in dictionary range or absent).
-/// Field groups then facet groups must exactly tile the file from the
-/// lineage section's end to EOF.
+/// Full structural validation of a v6 or v7 payload (`docs/multi-field.md`;
+/// v7 adds typed and auxiliary columns). Every read is bounds-checked and any
+/// malformed offset, count, or invariant returns `InvalidData`: the header,
+/// field table, and (v7) column table, shared-section geometry, text index and
+/// lineage walk, per-field `doc_lengths` sum plus full block-max directory and
+/// skip-run walk, and every column section's geometry and metadata bounds.
+/// Sections must contiguously tile the payload from header end to EOF.
 pub(in crate::postings) fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
     let view = MapView::new(map);
     let header = parse_v6_header(&view)?;

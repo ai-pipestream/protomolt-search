@@ -8,23 +8,22 @@
 //! Two storage shapes share one read surface ([`Bm25Index`]):
 //!
 //! - [`Bm25Store`] — the heap builder. Ingest appends here; `save`
-//!   writes the current format (v8: a v6/v7 payload wearing a CRC
-//!   integrity table, see `MAGIC_V8`) atomically next to the shard's
-//!   `.tv` as `<index>.bm25`.
+//!   writes the v8 integrity envelope around a v6/v7 payload (see
+//!   `MAGIC_V8`) atomically next to the shard's `.tv` as `<index>.bm25`.
 //! - [`Bm25Reader`] — the disk-resident shape. The file is memory
 //!   mapped; postings slices and document texts are read from the map on
 //!   demand (the OS page cache is the buffer pool, the Lucene model), so
 //!   a shard far larger than RAM serves from a few MB of heap (per-doc
-//!   length/offset tables only). v3 through v7 files stay readable.
+//!   length/offset tables only). Raw v6/v7 payloads and v8 envelopes open
+//!   with full structural validation.
 //!
-//! v5 (`TVBM2505`, see `docs/block-max.md`) splits each term into three
-//! runs so the scorer never decodes occurrence offsets for non-survivors:
-//! a fixed-stride doc run (12 B/posting: `doc_id | tf | occ_start`, one
-//! trailing sentinel `occ_start` per term), an occurrence run (`start,
-//! end` u32 pairs in posting order), and a skip run of per-block `(tf,
-//! dl)` Pareto frontiers (level 0: one record per 128 postings; level 1:
-//! one per 32 level-0 blocks). Stage 1 writes the skip run but no scorer
-//! consumes it yet.
+//! Each field's postings section (`docs/block-max.md`) splits every term
+//! into three runs so the scorer never decodes occurrence offsets for
+//! non-survivors: a fixed-stride doc run (12 B/posting: `doc_id | tf |
+//! occ_start`, plus one trailing sentinel `occ_start` per term), an
+//! occurrence run (`start, end` u32 pairs in posting order), and a skip
+//! run of per-block `(tf, dl)` Pareto frontiers (level 0: one record per
+//! 128 postings; level 1: one per 32 level-0 blocks).
 
 mod codec;
 mod columns;
@@ -39,7 +38,7 @@ pub use self::columns::{
     ColumnKind, StoredBinding, StoredDerived, FACET_ABSENT, GEO_ABSENT, INTEGER_ABSENT,
 };
 pub(crate) use self::format::fsync_parent;
-pub use self::reader::{transcode_to_v5, Bm25Reader, FieldTranspose, FieldView, TranscodeStats};
+pub use self::reader::{Bm25Reader, FieldTranspose, FieldView};
 pub use self::spill::SpillBuilder;
 pub use self::store::{Bm25Store, StoreFieldView};
 
@@ -77,7 +76,7 @@ pub trait Bm25Index {
     /// Call `f` for every posting of `term`, in doc-id order, as
     /// `(doc_id, tf)` — the scored path, which must NOT touch occurrence
     /// bytes. The default falls back to [`Self::for_each_posting`] and
-    /// drops the offsets; the v5 reader overrides it to walk only the
+    /// drops the offsets; [`Bm25Reader`] overrides it to walk only the
     /// fixed-stride doc run.
     fn for_each_doc_tf(&self, term: &str, f: &mut dyn FnMut(u32, u32)) {
         self.for_each_posting(term, &mut |doc_id, tf, _offsets| {
@@ -86,8 +85,8 @@ pub trait Bm25Index {
     }
     /// The occurrence spans `(start, end)` of `term` within `doc_id`
     /// (empty when the doc has no posting for the term or was ingested
-    /// SCORING_ONLY). The default scans [`Self::for_each_posting`]; the
-    /// v5 reader overrides it to binary-search the doc run and decode
+    /// SCORING_ONLY). The default scans [`Self::for_each_posting`];
+    /// [`Bm25Reader`] overrides it to binary-search the doc run and decode
     /// only that posting's occurrence slice.
     fn posting_offsets(&self, term: &str, doc_id: u32) -> Vec<(u32, u32)> {
         let mut found = Vec::new();
@@ -100,13 +99,13 @@ pub trait Bm25Index {
     }
     /// An impact cursor over `term`'s skip run and doc run — the
     /// block-max surface (`docs/block-max.md`). `None` for the heap
-    /// store and v3/v4 files, which keep the exhaustive scorers.
+    /// store, which uses the exhaustive scorer.
     fn impacts(&self, term: &str) -> Option<ImpactCursor<'_>> {
         let _ = term;
         None
     }
     /// Whether [`Self::impacts`] would return a cursor, WITHOUT
-    /// building one (the v5 reader answers with a directory lookup
+    /// building one ([`Bm25Reader`] answers with a directory lookup
     /// only). Used by callers selecting the pruned path, which builds
     /// the cursors itself.
     fn has_impacts(&self, term: &str) -> bool {
@@ -536,8 +535,6 @@ fn clone_parallel_ordinals(
     }
 }
 
-#[cfg(test)]
-mod derived_compat_tests;
 #[cfg(test)]
 mod format_tests;
 #[cfg(test)]

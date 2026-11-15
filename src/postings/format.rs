@@ -8,25 +8,12 @@ use super::reader::validate_structure_v6;
 #[cfg(doc)]
 use super::Bm25Reader;
 
-pub(super) const MAGIC_V1: &[u8; 8] = b"TVBM2501";
-pub(super) const MAGIC_V2: &[u8; 8] = b"TVBM2502";
-/// v3 stored ABSOLUTE term-blob offsets as u32, which overflow once the
-/// file passes 4 GiB; kept readable for files below that size.
-pub(super) const MAGIC_V3: &[u8; 8] = b"TVBM2503";
-/// v4 layout: identical to v3 except directory blob offsets are relative
-/// to the term blob's start (the blob is at most a few hundred MB, so
-/// u32 offsets are safe at any file size).
-pub(super) const MAGIC_V4: &[u8; 8] = b"TVBM2504";
-/// v5 layout: per-term doc run / occurrence run / skip run (see the
-/// module docs and `docs/block-max.md`); 34 B directory entries.
-pub(super) const MAGIC_V5: &[u8; 8] = b"TVBM2505";
 /// v6 layout: multi-field (`docs/multi-field.md`). Variable-length
-/// header holding an explicit section table (shared texts/text_index/
-/// lineages offsets plus a field table locating each field's
-/// doc_lengths/postings/directory sections); per-field sections keep
-/// the v5 shape, but section-internal pointers (text_index entries,
-/// directory run offsets) are RELATIVE to their section's start — the
-/// v4 blob lesson generalized, so sections survive relocation.
+/// header holding an explicit section table (shared `texts` / `text_index` /
+/// `lineages` offsets plus a field table locating each field's
+/// `doc_lengths` / `postings` / `directory` sections); section-internal
+/// pointers (`text_index` entries and directory run offsets) are relative
+/// to their section's start so sections survive relocation.
 pub(super) const MAGIC_V6: &[u8; 8] = b"TVBM2506";
 /// v7 layout: v6 plus a kinded per-document column table
 /// (`docs/facets.md`, `docs/score-functions.md`). The header gains a
@@ -105,35 +92,6 @@ pub(super) const COLUMN_KIND_MAP_U64: u8 = 16;
 /// is refused by name where it is attached. Kinds 15 and 16 contain exact integer maps.
 pub(super) const COLUMN_KIND_DERIVED: u8 = 17;
 
-/// Main cea2c63 wrote derived declarations as kind 15, already allocated to
-/// signed maps on the parallel branch. Recognize only its pinned name and
-/// SHA-256 prefix when those bytes cannot describe an in-file map section.
-/// The normal derived parser still validates the declaration and its digest.
-pub(super) fn compatible_column_kind(kind: u8, name: &[u8], payload: &[u8], file_len: u64) -> u8 {
-    if kind != COLUMN_KIND_MAP_I64 || name != DERIVED_ENTRY_NAME.as_bytes() {
-        return kind;
-    }
-    let Some(prefix) = payload.get(..66) else {
-        return kind;
-    };
-    if prefix[..2] != 64u16.to_le_bytes()
-        || !prefix[2..]
-            .iter()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    {
-        return kind;
-    }
-    let offset = u64::from_le_bytes(prefix[..8].try_into().unwrap());
-    let length = u64::from_le_bytes(prefix[8..16].try_into().unwrap());
-    if offset
-        .checked_add(length)
-        .is_some_and(|end| end <= file_len)
-    {
-        return kind;
-    }
-    COLUMN_KIND_DERIVED
-}
-
 pub(super) const COLUMN_KIND_SOURCES: u8 = 9;
 pub(super) const SOURCES_ENTRY_NAME: &str = "protobuf-sources";
 pub(super) const SOURCE_ENTRY_BYTES: u64 = 2 + SOURCES_ENTRY_NAME.len() as u64 + 1 + 16;
@@ -204,7 +162,7 @@ pub(super) const COLUMN_KIND_POS_LENGTHS: u8 = 18;
 pub(super) const POS_LENGTHS_ENTRY_PREFIX: &str = "pos_lengths:";
 
 /// Kind 19: calibrated quantized `u8`/`u16` SPLADE 128-doc Block-Max postings
-/// (`splade:<field>`, `u64 off | u64 len`, `TVSPLD01`/`TVSPLD02` payload), emitted only
+/// (`splade:<field>`, `u64 off | u64 len`, `TVSPLD02` payload), emitted only
 /// when a field records non-empty SPLADE impacts.
 pub(super) const COLUMN_KIND_SPLADE: u8 = 19;
 pub(super) const SPLADE_ENTRY_PREFIX: &str = "splade:";
@@ -498,7 +456,6 @@ fn push_column_section_start(
     let name = String::from_utf8_lossy(&map[*cursor + 2..*cursor + 2 + name_len]).into_owned();
     let kind = map[*cursor + 2 + name_len];
     let base = *cursor + 2 + name_len + 1;
-    let kind = compatible_column_kind(kind, name.as_bytes(), &map[base..], map.len() as u64);
     *cursor = match kind {
         COLUMN_KIND_FACET => {
             starts.push((format!("column:{name}:dict"), u64_at(base + 4)));
@@ -641,28 +598,6 @@ pub(super) fn write_u32<W: Write>(w: &mut W, v: u32) -> io::Result<()> {
 
 pub(super) fn write_u64<W: Write>(w: &mut W, v: u64) -> io::Result<()> {
     w.write_all(&v.to_le_bytes())
-}
-
-pub(super) fn write_str<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
-    write_u32(w, s.len() as u32)?;
-    w.write_all(s.as_bytes())
-}
-
-pub(super) fn take<'a>(r: &mut &'a [u8], n: usize) -> io::Result<&'a [u8]> {
-    if r.len() < n {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated"));
-    }
-    let (head, tail) = r.split_at(n);
-    *r = tail;
-    Ok(head)
-}
-
-pub(super) fn read_u32(r: &mut &[u8]) -> io::Result<u32> {
-    Ok(u32::from_le_bytes(take(r, 4)?.try_into().expect("4 bytes")))
-}
-
-pub(super) fn read_u64(r: &mut &[u8]) -> io::Result<u64> {
-    Ok(u64::from_le_bytes(take(r, 8)?.try_into().expect("8 bytes")))
 }
 
 pub(super) fn u16_at(bytes: &[u8]) -> u16 {

@@ -33,14 +33,10 @@ impl<'a> FieldView<'a> {
     }
 
     /// This file's own cursor for `term`, the part a segmented shard
-    /// chains (`src/segmented.rs`); `None` without v5 skip runs or
-    /// without the term.
+    /// chains (`src/segmented.rs`); `None` when the term is absent.
     pub(crate) fn file_impacts(self, term: &str) -> Option<FileImpacts<'a>> {
-        if !self.reader.v5_runs {
-            return None;
-        }
         let (doc_run_off, skip_run_off, occ_run_off, df) =
-            self.reader.directory_lookup_v5(self.field, term)?;
+            self.reader.directory_lookup(self.field, term)?;
         Some(FileImpacts::new(
             &self.reader.map,
             doc_run_off as usize,
@@ -48,6 +44,24 @@ impl<'a> FieldView<'a> {
             skip_run_off as usize,
             df,
         ))
+    }
+
+    fn posting_ordinal_slice(&self, section: u64, term: &str, doc_id: u32) -> Option<Vec<u32>> {
+        let r = self.reader;
+        let i = r.directory_index(self.field, term)?;
+        let (_, doc_run_off, _, _, df) = r.directory_entry(self.field, i);
+        let doc_run_off = doc_run_off as usize;
+        let j = r.posting_index(doc_run_off, df, doc_id)?;
+        let section = section as usize;
+        let base = r.u32_at(section + 4 + 4 * i as usize) as usize;
+        let data = section + 4 + 4 * (self.field.n_terms as usize + 1);
+        let occ_start = r.u32_at(doc_run_off + 12 * j + 8) as usize;
+        let occ_end = r.occ_start(doc_run_off, df as usize, j + 1) as usize;
+        Some(
+            (occ_start..occ_end)
+                .map(|o| r.u32_at(data + 4 * (base + o)))
+                .collect(),
+        )
     }
 }
 
@@ -66,112 +80,48 @@ impl Bm25Index for FieldView<'_> {
             .unwrap_or(0)
     }
     fn df(&self, term: &str) -> u32 {
-        if self.reader.v5_runs {
-            self.reader
-                .directory_lookup_v5(self.field, term)
-                .map_or(0, |(_, _, _, df)| df)
-        } else {
-            self.reader
-                .directory_lookup(self.field, term)
-                .map_or(0, |(_, df)| df)
-        }
+        self.reader
+            .directory_lookup(self.field, term)
+            .map_or(0, |(_, _, _, df)| df)
     }
     fn for_each_posting(&self, term: &str, f: &mut PostingCallback) {
         let r = self.reader;
-        if r.v5_runs {
-            let Some((doc_run_off, _, occ_run_off, df)) = r.directory_lookup_v5(self.field, term)
-            else {
-                return;
-            };
-            let (doc_run_off, occ_run_off) = (doc_run_off as usize, occ_run_off as usize);
-            for i in 0..df as usize {
-                let (doc_id, tf, occ_start) = r.v5_doc_entry(doc_run_off, i);
-                let occ_end = r.v5_occ_start(doc_run_off, df as usize, i + 1);
-                let offsets = r.v5_occ_slice(occ_run_off, occ_start, occ_end);
-                f(doc_id, tf, &offsets);
-            }
-        } else {
-            let Some((off, df)) = r.directory_lookup(self.field, term) else {
-                return;
-            };
-            r.v3_for_each_posting(off, df, f);
+        let Some((doc_run_off, _, occ_run_off, df)) = r.directory_lookup(self.field, term) else {
+            return;
+        };
+        let (doc_run_off, occ_run_off) = (doc_run_off as usize, occ_run_off as usize);
+        for i in 0..df as usize {
+            let (doc_id, tf, occ_start) = r.doc_entry(doc_run_off, i);
+            let occ_end = r.occ_start(doc_run_off, df as usize, i + 1);
+            let offsets = r.occ_slice(occ_run_off, occ_start, occ_end);
+            f(doc_id, tf, &offsets);
         }
     }
     fn for_each_doc_tf(&self, term: &str, f: &mut dyn FnMut(u32, u32)) {
         let r = self.reader;
-        if r.v5_runs {
-            let Some((doc_run_off, _, _, df)) = r.directory_lookup_v5(self.field, term) else {
-                return;
-            };
-            r.v5_for_each_doc_tf(doc_run_off as usize, df, f);
-        } else {
-            self.for_each_posting(term, &mut |doc_id, tf, _offsets| {
-                f(doc_id, tf);
-            });
-        }
+        let Some((doc_run_off, _, _, df)) = r.directory_lookup(self.field, term) else {
+            return;
+        };
+        r.for_each_doc_tf(doc_run_off as usize, df, f);
     }
     fn posting_offsets(&self, term: &str, doc_id: u32) -> Vec<(u32, u32)> {
         let r = self.reader;
-        if r.v5_runs {
-            let Some((doc_run_off, _, occ_run_off, df)) = r.directory_lookup_v5(self.field, term)
-            else {
-                return Vec::new();
-            };
-            // Binary search the fixed-stride doc run (doc ids ascending).
-            let doc_run_off = doc_run_off as usize;
-            let (mut lo, mut hi) = (0usize, df as usize);
-            while lo < hi {
-                let mid = (lo + hi) / 2;
-                if r.u32_at(doc_run_off + 12 * mid) < doc_id {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            let i = lo;
-            if i >= df as usize || r.u32_at(doc_run_off + 12 * i) != doc_id {
-                return Vec::new();
-            }
-            let occ_start = r.u32_at(doc_run_off + 12 * i + 8);
-            let occ_end = r.v5_occ_start(doc_run_off, df as usize, i + 1);
-            r.v5_occ_slice(occ_run_off as usize, occ_start, occ_end)
-        } else {
-            // v3/v4: sequential walk with early exit — postings are
-            // doc-id-ordered by construction, so stop at the first doc
-            // past the target; offset bytes before it are stepped over
-            // undecoded. (The trait default walks the whole list, which
-            // costs O(df) per survivor at k=1000.)
-            let Some((off, df)) = r.directory_lookup(self.field, term) else {
-                return Vec::new();
-            };
-            let mut cur = off as usize;
-            let term_len = u32::from_le_bytes(r.map[cur..cur + 4].try_into().unwrap()) as usize;
-            cur += 4 + term_len + 4; // term header + posting count
-            for _ in 0..df {
-                let doc = r.u32_at(cur);
-                let n_offsets = r.u32_at(cur + 8) as usize;
-                if doc == doc_id {
-                    let mut offsets = Vec::with_capacity(n_offsets);
-                    let mut o = cur + 12;
-                    for _ in 0..n_offsets {
-                        offsets.push((r.u32_at(o), r.u32_at(o + 4)));
-                        o += 8;
-                    }
-                    return offsets;
-                }
-                if doc > doc_id {
-                    return Vec::new();
-                }
-                cur += 12 + 8 * n_offsets;
-            }
-            Vec::new()
-        }
+        let Some((doc_run_off, _, occ_run_off, df)) = r.directory_lookup(self.field, term) else {
+            return Vec::new();
+        };
+        let doc_run_off = doc_run_off as usize;
+        let Some(i) = r.posting_index(doc_run_off, df, doc_id) else {
+            return Vec::new();
+        };
+        let occ_start = r.u32_at(doc_run_off + 12 * i + 8);
+        let occ_end = r.occ_start(doc_run_off, df as usize, i + 1);
+        r.occ_slice(occ_run_off as usize, occ_start, occ_end)
     }
     fn impacts(&self, term: &str) -> Option<ImpactCursor<'_>> {
         (*self).impacts_inner(term)
     }
     fn has_impacts(&self, term: &str) -> bool {
-        self.reader.v5_runs && self.reader.directory_lookup_v5(self.field, term).is_some()
+        self.reader.directory_lookup(self.field, term).is_some()
     }
     fn text(&self, doc_id: u32) -> Option<String> {
         self.reader.read_text(doc_id)
@@ -196,52 +146,20 @@ impl Bm25Index for FieldView<'_> {
     }
     fn posting_positions(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
         let r = self.reader;
-        if !r.v5_runs {
-            return None;
-        }
-        let i = r.directory_index_v5(self.field, term)?;
-        let (_, doc_run_off, _, _, df) = r.directory_entry_v5(self.field, i);
-        let doc_run_off = doc_run_off as usize;
-        let j = r.v5_posting_index(doc_run_off, df, doc_id)?;
+        let i = r.directory_index(self.field, term)?;
+        let (_, doc_run_off, _, _, df) = r.directory_entry(self.field, i);
+        r.posting_index(doc_run_off as usize, df, doc_id)?;
         let Some(section) = self.field.positions_off else {
             return Some(Vec::new());
         };
-        // base[i] + occ_start .. base[i] + occ_end, past the term count
-        // and the base table (see COLUMN_KIND_POSITIONS).
-        let section = section as usize;
-        let base = r.u32_at(section + 4 + 4 * i as usize) as usize;
-        let data = section + 4 + 4 * (self.field.n_terms as usize + 1);
-        let occ_start = r.u32_at(doc_run_off + 12 * j + 8) as usize;
-        let occ_end = r.v5_occ_start(doc_run_off, df as usize, j + 1) as usize;
-        Some(
-            (occ_start..occ_end)
-                .map(|o| r.u32_at(data + 4 * (base + o)))
-                .collect(),
-        )
+        self.posting_ordinal_slice(section, term, doc_id)
     }
     fn has_pos_lengths(&self) -> bool {
         self.field.positions_off.is_some() && self.field.pos_lengths_off.is_some()
     }
     fn posting_pos_lengths(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
-        let r = self.reader;
-        if !r.v5_runs {
-            return None;
-        }
         let section = self.field.pos_lengths_off?;
-        let i = r.directory_index_v5(self.field, term)?;
-        let (_, doc_run_off, _, _, df) = r.directory_entry_v5(self.field, i);
-        let doc_run_off = doc_run_off as usize;
-        let j = r.v5_posting_index(doc_run_off, df, doc_id)?;
-        let section = section as usize;
-        let base = r.u32_at(section + 4 + 4 * i as usize) as usize;
-        let data = section + 4 + 4 * (self.field.n_terms as usize + 1);
-        let occ_start = r.u32_at(doc_run_off + 12 * j + 8) as usize;
-        let occ_end = r.v5_occ_start(doc_run_off, df as usize, j + 1) as usize;
-        Some(
-            (occ_start..occ_end)
-                .map(|o| r.u32_at(data + 4 * (base + o)))
-                .collect(),
-        )
+        self.posting_ordinal_slice(section, term, doc_id)
     }
     fn has_splade(&self) -> bool {
         self.field.splade_range.is_some()
@@ -439,34 +357,57 @@ impl FieldView<'_> {
         Ok(())
     }
 
-    /// The field keyed by row (`docs/replay-from-segments.md`): one walk
-    /// of the directory in term order, then a counting sort of the
-    /// postings by row. Refused by name on a file without skip runs,
-    /// whose postings would have to be re-parsed per term.
+    /// The field keyed by physical slot (`docs/replay-from-segments.md`): one
+    /// walk of the directory in term order, then a counting sort of postings
+    /// by slot across `0..doc_lengths.len()`.
     pub fn transpose(&self) -> Result<FieldTranspose, String> {
         let r = self.reader;
-        if !r.v5_runs {
-            return Err(format!(
-                "field {:?}: the store has no skip runs (a v3/v4 file); a transpose needs the \
-                 v5 directory, rebuild the source first",
-                self.field.name
-            ));
-        }
-        let rows = r.doc_count as usize;
+        let rows = self.field.doc_lengths.len();
+        let (terms, row_starts, total_postings, total_occurrences) =
+            self.count_transpose_rows(rows)?;
+        let mut cursors = row_starts.clone();
+        let posted = self.fill_transpose_postings(&mut cursors, total_postings, total_occurrences);
+        let fi = r
+            .fields
+            .iter()
+            .position(|f| std::ptr::eq(f, self.field))
+            .expect("a field view borrows one of its reader's fields");
+        let sentences = self.field.sentences_off.map(|_| {
+            (0..rows as u32)
+                .map(|row| r.field_doc_sentences(fi, row).unwrap_or_default())
+                .collect()
+        });
+        let splade = self.transpose_splade_rows(rows)?;
+        Ok(FieldTranspose {
+            terms,
+            entries: posted.entries,
+            row_starts,
+            occurrences: posted.occurrences,
+            positions: posted.positions,
+            pos_lengths: posted.pos_lengths,
+            lengths: self.field.doc_lengths.clone(),
+            sentences,
+            splade_scales: splade.scales,
+            splade_by_row: splade.by_row,
+        })
+    }
+
+    fn count_transpose_rows(
+        &self,
+        rows: usize,
+    ) -> Result<(Vec<String>, Vec<u32>, usize, usize), String> {
+        let r = self.reader;
         let n_terms = self.field.n_terms;
-        let positions_section = self.field.positions_off.map(|off| off as usize);
-        let pos_lengths_section = self.field.pos_lengths_off.map(|off| off as usize);
         let mut terms = Vec::with_capacity(n_terms as usize);
-        // First walk: count postings per row, and total occurrences.
         let mut counts = vec![0u32; rows + 1];
         let mut total_postings = 0usize;
         let mut total_occurrences = 0usize;
         for i in 0..n_terms {
-            let (bytes, doc_run_off, _, _, df) = r.directory_entry_v5(self.field, i);
+            let (bytes, doc_run_off, _, _, df) = r.directory_entry(self.field, i);
             terms.push(String::from_utf8_lossy(bytes).into_owned());
             let doc_run_off = doc_run_off as usize;
             for j in 0..df as usize {
-                let (doc, _, _) = r.v5_doc_entry(doc_run_off, j);
+                let (doc, _, _) = r.doc_entry(doc_run_off, j);
                 let slot = doc as usize;
                 if slot >= rows {
                     return Err(format!(
@@ -477,56 +418,57 @@ impl FieldView<'_> {
                 counts[slot + 1] += 1;
                 total_postings += 1;
             }
-            let occ_end = r.v5_occ_start(doc_run_off, df as usize, df as usize) as usize;
+            let occ_end = r.occ_start(doc_run_off, df as usize, df as usize) as usize;
             let occ_first = if df == 0 {
                 occ_end
             } else {
-                r.v5_occ_start(doc_run_off, df as usize, 0) as usize
+                r.occ_start(doc_run_off, df as usize, 0) as usize
             };
             total_occurrences += occ_end - occ_first;
         }
-        let mut row_starts = counts;
-        for slot in 1..row_starts.len() {
-            row_starts[slot] += row_starts[slot - 1];
+        for slot in 1..counts.len() {
+            counts[slot] += counts[slot - 1];
         }
-        // Second walk: place each posting at its row's cursor, copying
-        // its spans (and ordinals) into the flat arrays.
-        let mut cursors = row_starts.clone();
+        Ok((terms, counts, total_postings, total_occurrences))
+    }
+
+    fn fill_transpose_postings(
+        &self,
+        cursors: &mut [u32],
+        total_postings: usize,
+        total_occurrences: usize,
+    ) -> TransposedPostings {
+        let r = self.reader;
+        let n_terms = self.field.n_terms;
+        let positions_section = self.field.positions_off.map(|off| off as usize);
+        let pos_lengths_section = self.field.pos_lengths_off.map(|off| off as usize);
         let mut entries = vec![(0u32, 0u32, 0u32, 0u32, 0u32); total_postings];
         let mut occurrences: Vec<(u32, u32)> = Vec::with_capacity(total_occurrences);
-        let mut positions: Option<Vec<u32>> =
-            positions_section.map(|_| Vec::with_capacity(total_occurrences));
-        let mut pos_lengths: Option<Vec<u32>> =
-            pos_lengths_section.map(|_| Vec::with_capacity(total_occurrences));
-        let positions_data =
-            positions_section.map(|section| section + 4 + 4 * (n_terms as usize + 1));
-        let pos_lengths_data =
-            pos_lengths_section.map(|section| section + 4 + 4 * (n_terms as usize + 1));
+        let mut positions = positions_section.map(|_| Vec::with_capacity(total_occurrences));
+        let mut pos_lengths = pos_lengths_section.map(|_| Vec::with_capacity(total_occurrences));
+        let data_off = |sec: usize| sec + 4 + 4 * (n_terms as usize + 1);
         for i in 0..n_terms {
-            let (_, doc_run_off, _, occ_run_off, df) = r.directory_entry_v5(self.field, i);
+            let (_, doc_run_off, _, occ_run_off, df) = r.directory_entry(self.field, i);
             let (doc_run_off, occ_run_off) = (doc_run_off as usize, occ_run_off as usize);
-            let base = positions_section.map(|section| r.u32_at(section + 4 + 4 * i as usize));
-            let len_base =
-                pos_lengths_section.map(|section| r.u32_at(section + 4 + 4 * i as usize));
+            let pos_sec =
+                positions_section.map(|s| (r.u32_at(s + 4 + 4 * i as usize), data_off(s)));
+            let len_sec =
+                pos_lengths_section.map(|s| (r.u32_at(s + 4 + 4 * i as usize), data_off(s)));
             for j in 0..df as usize {
-                let (doc, tf, occ_start) = r.v5_doc_entry(doc_run_off, j);
-                let occ_end = r.v5_occ_start(doc_run_off, df as usize, j + 1);
+                let (doc, tf, occ_start) = r.doc_entry(doc_run_off, j);
+                let occ_end = r.occ_start(doc_run_off, df as usize, j + 1);
                 let flat_start = occurrences.len() as u32;
                 for o in occ_start..occ_end {
                     let e = occ_run_off + 8 * o as usize;
                     occurrences.push((r.u32_at(e), r.u32_at(e + 4)));
                 }
                 let pos_start = positions.as_ref().map_or(0, |p| p.len() as u32);
-                if let (Some(out), Some(data), Some(base)) =
-                    (positions.as_mut(), positions_data, base)
-                {
+                if let (Some(out), Some((base, data))) = (positions.as_mut(), pos_sec) {
                     for o in occ_start..occ_end {
                         out.push(r.u32_at(data + 4 * (base as usize + o as usize)));
                     }
                 }
-                if let (Some(out), Some(data), Some(base)) =
-                    (pos_lengths.as_mut(), pos_lengths_data, len_base)
-                {
+                if let (Some(out), Some((base, data))) = (pos_lengths.as_mut(), len_sec) {
                     for o in occ_start..occ_end {
                         out.push(r.u32_at(data + 4 * (base as usize + o as usize)));
                     }
@@ -537,80 +479,55 @@ impl FieldView<'_> {
                 entries[at] = (i, tf, flat_start, occurrences.len() as u32, pos_start);
             }
         }
-        let fi = r
-            .fields
-            .iter()
-            .position(|f| std::ptr::eq(f, self.field))
-            .expect("a field view borrows one of its reader's fields");
-        let sentences = if self.field.sentences_off.is_some() {
-            let mut tables = Vec::with_capacity(rows);
-            for row in 0..rows as u32 {
-                tables.push(r.field_doc_sentences(fi, row).unwrap_or_default());
-            }
-            Some(tables)
-        } else {
-            None
-        };
-        let (splade_scales, splade_by_row) = match self.field.splade_range {
-            Some((off, len)) => {
-                let bytes = &r.map[off as usize..(off + len) as usize];
-                let decoded = crate::turbo_bridge::splade::SpladeFieldIndex::decode(bytes)
-                    .map_err(|e| {
-                        format!("field {:?}: invalid SPLADE section: {e}", self.field.name)
-                    })?;
-                let scales = (0..rows)
-                    .map(|row| decoded.doc_scale_bits(row as u32))
-                    .collect();
-                let mut by_row: Vec<Vec<(String, u16)>> = vec![Vec::new(); rows];
-                for (term, plist) in decoded.postings {
-                    for (doc, q) in plist {
-                        let slot = doc as usize;
-                        if slot >= rows {
-                            return Err(format!(
-                                "field {:?}: SPLADE term {:?} names row {doc} of a {rows}-row store",
-                                self.field.name, term
-                            ));
-                        }
-                        by_row[slot].push((term.clone(), q));
-                    }
-                }
-                (scales, Some(by_row))
-            }
-            None => (Vec::new(), None),
-        };
-        Ok(FieldTranspose {
-            terms,
+        TransposedPostings {
             entries,
-            row_starts,
             occurrences,
             positions,
             pos_lengths,
-            lengths: self.field.doc_lengths.clone(),
-            sentences,
-            splade_scales,
-            splade_by_row,
+        }
+    }
+
+    fn transpose_splade_rows(&self, rows: usize) -> Result<TransposedSplade, String> {
+        let Some((off, len)) = self.field.splade_range else {
+            return Ok(TransposedSplade {
+                scales: Vec::new(),
+                by_row: None,
+            });
+        };
+        let bytes = &self.reader.map[off as usize..(off + len) as usize];
+        let decoded = crate::turbo_bridge::splade::SpladeFieldIndex::decode(bytes)
+            .map_err(|e| format!("field {:?}: invalid SPLADE section: {e}", self.field.name))?;
+        let scales = (0..rows)
+            .map(|row| decoded.doc_scale_bits(row as u32))
+            .collect();
+        let mut by_row: Vec<Vec<(String, u16)>> = vec![Vec::new(); rows];
+        for (term, plist) in decoded.postings {
+            for (doc, q) in plist {
+                let slot = doc as usize;
+                if slot >= rows {
+                    return Err(format!(
+                        "field {:?}: SPLADE term {:?} names row {doc} of a {rows}-row store",
+                        self.field.name, term
+                    ));
+                }
+                by_row[slot].push((term.clone(), q));
+            }
+        }
+        Ok(TransposedSplade {
+            scales,
+            by_row: Some(by_row),
         })
     }
 
-    /// The directory entry's term bytes, on either directory shape.
+    /// The directory entry's term bytes.
     fn directory_term(&self, i: u32) -> &[u8] {
-        let r = self.reader;
-        if r.v5_runs {
-            r.directory_entry_v5(self.field, i).0
-        } else {
-            r.directory_entry(self.field, i).0
-        }
+        self.reader.directory_entry(self.field, i).0
     }
 
-    /// The directory entry's df, on either directory shape: the posting
-    /// list's length as written, tombstones included.
+    /// The directory entry's df: the posting list's length as written,
+    /// tombstones included.
     fn directory_df(&self, i: u32) -> u32 {
-        let r = self.reader;
-        if r.v5_runs {
-            r.directory_entry_v5(self.field, i).4
-        } else {
-            r.directory_entry(self.field, i).2
-        }
+        self.reader.directory_entry(self.field, i).4
     }
 
     /// Lower bound of `prefix` in the byte-sorted directory: the index
@@ -648,4 +565,16 @@ impl FieldView<'_> {
         }
         count
     }
+}
+
+struct TransposedPostings {
+    entries: Vec<(u32, u32, u32, u32, u32)>,
+    occurrences: Vec<(u32, u32)>,
+    positions: Option<Vec<u32>>,
+    pos_lengths: Option<Vec<u32>>,
+}
+
+struct TransposedSplade {
+    scales: Vec<u32>,
+    by_row: Option<Vec<Vec<(String, u16)>>>,
 }

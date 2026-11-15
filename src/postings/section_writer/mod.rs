@@ -121,10 +121,7 @@ pub(in crate::postings) fn write_text_index_from_lens<W: Write>(
 }
 
 /// Emit the variable-stride `lineages` section (1 B absent, 25 B present).
-pub(in crate::postings) fn write_lineages<W: Write>(
-    w: &mut W,
-    lineages: &[Option<DocLineage>],
-) -> io::Result<()> {
+fn write_lineages<W: Write>(w: &mut W, lineages: &[Option<DocLineage>]) -> io::Result<()> {
     for lineage in lineages {
         match lineage {
             Some(l) => {
@@ -140,9 +137,9 @@ pub(in crate::postings) fn write_lineages<W: Write>(
     Ok(())
 }
 
-/// Emit a v5-shaped term directory: `u32 count`, fixed-stride 34 B entries,
-/// then concatenated UTF-8 term bytes.
-pub(in crate::postings) fn write_v5_directory<'a, W: Write>(
+/// Emit a 34-byte block-max term directory: `u32 count`, fixed-stride 34 B
+/// entries, then concatenated UTF-8 term bytes.
+pub(in crate::postings) fn write_block_max_directory<'a, W: Write>(
     w: &mut W,
     count: usize,
     entries: impl IntoIterator<Item = (&'a str, u64, u64, u64, u32)> + Clone,

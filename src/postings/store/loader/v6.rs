@@ -6,8 +6,8 @@ use super::super::super::columns::{
     decode_binding_entry, decode_derived_entry, StoredBinding, StoredDerived,
 };
 use super::super::super::format::{
-    compatible_column_kind, COLUMN_KIND_ANALYSIS_BINDING, COLUMN_KIND_BINDING, COLUMN_KIND_DERIVED,
-    COLUMN_KIND_F64, COLUMN_KIND_FACET, COLUMN_KIND_GEO, COLUMN_KIND_I64, COLUMN_KIND_I64_PRESENT,
+    COLUMN_KIND_ANALYSIS_BINDING, COLUMN_KIND_BINDING, COLUMN_KIND_DERIVED, COLUMN_KIND_F64,
+    COLUMN_KIND_FACET, COLUMN_KIND_GEO, COLUMN_KIND_I64, COLUMN_KIND_I64_PRESENT,
     COLUMN_KIND_INDEX_BINDING, COLUMN_KIND_MAP_F64, COLUMN_KIND_MAP_FACET, COLUMN_KIND_MAP_I64,
     COLUMN_KIND_MAP_U64, COLUMN_KIND_POSITIONS, COLUMN_KIND_POS_LENGTHS, COLUMN_KIND_SENTENCES,
     COLUMN_KIND_SOURCES, COLUMN_KIND_SPLADE, COLUMN_KIND_U64, COLUMN_KIND_VECTOR_BINDING,
@@ -94,7 +94,7 @@ impl Bm25Store {
             }
             let positions_off = lookup_field_off(&col_metas.positions, &name);
             let pos_lengths_off = lookup_field_off(&col_metas.pos_lengths, &name);
-            let postings = Self::read_v5_shaped_postings(
+            let postings = Self::read_block_max_postings(
                 view.all,
                 d_off,
                 p_off,
@@ -219,14 +219,8 @@ impl V6ColumnMetas {
         let name_len = u64::from(view.u16_at(*cursor)?);
         let name = String::from_utf8(view.at(*cursor + 2, name_len)?.to_vec())
             .map_err(|_| invalid("invalid utf-8 in column name"))?;
-        let raw_kind = view.at(*cursor + 2 + name_len, 1)?[0];
+        let kind = view.at(*cursor + 2 + name_len, 1)?[0];
         let base = *cursor + 2 + name_len + 1;
-        let kind = compatible_column_kind(
-            raw_kind,
-            name.as_bytes(),
-            &view.all[base as usize - 8..],
-            (view.all.len() + 8) as u64,
-        );
         if let Some(next) = self.parse_value_entry(view, &name, kind, base)? {
             *cursor = next;
             return Ok(());

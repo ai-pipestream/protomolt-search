@@ -1,6 +1,8 @@
 //! Exact integer maps retain their types, presence and bounds across both writers/readers.
 mod common;
-use pipestream_search::postings::{AnalyzedDoc, Bm25Reader, Bm25Store, SpillBuilder};
+use pipestream_search::postings::{
+    AnalyzedDoc, Bm25Reader, Bm25Store, SpillBuilder, StoredDerived,
+};
 
 fn directory(tag: &str) -> std::path::PathBuf {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
@@ -13,16 +15,32 @@ fn document() -> AnalyzedDoc {
     AnalyzedDoc::body(vec![("map".into(), 1, vec![(0, 3)])], 1)
 }
 
-#[test]
-fn integer_map_writers_and_readers_preserve_exact_values() {
-    let dir = directory("roundtrip");
+fn derived_decl() -> StoredDerived {
+    StoredDerived::of(
+        &pipestream_search::derived::Declaration::compile(&pipestream_search::pb::DerivedColumns {
+            columns: vec![pipestream_search::pb::DerivedColumn {
+                name: "year".into(),
+                expression: "calendar.year(signed)".into(),
+                kind: pipestream_search::pb::MaterializeKind::I64 as i32,
+                disclosure: pipestream_search::pb::DerivedDisclosure::Inputs as i32,
+            }],
+        })
+        .unwrap(),
+    )
+}
+
+fn populate_integer_map_pair(
+    dir: &std::path::Path,
+    long_key: &str,
+    source: &pipestream_search::pb::ProtobufSource,
+) -> (Bm25Store, SpillBuilder) {
     let mut heap = Bm25Store::with_fields(&["body"])
         .with_map_numerics(&["float"])
         .with_integers(&["signed"])
         .with_unsigned_integers(&["unsigned"])
         .with_map_integers(&["signed_map", "empty_signed"])
         .with_map_unsigned_integers(&["unsigned_map", "empty_unsigned"]);
-    let mut spill = SpillBuilder::create_with_fields(&dir.as_path().join("build"), &["body"])
+    let mut spill = SpillBuilder::create_with_fields(&dir.join("build"), &["body"])
         .unwrap()
         .with_map_numeric_fields(&["float"])
         .with_integer_fields(&["signed"])
@@ -30,35 +48,135 @@ fn integer_map_writers_and_readers_preserve_exact_values() {
         .with_map_integer_fields(&["signed_map", "empty_signed"])
         .with_map_unsigned_integer_fields(&["unsigned_map", "empty_unsigned"])
         .with_buffer_bytes(1);
+    let derived = derived_decl();
+    heap.set_derived(Some(derived.clone()));
+    spill.set_derived(Some(derived));
     for row in 0..5 {
         heap.add_document(row, "map".into(), document());
         spill
             .add_document_with_lineage(row, "map".into(), document(), None)
             .unwrap();
     }
-    let long_key = "é".repeat(40_000);
+    for (row, key, value) in [
+        (0, "z", i64::MIN),
+        (0, "", i64::MAX),
+        (1, "", 0),
+        (3, "z", (1i64 << 53) + 1),
+        (3, long_key, -1),
+    ] {
+        heap.set_map_integer(0, row, key, value).unwrap();
+        spill.set_map_integer(0, row, key, value).unwrap();
+    }
+    for (row, key, value) in [
+        (0, "z", u64::MAX),
+        (0, "", (1u64 << 53) + 1),
+        (1, "", 0),
+        (3, "z", 1),
+        (3, long_key, 1 << 63),
+    ] {
+        heap.set_map_unsigned_integer(0, row, key, value).unwrap();
+        spill.set_map_unsigned_integer(0, row, key, value).unwrap();
+    }
+    for row in [0, 3] {
+        heap.set_map_numeric(0, row, "", 2.5);
+        spill.set_map_numeric(0, row, "", 2.5);
+        heap.set_integer(0, row, i64::MIN);
+        spill.set_integer(0, row, i64::MIN);
+        heap.set_unsigned_integer(0, row, u64::MAX);
+        spill.set_unsigned_integer(0, row, u64::MAX);
+    }
+    for archive in [heap.source_archive_mut(), spill.source_archive_mut()] {
+        archive
+            .attach_source_with_identity(3, source, Some(0), None)
+            .unwrap();
+    }
+    (heap, spill)
+}
+
+fn assert_integer_map_image(
+    path: &std::path::Path,
+    copied: &std::path::Path,
+    long_key: &str,
+    source: &pipestream_search::pb::ProtobufSource,
+) {
     let signed = [
         (0, "z", i64::MIN),
         (0, "", i64::MAX),
         (1, "", 0),
         (3, "z", (1i64 << 53) + 1),
-        (3, &long_key, -1),
+        (3, long_key, -1),
     ];
     let unsigned = [
         (0, "z", u64::MAX),
         (0, "", (1u64 << 53) + 1),
         (1, "", 0),
         (3, "z", 1),
-        (3, &long_key, 1 << 63),
+        (3, long_key, 1 << 63),
     ];
+    let read = Bm25Reader::open(path).unwrap();
+    let loaded = Bm25Store::load(path).unwrap();
+    assert_eq!(read.derived(), Some(&derived_decl()));
+    assert_eq!(loaded.derived(), Some(&derived_decl()));
+    assert_eq!(
+        read.protobuf_source(3).unwrap(),
+        Some((source.clone(), Some(0)))
+    );
+    read.verify_integrity().unwrap();
+    assert_eq!(read.map_integer_count(), 2);
+    assert_eq!(loaded.map_unsigned_integer_count(), 2);
+    assert_eq!(read.map_unsigned_integer_name(0), "unsigned_map");
+    assert_eq!(read.map_integer_index("signed_map"), Some(0));
+    assert!(read.map_integer_keys(1).is_empty());
+    assert!(read.map_unsigned_integer_keys(1).is_empty());
+    assert_eq!(
+        read.map_integer_keys(0),
+        &["".to_string(), "z".to_string(), long_key.to_string()]
+    );
     for (row, key, value) in signed {
-        heap.set_map_integer(0, row, key, value).unwrap();
-        spill.set_map_integer(0, row, key, value).unwrap();
+        let ord = read.map_integer_key_ord(0, key).unwrap();
+        assert_eq!(read.map_integer_value(0, ord, row), Some(value));
+        assert_eq!(
+            loaded.map_integer_value(0, loaded.map_integer_key_ord(0, key).unwrap(), row),
+            Some(value)
+        );
+        assert_eq!(read.map_integer_value(0, ord, 2), None);
+        assert_eq!(read.map_integer_value(0, ord, 4), None);
+        assert_eq!(read.map_integer_value(0, ord, u32::MAX), None);
     }
     for (row, key, value) in unsigned {
-        heap.set_map_unsigned_integer(0, row, key, value).unwrap();
-        spill.set_map_unsigned_integer(0, row, key, value).unwrap();
+        let ord = read.map_unsigned_integer_key_ord(0, key).unwrap();
+        assert_eq!(read.map_unsigned_integer_value(0, ord, row), Some(value));
+        assert_eq!(
+            loaded.map_unsigned_integer_value(
+                0,
+                loaded.map_unsigned_integer_key_ord(0, key).unwrap(),
+                row
+            ),
+            Some(value)
+        );
+        assert_eq!(read.map_unsigned_integer_value(0, ord, 2), None);
     }
+    assert_eq!(read.map_integer_key_min_max(0, 0), Some((0, i64::MAX)));
+    assert_eq!(
+        read.map_integer_key_min_max(0, 1),
+        Some((i64::MIN, (1i64 << 53) + 1))
+    );
+    assert_eq!(
+        read.map_unsigned_integer_key_min_max(0, 1),
+        Some((1, u64::MAX))
+    );
+    assert_eq!(read.map_unsigned_integer_key_min_max(1, 0), None);
+    assert_eq!(read.map_integer_value(0, u32::MAX, 0), None);
+    loaded.save(copied).unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), std::fs::read(copied).unwrap());
+}
+
+#[test]
+fn integer_map_writers_and_readers_preserve_exact_values() {
+    let dir = directory("roundtrip");
+    let long_key = "é".repeat(40_000);
+    let source = common::protobuf_source("map", "original");
+    let (mut heap, mut spill) = populate_integer_map_pair(dir.as_path(), &long_key, &source);
     assert!(heap.set_map_integer(0, 0, "z", 7).is_err());
     assert!(heap.set_map_integer(0, 0, "", i64::MIN).is_err());
     assert!(spill.set_map_integer(0, 0, "", i64::MIN).is_err());
@@ -68,20 +186,7 @@ fn integer_map_writers_and_readers_preserve_exact_values() {
         .set_map_unsigned_integer(0, u32::MAX, "bad", 7)
         .is_err());
     assert!(heap.set_map_integer(99, 0, "bad", 7).is_err());
-    for row in [0, 3] {
-        heap.set_map_numeric(0, row, "", 2.5);
-        spill.set_map_numeric(0, row, "", 2.5);
-        heap.set_integer(0, row, i64::MIN);
-        spill.set_integer(0, row, i64::MIN);
-        heap.set_unsigned_integer(0, row, u64::MAX);
-        spill.set_unsigned_integer(0, row, u64::MAX);
-    }
-    let source = common::protobuf_source("map", "original");
-    for archive in [heap.source_archive_mut(), spill.source_archive_mut()] {
-        archive
-            .attach_source_with_identity(3, &source, Some(0), None)
-            .unwrap();
-    }
+
     let heap_path = dir.as_path().join("heap");
     let spill_path = dir.as_path().join("spill");
     heap.save(&heap_path).unwrap();
@@ -90,73 +195,10 @@ fn integer_map_writers_and_readers_preserve_exact_values() {
         std::fs::read(&heap_path).unwrap(),
         std::fs::read(&spill_path).unwrap()
     );
+    let copied = dir.as_path().join("copied");
     for path in [&heap_path, &spill_path] {
-        let read = Bm25Reader::open(path).unwrap();
-        let loaded = Bm25Store::load(path).unwrap();
-        assert_eq!(
-            read.protobuf_source(3).unwrap(),
-            Some((source.clone(), Some(0)))
-        );
-        read.verify_integrity().unwrap();
-        assert_eq!(read.map_integer_count(), 2);
-        assert_eq!(loaded.map_unsigned_integer_count(), 2);
-        assert_eq!(read.map_unsigned_integer_name(0), "unsigned_map");
-        assert_eq!(read.map_integer_index("signed_map"), Some(0));
-        assert!(read.map_integer_keys(1).is_empty());
-        assert!(read.map_unsigned_integer_keys(1).is_empty());
-        assert_eq!(
-            read.map_integer_keys(0),
-            &["".to_string(), "z".to_string(), long_key.clone()]
-        );
-        for (row, key, value) in signed {
-            let ord = read.map_integer_key_ord(0, key).unwrap();
-            assert_eq!(read.map_integer_value(0, ord, row), Some(value));
-            assert_eq!(
-                loaded.map_integer_value(0, loaded.map_integer_key_ord(0, key).unwrap(), row),
-                Some(value)
-            );
-            assert_eq!(read.map_integer_value(0, ord, 2), None);
-            assert_eq!(read.map_integer_value(0, ord, 4), None);
-            assert_eq!(read.map_integer_value(0, ord, u32::MAX), None);
-        }
-        for (row, key, value) in unsigned {
-            let ord = read.map_unsigned_integer_key_ord(0, key).unwrap();
-            assert_eq!(read.map_unsigned_integer_value(0, ord, row), Some(value));
-            assert_eq!(
-                loaded.map_unsigned_integer_value(
-                    0,
-                    loaded.map_unsigned_integer_key_ord(0, key).unwrap(),
-                    row
-                ),
-                Some(value)
-            );
-            assert_eq!(read.map_unsigned_integer_value(0, ord, 2), None);
-        }
-        assert_eq!(read.map_integer_key_min_max(0, 0), Some((0, i64::MAX)));
-        assert_eq!(
-            read.map_integer_key_min_max(0, 1),
-            Some((i64::MIN, (1i64 << 53) + 1))
-        );
-        assert_eq!(
-            read.map_unsigned_integer_key_min_max(0, 1),
-            Some((1, u64::MAX))
-        );
-        assert_eq!(read.map_unsigned_integer_key_min_max(1, 0), None);
-        assert_eq!(read.map_integer_value(0, u32::MAX, 0), None);
-        let copied = dir.as_path().join("copied");
-        loaded.save(&copied).unwrap();
-        assert_eq!(std::fs::read(path).unwrap(), std::fs::read(copied).unwrap());
+        assert_integer_map_image(path, &copied, &long_key, &source);
     }
-    let mut legacy = Vec::new();
-    assert_eq!(
-        heap.write_v4_for_bench(&mut legacy).unwrap_err().kind(),
-        std::io::ErrorKind::Unsupported
-    );
-    assert!(legacy.is_empty());
-    assert_eq!(
-        heap.save_v5(&dir.as_path().join("v5")).unwrap_err().kind(),
-        std::io::ErrorKind::Unsupported
-    );
 }
 
 #[test]

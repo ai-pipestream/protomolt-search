@@ -1,11 +1,10 @@
-use std::io::{self, Write};
 use std::path::PathBuf;
 
 use super::codec::pareto_frontier;
 use super::store_tests::synthetic_corpus;
 use super::*;
 
-// --- v5 (TVBM2505) tests -------------------------------------------
+// --- Block-max postings & frontier tests -------------------------------
 
 /// Hand-rolled deterministic RNG (LCG, same style as
 /// `harness::unit_vectors`) — no proptest dependency.
@@ -28,9 +27,7 @@ impl Lcg {
 }
 
 pub(super) fn test_dir(name: &str) -> PathBuf {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target/tmp")
-        .join(format!("tvbm25_{name}_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("tvbm25_{name}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -83,167 +80,83 @@ fn vocab(rng: &mut Lcg, n: u64) -> Vec<String> {
         .collect()
 }
 
-/// v5 round trip: the reader serves exactly what the heap store
-/// holds, through every trait method the scorer uses.
-#[test]
-fn v5_round_trip_matches_heap_store() {
-    let dir = test_dir("v5rt");
-    let path = dir.join("shard.bm25");
-    let corpus = synthetic_corpus();
-    let mut store = Bm25Store::new();
-    for (id, text, doc, lineage) in &corpus {
-        store.add_document_with_lineage(*id, text.clone(), doc.clone(), *lineage);
-    }
-    store.save_v5(&path).unwrap();
-    let reader = Bm25Reader::open(&path).unwrap();
-
-    assert_eq!(Bm25Index::doc_count(&reader), store.doc_count());
-    assert_eq!(reader.total_doc_length(), store.total_doc_length());
-    assert_eq!(reader.next_doc_id(), store.next_doc_id());
-    for term in [
-        "court",
-        "plaintiff",
-        "rust",
-        "search",
-        "vector",
-        "quant",
-        "missing",
-    ] {
-        assert_eq!(reader.df(term), store.df(term), "df({term})");
-        // for_each_posting: identical (doc, tf, offsets) stream.
-        let mut got = Vec::new();
-        reader.for_each_posting(term, &mut |d, tf, o| got.push((d, tf, o.to_vec())));
-        let want = store
-            .postings(term)
-            .map(|ps| {
-                ps.iter()
-                    .map(|p| (p.doc_id, p.tf, p.offsets.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        assert_eq!(got, want, "for_each_posting({term})");
-        // for_each_doc_tf: identical (doc, tf) stream.
-        let mut got_tf = Vec::new();
-        reader.for_each_doc_tf(term, &mut |d, tf| got_tf.push((d, tf)));
-        let want_tf: Vec<(u32, u32)> = want.iter().map(|(d, tf, _)| (*d, *tf)).collect();
-        assert_eq!(got_tf, want_tf, "for_each_doc_tf({term})");
-        // posting_offsets: exact per (term, doc).
-        for (d, _, offs) in &want {
-            assert_eq!(
-                &reader.posting_offsets(term, *d),
-                offs,
-                "posting_offsets({term}, {d})"
-            );
-        }
-        assert!(reader.posting_offsets(term, u32::MAX).is_empty());
-    }
-    // text / lineage / doc_length (lineage exercises the lazily
-    // built offset index: this corpus has gap slots and missing
-    // lineages).
-    for (id, text, _, lineage) in &corpus {
-        assert_eq!(
-            reader.text(*id).as_deref(),
-            Some(text.as_str()),
-            "text({id})"
-        );
-        assert_eq!(reader.lineage(*id), *lineage, "lineage({id})");
-    }
-
-    // Scoring surface: top_k and score_candidates identical to heap.
-    let terms = vec![
-        "court".to_string(),
-        "rust".to_string(),
-        "missing".to_string(),
-    ];
-    let stats = crate::bm25::CorpusStats {
-        doc_count: store.doc_count(),
-        total_doc_length: store.total_doc_length(),
-        dfs: terms.iter().map(|t| store.df(t)).collect(),
-    };
-    let params = crate::bm25::Bm25Params::default();
-    let heap_hits = crate::bm25::top_k(&store, &terms, &stats, params, 20);
-    let disk_hits = crate::bm25::top_k(&reader, &terms, &stats, params, 20);
-    assert_eq!(heap_hits, disk_hits, "top_k heap vs v5 reader");
-    let oracle = crate::bm25::top_k_exhaustive(&store, &terms, &stats, params, 20);
-    assert_eq!(heap_hits, oracle, "top_k vs exhaustive oracle");
-    let ids: Vec<u32> = (0..store.next_doc_id()).filter(|i| i % 3 == 0).collect();
-    let heap_c = crate::bm25::score_candidates(&store, &terms, &stats, params, &ids);
-    let disk_c = crate::bm25::score_candidates(&reader, &terms, &stats, params, &ids);
-    assert_eq!(heap_c, disk_c, "score_candidates heap vs v5 reader");
-
-    // And the heap reload path (shard append) parses v5.
-    let loaded = Bm25Store::load(&path).unwrap();
-    assert_eq!(loaded.fields[0].postings, store.fields[0].postings);
-    assert_eq!(loaded.fields[0].doc_lengths, store.fields[0].doc_lengths);
-    assert_eq!(loaded.texts, store.texts);
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Bitwise cross-format property test: the SAME corpus written to v4
-/// and v5 must answer top_k with identical `(doc_id, score.to_bits(),
-/// term_offsets)` sequences — over random corpora, random k, random
-/// term counts, random k1/b — and identical to the exhaustive oracle.
-#[test]
-fn v5_v4_top_k_bitwise_identical() {
-    let dir = test_dir("v5x");
-    let mut rng = Lcg::new(0xB10C);
+fn assert_query_parity(store: &Bm25Store, reader: &Bm25Reader, rng: &mut Lcg, voc: &[String]) {
     let k1s = [0.0, 0.6, 1.2, 2.0];
     let bs = [0.0, 0.4, 0.75, 1.0];
+    let sig = |hits: &[crate::bm25::ScoredDoc]| {
+        hits.iter()
+            .map(|h| (h.doc_id, h.score.to_bits(), h.term_offsets.clone()))
+            .collect::<Vec<_>>()
+    };
+    for _ in 0..6 {
+        let n_terms = 1 + rng.below(4) as usize;
+        let mut terms: Vec<String> = voc
+            .iter()
+            .filter(|_| rng.below(2) == 0)
+            .take(n_terms.max(1))
+            .cloned()
+            .collect();
+        if terms.is_empty() {
+            terms.push(voc[0].clone());
+        }
+        let stats = crate::bm25::CorpusStats {
+            doc_count: store.doc_count(),
+            total_doc_length: store.total_doc_length(),
+            dfs: terms.iter().map(|t| store.df(t)).collect(),
+        };
+        let params = crate::bm25::Bm25Params {
+            k1: k1s[rng.below(k1s.len() as u64) as usize],
+            b: bs[rng.below(bs.len() as u64) as usize],
+        };
+        let k = 1 + rng.below(30) as usize;
+        let heap = sig(&crate::bm25::top_k(store, &terms, &stats, params, k));
+        let oracle = sig(&crate::bm25::top_k_exhaustive(
+            store, &terms, &stats, params, k,
+        ));
+        let disk = sig(&crate::bm25::top_k(reader, &terms, &stats, params, k));
+        let pruned = sig(&crate::bm25::top_k_pruned(
+            reader, &terms, &stats, params, k, 0.0,
+        ));
+        assert_eq!(heap, oracle, "top_k diverged from exhaustive oracle");
+        assert_eq!(heap, disk, "reader top_k diverged from heap");
+        assert_eq!(heap, pruned, "reader top_k_pruned diverged from heap");
+    }
+}
+
+/// Bitwise cross-engine property test: the same random corpus indexed in
+/// `Bm25Store` and streamed through `SpillBuilder` emits identical `.bm25`
+/// bytes and answers `top_k` / `top_k_pruned` with identical
+/// `(doc_id, score.to_bits(), term_offsets)` sequences across random `k`,
+/// term counts, and `k1`/`b`.
+#[test]
+fn store_spill_reader_top_k_bitwise_identical() {
+    let dir = test_dir("store_spill_parity");
+    let mut rng = Lcg::new(0xB10C);
     for round in 0..24 {
         let n_voc = 3 + rng.below(20);
         let voc = vocab(&mut rng, n_voc);
         let n_docs = 30 + rng.below(170);
         let corpus = random_corpus(&mut rng, n_docs, &voc);
         let store = build_store(&corpus);
-        let v5_path = dir.join(format!("r{round}.v5.bm25"));
-        let v4_path = dir.join(format!("r{round}.v4.bm25"));
-        store.save_v5(&v5_path).unwrap();
-        {
-            let mut w = io::BufWriter::new(std::fs::File::create(&v4_path).unwrap());
-            store.write_v4_for_bench(&mut w).unwrap();
-            w.flush().unwrap();
+        let mut spill = SpillBuilder::create(&dir.join(format!("work_{round}")))
+            .unwrap()
+            .with_buffer_bytes(256);
+        for (id, text, doc) in &corpus {
+            spill
+                .add_document_with_lineage(*id, text.clone(), doc.clone(), None)
+                .unwrap();
         }
-        let v5r = Bm25Reader::open(&v5_path).unwrap();
-        let v4r = Bm25Reader::open(&v4_path).unwrap();
-        for _ in 0..6 {
-            let n_terms = 1 + rng.below(4) as usize;
-            let terms: Vec<String> = voc
-                .iter()
-                .filter(|_| rng.below(2) == 0)
-                .take(n_terms.max(1))
-                .cloned()
-                .collect();
-            let terms = if terms.is_empty() {
-                vec![voc[0].clone()]
-            } else {
-                terms
-            };
-            let stats = crate::bm25::CorpusStats {
-                doc_count: store.doc_count(),
-                total_doc_length: store.total_doc_length(),
-                dfs: terms.iter().map(|t| store.df(t)).collect(),
-            };
-            let params = crate::bm25::Bm25Params {
-                k1: k1s[rng.below(k1s.len() as u64) as usize],
-                b: bs[rng.below(bs.len() as u64) as usize],
-            };
-            let k = 1 + rng.below(30) as usize;
-            let sig = |hits: &[crate::bm25::ScoredDoc]| {
-                hits.iter()
-                    .map(|h| (h.doc_id, h.score.to_bits(), h.term_offsets.clone()))
-                    .collect::<Vec<_>>()
-            };
-            let heap = sig(&crate::bm25::top_k(&store, &terms, &stats, params, k));
-            let oracle = sig(&crate::bm25::top_k_exhaustive(
-                &store, &terms, &stats, params, k,
-            ));
-            let v5 = sig(&crate::bm25::top_k(&v5r, &terms, &stats, params, k));
-            let v4 = sig(&crate::bm25::top_k(&v4r, &terms, &stats, params, k));
-            assert_eq!(heap, oracle, "round {round}: top_k diverged from oracle");
-            assert_eq!(heap, v5, "round {round}: v5 reader diverged");
-            assert_eq!(heap, v4, "round {round}: v4 reader diverged");
-        }
+        let store_path = dir.join(format!("r{round}.store.bm25"));
+        let spill_path = dir.join(format!("r{round}.spill.bm25"));
+        store.save(&store_path).unwrap();
+        spill.finish(&spill_path).unwrap();
+        assert_eq!(
+            std::fs::read(&store_path).unwrap(),
+            std::fs::read(&spill_path).unwrap(),
+            "round {round}: store and spill bytes diverged"
+        );
+        let reader = Bm25Reader::open(&spill_path).unwrap();
+        assert_query_parity(&store, &reader, &mut rng, &voc);
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -279,67 +192,82 @@ fn pareto_frontier_collapses_never_drops() {
     }
 }
 
+fn decode_l0_records(bytes: &[u8], skip_off: u64, df: u32) -> Vec<(u32, Vec<(u32, u32)>)> {
+    let n_blocks = (df as usize).div_ceil(BLOCK);
+    let mut cur = skip_off as usize + 8;
+    let mut out = Vec::with_capacity(n_blocks);
+    for _ in 0..n_blocks {
+        let last_doc_id = u32::from_le_bytes(bytes[cur..cur + 4].try_into().unwrap());
+        let n_pairs = bytes[cur + 4] as usize;
+        cur += 5;
+        let mut pairs = Vec::with_capacity(n_pairs);
+        for _ in 0..n_pairs {
+            let tf = u32::from_le_bytes(bytes[cur..cur + 4].try_into().unwrap());
+            let dl = u32::from_le_bytes(bytes[cur + 4..cur + 8].try_into().unwrap());
+            pairs.push((tf, dl));
+            cur += 8;
+        }
+        out.push((last_doc_id, pairs));
+    }
+    out
+}
+
+fn check_frontier_terms(store: &Bm25Store, reader: &Bm25Reader, terms: &[String]) -> bool {
+    use crate::bm25::{tf_norm, Bm25Params};
+    let params_list = [
+        Bm25Params { k1: 0.0, b: 0.0 },
+        Bm25Params { k1: 1.2, b: 0.75 },
+        Bm25Params { k1: 2.0, b: 1.0 },
+    ];
+    let avgdl = store.total_doc_length() as f64 / store.doc_count() as f64;
+    let mut saw_collapsed = false;
+    for term in terms {
+        let Some((_, skip_off, _, df)) = reader.directory_lookup(&reader.fields[0], term) else {
+            continue;
+        };
+        let records = decode_l0_records(&reader.map, skip_off, df);
+        let postings = store.postings(term).unwrap();
+        assert_eq!(records.len(), postings.len().div_ceil(BLOCK));
+        for (block_i, (_, pairs)) in records.iter().enumerate() {
+            assert!(!pairs.is_empty() && pairs.len() <= MAX_FRONTIER);
+            saw_collapsed |= pairs.len() == MAX_FRONTIER;
+            let block = &postings[block_i * BLOCK..((block_i + 1) * BLOCK).min(postings.len())];
+            for p in block {
+                let dl = store.doc_length(p.doc_id);
+                assert!(
+                    pairs.iter().any(|&(t, d)| t >= p.tf && d <= dl),
+                    "{term} block {block_i}: posting ({},{dl}) not bounded by {pairs:?}",
+                    p.tf
+                );
+            }
+            for params in params_list {
+                for a in [avgdl, 1.0, 50.0, 1000.0] {
+                    let true_max = block
+                        .iter()
+                        .map(|p| tf_norm(params, p.tf, store.doc_length(p.doc_id), a))
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    let stored_max = pairs
+                        .iter()
+                        .map(|&(t, d)| tf_norm(params, t, d, a))
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    assert!(
+                        stored_max >= true_max,
+                        "{term} block {block_i} underbounds at avgdl {a}, {params:?}: \
+                         stored {stored_max} < true {true_max}"
+                    );
+                }
+            }
+        }
+    }
+    saw_collapsed
+}
+
 /// Frontier safety gate: for every level-0 block of every term, the
 /// stored (possibly collapsed) frontier's max over tf_norm is >= the
 /// true block max, at several avgdl values and k1/b combos.
 #[test]
-fn v5_frontier_never_underbounds() {
-    use crate::bm25::{tf_norm, Bm25Params};
-    let dir = test_dir("v5frontier");
-
-    fn check(store: &Bm25Store, reader: &Bm25Reader, terms: &[String]) -> bool {
-        let params_list = [
-            Bm25Params { k1: 0.0, b: 0.0 },
-            Bm25Params { k1: 1.2, b: 0.75 },
-            Bm25Params { k1: 2.0, b: 1.0 },
-        ];
-        let avgdl = store.total_doc_length() as f64 / store.doc_count() as f64;
-        let mut saw_collapsed = false;
-        for term in terms {
-            let Some((_, skip_off, _, df)) = reader.directory_lookup_v5(&reader.fields[0], term)
-            else {
-                continue;
-            };
-            let records = reader.v5_l0_records(skip_off, df);
-            let postings = store.postings(term).unwrap();
-            assert_eq!(records.len(), postings.len().div_ceil(BLOCK));
-            for (block_i, (_, pairs)) in records.iter().enumerate() {
-                assert!(!pairs.is_empty() && pairs.len() <= MAX_FRONTIER);
-                saw_collapsed |= pairs.len() == MAX_FRONTIER;
-                let block = &postings[block_i * BLOCK..((block_i + 1) * BLOCK).min(postings.len())];
-                // Block frontier covers every posting (tf' >= tf, dl' <= dl).
-                for p in block {
-                    let dl = store.doc_length(p.doc_id);
-                    assert!(
-                        pairs.iter().any(|&(t, d)| t >= p.tf && d <= dl),
-                        "{term} block {block_i}: posting ({},{dl}) not bounded by {pairs:?}",
-                        p.tf
-                    );
-                }
-                for params in params_list {
-                    for a in [avgdl, 1.0, 50.0, 1000.0] {
-                        let true_max = block
-                            .iter()
-                            .map(|p| tf_norm(params, p.tf, store.doc_length(p.doc_id), a))
-                            .fold(f64::NEG_INFINITY, f64::max);
-                        let stored_max = pairs
-                            .iter()
-                            .map(|&(t, d)| tf_norm(params, t, d, a))
-                            .fold(f64::NEG_INFINITY, f64::max);
-                        assert!(
-                            stored_max >= true_max,
-                            "{term} block {block_i} underbounds at avgdl {a}, {params:?}: \
-                             stored {stored_max} < true {true_max}"
-                        );
-                    }
-                }
-            }
-        }
-        saw_collapsed
-    }
-
-    // Small vocab + many docs: every term spans several 128-posting
-    // blocks.
+fn frontier_never_underbounds() {
+    let dir = test_dir("frontier");
     let mut rng = Lcg::new(0xFE07);
     let voc = vocab(&mut rng, 4);
     let corpus = random_corpus(&mut rng, 900, &voc);
@@ -347,11 +275,8 @@ fn v5_frontier_never_underbounds() {
     let path = dir.join("random.bm25");
     store.save(&path).unwrap();
     let reader = Bm25Reader::open(&path).unwrap();
-    check(&store, &reader, &voc);
+    check_frontier_terms(&store, &reader, &voc);
 
-    // A (tf, dl) staircase forces frontier collapse: within a block,
-    // tf and dl both strictly increase, so every posting is on the
-    // frontier and the cap must collapse, never drop.
     let mut stair = Bm25Store::new();
     for i in 0..300u32 {
         stair.add_document(
@@ -367,22 +292,21 @@ fn v5_frontier_never_underbounds() {
     stair.save(&path).unwrap();
     let reader = Bm25Reader::open(&path).unwrap();
     assert!(
-        check(&stair, &reader, &["stair".to_string()]),
+        check_frontier_terms(&stair, &reader, &["stair".to_string()]),
         "collapse path never exercised"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Laziness proof: corrupt the occurrence run of a COPY of a v5 file;
+/// Laziness proof: corrupt the occurrence run of a COPY of a `.bm25` file;
 /// the for_each_doc_tf-based scored path (top_k) must return identical
 /// scores/doc ids, while posting_offsets returns the garbage — the
 /// scored path never touched the occurrence bytes.
 #[test]
-fn v5_scored_path_never_reads_occurrence_run() {
-    let dir = test_dir("v5lazy");
+fn scored_path_never_reads_occurrence_run() {
+    let dir = test_dir("occ_lazy");
     let path = dir.join("shard.bm25");
-    // One term, several docs, offsets on every posting.
     let mut store = Bm25Store::new();
     for i in 0..50u32 {
         let tf = 1 + i % 3;
@@ -401,9 +325,7 @@ fn v5_scored_path_never_reads_occurrence_run() {
     }
     store.save(&path).unwrap();
     let reader = Bm25Reader::open(&path).unwrap();
-    let (_, skip_off, occ_off, _) = reader
-        .directory_lookup_v5(&reader.fields[0], "court")
-        .unwrap();
+    let (_, skip_off, occ_off, _) = reader.directory_lookup(&reader.fields[0], "court").unwrap();
 
     let corrupted = dir.join("corrupted.bm25");
     let mut bytes = std::fs::read(&path).unwrap();
@@ -428,15 +350,11 @@ fn v5_scored_path_never_reads_occurrence_run() {
     let a = crate::bm25::top_k(&good, &terms, &stats, params, 10);
     let b = crate::bm25::top_k(&bad, &terms, &stats, params, 10);
     assert_eq!(sig(&a), sig(&b), "scored path touched occurrence bytes");
-    // The survivors' offsets DO come from the occurrence run, so they
-    // reflect the corruption — proving the corruption took and that
-    // offsets really are fetched separately.
     assert_ne!(
         a.iter().map(|h| &h.term_offsets).collect::<Vec<_>>(),
         b.iter().map(|h| &h.term_offsets).collect::<Vec<_>>(),
         "corruption did not reach the occurrence run"
     );
-    // posting_offsets decodes the corrupted run: garbage, same shape.
     let good_offs = good.posting_offsets("court", 7);
     let bad_offs = bad.posting_offsets("court", 7);
     assert_eq!(good_offs.len(), bad_offs.len());
@@ -453,115 +371,6 @@ fn synthetic_store() -> Bm25Store {
         store.add_document_with_lineage(id, text, doc, lineage);
     }
     store
-}
-
-/// The increment-1 parity contract (`docs/multi-field.md` build
-/// order step 1): a single-field v6 file carries the SAME section
-/// bytes as the v5 file of the same corpus. doc_lengths, texts,
-/// lineages, and postings are byte-identical; text_index entries
-/// and directory run offsets differ only by their documented
-/// rebasing (v6 stores them section-relative).
-#[test]
-fn v6_single_field_sections_match_v5() {
-    let store = synthetic_store();
-    let mut v5 = Vec::new();
-    store.write_to(&mut v5).unwrap();
-    let mut v6 = Vec::new();
-    store.write_v6_to(&mut v6).unwrap();
-
-    let u32le = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
-    let u64le = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
-
-    // v5 geometry from its fixed header.
-    let v5_texts_off = u64le(&v5, 16) as usize;
-    let v5_lineages_off = u64le(&v5, 24) as usize;
-    let v5_postings_off = u64le(&v5, 32) as usize;
-    let v5_directory_off = u64le(&v5, 40) as usize;
-    let n_slots = u32le(&v5, 48) as usize;
-    let v5_text_index_off = v5_lineages_off - 12 * n_slots;
-
-    // v6 geometry from its section table.
-    assert_eq!(&v6[..8], b"TVBM2506");
-    assert_eq!(u32le(&v6, 8), 1, "n_fields");
-    assert_eq!(u32le(&v6, 12) as usize, n_slots, "n_slots");
-    let t_off = u64le(&v6, 16) as usize;
-    let ti_off = u64le(&v6, 24) as usize;
-    let l_off = u64le(&v6, 32) as usize;
-    let name_len = u16::from_le_bytes(v6[40..42].try_into().unwrap()) as usize;
-    assert_eq!(&v6[42..42 + name_len], b"body");
-    let fe = 42 + name_len;
-    assert_eq!(u64le(&v6, fe), 0, "analysis fingerprint placeholder");
-    assert_eq!(u64le(&v6, fe + 8), u64le(&v5, 8), "total_length");
-    let dl_off = u64le(&v6, fe + 16) as usize;
-    let p_off = u64le(&v6, fe + 24) as usize;
-    let d_off = u64le(&v6, fe + 32) as usize;
-
-    // Byte-identical sections.
-    assert_eq!(
-        &v6[dl_off..dl_off + 4 * n_slots],
-        &v5[52..v5_texts_off],
-        "doc_lengths section"
-    );
-    assert_eq!(
-        &v6[t_off..ti_off],
-        &v5[v5_texts_off..v5_text_index_off],
-        "texts section"
-    );
-    assert_eq!(
-        &v6[l_off..dl_off],
-        &v5[v5_lineages_off..v5_postings_off],
-        "lineages section"
-    );
-    assert_eq!(
-        &v6[p_off..d_off],
-        &v5[v5_postings_off..v5_directory_off],
-        "postings section"
-    );
-
-    // text_index: identical entries after the documented rebase.
-    for slot in 0..n_slots {
-        let a = v5_text_index_off + 12 * slot;
-        let b = ti_off + 12 * slot;
-        assert_eq!(
-            u32le(&v5, a + 8),
-            u32le(&v6, b + 8),
-            "text len, slot {slot}"
-        );
-        if u32le(&v5, a + 8) != u32::MAX {
-            assert_eq!(
-                u64le(&v5, a) - v5_texts_off as u64,
-                u64le(&v6, b),
-                "text offset, slot {slot}"
-            );
-        } else {
-            assert_eq!(u64le(&v6, b), 0, "absent marker, slot {slot}");
-        }
-    }
-
-    // directory: identical entries after the documented rebase,
-    // identical term blob, both files fully tiled.
-    let n_terms = u32le(&v5, v5_directory_off) as usize;
-    assert_eq!(u32le(&v6, d_off) as usize, n_terms, "n_terms");
-    for i in 0..n_terms {
-        let a = v5_directory_off + 4 + 34 * i;
-        let b = d_off + 4 + 34 * i;
-        for run in 0..3 {
-            assert_eq!(
-                u64le(&v5, a + 8 * run) - v5_postings_off as u64,
-                u64le(&v6, b + 8 * run),
-                "run offset {run}, term {i}"
-            );
-        }
-        assert_eq!(
-            &v5[a + 24..a + 34],
-            &v6[b + 24..b + 34],
-            "df/blob/len, term {i}"
-        );
-    }
-    let blob_a = v5_directory_off + 4 + 34 * n_terms;
-    let blob_b = d_off + 4 + 34 * n_terms;
-    assert_eq!(v5.len() - blob_a, v6.len() - blob_b, "blob sizes");
-    assert_eq!(&v5[blob_a..], &v6[blob_b..], "term blob");
 }
 
 /// v6 round trip: the reader serves exactly what the heap store
@@ -855,54 +664,6 @@ fn fused_scoring_v6_reader_matches_store() {
         assert_eq!(w.doc_id, g.doc_id);
         assert_eq!(w.score.to_bits(), g.score.to_bits(), "doc {}", w.doc_id);
         assert_eq!(w.term_offsets, g.term_offsets, "doc {}", w.doc_id);
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The transcoder's contract: transcoding the v4 file of a corpus
-/// produces byte-for-byte the v5 file the direct writer emits, on
-/// a gappy/lineaged corpus and on one whose hot term spans
-/// multiple level-1 skip groups (df > 4096).
-#[test]
-fn transcode_v4_matches_direct_v5_bytes() {
-    let dir = test_dir("transcode");
-    let hot_store = {
-        let mut store = Bm25Store::new();
-        for i in 0..4300u32 {
-            let tf = 1 + i % 3;
-            let mut terms: DocTerms = vec![("hot".to_string(), tf, vec![(i, i + 2)])];
-            if i % 5 == 0 {
-                terms.push((format!("t{}", i % 7), 1, Vec::new()));
-            }
-            let length = terms.iter().map(|t| t.1).sum();
-            store.add_document(i * 2, format!("doc {i}"), AnalyzedDoc::body(terms, length));
-        }
-        store
-    };
-    for (tag, store) in [("synthetic", synthetic_store()), ("hot", hot_store)] {
-        let v4_path = dir.join(format!("{tag}.v4.bm25"));
-        {
-            let mut w = io::BufWriter::new(std::fs::File::create(&v4_path).unwrap());
-            store.write_v4_for_bench(&mut w).unwrap();
-            w.flush().unwrap();
-        }
-        let v5_path = dir.join(format!("{tag}.v5.bm25"));
-        let stats = transcode_to_v5(&v4_path, &v5_path).unwrap();
-        assert_eq!(stats.n_slots, store.next_doc_id(), "{tag}: n_slots");
-        let mut direct = Vec::new();
-        store.write_to(&mut direct).unwrap();
-        let transcoded = std::fs::read(&v5_path).unwrap();
-        assert_eq!(transcoded.len(), direct.len(), "{tag}: sizes differ");
-        assert!(
-            transcoded == direct,
-            "{tag}: transcoded v5 is not byte-identical to the direct writer"
-        );
-        // And it serves as v5, block-max surface included.
-        let reader = Bm25Reader::open(&v5_path).unwrap();
-        let probe = if tag == "hot" { "hot" } else { "court" };
-        assert!(reader.has_impacts(probe), "{tag}: no impacts on {probe}");
-        // Transcoding a v5 file is refused.
-        assert!(transcode_to_v5(&v5_path, &dir.join("again.bm25")).is_err());
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

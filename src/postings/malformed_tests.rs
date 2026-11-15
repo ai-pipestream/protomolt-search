@@ -1,15 +1,16 @@
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
 
+use super::format_tests::test_dir;
 use super::*;
 
-/// Build a store whose v5 file exercises every validated structure:
-/// one term with >4096 postings (2 level-1 groups), other terms,
-/// gap slots, lineages, offsets.
+/// Build a store that exercises every validated structure: one term with
+/// `> 4096` postings (2 level-1 groups), secondary terms, gap slots, lineages,
+/// and occurrence offsets.
 fn malformed_corpus_store() -> Bm25Store {
     let mut store = Bm25Store::new();
     for i in 0..4300u32 {
-        let id = i * 2; // gap slots
+        let id = i * 2;
         let lineage = (i % 3 == 0).then_some(DocLineage {
             parent_id: u64::from(i),
             group_id: u64::from(i) * 7,
@@ -34,14 +35,8 @@ fn malformed_corpus_store() -> Bm25Store {
     store
 }
 
-fn write_v4(store: &Bm25Store, path: &Path) {
-    let mut w = io::BufWriter::new(std::fs::File::create(path).unwrap());
-    store.write_v4_for_bench(&mut w).unwrap();
-    w.flush().unwrap();
-}
-
-/// A small store (~few KB on disk) for the every-byte truncation
-/// sweep: gaps, lineages, one multi-block term, offsets.
+/// Small store (~few KB on disk) for the every-byte truncation sweep:
+/// gaps, lineages, one multi-block term, and offsets.
 fn small_corpus_store() -> Bm25Store {
     let mut store = Bm25Store::new();
     for i in 0..140u32 {
@@ -67,23 +62,23 @@ fn small_corpus_store() -> Bm25Store {
     store
 }
 
-/// Truncation at EVERY byte length must error, never panic — on a
-/// small file so the sweep stays fast. v6, v5, and v4.
+fn write_raw_payload(store: &Bm25Store, path: &Path) {
+    let mut raw = Vec::new();
+    store.write_v6_to(&mut raw).unwrap();
+    std::fs::write(path, raw).unwrap();
+}
+
+/// Truncation at EVERY byte length must error, never panic — across both
+/// raw payload (`TVBM2506`) and integrity-wrapped (`TVBM2508`) files.
 #[test]
 fn truncated_open_errors_never_panics() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target/tmp")
-        .join(format!("truncate_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = test_dir("truncate");
     let store = small_corpus_store();
-    let v6_path = dir.join("small.v6.bm25");
-    let v5_path = dir.join("small.v5.bm25");
-    let v4_path = dir.join("small.v4.bm25");
-    store.save(&v6_path).unwrap();
-    store.save_v5(&v5_path).unwrap();
-    write_v4(&store, &v4_path);
-    for (tag, src) in [("v6", &v6_path), ("v5", &v5_path), ("v4", &v4_path)] {
+    let raw_path = dir.join("small.raw.bm25");
+    let v8_path = dir.join("small.v8.bm25");
+    write_raw_payload(&store, &raw_path);
+    store.save(&v8_path).unwrap();
+    for (tag, src) in [("raw", &raw_path), ("v8", &v8_path)] {
         let bytes = std::fs::read(src).unwrap();
         Bm25Reader::open(src).unwrap();
         let trunc = dir.join(format!("trunc.{tag}"));
@@ -93,6 +88,10 @@ fn truncated_open_errors_never_panics() {
                 Bm25Reader::open(&trunc).is_err(),
                 "{tag}: truncation to {len} bytes opened successfully"
             );
+            assert!(
+                Bm25Store::load(&trunc).is_err(),
+                "{tag}: truncation to {len} bytes loaded successfully"
+            );
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -100,26 +99,16 @@ fn truncated_open_errors_never_panics() {
 
 #[test]
 fn corrupted_open_errors_never_panics() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target/tmp")
-        .join(format!("malformed_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = test_dir("malformed");
     let store = malformed_corpus_store();
-    let v6_path = dir.join("corpus.v6.bm25");
-    let v5_path = dir.join("corpus.v5.bm25");
-    let v4_path = dir.join("corpus.v4.bm25");
-    store.save(&v6_path).unwrap();
-    store.save_v5(&v5_path).unwrap();
-    write_v4(&store, &v4_path);
+    let raw_path = dir.join("corpus.raw.bm25");
+    let v8_path = dir.join("corpus.v8.bm25");
+    write_raw_payload(&store, &raw_path);
+    store.save(&v8_path).unwrap();
 
-    for (tag, src) in [("v6", &v6_path), ("v5", &v5_path), ("v4", &v4_path)] {
+    for (tag, src) in [("raw", &raw_path), ("v8", &v8_path)] {
         let bytes = std::fs::read(src).unwrap();
-        // Sanity: the intact file opens.
         Bm25Reader::open(src).unwrap();
-
-        // Random single-byte flips in the header, directory, and
-        // skip-run regions: error or valid open, never a panic.
         let mut s = 0xC0FFEEu64;
         let mut next = move || {
             s = s
@@ -127,50 +116,15 @@ fn corrupted_open_errors_never_panics() {
                 .wrapping_add(1442695040888963407);
             (s >> 33) as usize
         };
-        // v6: flips anywhere — the explicit section table makes
-        // the whole file validated structure. v5/v4: header,
-        // directory, and (v5) skip-run regions from the fixed
-        // header: magic(8) total_length(8) texts(8) lineages(8)
-        // postings(8) directory(8) n_slots(4).
-        let regions: Vec<(usize, usize)> = if tag == "v6" {
-            vec![(0, bytes.len())]
-        } else {
-            let directory_off = u64::from_le_bytes(bytes[40..48].try_into().unwrap()) as usize;
-            let n_terms =
-                u32::from_le_bytes(bytes[directory_off..directory_off + 4].try_into().unwrap())
-                    as usize;
-            let mut regions: Vec<(usize, usize)> = vec![(0, 52), (directory_off, bytes.len())];
-            if tag == "v5" {
-                for i in 0..n_terms {
-                    let e = directory_off + 4 + 34 * i;
-                    let skip_off =
-                        u64::from_le_bytes(bytes[e + 8..e + 16].try_into().unwrap()) as usize;
-                    let end = if i + 1 < n_terms {
-                        u64::from_le_bytes(bytes[e + 34..e + 42].try_into().unwrap()) as usize
-                    } else {
-                        directory_off
-                    };
-                    regions.push((skip_off, end));
-                }
-            }
-            regions
-        };
-        // v3/v4 flips stay in the header and directory: postings
-        // record payloads are data (like occurrence bytes and
-        // frontier pairs), not validated structure.
         let flipped = dir.join(format!("flip.{tag}"));
-        let (mut errors, mut opens) = (0usize, 0usize);
+        let mut errors = 0usize;
         for _ in 0..2000 {
-            let &(lo, hi) = &regions[next() % regions.len()];
-            let pos = lo + next() % (hi - lo).max(1);
+            let pos = next() % bytes.len();
             let mut bad = bytes.clone();
             bad[pos] ^= 1 + (next() % 255) as u8;
             std::fs::write(&flipped, &bad).unwrap();
             match Bm25Reader::open(&flipped) {
                 Ok(reader) => {
-                    opens += 1;
-                    // A valid open must stay usable on the read
-                    // paths the structure guards (no panics).
                     let _ = reader.df("hot");
                     reader.for_each_doc_tf("hot", &mut |_, _| {});
                     let _ = reader.posting_offsets("hot", 0);
@@ -179,7 +133,62 @@ fn corrupted_open_errors_never_panics() {
             }
         }
         assert!(errors > 0, "{tag}: no flip was ever rejected");
-        eprintln!("{tag}: flips: {errors} rejected, {opens} opened-valid");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn legacy_magics_and_kind15_derived_fail_closed() {
+    let dir = test_dir("legacy_refusal");
+    let bad_path = dir.join("bad.bm25");
+    for magic in [
+        &b"TVBM2501"[..],
+        &b"TVBM2502"[..],
+        &b"TVBM2503"[..],
+        &b"TVBM2504"[..],
+        &b"TVBM2505"[..],
+        &b"TVBM2500"[..],
+        &b"TVBM2599"[..],
+        &b"TVBM25"[..],
+    ] {
+        let mut buf = magic.to_vec();
+        buf.resize(128, 0);
+        std::fs::write(&bad_path, &buf).unwrap();
+        assert_eq!(
+            Bm25Reader::open(&bad_path).err().unwrap().kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert_eq!(
+            Bm25Store::load(&bad_path).err().unwrap().kind(),
+            io::ErrorKind::InvalidData,
+        );
+    }
+
+    let mut store = small_corpus_store();
+    let decl = crate::derived::Declaration::compile(&crate::pb::DerivedColumns {
+        columns: vec![crate::pb::DerivedColumn {
+            name: "year".into(),
+            expression: "calendar.year(decided)".into(),
+            kind: crate::pb::MaterializeKind::I64 as i32,
+            disclosure: crate::pb::DerivedDisclosure::Inputs as i32,
+        }],
+    })
+    .unwrap();
+    store.set_derived(Some(StoredDerived::of(&decl)));
+    let mut raw = Vec::new();
+    store.write_v6_to(&mut raw).unwrap();
+    let needle = b"derived-columns";
+    let pos = raw.windows(needle.len()).position(|w| w == needle).unwrap();
+    assert_eq!(raw[pos + needle.len()], 17);
+    raw[pos + needle.len()] = 15;
+    std::fs::write(&bad_path, &raw).unwrap();
+    assert_eq!(
+        Bm25Reader::open(&bad_path).err().unwrap().kind(),
+        io::ErrorKind::InvalidData,
+    );
+    assert_eq!(
+        Bm25Store::load(&bad_path).err().unwrap().kind(),
+        io::ErrorKind::InvalidData,
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

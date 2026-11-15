@@ -9,14 +9,15 @@
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 
-/// Postings per SPLADE skip block, matching BM25 v5 level-0 blocks (`128`).
+/// Postings per SPLADE skip block, matching BM25 level-0 blocks (`128`).
 pub const SPLADE_BLOCK_SIZE: usize = 128;
 
-/// Magic bytes of legacy uniform-scale `COLUMN_KIND_SPLADE` sections.
-pub const SPLADE_SECTION_MAGIC: &[u8; 8] = b"TVSPLD01";
-/// Lossless mixed-scale variant: blocks append max-scale bits and postings
-/// append their document's scale bits. Uniform-scale fields keep v1 bytes.
-const SPLADE_SECTION_MAGIC_V2: &[u8; 8] = b"TVSPLD02";
+/// Magic bytes of `COLUMN_KIND_SPLADE` sections: 12-byte block headers carry
+/// per-block max-scale bits and 10-byte postings carry per-document scale bits.
+pub const SPLADE_SECTION_MAGIC: &[u8; 8] = b"TVSPLD02";
+
+const SPLADE_BLOCK_STRIDE: usize = 12;
+const SPLADE_POSTING_STRIDE: usize = 10;
 
 // Bound an f32 sum independently of term order. gamma_n accounts for the
 // worst-case rounding of the n-1 additions; one extra operation also covers
@@ -101,9 +102,9 @@ pub fn quantize_splade_impacts(
 /// Heap-resident quantized SPLADE inverted index for one field on one shard.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SpladeFieldIndex {
-    /// IEEE-754 `f32::to_bits()` of the impact quantization scale (`0` when empty).
+    /// IEEE-754 `f32::to_bits()` of the baseline quantization scale (`0` when empty).
     pub scale_bits: u32,
-    /// Per-document overrides; integer impacts are never requantized at merge.
+    /// Per-document scale overrides; integer impacts are never requantized at merge.
     pub scales: BTreeMap<u32, u32>,
     /// Term -> doc-id-ordered `(doc_id, quantized_impact)` postings.
     pub postings: BTreeMap<String, Vec<(u32, u16)>>,
@@ -147,12 +148,12 @@ impl SpladeFieldIndex {
         }
     }
 
-    /// Original document scale, including legacy uniform-scale fields.
+    /// Per-document quantization scale bits (`f32::to_bits()`).
     pub fn doc_scale_bits(&self, doc: u32) -> u32 {
         self.scales.get(&doc).copied().unwrap_or(self.scale_bits)
     }
 
-    /// Exact serialized byte length of this section (v1 uniform or v2 mixed scale).
+    /// Exact serialized byte length of this `TVSPLD02` section.
     pub fn encoded_len(&self) -> u64 {
         self.encoded_len_for_terms(
             self.postings
@@ -167,8 +168,6 @@ impl SpladeFieldIndex {
     ) -> u64 {
         let mut size = 0u64;
         let mut any = false;
-        let block_stride = if self.scales.is_empty() { 8 } else { 12 };
-        let posting_stride = if self.scales.is_empty() { 6 } else { 10 };
         for (term, plist) in terms {
             any = true;
             let n_blocks = plist.len().div_ceil(SPLADE_BLOCK_SIZE) as u64;
@@ -176,8 +175,8 @@ impl SpladeFieldIndex {
                 + term.len() as u64
                 + 4
                 + 4
-                + n_blocks * block_stride
-                + (plist.len() as u64) * posting_stride;
+                + n_blocks * SPLADE_BLOCK_STRIDE as u64
+                + (plist.len() as u64) * SPLADE_POSTING_STRIDE as u64;
         }
         if any {
             16 + size
@@ -186,7 +185,7 @@ impl SpladeFieldIndex {
         }
     }
 
-    /// Writes v1 for uniform scales or lossless v2 for mixed document scales.
+    /// Serializes this field's SPLADE postings in canonical `TVSPLD02` format.
     pub fn write<W: Write>(&self, w: &mut W) -> io::Result<()> {
         self.write_terms(
             self.postings.len(),
@@ -206,12 +205,7 @@ impl SpladeFieldIndex {
         if term_count == 0 {
             return Ok(());
         }
-        let mixed = !self.scales.is_empty();
-        w.write_all(if mixed {
-            SPLADE_SECTION_MAGIC_V2
-        } else {
-            SPLADE_SECTION_MAGIC
-        })?;
+        w.write_all(SPLADE_SECTION_MAGIC)?;
         w.write_all(&self.scale_bits.to_le_bytes())?;
         w.write_all(&(term_count as u32).to_le_bytes())?;
         for (term, plist) in terms {
@@ -225,29 +219,25 @@ impl SpladeFieldIndex {
                 let max_doc = chunk.last().map_or(0, |&(d, _)| d);
                 let max_impact = chunk.iter().map(|&(_, q)| q).max().unwrap_or(0);
                 let block_len = chunk.len() as u16;
+                let max_scale = chunk
+                    .iter()
+                    .map(|&(d, _)| f32::from_bits(self.doc_scale_bits(d)))
+                    .fold(0.0_f32, f32::max);
                 w.write_all(&max_doc.to_le_bytes())?;
                 w.write_all(&max_impact.to_le_bytes())?;
                 w.write_all(&block_len.to_le_bytes())?;
-                if mixed {
-                    let max_scale = chunk
-                        .iter()
-                        .map(|&(d, _)| f32::from_bits(self.doc_scale_bits(d)))
-                        .fold(0.0_f32, f32::max);
-                    w.write_all(&max_scale.to_bits().to_le_bytes())?;
-                }
+                w.write_all(&max_scale.to_bits().to_le_bytes())?;
             }
             for &(doc_id, q) in plist {
                 w.write_all(&doc_id.to_le_bytes())?;
                 w.write_all(&q.to_le_bytes())?;
-                if mixed {
-                    w.write_all(&self.doc_scale_bits(doc_id).to_le_bytes())?;
-                }
+                w.write_all(&self.doc_scale_bits(doc_id).to_le_bytes())?;
             }
         }
         Ok(())
     }
 
-    /// Decodes either SPLADE section version back into a [`SpladeFieldIndex`].
+    /// Decodes a `TVSPLD02` SPLADE section back into a [`SpladeFieldIndex`].
     pub fn decode(bytes: &[u8]) -> io::Result<Self> {
         let reader = SpladeSectionReader::open(bytes)?;
         let mut postings = BTreeMap::new();
@@ -260,10 +250,10 @@ impl SpladeFieldIndex {
                 .to_string();
             let mut plist = Vec::with_capacity(entry.df as usize);
             for j in 0..entry.df as usize {
-                let p = entry.postings_off + j * reader.posting_stride;
+                let p = entry.postings_off + j * SPLADE_POSTING_STRIDE;
                 let doc_id = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
                 let q = u16::from_le_bytes(bytes[p + 4..p + 6].try_into().unwrap());
-                let scale = reader.posting_scale_bits(p);
+                let scale = u32::from_le_bytes(bytes[p + 6..p + 10].try_into().unwrap());
                 if scale != reader.scale_bits {
                     scales.insert(doc_id, scale);
                 }
@@ -353,127 +343,312 @@ struct SpladeTermMeta {
     postings_off: usize,
     global_max_impact: u16,
     global_max_scale: f32,
-    block_stride: usize,
-    posting_stride: usize,
 }
 
-/// Zero-copy memory-mapped reader over a `TVSPLD01`/`TVSPLD02` (`COLUMN_KIND_SPLADE`) section.
+fn splade_invalid(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
+}
+
+fn parse_splade_term<'a>(
+    bytes: &'a [u8],
+    cur: &mut usize,
+    prev_term: &mut Option<&'a [u8]>,
+    base_scale: f32,
+) -> io::Result<SpladeTermMeta> {
+    if *cur + 2 > bytes.len() {
+        return Err(splade_invalid("truncated SPLADE term length"));
+    }
+    let term_len = u16::from_le_bytes(bytes[*cur..*cur + 2].try_into().unwrap()) as usize;
+    *cur += 2;
+    if *cur + term_len + 8 > bytes.len() {
+        return Err(splade_invalid("truncated SPLADE term header"));
+    }
+    let term_slice = &bytes[*cur..*cur + term_len];
+    std::str::from_utf8(term_slice).map_err(|_| splade_invalid("invalid utf-8 in SPLADE term"))?;
+    if let Some(prev) = *prev_term {
+        if term_slice <= prev {
+            return Err(splade_invalid("SPLADE terms are not strictly byte-sorted"));
+        }
+    }
+    *prev_term = Some(term_slice);
+    let term_off = *cur;
+    *cur += term_len;
+    let df = u32::from_le_bytes(bytes[*cur..*cur + 4].try_into().unwrap());
+    let n_blocks = u32::from_le_bytes(bytes[*cur + 4..*cur + 8].try_into().unwrap());
+    *cur += 8;
+    if n_blocks as usize != (df as usize).div_ceil(SPLADE_BLOCK_SIZE) {
+        return Err(splade_invalid("SPLADE block count disagrees with df"));
+    }
+    let blocks_bytes = (n_blocks as usize)
+        .checked_mul(SPLADE_BLOCK_STRIDE)
+        .ok_or_else(|| splade_invalid("SPLADE blocks overflow"))?;
+    let postings_bytes = (df as usize)
+        .checked_mul(SPLADE_POSTING_STRIDE)
+        .ok_or_else(|| splade_invalid("SPLADE postings overflow"))?;
+    if *cur + blocks_bytes + postings_bytes > bytes.len() {
+        return Err(splade_invalid("truncated SPLADE blocks or postings"));
+    }
+    let blocks_off = *cur;
+    let mut global_max_impact = 0u16;
+    let mut global_max_scale = base_scale;
+    for b in 0..n_blocks as usize {
+        let bo = blocks_off + b * SPLADE_BLOCK_STRIDE;
+        let bmax = u16::from_le_bytes(bytes[bo + 4..bo + 6].try_into().unwrap());
+        global_max_impact = global_max_impact.max(bmax);
+        let blen = u16::from_le_bytes(bytes[bo + 6..bo + 8].try_into().unwrap()) as usize;
+        if blen != (df as usize - b * SPLADE_BLOCK_SIZE).min(SPLADE_BLOCK_SIZE) {
+            return Err(splade_invalid("SPLADE block length disagrees with df"));
+        }
+        let bs = f32::from_le_bytes(bytes[bo + 8..bo + 12].try_into().unwrap());
+        if !bs.is_finite() || bs <= 0.0 {
+            return Err(splade_invalid("invalid SPLADE block scale"));
+        }
+        global_max_scale = global_max_scale.max(bs);
+    }
+    let postings_off = blocks_off + blocks_bytes;
+    *cur = postings_off + postings_bytes;
+    Ok(SpladeTermMeta {
+        term_off,
+        term_len,
+        df,
+        n_blocks,
+        blocks_off,
+        postings_off,
+        global_max_impact,
+        global_max_scale,
+    })
+}
+
+struct SpladeCursor<'b> {
+    meta: &'b SpladeTermMeta,
+    q_weight: f32,
+    upper_bound: f32,
+    block_idx: usize,
+    in_block_idx: usize,
+    posting_abs_idx: usize,
+    cur_doc: u32,
+    block_entered: bool,
+}
+
+impl<'b> SpladeCursor<'b> {
+    fn new(bytes: &[u8], meta: &'b SpladeTermMeta, q_weight: f32) -> Self {
+        let cur_doc = if meta.df > 0 {
+            u32::from_le_bytes(
+                bytes[meta.postings_off..meta.postings_off + 4]
+                    .try_into()
+                    .unwrap(),
+            )
+        } else {
+            u32::MAX
+        };
+        Self {
+            meta,
+            q_weight,
+            upper_bound: q_weight * f32::from(meta.global_max_impact) * meta.global_max_scale,
+            block_idx: 0,
+            in_block_idx: 0,
+            posting_abs_idx: 0,
+            cur_doc,
+            block_entered: false,
+        }
+    }
+
+    fn mark_block_entered(&mut self, stats: &mut SpladeTraversalStats) {
+        if !self.block_entered && self.block_idx < self.meta.n_blocks as usize {
+            self.block_entered = true;
+            stats.blocks_visited += 1;
+        }
+    }
+
+    fn finish_remaining_blocks(&mut self, stats: &mut SpladeTraversalStats) {
+        if self.block_idx < self.meta.n_blocks as usize {
+            if !self.block_entered {
+                stats.blocks_skipped += 1;
+            }
+            let after = (self.meta.n_blocks as usize).saturating_sub(self.block_idx + 1);
+            stats.blocks_skipped += after as u64;
+            self.block_idx = self.meta.n_blocks as usize;
+            self.block_entered = false;
+        }
+    }
+
+    fn block_header(&self, bytes: &[u8], b: usize) -> (u32, u16, u16, f32) {
+        let bo = self.meta.blocks_off + b * SPLADE_BLOCK_STRIDE;
+        let max_doc = u32::from_le_bytes(bytes[bo..bo + 4].try_into().unwrap());
+        let max_q = u16::from_le_bytes(bytes[bo + 4..bo + 6].try_into().unwrap());
+        let blen = u16::from_le_bytes(bytes[bo + 6..bo + 8].try_into().unwrap());
+        let max_scale = f32::from_le_bytes(bytes[bo + 8..bo + 12].try_into().unwrap());
+        (max_doc, max_q, blen, max_scale)
+    }
+
+    fn block_upper_bound(&self, bytes: &[u8]) -> f32 {
+        if self.block_idx >= self.meta.n_blocks as usize {
+            return 0.0;
+        }
+        let (_, max_q, _, scale) = self.block_header(bytes, self.block_idx);
+        self.q_weight * f32::from(max_q) * scale
+    }
+
+    fn current_impact(&self, bytes: &[u8]) -> f32 {
+        let p = self.meta.postings_off + self.posting_abs_idx * SPLADE_POSTING_STRIDE;
+        let q = u16::from_le_bytes(bytes[p + 4..p + 6].try_into().unwrap());
+        let scale = f32::from_le_bytes(bytes[p + 6..p + 10].try_into().unwrap());
+        self.q_weight * f32::from(q) * scale
+    }
+
+    fn advance_one(&mut self, bytes: &[u8], stats: &mut SpladeTraversalStats) {
+        self.mark_block_entered(stats);
+        self.posting_abs_idx += 1;
+        if self.posting_abs_idx >= self.meta.df as usize {
+            self.cur_doc = u32::MAX;
+            self.block_idx = self.meta.n_blocks as usize;
+            self.block_entered = false;
+            return;
+        }
+        let (_, _, blen, _) = self.block_header(bytes, self.block_idx);
+        self.in_block_idx += 1;
+        if self.in_block_idx >= blen as usize {
+            self.block_idx += 1;
+            self.in_block_idx = 0;
+            self.block_entered = false;
+        }
+        let p = self.meta.postings_off + self.posting_abs_idx * SPLADE_POSTING_STRIDE;
+        self.cur_doc = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
+    }
+
+    fn seek_ge(&mut self, bytes: &[u8], target: u32, stats: &mut SpladeTraversalStats) {
+        if self.cur_doc >= target || self.cur_doc == u32::MAX {
+            return;
+        }
+        let mut jumped = false;
+        while self.block_idx < self.meta.n_blocks as usize {
+            let (max_doc, _, _, _) = self.block_header(bytes, self.block_idx);
+            if max_doc >= target {
+                break;
+            }
+            if !self.block_entered {
+                stats.blocks_skipped += 1;
+            }
+            self.block_idx += 1;
+            self.in_block_idx = 0;
+            self.block_entered = false;
+            jumped = true;
+        }
+        if self.block_idx >= self.meta.n_blocks as usize {
+            self.posting_abs_idx = self.meta.df as usize;
+            self.cur_doc = u32::MAX;
+            return;
+        }
+        if jumped {
+            self.posting_abs_idx = self.block_idx * SPLADE_BLOCK_SIZE;
+        }
+        let (_, _, blen, _) = self.block_header(bytes, self.block_idx);
+        let block_start = self.block_idx * SPLADE_BLOCK_SIZE;
+        let block_end = block_start + blen as usize;
+        while self.posting_abs_idx < block_end {
+            let p = self.meta.postings_off + self.posting_abs_idx * SPLADE_POSTING_STRIDE;
+            let d = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
+            if d >= target {
+                self.cur_doc = d;
+                self.in_block_idx = self.posting_abs_idx - block_start;
+                if self.in_block_idx > 0 {
+                    self.mark_block_entered(stats);
+                }
+                return;
+            }
+            self.mark_block_entered(stats);
+            self.posting_abs_idx += 1;
+        }
+        self.cur_doc = u32::MAX;
+    }
+}
+
+struct TopKCollector {
+    heap: Vec<(u32, f32)>,
+    k: usize,
+    floor: f32,
+    threshold: f32,
+}
+
+impl TopKCollector {
+    fn push(&mut self, pivot_doc: u32, score: f32) {
+        if (self.heap.len() < self.k && score >= self.floor)
+            || score > self.threshold
+            || (self.heap.len() == self.k
+                && score == self.threshold
+                && pivot_doc < self.heap.last().unwrap().0)
+        {
+            let pos = self
+                .heap
+                .partition_point(|&(d, s)| s > score || (s == score && d < pivot_doc));
+            self.heap.insert(pos, (pivot_doc, score));
+            if self.heap.len() > self.k {
+                self.heap.pop();
+            }
+            if self.heap.len() == self.k {
+                self.threshold = self.threshold.max(self.heap.last().unwrap().1);
+            }
+        }
+    }
+}
+
+fn find_wand_pivot(cursors: &[SpladeCursor<'_>], effective_floor: f32) -> Option<usize> {
+    let mut cum_ub = 0.0_f64;
+    for (idx, c) in cursors.iter().enumerate() {
+        if c.cur_doc == u32::MAX {
+            break;
+        }
+        cum_ub += f64::from(c.upper_bound);
+        if conservative_sum(cum_ub, idx + 1) > f64::from(effective_floor) {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+fn finish_all_cursors(cursors: &mut [SpladeCursor<'_>], stats: &mut SpladeTraversalStats) {
+    for c in cursors {
+        c.finish_remaining_blocks(stats);
+    }
+}
+
+/// Zero-copy memory-mapped reader over a `TVSPLD02` (`COLUMN_KIND_SPLADE`) section.
 #[derive(Clone, Debug)]
 pub struct SpladeSectionReader<'a> {
     bytes: &'a [u8],
     scale_bits: u32,
     terms: Vec<SpladeTermMeta>,
-    posting_stride: usize,
 }
 
 impl<'a> SpladeSectionReader<'a> {
-    /// Validates and opens a v1 or v2 SPLADE byte slice without copying posting runs.
+    /// Validates and opens a `TVSPLD02` SPLADE byte slice without copying posting runs.
     pub fn open(bytes: &'a [u8]) -> io::Result<Self> {
-        let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
-        if bytes.len() < 16
-            || (&bytes[..8] != SPLADE_SECTION_MAGIC && &bytes[..8] != SPLADE_SECTION_MAGIC_V2)
-        {
-            return Err(invalid("invalid SPLADE section magic"));
+        if bytes.len() < 16 || &bytes[..8] != SPLADE_SECTION_MAGIC {
+            return Err(splade_invalid("invalid SPLADE section magic"));
         }
         let scale_bits = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        let mixed = &bytes[..8] == SPLADE_SECTION_MAGIC_V2;
-        let (block_stride, posting_stride) = if mixed { (12, 10) } else { (8, 6) };
         let scale = f32::from_bits(scale_bits);
         if !scale.is_finite() || scale <= 0.0 {
-            return Err(invalid("invalid SPLADE scale"));
+            return Err(splade_invalid("invalid SPLADE scale"));
         }
         let n_terms = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
         if n_terms > bytes.len() / 10 {
-            return Err(invalid("excessive SPLADE term count"));
+            return Err(splade_invalid("excessive SPLADE term count"));
         }
         let mut cur = 16usize;
         let mut terms = Vec::with_capacity(n_terms);
         let mut prev_term: Option<&[u8]> = None;
         for _ in 0..n_terms {
-            if cur + 2 > bytes.len() {
-                return Err(invalid("truncated SPLADE term length"));
-            }
-            let term_len = u16::from_le_bytes(bytes[cur..cur + 2].try_into().unwrap()) as usize;
-            cur += 2;
-            if cur + term_len + 8 > bytes.len() {
-                return Err(invalid("truncated SPLADE term header"));
-            }
-            let term_slice = &bytes[cur..cur + term_len];
-            std::str::from_utf8(term_slice).map_err(|_| invalid("invalid utf-8 in SPLADE term"))?;
-            if let Some(prev) = prev_term {
-                if term_slice <= prev {
-                    return Err(invalid("SPLADE terms are not strictly byte-sorted"));
-                }
-            }
-            prev_term = Some(term_slice);
-            let term_off = cur;
-            cur += term_len;
-            let df = u32::from_le_bytes(bytes[cur..cur + 4].try_into().unwrap());
-            let n_blocks = u32::from_le_bytes(bytes[cur + 4..cur + 8].try_into().unwrap());
-            cur += 8;
-            if n_blocks as usize != (df as usize).div_ceil(SPLADE_BLOCK_SIZE) {
-                return Err(invalid("SPLADE block count disagrees with df"));
-            }
-            let blocks_bytes = (n_blocks as usize)
-                .checked_mul(block_stride)
-                .ok_or_else(|| invalid("SPLADE blocks overflow"))?;
-            let postings_bytes = (df as usize)
-                .checked_mul(posting_stride)
-                .ok_or_else(|| invalid("SPLADE postings overflow"))?;
-            if cur + blocks_bytes + postings_bytes > bytes.len() {
-                return Err(invalid("truncated SPLADE blocks or postings"));
-            }
-            let blocks_off = cur;
-            let mut global_max = 0u16;
-            let mut global_max_scale = scale;
-            for b in 0..n_blocks as usize {
-                let bo = blocks_off + b * block_stride;
-                let bmax = u16::from_le_bytes(bytes[bo + 4..bo + 6].try_into().unwrap());
-                global_max = global_max.max(bmax);
-                let blen = u16::from_le_bytes(bytes[bo + 6..bo + 8].try_into().unwrap()) as usize;
-                if blen != (df as usize - b * SPLADE_BLOCK_SIZE).min(SPLADE_BLOCK_SIZE) {
-                    return Err(invalid("SPLADE block length disagrees with df"));
-                }
-                if mixed {
-                    let bs = f32::from_le_bytes(bytes[bo + 8..bo + 12].try_into().unwrap());
-                    if !bs.is_finite() || bs <= 0.0 {
-                        return Err(invalid("invalid SPLADE block scale"));
-                    }
-                    global_max_scale = global_max_scale.max(bs);
-                }
-            }
-            let postings_off = blocks_off + blocks_bytes;
-            cur = postings_off + postings_bytes;
-            terms.push(SpladeTermMeta {
-                term_off,
-                term_len,
-                df,
-                n_blocks,
-                blocks_off,
-                postings_off,
-                global_max_impact: global_max,
-                global_max_scale,
-                block_stride,
-                posting_stride,
-            });
+            terms.push(parse_splade_term(bytes, &mut cur, &mut prev_term, scale)?);
         }
         if cur != bytes.len() {
-            return Err(invalid("trailing bytes in SPLADE section"));
+            return Err(splade_invalid("trailing bytes in SPLADE section"));
         }
         Ok(Self {
             bytes,
             scale_bits,
             terms,
-            posting_stride,
         })
-    }
-
-    fn posting_scale_bits(&self, off: usize) -> u32 {
-        if self.posting_stride == 10 {
-            u32::from_le_bytes(self.bytes[off + 6..off + 10].try_into().unwrap())
-        } else {
-            self.scale_bits
-        }
     }
 
     /// Walk a section already checked by `open`, without allocating the term
@@ -485,10 +660,7 @@ impl<'a> SpladeSectionReader<'a> {
         end: u32,
         mut visit: impl FnMut(&str, u32, u16, u32) -> Result<(), E>,
     ) -> Result<(), E> {
-        let mixed = &bytes[..8] == SPLADE_SECTION_MAGIC_V2;
-        let (block_stride, posting_stride) = if mixed { (12, 10) } else { (8, 6) };
         let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
-        let scale_bits = u32_at(8);
         let mut at = 16;
         for _ in 0..u32_at(12) {
             let len = u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()) as usize;
@@ -497,9 +669,9 @@ impl<'a> SpladeSectionReader<'a> {
             at += len;
             let df = u32_at(at) as usize;
             let blocks = u32_at(at + 4) as usize;
-            let postings = at + 8 + blocks * block_stride;
-            at = postings + df * posting_stride;
-            let doc_at = |i: usize| u32_at(postings + i * posting_stride);
+            let postings = at + 8 + blocks * SPLADE_BLOCK_STRIDE;
+            at = postings + df * SPLADE_POSTING_STRIDE;
+            let doc_at = |i: usize| u32_at(postings + i * SPLADE_POSTING_STRIDE);
             let (mut lo, mut hi) = (0, df);
             while lo < hi {
                 let mid = (lo + hi) / 2;
@@ -514,9 +686,9 @@ impl<'a> SpladeSectionReader<'a> {
                 if doc >= end {
                     break;
                 }
-                let p = postings + i * posting_stride;
+                let p = postings + i * SPLADE_POSTING_STRIDE;
                 let q = u16::from_le_bytes(bytes[p + 4..p + 6].try_into().unwrap());
-                let scale = if mixed { u32_at(p + 6) } else { scale_bits };
+                let scale = u32_at(p + 6);
                 visit(name, doc, q, scale)?;
             }
         }
@@ -530,6 +702,80 @@ impl<'a> SpladeSectionReader<'a> {
             .binary_search_by(|m| self.bytes[m.term_off..m.term_off + m.term_len].cmp(nb))
             .ok()?;
         self.terms.get(idx)
+    }
+
+    fn build_query_cursors(
+        &self,
+        query_weights: &[(String, f32)],
+        stats: &mut SpladeTraversalStats,
+    ) -> Vec<SpladeCursor<'_>> {
+        let mut qmap: BTreeMap<&str, f32> = BTreeMap::new();
+        for (t, w) in query_weights {
+            if w.is_finite() && *w > 0.0 {
+                *qmap.entry(t.as_str()).or_insert(0.0) += *w;
+            }
+        }
+        let mut cursors = Vec::with_capacity(qmap.len());
+        for (term, qw) in qmap {
+            if let Some(meta) = self.lookup_term(term) {
+                if meta.df > 0 {
+                    stats.total_blocks += u64::from(meta.n_blocks);
+                    cursors.push(SpladeCursor::new(self.bytes, meta, qw));
+                }
+            }
+        }
+        cursors
+    }
+
+    fn evaluate_aligned_pivot<F>(
+        &self,
+        cursors: &mut [SpladeCursor<'_>],
+        pivot_doc: u32,
+        effective_floor: f32,
+        admitted: &F,
+        collector: &mut TopKCollector,
+        stats: &mut SpladeTraversalStats,
+    ) where
+        F: Fn(u32) -> bool,
+    {
+        // Every query term can contribute before the next block boundary,
+        // including cursors not yet aligned at the candidate. Summing all
+        // current blocks permits whole-block skips without losing those hits.
+        let mut block_ub = 0.0_f64;
+        let mut min_block_end = u32::MAX;
+        let mut end_same = 0usize;
+        for c in cursors.iter() {
+            if c.cur_doc == u32::MAX {
+                break;
+            }
+            block_ub += f64::from(c.block_upper_bound(self.bytes));
+            let (last_doc, _, _, _) = c.block_header(self.bytes, c.block_idx);
+            min_block_end = min_block_end.min(last_doc);
+            if c.cur_doc == pivot_doc {
+                end_same += 1;
+            }
+        }
+        if conservative_sum(block_ub, cursors.len()) <= f64::from(effective_floor) {
+            let next_target = min_block_end.saturating_add(1);
+            for c in cursors.iter_mut() {
+                c.seek_ge(self.bytes, next_target, stats);
+            }
+            return;
+        }
+        for c in &mut cursors[..end_same] {
+            c.mark_block_entered(stats);
+        }
+        if admitted(pivot_doc) {
+            let mut score = 0.0_f32;
+            for c in &cursors[..end_same] {
+                score += c.current_impact(self.bytes);
+                stats.postings_scored += 1;
+            }
+            collector.push(pivot_doc, score);
+        }
+        for c in &mut cursors[..end_same] {
+            c.advance_one(self.bytes, stats);
+        }
     }
 
     /// Document-at-a-time Block-Max MaxScore / WAND top-`k` traversal over the
@@ -578,307 +824,57 @@ impl<'a> SpladeSectionReader<'a> {
         } else {
             0.0
         };
-
-        struct Cursor<'b> {
-            meta: &'b SpladeTermMeta,
-            q_weight: f32,
-            upper_bound: f32,
-            block_idx: usize,
-            in_block_idx: usize,
-            posting_abs_idx: usize,
-            cur_doc: u32,
-            block_entered: bool,
-        }
-
-        impl<'b> Cursor<'b> {
-            fn new(bytes: &[u8], meta: &'b SpladeTermMeta, q_weight: f32, _doc_scale: f32) -> Self {
-                let cur_doc = if meta.df > 0 {
-                    u32::from_le_bytes(
-                        bytes[meta.postings_off..meta.postings_off + 4]
-                            .try_into()
-                            .unwrap(),
-                    )
-                } else {
-                    u32::MAX
-                };
-                Self {
-                    meta,
-                    q_weight,
-                    upper_bound: q_weight
-                        * f32::from(meta.global_max_impact)
-                        * meta.global_max_scale,
-                    block_idx: 0,
-                    in_block_idx: 0,
-                    posting_abs_idx: 0,
-                    cur_doc,
-                    block_entered: false,
-                }
-            }
-
-            fn mark_block_entered(&mut self, stats: &mut SpladeTraversalStats) {
-                if !self.block_entered && self.block_idx < self.meta.n_blocks as usize {
-                    self.block_entered = true;
-                    stats.blocks_visited += 1;
-                }
-            }
-
-            fn finish_remaining_blocks(&mut self, stats: &mut SpladeTraversalStats) {
-                if self.block_idx < self.meta.n_blocks as usize {
-                    if !self.block_entered {
-                        stats.blocks_skipped += 1;
-                    }
-                    let after = (self.meta.n_blocks as usize).saturating_sub(self.block_idx + 1);
-                    stats.blocks_skipped += after as u64;
-                    self.block_idx = self.meta.n_blocks as usize;
-                    self.block_entered = false;
-                }
-            }
-
-            fn block_header(&self, bytes: &[u8], b: usize) -> (u32, u16, u16) {
-                let bo = self.meta.blocks_off + b * self.meta.block_stride;
-                let max_doc = u32::from_le_bytes(bytes[bo..bo + 4].try_into().unwrap());
-                let max_q = u16::from_le_bytes(bytes[bo + 4..bo + 6].try_into().unwrap());
-                let blen = u16::from_le_bytes(bytes[bo + 6..bo + 8].try_into().unwrap());
-                (max_doc, max_q, blen)
-            }
-
-            fn block_upper_bound(&self, bytes: &[u8], doc_scale: f32) -> f32 {
-                if self.block_idx >= self.meta.n_blocks as usize {
-                    return 0.0;
-                }
-                let (_, max_q, _) = self.block_header(bytes, self.block_idx);
-                let scale = if self.meta.block_stride == 12 {
-                    let bo = self.meta.blocks_off + self.block_idx * self.meta.block_stride;
-                    f32::from_le_bytes(bytes[bo + 8..bo + 12].try_into().unwrap())
-                } else {
-                    doc_scale
-                };
-                self.q_weight * f32::from(max_q) * scale
-            }
-
-            fn current_impact(&self, bytes: &[u8], doc_scale: f32) -> f32 {
-                let p = self.meta.postings_off + self.posting_abs_idx * self.meta.posting_stride;
-                let q = u16::from_le_bytes(bytes[p + 4..p + 6].try_into().unwrap());
-                let scale = if self.meta.posting_stride == 10 {
-                    f32::from_le_bytes(bytes[p + 6..p + 10].try_into().unwrap())
-                } else {
-                    doc_scale
-                };
-                self.q_weight * f32::from(q) * scale
-            }
-
-            fn advance_one(&mut self, bytes: &[u8], stats: &mut SpladeTraversalStats) {
-                self.mark_block_entered(stats);
-                self.posting_abs_idx += 1;
-                if self.posting_abs_idx >= self.meta.df as usize {
-                    self.cur_doc = u32::MAX;
-                    self.block_idx = self.meta.n_blocks as usize;
-                    self.block_entered = false;
-                    return;
-                }
-                let (_, _, blen) = self.block_header(bytes, self.block_idx);
-                self.in_block_idx += 1;
-                if self.in_block_idx >= blen as usize {
-                    self.block_idx += 1;
-                    self.in_block_idx = 0;
-                    self.block_entered = false;
-                }
-                let p = self.meta.postings_off + self.posting_abs_idx * self.meta.posting_stride;
-                self.cur_doc = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
-            }
-
-            fn seek_ge(&mut self, bytes: &[u8], target: u32, stats: &mut SpladeTraversalStats) {
-                if self.cur_doc >= target || self.cur_doc == u32::MAX {
-                    return;
-                }
-                // Skip whole 128-posting blocks whose max_doc < target!
-                let mut jumped = false;
-                while self.block_idx < self.meta.n_blocks as usize {
-                    let (max_doc, _, _) = self.block_header(bytes, self.block_idx);
-                    if max_doc >= target {
-                        break;
-                    }
-                    if !self.block_entered {
-                        stats.blocks_skipped += 1;
-                    }
-                    self.block_idx += 1;
-                    self.in_block_idx = 0;
-                    self.block_entered = false;
-                    jumped = true;
-                }
-                if self.block_idx >= self.meta.n_blocks as usize {
-                    self.posting_abs_idx = self.meta.df as usize;
-                    self.cur_doc = u32::MAX;
-                    return;
-                }
-                if jumped {
-                    self.posting_abs_idx = self.block_idx * SPLADE_BLOCK_SIZE;
-                }
-                let (_, _, blen) = self.block_header(bytes, self.block_idx);
-                let block_start = self.block_idx * SPLADE_BLOCK_SIZE;
-                let block_end = block_start + blen as usize;
-                while self.posting_abs_idx < block_end {
-                    let p =
-                        self.meta.postings_off + self.posting_abs_idx * self.meta.posting_stride;
-                    let d = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
-                    if d >= target {
-                        self.cur_doc = d;
-                        self.in_block_idx = self.posting_abs_idx - block_start;
-                        if self.in_block_idx > 0 {
-                            self.mark_block_entered(stats);
-                        }
-                        return;
-                    }
-                    self.mark_block_entered(stats);
-                    self.posting_abs_idx += 1;
-                }
-                self.cur_doc = u32::MAX;
-            }
-        }
-
-        // Merge duplicate query terms cleanly.
-        let mut qmap: BTreeMap<&str, f32> = BTreeMap::new();
-        for (t, w) in query_weights {
-            if w.is_finite() && *w > 0.0 {
-                *qmap.entry(t.as_str()).or_insert(0.0) += *w;
-            }
-        }
-        let mut cursors: Vec<Cursor<'_>> = Vec::with_capacity(qmap.len());
-        for (term, qw) in qmap {
-            if let Some(meta) = self.lookup_term(term) {
-                if meta.df > 0 {
-                    stats.total_blocks += u64::from(meta.n_blocks);
-                    cursors.push(Cursor::new(self.bytes, meta, qw, doc_scale));
-                }
-            }
-        }
+        let mut cursors = self.build_query_cursors(query_weights, &mut stats);
         if cursors.is_empty() {
             return (Vec::new(), floor, stats);
         }
-
-        // Min-heap of top-k `(score_bits_ordered, doc_id)` kept in a small sorted Vec
-        // (k is typically 10..1000; binary-search insert is cache-hot and exact).
-        // The query's posting counts bound its possible unique matches, even
-        // before admission. Reserve only that much, including an insertion's
-        // spare slot when k is smaller. Keep the requested k for threshold
-        // semantics; huge k must not overflow or reserve caller-sized memory.
         let possible_matches = cursors.iter().fold(0usize, |total, cursor| {
             total.saturating_add(cursor.meta.df as usize)
         });
-        let mut heap: Vec<(u32, f32)> =
-            Vec::with_capacity(k.saturating_add(1).min(possible_matches));
-        let mut threshold = floor;
+        let mut collector = TopKCollector {
+            heap: Vec::with_capacity(k.saturating_add(1).min(possible_matches)),
+            k,
+            floor,
+            threshold: floor,
+        };
 
         loop {
-            // Sort active cursors by current doc_id ascending, breaking ties in canonical term order.
             cursors.sort_by(|a, b| {
                 a.cur_doc
                     .cmp(&b.cur_doc)
                     .then_with(|| a.meta.term_off.cmp(&b.meta.term_off))
             });
             if cursors[0].cur_doc == u32::MAX {
-                for c in &mut cursors {
-                    c.finish_remaining_blocks(&mut stats);
-                }
+                finish_all_cursors(&mut cursors, &mut stats);
                 break;
             }
-
-            let effective_floor = (threshold - slack).max(0.0);
-
-            // WAND pivot selection using per-term global upper bounds.
-            let mut cum_ub = 0.0_f64;
-            let mut pivot_idx = None;
-            for (idx, c) in cursors.iter().enumerate() {
-                if c.cur_doc == u32::MAX {
-                    break;
-                }
-                cum_ub += f64::from(c.upper_bound);
-                if conservative_sum(cum_ub, idx + 1) > f64::from(effective_floor) {
-                    pivot_idx = Some(idx);
-                    break;
-                }
-            }
-            let Some(p_idx) = pivot_idx else {
-                // Remaining upper bounds across all active cursors cannot beat threshold!
-                for c in &mut cursors {
-                    c.finish_remaining_blocks(&mut stats);
-                }
+            let effective_floor = (collector.threshold - slack).max(0.0);
+            let Some(p_idx) = find_wand_pivot(&cursors, effective_floor) else {
+                finish_all_cursors(&mut cursors, &mut stats);
                 break;
             };
-
             let pivot_doc = cursors[p_idx].cur_doc;
             if pivot_doc == u32::MAX {
-                for c in &mut cursors {
-                    c.finish_remaining_blocks(&mut stats);
-                }
+                finish_all_cursors(&mut cursors, &mut stats);
                 break;
             }
-
             if cursors[0].cur_doc == pivot_doc {
-                // Every query term can contribute before the next block boundary,
-                // including cursors not yet aligned at the candidate. Summing all
-                // current blocks permits whole-block skips without losing those hits.
-                let mut block_ub = 0.0_f64;
-                let mut min_block_end = u32::MAX;
-                let mut end_same = 0usize;
-                for c in &cursors {
-                    if c.cur_doc == u32::MAX {
-                        break;
-                    }
-                    block_ub += f64::from(c.block_upper_bound(self.bytes, doc_scale));
-                    let (last_doc, _, _) = c.block_header(self.bytes, c.block_idx);
-                    min_block_end = min_block_end.min(last_doc);
-                    if c.cur_doc == pivot_doc {
-                        end_same += 1;
-                    }
-                }
-                if conservative_sum(block_ub, cursors.len()) <= f64::from(effective_floor) {
-                    let next_target = min_block_end.saturating_add(1);
-                    for c in &mut cursors {
-                        c.seek_ge(self.bytes, next_target, &mut stats);
-                    }
-                    continue;
-                }
-
-                // Candidate passes Block-Max gate: score if admitted!
-                for c in &mut cursors[..end_same] {
-                    c.mark_block_entered(&mut stats);
-                }
-                if admitted(pivot_doc) {
-                    let mut score = 0.0_f32;
-                    for c in &cursors[..end_same] {
-                        score += c.current_impact(self.bytes, doc_scale);
-                        stats.postings_scored += 1;
-                    }
-                    if (heap.len() < k && score >= floor)
-                        || score > threshold
-                        || (heap.len() == k
-                            && score == threshold
-                            && pivot_doc < heap.last().unwrap().0)
-                    {
-                        let pos = heap
-                            .partition_point(|&(d, s)| s > score || (s == score && d < pivot_doc));
-                        heap.insert(pos, (pivot_doc, score));
-                        if heap.len() > k {
-                            heap.pop();
-                        }
-                        if heap.len() == k {
-                            threshold = threshold.max(heap.last().unwrap().1);
-                        }
-                    }
-                }
-                for c in &mut cursors[..end_same] {
-                    c.advance_one(self.bytes, &mut stats);
-                }
+                self.evaluate_aligned_pivot(
+                    &mut cursors,
+                    pivot_doc,
+                    effective_floor,
+                    &admitted,
+                    &mut collector,
+                    &mut stats,
+                );
             } else {
-                // Advance leading cursors (`< pivot_doc`) directly to `pivot_doc`, skipping blocks!
                 for c in &mut cursors[..p_idx] {
                     c.seek_ge(self.bytes, pivot_doc, &mut stats);
                 }
             }
         }
 
-        (heap, threshold, stats)
+        (collector.heap, collector.threshold, stats)
     }
 }
 

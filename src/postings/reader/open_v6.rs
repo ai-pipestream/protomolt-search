@@ -8,8 +8,8 @@ use super::super::columns::{
     StoredDerived, UnsignedSlice,
 };
 use super::super::format::{
-    compatible_column_kind, COLUMN_KIND_ANALYSIS_BINDING, COLUMN_KIND_BINDING, COLUMN_KIND_DERIVED,
-    COLUMN_KIND_F64, COLUMN_KIND_FACET, COLUMN_KIND_GEO, COLUMN_KIND_I64, COLUMN_KIND_I64_PRESENT,
+    COLUMN_KIND_ANALYSIS_BINDING, COLUMN_KIND_BINDING, COLUMN_KIND_DERIVED, COLUMN_KIND_F64,
+    COLUMN_KIND_FACET, COLUMN_KIND_GEO, COLUMN_KIND_I64, COLUMN_KIND_I64_PRESENT,
     COLUMN_KIND_INDEX_BINDING, COLUMN_KIND_MAP_F64, COLUMN_KIND_MAP_FACET, COLUMN_KIND_MAP_I64,
     COLUMN_KIND_MAP_U64, COLUMN_KIND_POSITIONS, COLUMN_KIND_POS_LENGTHS, COLUMN_KIND_SENTENCES,
     COLUMN_KIND_SOURCES, COLUMN_KIND_SPLADE, COLUMN_KIND_U64, COLUMN_KIND_VECTOR_BINDING,
@@ -18,11 +18,9 @@ use super::super::format::{
 use super::{validate_structure_v6, Bm25Reader, FieldSlice, SortedNumbers};
 
 impl Bm25Reader {
-    /// Open a validated v6 or v7 map, one [`FieldSlice`] per
-    /// field-table entry (plus one [`FacetSlice`] per v7 facet-table
-    /// entry). Every field's sections are v5-shaped, so the entire v5
-    /// read machinery serves each field with run offsets rebased by
-    /// that field's postings section offset.
+    /// Open a validated v6 or v7 map, one [`FieldSlice`] per field-table entry
+    /// (plus typed and auxiliary column slices on v7 files). Run offsets are
+    /// rebased by each field's postings section offset.
     pub(super) fn open_v6v7(map: memmap2::Mmap, v7: bool) -> io::Result<Self> {
         let len = map.len();
         Self::open_v6v7_bounded(map, v7, len)
@@ -73,8 +71,6 @@ impl Bm25Reader {
             lineages_off,
             text_index_off,
             text_base: texts_off,
-            v5_runs: true,
-            blob_relative: true,
             binding: cols.binding,
             derived: cols.derived,
             source_section: cols.source_section,
@@ -169,10 +165,8 @@ impl DecodedV7Columns {
     ) -> io::Result<()> {
         let name_len = u16::from_le_bytes(map[*cursor..*cursor + 2].try_into().unwrap()) as usize;
         let name = String::from_utf8_lossy(&map[*cursor + 2..*cursor + 2 + name_len]).into_owned();
-        let raw_kind = map[*cursor + 2 + name_len];
+        let kind = map[*cursor + 2 + name_len];
         let base = *cursor + 2 + name_len + 1;
-        let kind =
-            compatible_column_kind(raw_kind, name.as_bytes(), &map[base..], map.len() as u64);
         if let Some(next) = self.decode_scalar_column(map, n_slots, &name, kind, base) {
             *cursor = next;
             return Ok(());
