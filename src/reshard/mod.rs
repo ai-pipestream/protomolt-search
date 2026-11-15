@@ -27,41 +27,53 @@
 //!   child and a re-split of a child bisects its range again.
 
 mod analysis_sidecar;
+mod bucket_replay;
 mod child_build;
 mod compact_log;
+mod compat;
+mod cuts;
 mod hash_split;
 mod hnsw_sources;
 mod merge_inputs;
+mod parallel_build;
 mod partitioned;
 mod placement_split;
+mod reconstruct;
 mod replay;
 mod segment_compaction;
 mod segment_sources;
+mod segmented_split;
 mod source_agreement;
+mod split_inputs;
 mod tree_logs;
 mod tree_split;
 
 pub use self::child_build::manifest_derived;
-pub(crate) use self::compact_log::compact_log_with_sources;
-pub use self::compact_log::{compact_log, CompactedRow, CompactionBuild, RowSink};
+pub use self::compact_log::{
+    compact_log, CompactedRow, CompactionBuild, CompactionRequest, RowSink,
+};
+pub(crate) use self::compat::{compact_log_partitioned_with_sources, compact_log_with_sources};
+pub use self::compat::{
+    split, split_logs, split_logs_segmented, split_placement_logs, split_stable_logs,
+};
 pub use self::hash_split::{
-    merge, split, split_logs, split_logs_segmented, split_stable_logs, split_stable_logs_ranged,
+    merge, split_logs_with, split_stable_logs_ranged, split_stable_logs_with, SplitRequest,
 };
 pub(crate) use self::hnsw_sources::HnswCompactionSources;
 pub use self::partitioned::compact_log_partitioned;
-pub(crate) use self::partitioned::compact_log_partitioned_with_sources;
 pub use self::placement_split::{
-    placement_shard_map_toml, split_placement_logs, validate_placement_children, PlacementChild,
-    PlacementReshardOutput,
+    placement_shard_map_toml, split_placement_logs_with, validate_placement_children,
+    PlacementChild, PlacementReshardOutput, PlacementSplitRequest,
 };
+pub(crate) use self::reconstruct::reconstruct_document;
 pub use self::replay::{read_generation_binding, resolve_gen};
 pub use self::segment_compaction::{
     compact_segments_partitioned, SegmentCompactionBuild, SegmentCompactionOptions,
 };
 pub(crate) use self::segment_sources::{
-    open_segment_exact, open_segment_sources, reconstruct_document, segment_tables,
-    SegmentSourceShard, SourceTables,
+    open_segment_exact, open_segment_sources, segment_tables, SegmentSourceShard, SourceTables,
 };
+pub use self::segmented_split::split_logs_segmented_with;
 pub use self::tree_logs::split_placement_tree_logs;
 pub use self::tree_split::{
     tree_children, tree_shard_map_toml, SpillCut, TreeChild, TreeChildLayout, TreeReshardOutput,
@@ -253,12 +265,19 @@ pub struct ColumnTables {
 /// `config::ShardMap`). `addr` is a TODO placeholder — the operator fills
 /// in where each child will listen.
 pub fn shard_map_toml(out: &ReshardOutput) -> String {
+    render_shard_map(out, |_| String::new())
+}
+
+/// The shard map for `out`, with `extra(i)` appended to child `i`'s
+/// `[[shards]]` block.
+fn render_shard_map(out: &ReshardOutput, extra: impl Fn(usize) -> String) -> String {
     let mut s = format!("generation = {}\n", out.generation);
-    for child in &out.children {
+    for (i, child) in out.children.iter().enumerate() {
         s.push_str(&format!(
             "\n[[shards]]\naddr = \"TODO\"\nslot_offset = {}\nhash_lo = {}\nhash_hi = {}\n",
             child.slot_offset, child.hash_lo, child.hash_hi
         ));
+        s.push_str(&extra(i));
     }
     s
 }

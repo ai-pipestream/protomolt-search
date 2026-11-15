@@ -1,6 +1,6 @@
 //! Placement-tree split types, options, and the shard-map rendering of a tree.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use super::replay::Replay;
 use super::{ChildImage, ReshardOutput};
@@ -19,10 +19,6 @@ pub struct TreeChild {
     pub hash_lo: u64,
     pub hash_hi: u64,
 }
-
-/// Built bucket images by plan position, handed from the sealing
-/// threads to the appending one.
-pub(super) type BuiltBuckets = BTreeMap<usize, Result<(ChildImage, u64), String>>;
 
 /// The bytes a spilled row costs the child build while its bucket is
 /// replayed: the conservative end of the documented 40-70 KB band

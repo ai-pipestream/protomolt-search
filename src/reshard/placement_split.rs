@@ -3,14 +3,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::wal;
-
-use super::child_build::finish_child;
-use super::partitioned::partition_key_of;
-use super::replay::{
-    read_gen_manifest, read_gens_binding, replay_buckets, require_backend_config,
-    require_complete_history, same_backend_config, Replay,
-};
+use super::child_build::{finish_child, ChildSlot};
+use super::cuts::partition_key_of;
+use super::split_inputs::{create_out_dir, distribute, replay_clocked, SplitInputs};
 use super::{Analyzer, ReshardOutput, WalCutoff};
 
 /// One child of a placement-keyed split: the inclusive code range it
@@ -99,85 +94,55 @@ pub fn validate_placement_children(
     Ok(())
 }
 
-/// Split one or more full-history generations into children keyed by
-/// the placement code each logged document carries in `column`
-/// (`docs/placement.md`). No CEL runs at replay: the code was written at
-/// ingest and the log holds it. A document whose code falls in no
-/// child's range, a document with no value, and a vector row with no
-/// document all go to `default_child`; without one, any such row
-/// refuses the split by id. Every child keeps the parent's stable-key
-/// hash coverage (the whole space), because routing under a tree is by
-/// code first and by hash inside the group.
-#[allow(clippy::too_many_arguments)]
-pub fn split_placement_logs(
-    gens: &[PathBuf],
-    column: &str,
-    children: &[PlacementChild],
-    default_child: Option<usize>,
-    out_dir: &Path,
-    slot_offsets: &[u64],
-    vectors_only: bool,
-    bm25_fields: Option<&[String]>,
-    analyze: &mut Analyzer,
-) -> Result<PlacementReshardOutput, String> {
-    if column.trim().is_empty() {
-        return Err("a placement split needs the placement column's name".to_string());
-    }
-    validate_placement_children(children, default_child)?;
-    if slot_offsets.len() != children.len() {
-        return Err(format!(
-            "a placement split needs one slot offset per child: {} offsets for {} children",
-            slot_offsets.len(),
-            children.len()
-        ));
-    }
-    let Some(first_gen) = gens.first() else {
-        return Err("a placement split requires at least one input generation".to_string());
-    };
-    let manifest = read_gen_manifest(first_gen)?;
-    let mut top_generation = manifest.generation;
-    let mut cutoffs = Vec::with_capacity(gens.len());
-    let mut replay = Replay::default();
-    for gen in gens {
-        let current = read_gen_manifest(gen)?;
-        require_backend_config(&current, gen)?;
-        require_complete_history(&current, gen)?;
-        if !same_backend_config(&manifest, &current) {
+/// A split of one or more full-history generations into children keyed
+/// by the placement code each logged document carries in `column`
+/// (`docs/placement.md`): child `i` takes the codes in `children[i]` and
+/// `slot_offsets[i]`.
+#[derive(Debug, Clone, Copy)]
+pub struct PlacementSplitRequest<'a> {
+    pub gens: &'a [PathBuf],
+    /// The placement column.
+    pub column: &'a str,
+    pub children: &'a [PlacementChild],
+    /// The child that takes rows with no code, or a code no child covers.
+    pub default_child: Option<usize>,
+    pub out_dir: &'a Path,
+    pub slot_offsets: &'a [u64],
+    /// Replay vectors only, leaving every document behind.
+    pub vectors_only: bool,
+    /// The BM25 field table; derived from the records when `None`.
+    pub bm25_fields: Option<&'a [String]>,
+}
+
+impl PlacementSplitRequest<'_> {
+    fn check(&self) -> Result<(), String> {
+        if self.column.trim().is_empty() {
+            return Err("a placement split needs the placement column's name".to_string());
+        }
+        validate_placement_children(self.children, self.default_child)?;
+        if self.slot_offsets.len() != self.children.len() {
             return Err(format!(
-                "{}: vector backend configuration differs from the first input",
-                gen.display()
+                "a placement split needs one slot offset per child: {} offsets for {} children",
+                self.slot_offsets.len(),
+                self.children.len()
             ));
         }
-        let clocked = wal::read_clocked_records(gen, 0)
-            .map_err(|error| format!("clocked replay {}: {error}", gen.display()))?;
-        cutoffs.push(WalCutoff {
-            generation: current.generation,
-            high_watermark: clocked.last().map_or(0, |record| record.clock),
-        });
-        replay_buckets(
-            gen,
-            0..current.bucket_count,
-            current.bucket_count as usize,
-            current.dim as usize,
-            vectors_only,
-            &mut replay,
-        )?;
-        top_generation = top_generation.max(current.generation);
+        Ok(())
     }
-    replay.compact();
-    let binding = read_gens_binding(gens)?;
-    std::fs::create_dir_all(out_dir)
-        .map_err(|error| format!("mkdir {}: {error}", out_dir.display()))?;
-    let child_of = |id: u64, code: Option<i64>| -> Result<usize, String> {
+
+    /// The child a row with placement code `code` goes to.
+    fn child_of(&self, id: u64, code: Option<i64>) -> Result<usize, String> {
         if let Some(code) = code {
-            if let Some(i) = children
+            if let Some(i) = self
+                .children
                 .iter()
                 .position(|child| code >= child.lo && code <= child.hi)
             {
                 return Ok(i);
             }
         }
-        default_child.ok_or_else(|| match code {
+        let column = self.column;
+        self.default_child.ok_or_else(|| match code {
             Some(code) => format!(
                 "live source id {id} carries placement code {code}, outside every child's \
                  range, and the split names no default child"
@@ -187,53 +152,51 @@ pub fn split_placement_logs(
                  default child"
             ),
         })
-    };
+    }
+}
+
+/// Split by placement code: no CEL runs at replay, since the code was
+/// written at ingest and the log holds it. A document whose code falls in
+/// no child's range, a document with no value, and a vector row with no
+/// document all go to the default child; without one, any such row
+/// refuses the split by id. Every child keeps the parent's stable-key
+/// hash coverage (the whole space), because routing under a tree is by
+/// code first and by hash inside the group.
+pub fn split_placement_logs_with(
+    request: &PlacementSplitRequest<'_>,
+    analyze: &mut Analyzer,
+) -> Result<PlacementReshardOutput, String> {
+    request.check()?;
+    let inputs = SplitInputs::check(request.gens, "a placement split", false)?;
+    let (replay, source_cutoffs) = replay_clocked(request.gens, request.vectors_only)?;
+    create_out_dir(request.out_dir)?;
     let mut codes: BTreeMap<u64, Option<i64>> = BTreeMap::new();
     for (id, document) in &replay.documents {
-        codes.insert(*id, partition_key_of(document, column)?);
+        codes.insert(*id, partition_key_of(document, request.column)?);
     }
-    let mut buckets: Vec<Replay> = children.iter().map(|_| Replay::default()).collect();
-    let keys = replay.stable_keys;
-    for (id, vector) in replay.vectors {
-        let shard = child_of(id, codes.get(&id).copied().flatten())?;
-        buckets[shard].vectors.insert(id, vector);
-        if let Some(row) = replay.retained.remove(&id) {
-            buckets[shard].retained.insert(id, row);
-        }
-        if let Some(key) = keys.get(&id) {
-            buckets[shard].stable_keys.insert(id, key.clone());
-        }
-    }
-    for (id, document) in replay.documents {
-        let shard = child_of(id, codes.get(&id).copied().flatten())?;
-        buckets[shard].documents.insert(id, document);
-        if let Some(key) = keys.get(&id) {
-            buckets[shard].stable_keys.insert(id, key.clone());
-        }
-    }
-    let mut out = Vec::with_capacity(children.len());
-    for (shard, replay) in buckets.into_iter().enumerate() {
+    let partitions = distribute(replay, request.children.len(), |id, _| {
+        request.child_of(id, codes.get(&id).copied().flatten())
+    })?;
+    let schema = inputs.schema(request.bm25_fields);
+    let mut out = Vec::with_capacity(request.children.len());
+    for (shard, replay) in partitions.into_iter().enumerate() {
+        let slot = ChildSlot::full_range(shard, request.out_dir, request.slot_offsets[shard]);
         out.push(finish_child(
-            &manifest,
+            &inputs.manifest,
             replay,
-            shard,
-            out_dir,
-            slot_offsets[shard],
-            0,
-            u64::MAX,
-            bm25_fields,
-            binding.as_ref(),
+            slot,
+            &schema,
             analyze,
         )?);
     }
     Ok(PlacementReshardOutput {
         images: ReshardOutput {
-            generation: top_generation + 1,
+            generation: inputs.next_generation()?,
             children: out,
         },
-        source_cutoffs: cutoffs,
-        ranges: children.to_vec(),
-        default_child,
+        source_cutoffs,
+        ranges: request.children.to_vec(),
+        default_child: request.default_child,
     })
 }
 
@@ -242,22 +205,17 @@ pub fn split_placement_logs(
 /// operator to place, with the range in a comment, because the map
 /// names one code per shard.
 pub fn placement_shard_map_toml(out: &PlacementReshardOutput) -> String {
-    let mut s = format!("generation = {}\n", out.images.generation);
-    for (child, range) in out.images.children.iter().zip(&out.ranges) {
-        s.push_str(&format!(
-            "\n[[shards]]\naddr = \"TODO\"\nslot_offset = {}\nhash_lo = {}\nhash_hi = {}\n",
-            child.slot_offset, child.hash_lo, child.hash_hi
-        ));
+    super::render_shard_map(&out.images, |i| {
+        let range = out.ranges[i];
         if range.is_none() {
-            s.push_str("# the default child: rows with no code or a code no child covers\n");
+            "# the default child: rows with no code or a code no child covers\n".to_string()
         } else if range.lo == range.hi {
-            s.push_str(&format!("placement = {}\n", range.lo));
+            format!("placement = {}\n", range.lo)
         } else {
-            s.push_str(&format!(
+            format!(
                 "# placement codes {}..={}: one code per shard in the map; choose one\n",
                 range.lo, range.hi
-            ));
+            )
         }
-    }
-    s
+    })
 }
