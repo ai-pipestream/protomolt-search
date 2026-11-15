@@ -155,10 +155,8 @@ impl NodeServiceImpl {
         if guard.bm25.is_none() {
             let builder = self.new_builder(guard.generation.as_ref())?;
             guard.bm25 = Some(builder);
-            // A vector index created before the first document (a
-            // calibration, or vectors ingested first) becomes the
-            // segmented provider's tail now that the catalog exists, so
-            // its rows seal with the documents (docs/immutable-segments.md).
+            // Adopt any pre-existing plain vector index as the segmented
+            // provider's tail so its rows seal together with documents.
             let snapshot = match guard.bm25.as_ref() {
                 Some(Bm25Shard::Segmented(g)) => Some(g.snapshot().clone()),
                 _ => None,
@@ -225,14 +223,7 @@ impl NodeServiceImpl {
                 }
             }
         }
-        // Positions agree between the record and the ACTIVE storage
-        // (docs/phrase-proximity.md). A file the node loaded declares
-        // its own positional fields; a document that keeps positions on
-        // a field the file never declared would build a column that is
-        // positional for new documents only, and a document without
-        // positions into a field that keeps them would leave a hole the
-        // store cannot represent. Both refuse here, before anything
-        // mutates, naming the field and the fix.
+        // Verify positional-field declarations match active storage before mutating.
         {
             let shard = guard.bm25.as_ref().expect("builder just ensured");
             for name in &doc.position_fields {
@@ -449,10 +440,8 @@ impl NodeServiceImpl {
             }
             slots
         };
-        // Map entries (docs/map-columns.md): unknown columns, repeated
-        // (column, key) pairs, and non-finite numeric values refuse before
-        // anything mutates. Empty keys are literal keys. An empty string is a present
-        // map value; absence is represented only by an omitted entry.
+        // Validate map entries (unknown columns, duplicate keys, non-finite
+        // values) before mutating; empty strings are present keys/values.
         let map_facet_slots: Vec<(usize, &str, &str)> = {
             let shard = guard.bm25.as_ref().expect("builder just ensured");
             let mut seen: Vec<(&str, &str)> = Vec::new();
@@ -615,10 +604,8 @@ impl NodeServiceImpl {
             }
             slots
         };
-        // Geo points (docs/geo-columns.md). Same refuse-before-mutating
-        // shape as the others: every entry resolves and validates before
-        // a single value is written, so a document that names one bad
-        // coordinate leaves no half-applied point behind.
+        // Validate all geo points before mutating so invalid coordinates leave
+        // no partial writes.
         let geo_slots: Vec<(usize, f64, f64)> = {
             let shard = guard.bm25.as_ref().expect("builder just ensured");
             let mut seen: Vec<&str> = Vec::new();

@@ -3,28 +3,11 @@
 use crate::node::*;
 
 impl Bm25Shard {
-    /// Count-then-rank facet counting
-    /// (`docs/plans/track-1-features.md` section 2): count the
-    /// requested facet fields over this shard's match set — every
-    /// document holding at least one scored term in any queried field
-    /// AND passing every filter — independent of `k`, `min_score`, and
-    /// block-max pruning, which bound what is SURFACED, never what
-    /// matched. A filter, by contrast, bounds what MATCHES: a
-    /// filtered-out document is not in the result set, and counting it
-    /// would misstate the drill-down. Walks each term's doc run to
-    /// exhaustion (fixed-stride on a v5-shaped reader, never
-    /// occurrence bytes), dedups documents in a slot bitmap, masks the
-    /// bitmap with THE SAME [`crate::filter::DocFilter::passes`] the
-    /// scorers gate the heap with, and resolves one facet ordinal per
-    /// surviving document. A facet field the shard's table lacks
-    /// answers `known: false` and no counts — the coordinator turns
-    /// all-unknown into a refusal.
-    ///
-    /// All three facet kinds — plain, map-keyed, and range
-    /// (`docs/range-facets.md`) — share the ONE bitmap this builds:
-    /// the traversal is the expensive half, and asking for two kinds
-    /// must not pay for it twice. Range edges are validated by
-    /// [`validate_range_facet_fields`] before this runs.
+    /// Count plain, map-keyed, and range facets plus column stats and distinct
+    /// values over one shared match-set bitmap (every document matching at least
+    /// one queried term and passing `filter`, independent of `k` and `min_score`).
+    /// Unknown columns return `known: false` so the coordinator refuses only
+    /// columns unknown across all shards.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]
     pub(in crate::node) fn count_facets(
@@ -68,10 +51,8 @@ impl Bm25Shard {
                 }
             }
         }
-        // One counting pass over the matched docs per requested field:
-        // resolve an ordinal, bump a slot. Plain facets read the ords
-        // column; map facets binary-search the doc's pair list for the
-        // requested key (docs/map-columns.md).
+        // Count matched documents per ordinal slot; map facets binary-search
+        // each document's sorted `(key_ord, val_ord)` pairs.
         let count_by = |resolve: &dyn Fn(u32) -> Option<u32>, n_values: usize| -> Vec<u64> {
             let mut counts = vec![0u64; n_values];
             for (wi, &word) in bits.iter().enumerate() {
@@ -352,15 +333,8 @@ pub(in crate::node) enum RangeSource {
     MapUnsigned { column: usize, key_ord: u32 },
 }
 
-/// Validate a request's range-facet edge lists (`docs/range-facets.md`).
-/// Edges must be at least two finite values in strictly ascending
-/// order: fewer than two describes no interval at all, a non-finite
-/// edge makes the bucket test meaningless, and an unsorted list would
-/// silently answer for intervals nobody asked for. Every refusal names
-/// the column and the knob, like every other column refusal here.
-/// Purely local — no shard state involved — so the coordinator ALSO
-/// runs it before its zero-term/k=0 early return: a malformed edge
-/// list must refuse even when there is no match set to count.
+/// Validate range-facet edge lists: each field requires at least two finite
+/// edges in strictly ascending order.
 pub(crate) fn validate_range_facet_fields(
     fields: &[crate::pb::RangeFacetField],
 ) -> Result<(), Status> {
@@ -389,35 +363,18 @@ pub(in crate::node) fn validate_lat_lon(what: &str, lat: f64, lon: f64) -> Resul
     Ok(())
 }
 
-/// Validate a request's geo filters (`docs/geo-columns.md`) and resolve
-/// each one's region. Purely local — no shard state involved — so the
-/// coordinator ALSO runs it before its zero-term/k=0 early return, on
-/// the [`validate_range_facet_fields`] pattern: a malformed filter must
-/// refuse even when there is no match set to filter.
-///
-/// What it refuses, each by name and with the knob:
-///
-/// - an empty column name, or an unset `region` (a filter that filters
-///   nothing is not a filter),
-/// - coordinates that are not finite degrees on the globe,
-/// - `min_lat > max_lat`,
-/// - `min_lon > max_lon` — an ANTIMERIDIAN-CROSSING box. This
-///   increment refuses it rather than reinterpreting the pair as a
-///   wraparound: the two readings differ by the whole planet, and only
-///   the caller knows which was meant. Wraparound is future work with
-///   its own decision to make, not a default to guess.
-/// - a radius that is not a finite, strictly positive number of meters,
-///   or one whose metric is unspecified.
+/// Validate geo filters locally and resolve each into a [`crate::geo::GeoRegion`],
+/// rejecting empty column names, unset regions, non-finite/out-of-range degrees,
+/// inverted latitude or antimeridian-crossing longitude bounds, and non-positive
+/// or unspecified-metric radii.
 pub(crate) fn validate_geo_filters(
     filters: &[crate::pb::GeoFilter],
 ) -> Result<Vec<crate::geo::GeoRegion>, Status> {
     filters.iter().map(validate_geo_filter).collect()
 }
 
-/// [`validate_geo_filters`] for one filter — also the validation a geo
-/// LEAF of a compiled filter tree gets (`docs/cel-filters.md`), so the
-/// two ways of sending a region can never diverge on what a legal
-/// region is.
+/// Validate a single [`crate::pb::GeoFilter`] (shared by top-level `geo_filters`
+/// and compiled filter-tree geo leaves).
 pub(crate) fn validate_geo_filter(
     f: &crate::pb::GeoFilter,
 ) -> Result<crate::geo::GeoRegion, Status> {
@@ -484,17 +441,9 @@ pub(crate) fn validate_geo_filter(
     }
 }
 
-/// Convert a `google.protobuf.Timestamp` to the epoch MICROSECONDS an
-/// i64 column stores (`docs/range-facets.md`). Timestamps are pure
-/// ingest sugar: the node does this once, the column holds plain i64,
-/// and replay from the WAL redoes it from the same instant.
-///
-/// The remainder below a microsecond is not representable and is
-/// dropped; `nanos` is non-negative in a valid Timestamp, so the drop
-/// always floors toward negative infinity and the unit contract holds
-/// on both sides of the epoch. Everything that could make the stored
-/// value invalid instead refuses: seconds outside years 0001 through 9999
-/// or nanos outside [0, 1e9). Integer presence is tracked separately.
+/// Convert a `google.protobuf.Timestamp` to epoch microseconds for `i64`
+/// storage, flooring sub-microsecond `nanos` toward negative infinity and
+/// rejecting out-of-range seconds or invalid `nanos`.
 pub(crate) fn timestamp_to_epoch_micros(
     field: &str,
     ts: &prost_types::Timestamp,

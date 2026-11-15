@@ -21,7 +21,7 @@ pub(super) struct ShardQueryCtx {
     /// tree with the clauses its placement leaf implies removed. A hedge
     /// leg reads the same entry as its primary.
     pub(super) shard_filters: Arc<Vec<Option<crate::pb::FilterExpr>>>,
-    /// Per shard, the proportional `floor_share_ppm` (`#72`).
+    /// Per shard, the proportional `floor_share_ppm`.
     pub(super) shard_floor_shares: Arc<Vec<Option<u32>>>,
     /// Merges every shard's published floor into the running global max.
     pub(super) tracker: Arc<Mutex<FloorTracker>>,
@@ -278,21 +278,9 @@ impl CoordinatorServiceImpl {
         resolved
     }
 
-    /// Run one fan-out search against every configured node. Broken out
-    /// from the gRPC handler so tests and the binary can drive it directly.
-    ///
-    /// Floor flow per query:
-    /// 1. open a `SearchShard` stream per node and send `StartShardSearch`;
-    /// 2. each stream pump feeds shard floor updates into one shared
-    ///    [`FloorTracker`]; raises land in a conflating `watch` cell that
-    ///    per-stream forwarders relay — a burst of raises collapses to the
-    ///    latest value instead of one message per raise;
-    /// 3. each pump ends on the node's terminal `SearchShardDone`.
-    ///
-    /// Per shard, [`FanoutLimits`] adds a hedged retry to the shard's
-    /// replica after `hedge_delay` (first success wins; identical data
-    /// plus exact search means identical results either way) and bounds
-    /// the whole attempt with `shard_deadline`.
+    /// Fan out a `SearchShard` vector search across configured shards, relaying
+    /// monotone global floor raises through a conflating `watch` channel and
+    /// applying [`FanoutLimits`] replica hedging and deadlines per shard.
     pub async fn fanout_search(
         &self,
         request_id: &str,

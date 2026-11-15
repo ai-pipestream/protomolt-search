@@ -1,34 +1,9 @@
-//! Online compaction of one shard while it keeps taking writes
-//! (`docs/mutations.md`): the live-reshard shape, in-process, for both
-//! layouts.
+//! Online shard compaction across single-image and segmented layouts.
 //!
-//! 1. Fix a cutoff `(WAL generation, high watermark)` and fsync the log
-//!    through it. Writes continue.
-//! 2. Replay the log through the cutoff into a dense all-live image
-//!    (`reshard::compact_log`), handing every live row to a sink that
-//!    writes the REWRITTEN full-history WAL generation: the same records,
-//!    dense new ids, tombstoned rows gone. The replay also yields the
-//!    old-to-new id map.
-//! 3. Open the image as a shadow [`ShardState`] whose WAL is that new
-//!    generation, and tail the live log into it through the same apply
-//!    functions ingest uses, no lock held, until fewer than `tail_bound`
-//!    records remain.
-//! 4. Prepare the final tail without the shard's write lock. Under the
-//!    lock, verify the WAL has not advanced; otherwise release and retry.
-//!    Once caught up, write a commit marker, move the new generation into
-//!    place, and swap the state. Existing query snapshots finish on it.
-//! 5. The next flush (this call makes one at once) writes the new
-//!    generation's images, removes the marker, and retires the old
-//!    files. A marker found at open means the closing flush never ran:
-//!    the cutover rolls back to the intact old generation, which lost
-//!    nothing that was ever flushed.
-//!
-//! Why the log is rewritten rather than rotated the way a snapshot
-//! install rotates it: a generation that records the compacted image as
-//! `preexisting_*` is partial history, and `reshard` refuses partial
-//! history — the shard could then be compacted exactly once, ever. The
-//! rewrite costs one pass over the live rows and keeps every later
-//! compaction, split, merge, and replica catch-up possible.
+//! Fixes a cutoff, replays live rows into a dense generation (rewriting full WAL
+//! history when a log is present so later compactions and splits remain valid),
+//! tails concurrent appends without holding the shard write lock, and swaps the
+//! serving `ShardState` behind a crash-recoverable commit marker.
 
 mod cutover;
 mod from_segments;
@@ -142,22 +117,18 @@ struct Preflight {
     backend_kind: String,
     scoring_fingerprint: String,
     stats_epoch: u64,
-    /// The integer column the outputs are ordered by
-    /// (docs/immutable-segments.md "Partitioned layout"); `None` keeps
-    /// the bucket layout.
+    /// Integer column ordering the output segments; `None` keeps the bucket layout.
     partition: Option<String>,
     /// The live shard's column tables on the segment layout, given to
     /// the build so every output declares them.
     columns: Option<crate::reshard::ColumnTables>,
-    /// Sealed HNSW segments available for donor transplant and `#99` join-set
+    /// Sealed HNSW segments available for donor transplant and join-set
     /// graph merge during compaction.
     hnsw_sources: Option<crate::reshard::HnswCompactionSources>,
 }
 
-/// The row source the cutoff qualified for: the log (the historical
-/// path), or the sealed segments of a catalog without one
-/// (docs/replay-from-segments.md, "Partitioned compaction of a catalog
-/// without a log").
+/// Row source selected at preflight: either the WAL or sealed segments on a
+/// WAL-less catalog.
 enum PreflightKind {
     Wal(Box<Preflight>),
     Segments(Box<SegmentPreflight>),
@@ -196,10 +167,8 @@ struct MidRow {
     vectors: usize,
 }
 
-/// The cutover preparation of the from-segments path
-/// (`docs/replay-from-segments.md`): the catalog over the final manifest
-/// (staged, uncommitted), the shadow serving state opened over it, the
-/// translated overlay, and the fence values the install re-checks.
+/// Staged from-segments cutover state: uncommitted final manifest catalog,
+/// shadow serving state, translated live-doc overlay, and fence epochs.
 struct PreparedSegmentCutover {
     multi_res_vectors: crate::multi_res::MultiResVectors,
     catalog: SegmentCatalog,
@@ -243,12 +212,10 @@ fn layout_name(segmented: bool) -> &'static str {
 }
 
 impl NodeServiceImpl {
-    /// Compact this shard online (`docs/mutations.md`): the blocking
-    /// entry point behind `NodeService.CompactShard`, also for an
-    /// in-process control-plane worker. The WAL path needs a Tokio
-    /// runtime on the calling thread's context for the analysis sessions
-    /// (`spawn_blocking` threads have one); the from-segments path of a
-    /// catalog without a WAL analyzes nothing and needs none.
+    /// Compact this shard online: the blocking entry point behind
+    /// `NodeService.CompactShard` and in-process control-plane workers.
+    /// The WAL path requires a Tokio runtime context for analysis sessions;
+    /// the WAL-less from-segments path needs none.
     pub fn compact_shard(
         &self,
         request: &CompactShardRequest,

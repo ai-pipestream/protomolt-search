@@ -170,30 +170,10 @@ pub(in crate::node) fn check_wal_tables(
     wal::check_manifest_tables(&held, &fresh).map_err(|e| format!("WAL at {}: {e}", dir.display()))
 }
 
-/// Open the shard's WAL at `<index path>.wal/`: resume the newest
-/// generation after a restart (truncating any torn tails, continuing the
-/// per-file sequences) or start generation 0. A resumed log keeps its own
-/// bucket count — the configured `--wal-buckets` only applies at WAL
-/// creation. Panics on IO failure, like the BM25 load path in the
-/// binary — a shard that cannot log must not silently run unlogged.
-///
-/// Resume reconciles the log against the applied state first: records at
-/// or above the applied tip (`slot_offset + max(vector tip, document
-/// tip)`) are truncated, because appends are buffered and a crash can
-/// leave the on-disk log ahead of the on-disk indexes — the reopening
-/// shard would otherwise re-assign ids the log already holds. The
-/// dropped records were never durable-acked (Flush is the durability
-/// point).
-///
-/// A log CREATED over an already-populated shard records the shard's
-/// current contents as `preexisting_*` in its manifest: it can serve and
-/// recover, but it is not full history and cannot drive a reshard.
-///
-/// Concurrent first-open is idempotent (see [`wal::open_or_create`]):
-/// twin nodes sharing the shard files can cold-start against a shard
-/// whose WAL directory does not exist yet, and both end up with a
-/// writer onto the same well-formed generation instead of one of them
-/// panicking on the mid-create directory.
+/// Open or create the shard's WAL at `<index_path>.wal/`, truncating buffered
+/// records at or above the persisted index tip (`slot_offset + max(vector_tip, doc_tip)`)
+/// and recording `preexisting_*` counts when initialized over an existing shard.
+/// Concurrent cold-starts are idempotent via [`wal::open_or_create`]; panics on I/O failure.
 pub(in crate::node) fn open_wal(
     index: Option<&VectorIndex>,
     config: &NodeConfig,
@@ -212,10 +192,7 @@ pub(in crate::node) fn open_wal(
     let fresh = wal_manifest(index, config, 0, (vector_tip, doc_tip));
     let mut writer = wal::open_or_create(&dir, cutoff, fresh.clone())
         .unwrap_or_else(|e| panic!("open WAL at {}: {e}", dir.display()));
-    // The log belongs to one collection (docs/collections.md). A manifest
-    // from before collections is adopted by the node that opens it, and
-    // written; one that names another collection is refused, because a
-    // replay of it here would put that dataset's documents into this one.
+    // Adopt empty collection manifests; panic if the log belongs to another collection.
     let held = writer.manifest().collection.clone();
     if held.is_empty() && !config.collection.is_empty() {
         writer.update_manifest(|m| m.collection = config.collection.clone());
@@ -227,11 +204,7 @@ pub(in crate::node) fn open_wal(
             config.collection
         );
     }
-    // The log records the declaration it was written under and the
-    // complete column table, empty columns included
-    // (docs/derived-columns.md). A manifest from before either is
-    // adopted by the node that opens it; one that disagrees is refused,
-    // because replaying it here would mix two meanings of one column.
+    // Verify derived-column declaration and column-table compatibility, adopting unset fields.
     if let Err(error) = wal::check_manifest_tables(writer.manifest(), &fresh) {
         panic!("WAL at {}: {error}", dir.display());
     }

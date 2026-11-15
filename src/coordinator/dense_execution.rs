@@ -496,13 +496,9 @@ impl CoordinatorServiceImpl {
 }
 
 impl CoordinatorServiceImpl {
-    /// One provider identity across the shard fleet, or a refusal that
-    /// names the mismatch (`docs/mmap-vectors.md`): every reachable shard
-    /// must advertise the same backend kind, scoring fingerprint, and
-    /// dimension before the coordinator scores anything across them.
-    /// With `require_configured`, a shard without a vector backend is a
-    /// refusal too; without it (ingest, health), unconfigured shards are
-    /// skipped and an all-unconfigured fleet is an empty identity.
+    /// Verify uniform vector provider kind, scoring fingerprint, and dimension
+    /// across reachable shards. When `require_configured` is set, unconfigured
+    /// shards also fail preflight; otherwise they are skipped.
     pub(crate) async fn fleet_vector_identity(
         &self,
         require_configured: bool,
@@ -596,11 +592,9 @@ impl CoordinatorServiceImpl {
         Ok(None)
     }
 
-    /// `DENSE_EXECUTION_MODE_AUTO` with FP32 rerank, no policy, and no
-    /// `selection_k`: resolve through the installed profile's default
-    /// target exactly as an explicit `DenseQualityPolicy` naming it would
-    /// (`docs/dense-quality-profile.md`). No profile, or a profile without
-    /// a default, refuses by name rather than running at `selection_k = k`.
+    /// Resolve `DENSE_EXECUTION_MODE_AUTO` with FP32 rerank and no explicit
+    /// policy or `selection_k` through the installed profile's default recall
+    /// target, refusing when no profile or default target is configured.
     pub(crate) async fn resolve_dense_quality_default(
         &self,
         k: u32,
@@ -874,12 +868,8 @@ pub struct FleetVectorIdentity {
     pub rows: u64,
 }
 
-/// The request side of a dense execution policy key
-/// (`docs/dense-execution-policy.md`): the requested `k` as sent (0 is
-/// refused by the policy, not defaulted), the candidate depth the
-/// request named (`selection_k`, 0 when none), and the request's
-/// filters, whose live selectivity the coordinator measures when AUTO
-/// consults the policy.
+/// Request-side key for dense execution policy lookup: raw `k`, optional
+/// `candidate_depth` (`selection_k`), and compiled filters for live selectivity.
 #[derive(Debug, Clone, Copy)]
 pub struct DenseRequestKey<'a> {
     pub k: u32,

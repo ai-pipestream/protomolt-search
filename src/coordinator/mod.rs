@@ -195,8 +195,7 @@ use variants::variant_text;
 use vector_fanout::run_shard_with_hedge;
 use vector_fanout::ShardQueryCtx;
 
-/// The distinct-value cap a CARDINALITY aggregation gets when the
-/// request names none (docs/aggregations.md "Cardinality").
+/// Default distinct-value cap for `CARDINALITY` aggregations when unspecified.
 pub(crate) const DEFAULT_MAX_DISTINCT: u32 = 100_000;
 
 /// Process-unique request id counter for coordinator-assigned ids.
@@ -207,15 +206,9 @@ static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// unbounded k would hold the floor at -inf and stream every shard dry.
 pub const DEFAULT_MAX_K: u32 = 10_000;
 
-/// Candidate ids per rescore call (`Bm25Rescore`, `VectorRescore`) when a
-/// boolean group scores a clause over its surviving ids. A lexical call
-/// is one cursor walk over its candidates and a dense call is one masked
-/// scan of the shard, so the pieces only pipeline the wire with the
-/// shards' work: on the local benchmark a 600,000-row membership over
-/// 2,000,000 rows scored in 1.20 s at pieces of 10,000 and 1.27 s in one
-/// call (docs/benchmarks/partition-pruning-2026-09.md). The knob exists
-/// so the batch is its own setting and not `max_k`; this default is the
-/// measured one.
+/// Candidate IDs per rescore call (`Bm25Rescore`, `VectorRescore`) when scoring
+/// a Boolean clause over surviving IDs, pipelining wire transfer with shard work
+/// independently of `max_k`.
 pub const DEFAULT_SIGNAL_BATCH: u32 = 10_000;
 
 pub const DEFAULT_MAX_RERANK_BYTES: u64 = 256 * 1024 * 1024;
@@ -247,16 +240,13 @@ pub struct CoordinatorServiceImpl {
     /// Node addresses in `http://host:port` form, in stable shard order
     /// (index in this list is the shard index used for tie-breaking).
     node_addrs: Vec<String>,
-    /// The collection this coordinator serves (`docs/collections.md`):
-    /// empty for the unnamed single dataset. A request naming another
-    /// collection is refused by `admit`; a node reporting another is
-    /// refused by `verify_collection_membership` and flagged in health.
+    /// Collection served by this coordinator (empty for the unnamed single
+    /// dataset); mismatched requests and nodes are refused.
     collection: String,
     /// Public paging tokens share a key across clones, including hot snapshots.
     cursor_signer: Arc<crate::query_cursor::CursorSigner>,
-    /// TLS material for the channels to shards (`docs/security.md`);
-    /// `None` uses the process-wide material when installed, plaintext
-    /// otherwise.
+    /// TLS material for shard channels; `None` falls back to process-wide TLS
+    /// when installed, or plaintext otherwise.
     client_tls: Option<crate::security::ClientTls>,
     /// The key that signs UDP floor and cancel datagrams; without one
     /// the datagrams are plain, which a node accepts on loopback only.
@@ -273,19 +263,16 @@ pub struct CoordinatorServiceImpl {
     /// Serve `SearchService.Search` over the streaming protocol
     /// (`fanout_stream_search`) instead of the per-shard top-k fan-out.
     stream_search: bool,
-    /// Optional coordinator-wide default stillness window before sending
+    /// Optional coordinator-wide stillness window before sending
     /// `FinishStreamSearch` to unfinished shards once top-`k` is full and a
-    /// shard quorum has completed (`docs/hnsw.md`, "Graceful stream close").
+    /// shard quorum has completed.
     stream_finish_settle: Option<Duration>,
     /// Optional coordinator-wide default deadline before sending
     /// `FinishStreamSearch { deadline: true }` to unfinished shards.
     stream_finish_deadline: Option<Duration>,
-    /// Run `Bm25Search` over the exact `Bm25QueryStream` candidate
-    /// protocol instead of the unary per-shard top-k round. The
-    /// coordinator owns the only authoritative global heap, relays its
-    /// emission-safe floor, and accepts a result only after every shard
-    /// supplies a matching score-space fingerprint and completion
-    /// certificate (docs/block-max.md).
+    /// Run `Bm25Search` over the exact `Bm25QueryStream` candidate protocol
+    /// instead of unary per-shard top-k rounds, verifying score-space
+    /// fingerprints and completion certificates across all shards.
     bm25_stream: bool,
     /// Runtime knobs (`max_k`, hedge delay, shard pruning, signal batch) read
     /// at request time and shared across clones of this coordinator.
@@ -304,9 +291,8 @@ pub struct CoordinatorServiceImpl {
     /// Resolved UDP floor target per node address (`None` =
     /// unresolvable), cached on first use. IPv4 preferred.
     floor_targets: Arc<Mutex<HashMap<String, Option<std::net::SocketAddr>>>>,
-    /// Cached vector row count per shard address from `GetVectorBackend`,
-    /// used to compute each shard's eligible-row share `p` (`floor_share_ppm`)
-    /// for `#72`'s ascent gate.
+    /// Cached vector row count per shard address from `GetVectorBackend` for
+    /// computing each shard's proportional `floor_share_ppm` ascent gate.
     shard_vector_rows: Arc<Mutex<HashMap<String, u64>>>,
     /// Per-node BM25 term-stat shares, keyed by each node's
     /// `stats_epoch` (src/stats_cache.rs). Sound because the nodes
@@ -325,36 +311,29 @@ pub struct CoordinatorServiceImpl {
     clustered_vectors: Option<ClusteredTurboVecBackend>,
     /// Optional measured candidate-depth contract for FP32 reranking.
     dense_quality_profile: Option<Arc<crate::quality::DenseQualityProfile>>,
-    /// The coordinator's synonym table (`docs/synonyms.md`), applied to
-    /// every lexical query unless the request turns it off.
+    /// Synonym table applied to lexical queries unless disabled per request.
     synonyms: Option<Arc<crate::synonyms::SynonymTable>>,
-    /// The generation-bound policy AUTO consults on a non-exhaustive
-    /// provider (`docs/dense-execution-policy.md`).
+    /// Generation-bound policy consulted by `AUTO` on non-exhaustive providers.
     dense_execution_policy: Option<Arc<crate::dense_policy::DenseExecutionPolicy>>,
     /// Product shard-map generation (zero for the implicit static list).
     topology_generation: u64,
     /// Inclusive stable-key ranges parallel to `node_addrs`. Empty for the
     /// legacy explicitly addressed topology.
     hash_ranges: Vec<Option<(u64, u64)>>,
-    /// Placement codes parallel to `node_addrs` (`docs/placement.md`),
-    /// and the validated tree they name. Empty and `None` without one.
+    /// Placement codes parallel to `node_addrs` and their validated tree
+    /// (`Empty` and `None` when unplaced).
     placement_codes: Vec<Option<i64>>,
     placement: Option<Arc<crate::placement::Placement>>,
-    /// The index's derived-column declaration (`docs/derived-columns.md`),
-    /// from the shard map's `[[derived]]` table: evaluated over each
-    /// routed document so a placement predicate on a derived column
-    /// routes the way the shards store it, and consulted by field
-    /// permissions so a derived column discloses no more than its
-    /// inputs. Static for the process, like a node's; a reloaded map
-    /// that declares otherwise is refused.
+    /// Compiled derived-column declaration from the shard map's `[[derived]]`
+    /// table, evaluated during placement routing and consulted by field
+    /// permissions. Static for the lifetime of the process.
     derived: Option<Arc<crate::derived::Declaration>>,
     /// Hot topology authority. Public RPC entry points snapshot this once and
     /// recurse into a frozen clone with this field cleared, so no request can
     /// observe half of two generations.
     live_topology: Option<Arc<RwLock<Arc<CoordinatorTopology>>>>,
-    /// The generation the live topology currently serves, as a watch so a
-    /// relay (`docs/relay-coordinators.md`, "Map interface") wakes when the
-    /// map moves under it. Replaced on every publication.
+    /// Watch channel publishing the active live-topology generation so relays
+    /// wake when the shard map advances.
     topology_watch: Arc<watch::Sender<u64>>,
     /// Routed writes take a read guard. A cutover holds the owned write guard
     /// while the final WAL tail is verified and the new map is published;
@@ -362,7 +341,7 @@ pub struct CoordinatorServiceImpl {
     write_gate: Arc<tokio::sync::RwLock<()>>,
     cutover_guard: Arc<Mutex<Option<CutoverLease>>>,
     cutover_pending: Arc<std::sync::atomic::AtomicBool>,
-    /// Product-owned phrase vocabulary used to derive canonical query terms.
+    /// Product-owned phrase vocabulary for deriving canonical query terms.
     phrase_index: Option<Arc<crate::phrases::PhraseIndex>>,
     /// Request-local observer installed only by public QueryStream. A watch
     /// cell intentionally conflates intermediate snapshots: every revision

@@ -168,9 +168,8 @@ pub(crate) struct StreamFanout {
     pub(super) floor_txs: Vec<Option<mpsc::Sender<StreamSearchRequest>>>,
     pub(super) udp_lanes: Vec<Option<(u64, std::net::SocketAddr)>>,
     pub(super) udp_socket: Option<Arc<std::net::UdpSocket>>,
-    /// The signing key and a sequence shared by every lane of this
-    /// fan-out (docs/security.md); a node ignores a sequence at or
-    /// behind the newest it applied, so each token sees them ascend.
+    /// Signing key and monotonic sequence shared across all UDP lanes of this
+    /// fan-out; nodes ignore sequences at or behind the newest applied frame.
     pub(super) udp_key: Option<crate::security::UdpKey>,
     pub(super) udp_seq: Arc<std::sync::atomic::AtomicU32>,
 }
@@ -464,9 +463,8 @@ impl CoordinatorServiceImpl {
         )?)
     }
 
-    /// `candidate_depth` is how many candidates the shard should consider
-    /// for the query (the request's `k`): a configured-ANN provider walks
-    /// its graph to it and refuses the scan without it (`docs/hnsw.md`).
+    /// Open a streaming fan-out with identity resolution; `candidate_depth`
+    /// sets per-shard candidate walk depth (required by ANN providers).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_stream_fanout_with_identities(
         &self,
@@ -680,7 +678,7 @@ impl CoordinatorServiceImpl {
     }
 
     /// Per-shard proportional share (`0..=1_000_000`) of the parent's
-    /// `floor_share_ppm` across active (non-skipped) shards (`#72`).
+    /// `floor_share_ppm` across active (non-skipped) shards.
     pub(crate) fn shard_floor_share_ppms(
         &self,
         filters: &RequestFilters,

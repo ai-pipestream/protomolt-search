@@ -15,8 +15,7 @@ pub struct BrowseAfter {
 /// One merged browse page.
 #[derive(Debug, Clone)]
 pub struct BrowseRows {
-    /// Sealed segments the shards consulted and ruled out
-    /// (docs/segment-pruning.md).
+    /// Sealed segments the shards consulted and ruled out.
     pub prune: crate::segment_prune::PruneStats,
     /// Global doc ids in final order.
     pub ids: Vec<u64>,

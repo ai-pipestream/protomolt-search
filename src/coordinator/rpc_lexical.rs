@@ -18,9 +18,7 @@ impl CoordinatorServiceImpl {
             }
             let req = request.into_inner();
             let k = self.resolve_k(req.k)?;
-            // A malformed HighlightSpec refuses here, before any shard is
-            // asked, so an empty fleet answers the same as a full one
-            // (docs/highlighting.md).
+            // Validate HighlightSpec before fan-out so empty fleets refuse identically.
             if let Some(spec) = req.highlight.as_ref() {
                 crate::highlight::Plan::from_spec(spec)?;
             }
@@ -29,12 +27,8 @@ impl CoordinatorServiceImpl {
                     "min_score must be finite (NaN and -inf are not valid floors)",
                 ));
             }
-            // CEL text compiles ONCE, here, into the predicate IR the
-            // shards execute (docs/cel-filters.md): every shard sees the
-            // same tree, and none ever sees CEL text.
+            // Compile CEL filter and projection expressions once into shard IR.
             let user_filter = crate::cel::compile_filter(&req.filter)?;
-            // Projection text compiles ONCE, here, into the ValueExpr IR
-            // the shards resolve and evaluate (docs/cel-values.md).
             let projections = compile_projections(&req.projections)?;
             if let Some(fields) = &self.field_permissions {
                 fields.bm25(&req, user_filter.as_ref(), &projections)?;

@@ -3,12 +3,8 @@
 use super::*;
 
 impl CoordinatorServiceImpl {
-    /// Aggregation fan-out (docs/aggregations.md): every shard folds
-    /// exact partials over its admitted documents; the coordinator
-    /// merges them IN SHARD ORDER so the folds are deterministic
-    /// bit-for-bit across runs. The typo rules hold as on every
-    /// filtered route, and expression column leaves follow the
-    /// projection contract: a leaf NO shard knows refuses by name.
+    /// Fan out an aggregation across shards and merge exact partials in shard
+    /// order for bit-deterministic results, refusing unknown columns by name.
     pub(crate) async fn fanout_aggregate(
         &self,
         filters: &RequestFilters,
@@ -311,11 +307,8 @@ impl CoordinatorServiceImpl {
         })
     }
 
-    /// The exact-percentile binary search (docs/aggregations.md): every
-    /// requested (spec, percentile) target converges simultaneously
-    /// over at most 64 count-below rounds in the order-bits domain, and
-    /// each answer is the nearest-rank order statistic — a value some
-    /// admitted document actually holds, never an interpolation.
+    /// Solve exact nearest-rank percentiles simultaneously across at most 64
+    /// count-below binary-search rounds in the order-bits domain.
     pub(super) async fn solve_percentiles(
         &self,
         filters: &RequestFilters,

@@ -271,9 +271,8 @@ async fn cutover_with_shadow_flush(always_advance: bool, flush_case: ShadowFlush
     .unwrap();
 }
 
-/// A bound, WAL-less, segmented catalog served in-process: the shape
-/// the children of a re-placement split come in
-/// (docs/replay-from-segments.md).
+/// Bound, WAL-less, segmented catalog served in-process (the shape produced for
+/// re-placement split children).
 fn walless_fixture(label: &str, rows: usize) -> (PathBuf, NodeServiceImpl) {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

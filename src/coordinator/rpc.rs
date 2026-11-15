@@ -155,9 +155,7 @@ impl CoordinatorServiceImpl {
                 ))
                 .await;
             }
-            // Derivation is local and deterministic (docs/descriptor-mappings.md):
-            // nothing fans out, nothing binds, and the same request returns the
-            // same fingerprint on every coordinator.
+            // Plan derivation is local and deterministic across coordinators.
             let req = request.into_inner();
             let plan = crate::mapping::derive_plan_with_definition(
                 &req.descriptor_set,
@@ -206,11 +204,9 @@ impl CoordinatorServiceImpl {
         .await
     }
 
-    /// Placement dry run (`docs/placement.md`, "The dry run"): what a
-    /// proposed tree would do to the rows this topology holds, from
-    /// filtered counts (`src/placement_plan.rs` has the arithmetic). It
-    /// reads only. A predicate naming a column no shard holds is refused
-    /// by name, the rule every filtered route applies to a typo.
+    /// Read-only placement dry run computing per-shard row movement under a
+    /// proposed tree via filtered counts (`src/placement_plan.rs`), refusing
+    /// predicates on columns unknown to every shard.
     pub(super) async fn rpc_plan_placement(
         &self,
         request: Request<crate::pb::PlanPlacementRequest>,
@@ -303,10 +299,8 @@ impl CoordinatorServiceImpl {
 }
 
 impl CoordinatorServiceImpl {
-    /// Exact aggregates over the filtered corpus
-    /// (docs/aggregations.md). CEL compiles ONCE, here: the filter
-    /// into the predicate IR, each expression into the ValueExpr IR;
-    /// no shard ever sees text.
+    /// Compute exact aggregates over the filtered corpus, compiling CEL filter
+    /// and `ValueExpr` expressions once at the coordinator.
     pub(super) async fn rpc_aggregate(
         &self,
         request: Request<crate::pb::AggregateRequest>,

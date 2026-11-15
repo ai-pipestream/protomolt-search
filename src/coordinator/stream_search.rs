@@ -3,24 +3,11 @@
 use super::*;
 
 impl CoordinatorServiceImpl {
-    /// [`Self::fanout_search`] over the streaming protocol
-    /// (`NodeService.StreamSearch`): shards hold no top-k and emit
-    /// every candidate at or above the live floor; the heap here — the
-    /// only one in the system — defines k. Whenever its k-th best
-    /// tightens, `floor_seed(kth)` (one f32 ULP below, so boundary ties
-    /// survive) is pushed to every open stream.
-    ///
-    /// Exactness: the successful path never sends Stop, every shard's
-    /// terminal summary must certify `completed = true`, every emission
-    /// scored at or above the floor in effect when its block was scanned,
-    /// and every pushed floor is a lower bound on the global k-th best. An
-    /// error cancels unfinished streams, whose summaries are necessarily
-    /// incomplete and unusable. Successful results are identical to
-    /// [`Self::fanout_search`] (same scores, same `merge_topk` total order).
-    ///
-    /// `initial_floor` seeds every shard's starting floor — the hybrid
-    /// seam, where a finished BM25 leg's decomposed floor prunes the
-    /// vector scan from the first block.
+    /// Execute [`Self::fanout_search`] over `NodeService.StreamSearch`. Shards
+    /// emit all candidates at or above the live floor (`initial_floor` seeds the
+    /// starting bound), the coordinator maintains the sole global top-`k` heap
+    /// and broadcasts `floor_seed(kth)` raises, and every shard must certify
+    /// `completed = true` in its terminal summary.
     pub async fn fanout_stream_search(
         &self,
         request_id: &str,

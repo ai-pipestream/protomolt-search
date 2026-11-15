@@ -440,23 +440,9 @@ impl Drop for IngestGuard {
     }
 }
 
-/// Wait for a shard lock without holding a runtime worker hostage.
-///
-/// `ShardState` sits behind a std `RwLock`, and most acquisitions are
-/// uncontended and short, so they happen inline. A contended one is a
-/// different matter on a tokio worker: a compaction cutover holds the
-/// write lock while it analyzes its last records over the network, and
-/// that stream is served by the same runtime. A worker that parks in the
-/// futex under those conditions takes the tasks in its slot with it, and
-/// the cutover then waits for a stream the parked worker was about to
-/// drive: both sides wait forever. Measured on 2026-09-05 with a stack
-/// dump of the hung test process, not inferred.
-///
-/// So a contended wait on a multi-thread runtime goes through
-/// `block_in_place`, which hands the worker's queue to another thread
-/// before this one parks. Off the runtime, or on a current-thread
-/// runtime (where `block_in_place` is not allowed and the wait is the
-/// caller's own), the wait happens inline.
+/// Acquire a blocking `ShardState` lock via `tokio::task::block_in_place` when
+/// called on a multi-threaded Tokio worker so contended acquisitions yield the
+/// worker's task queue rather than starving async analysis streams.
 fn wait_off_runtime<T>(wait: impl FnOnce() -> T) -> T {
     use tokio::runtime::{Handle, RuntimeFlavor};
     match Handle::try_current() {

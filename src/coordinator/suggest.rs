@@ -29,16 +29,10 @@ pub const DEFAULT_SUGGEST_SCAN: usize = 100_000;
 pub const MAX_SUGGEST_SCAN: usize = 1_000_000;
 
 impl CoordinatorServiceImpl {
-    /// Autocomplete over one field's dictionary (`docs/suggest.md`):
-    /// normalize the prefix as a prefix term is normalized (the field's
-    /// char filters, never its stemmer), ask every shard for the terms
-    /// under it with their posting df, union by term summing df, and
-    /// rank by df descending then term bytes ascending. The union IS the
-    /// dictionary one image of the rows would hold and the summed df is
-    /// that image's posting df, so the fleet's answer equals the
-    /// monolith's bitwise. Past `max_scan` on any shard or in the union
-    /// the request refuses naming the count; nothing is truncated to a
-    /// quieter match set.
+    /// Autocomplete over one field's dictionary: normalize the prefix under the
+    /// field's char filters (without stemming), union per-shard dictionary hits
+    /// summing posting `df`, and rank by `(df desc, term asc)`, refusing if any
+    /// shard or the fleet union exceeds `max_scan`.
     pub(super) async fn rpc_suggest(
         &self,
         request: Request<crate::pb::SuggestRequest>,

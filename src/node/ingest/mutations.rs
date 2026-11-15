@@ -264,10 +264,8 @@ impl NodeServiceImpl {
 // The mutation handlers' bodies against a state the caller holds (see
 // `NodeServiceImpl::apply_batch_locked`).
 impl NodeServiceImpl {
-    /// Refuse an id-addressed mutation whose ids were issued under
-    /// another WAL generation: a compaction or snapshot install
-    /// renumbered the rows since, so the ids name different documents
-    /// now (docs/mutations.md). `None` claims nothing.
+    /// Refuse an ID-addressed mutation whose IDs were issued under an older WAL
+    /// generation before compaction or snapshot installation renumbered rows.
     pub(in crate::node) fn check_wal_generation(
         guard: &ShardState,
         expected: Option<u64>,

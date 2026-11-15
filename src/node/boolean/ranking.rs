@@ -147,8 +147,7 @@ pub(in crate::node) fn check_floor_prune_options(
     if !requested {
         // When `floor_k` and `floor_share_ppm` are supplied without enabling
         // floor pruning, carry them with `enabled = false` on graph providers
-        // so `#95` patience still enforces `#72`'s ascent gate when a shared
-        // floor is active.
+        // so patience early-stop still enforces the shared-floor ascent gate.
         if let Some(k) = floor_k.filter(|&k| k > 0) {
             let descriptor = index.descriptor();
             if descriptor
@@ -219,12 +218,8 @@ fn dense_pass(
             "query coordinate {coord} is invalid: {value}"
         )));
     }
-    // A pass must score every masked slot. A provider that certifies
-    // exhaustive completion does so on its own; a graph walk reaches only
-    // part of the mask and still completes, so a provider without the
-    // certificate is pinned to the enumerate regime, which scores every
-    // allowed row exactly by construction (docs/hnsw.md, "Filters"). A
-    // provider with neither would silently drop members or their scores.
+    // Score every masked slot: providers without `ExhaustiveCompletion` fall
+    // back to `MaskEnumeration` so a partial graph walk cannot drop members.
     let descriptor = index.descriptor();
     let has = |capability| descriptor.capabilities.contains(&capability);
     let options = VectorSearchOptions::new().with_mask(mask);

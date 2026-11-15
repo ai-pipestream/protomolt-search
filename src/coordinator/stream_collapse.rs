@@ -3,22 +3,10 @@
 use super::*;
 
 impl CoordinatorServiceImpl {
-    /// Document-mode streaming: [`Self::fanout_stream_search`] with
-    /// `k` meaning k distinct PARENT documents. Shards emit chunks
-    /// tagged with their parents (lineage `parent_id`, or tagged
-    /// self-parents); the coordinator owns the whole document
-    /// aggregation — a parent's score is its best chunk's, the floor
-    /// is one ULP below the k-th best parent score, and each returned
-    /// parent carries EVERY chunk at or above the final floor,
-    /// whichever shards held them. No colocation: an opinion whose
-    /// chunks straddle a shard cut aggregates here exactly like one
-    /// whose chunks share a shard.
-    ///
-    /// Lossless: a chunk below the parent floor can neither beat its
-    /// own parent's best nor introduce a new top-k parent, and every
-    /// chunk scoring at or above the FINAL floor cleared every earlier
-    /// (lower) floor, so filtering the retained chunks to the final
-    /// floor makes the groups exact and layout-invariant.
+    /// Parent-collapsed streaming search (`k` distinct parent documents).
+    /// Shards emit parent-tagged chunks; the coordinator tracks each parent's
+    /// best chunk score, pushes `floor_seed(kth_parent)` across streams, and
+    /// retains every chunk at or above the final floor across shard boundaries.
     pub async fn fanout_stream_search_collapse(
         &self,
         request_id: &str,

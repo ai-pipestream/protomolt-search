@@ -1,7 +1,7 @@
 use crate::node::*;
 
-/// How one histogram buckets: a fixed width over doubles, or a
-/// calendar unit over epoch-micros ints (docs/aggregations.md).
+/// Histogram bucketing mode: fixed width over `f64` or calendar interval over
+/// epoch-microsecond `i64` values.
 #[derive(Clone, Copy)]
 pub(super) enum Bucketing {
     Fixed(f64),

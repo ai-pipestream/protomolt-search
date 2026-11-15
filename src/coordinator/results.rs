@@ -24,21 +24,8 @@ pub struct HybridLegs {
     pub min_vector_score: f32,
 }
 
-/// The per-leg payload to put on the wire, blanked for a leg this query
-/// has disabled.
-///
-/// A weight of exactly 0 disables a leg (see `HybridLegs`) and both
-/// fusion functions honor it — but they do so AFTER the shard has
-/// already scanned. A shard has no weight field to read; it gates the
-/// vector scan on a non-empty `vector` and the BM25 scan on non-empty
-/// `terms`, so sending a payload for a disabled leg buys a full scan
-/// whose result is then discarded. Measured on the 86.6M-chunk fleet: a
-/// `vector_weight: 0` query still paid ~320 ms of vector scan out of
-/// ~340 ms total, so "bm25-only" cost 20x what the lexical leg costs
-/// alone.
-///
-/// `dfs` travels with `terms` because `shard_legs` and `hybrid_shard`
-/// both reject a request whose lengths disagree.
+/// Build wire leg payloads, omitting `vector` or `(terms, dfs)` when that leg's
+/// weight is zero so shards skip the disabled leg's scan altogether.
 pub(super) fn leg_payloads(
     vector: &[f32],
     terms: &[String],
@@ -160,7 +147,7 @@ pub struct CollapseStreamResult {
     /// or `DEADLINE`).
     pub shards_finished_early: u32,
     /// Shards where at least one segment's walk pruned candidates against the
-    /// shared score floor (`#72`).
+    /// shared score floor.
     pub shards_floor_pruned: u32,
 }
 
@@ -178,7 +165,7 @@ pub struct StreamFanoutResult {
     /// or `DEADLINE`).
     pub shards_finished_early: u32,
     /// Shards where at least one segment's walk pruned candidates against the
-    /// shared score floor (`#72`).
+    /// shared score floor.
     pub shards_floor_pruned: u32,
 }
 

@@ -122,9 +122,7 @@ impl crate::filter_bits::ColumnSets for Bm25Shard {
     }
 }
 
-/// The value-expression resolution surface (`docs/cel-values.md`):
-/// the same name-to-index lookups filters use, packaged as the trait
-/// `values::resolve` consumes.
+/// Value-expression column lookup implementation consumed by `values::resolve`.
 impl crate::values::ColumnLookup for Bm25Shard {
     fn map_integer_index(&self, name: &str) -> Option<usize> {
         Bm25Shard::map_integer_index(self, name)
@@ -224,9 +222,7 @@ pub(in crate::node) fn projected_value(
     crate::pb::ProjectedValue { value }
 }
 
-/// Order-preserving u64 key for an i64 value: offset binary, so the
-/// unsigned comparison of the results matches the signed comparison of
-/// the inputs (docs/query-api.md, sorted browse).
+/// Order-preserving `u64` key for a signed `i64` value via offset binary.
 pub(crate) fn i64_order_bits(x: i64) -> u64 {
     (x as u64) ^ (1u64 << 63)
 }
@@ -291,11 +287,8 @@ pub(crate) struct ScoreStageSpec {
     pub(in crate::node) typed_map: bool,
 }
 
-/// Parse and validate a wire score-stage list into resolved ops plus
-/// their column names — the shard-independent half of chain building
-/// (`docs/score-functions.md`). Refuses unknown ops, empty column
-/// names, and parameters outside each op's admission rule: every
-/// refusal here is a stage whose monotonicity or bound would not hold.
+/// Parse and validate wire score stages into shard-independent stage specs,
+/// refusing unknown ops, empty column names, or out-of-range parameters.
 pub(crate) fn parse_score_stages(
     stages: &[crate::pb::ScoreStage],
 ) -> Result<Vec<ScoreStageSpec>, Status> {

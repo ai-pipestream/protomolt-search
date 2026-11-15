@@ -85,8 +85,7 @@ pub(in crate::node) fn apply_stream_datagram(
     key: Option<&crate::security::UdpKey>,
     datagram: &[u8],
 ) {
-    // With a key configured only a signed datagram is read at all
-    // (docs/security.md); the plain frame is for loopback lanes.
+    // Require a signed datagram when a key is configured; plain frames are loopback-only.
     let (signal, seq) = match key {
         Some(key) => match crate::stream_signal::decode_signed(key, datagram) {
             Some((signal, seq)) => (Some(signal), Some(seq)),
@@ -152,10 +151,8 @@ pub(in crate::node) struct ScanSample {
     pub(in crate::node) nanos: u64,
 }
 
-/// The node's observed scan rate (`docs/bandwidth-budget.md`): the ratio
-/// of encoded bytes to active kernel time over the recent scans the
-/// window holds. `bytes_per_second` is zero, meaning unknown, below
-/// [`SCAN_WINDOW_MIN_SAMPLES`] or when no active time was observed.
+/// Observed scan throughput over recent windowed scans (`0` until at least
+/// [`SCAN_WINDOW_MIN_SAMPLES`] non-zero kernel passes have been recorded).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScanRate {
     pub bytes_per_second: u64,
@@ -246,8 +243,7 @@ impl Default for ScanWindow {
     }
 }
 
-/// The process-wide window: one rate per node process, which is what the
-/// lease renewal reports (`docs/bandwidth-budget.md`).
+/// Process-wide scan throughput window reported on lease renewal.
 static SCAN_WINDOW: ScanWindow = ScanWindow::new();
 
 /// The node's observed scan rate for the lease renewal.
@@ -528,8 +524,7 @@ pub(in crate::node) fn run_scan_batch(
             pass_nanos = pass_nanos.saturating_add(pass.nanos);
         },
     );
-    // One sample for the batched scan, whatever the batch size: the
-    // pass over the shard happened once (docs/bandwidth-budget.md).
+    // Record one sample per batched shard pass regardless of batch width.
     observe_scan(pass_bytes, pass_nanos);
     for ((((done, (hits, mut stats)), (geo_columns_known, filter_columns_known)), prune), spec) in
         dones

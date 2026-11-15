@@ -3,14 +3,9 @@
 use super::*;
 
 impl CoordinatorServiceImpl {
-    /// One shard-side Boolean evaluation over the fleet
-    /// (`docs/query-api.md`, "Recursive boolean execution"). The root's
-    /// MUST filter leaves are the AND spine the placement tree prunes
-    /// shards by: a shard the spine excludes is not asked, and a leaf a
-    /// shard's placement implies is dropped from that shard's copy of
-    /// the leaf. Each consulted shard answers its best `depth` members;
-    /// the merge is the ranked union cut to `depth`. `claims[shard]` is
-    /// that shard's stats-epoch claim for the lexical leaves.
+    /// Evaluate a Boolean plan across the fleet, pruning shards against the
+    /// root's MUST filter spine, stripping placement-implied leaves per shard,
+    /// and merging consulted shards' top-`depth` candidates.
     pub(crate) async fn evaluate_boolean_fanout(
         &self,
         plan: &BooleanFanoutPlan,

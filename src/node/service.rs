@@ -17,15 +17,12 @@ pub struct NodeServiceImpl {
     /// shard — every doc logged, none attributable — so the second stream
     /// is refused outright rather than merged.
     pub(in crate::node) ingest_busy: Arc<std::sync::atomic::AtomicBool>,
-    /// A fence on ingest (`docs/cluster-control.md`, "Shard split"): set
-    /// by the node agent when the shard's rows are moving to its split
-    /// children, so no append can land between the children's final
-    /// catch-up and the topology cutover. The reason names the
-    /// children; a fenced shard refuses every ingest stream by name and
-    /// keeps serving queries.
+    /// Ingest fence set by the node agent during shard split cutover so no
+    /// append lands between final child catch-up and topology publication;
+    /// fenced shards refuse ingest streams while continuing to serve queries.
     pub(in crate::node) ingest_fence: Arc<std::sync::Mutex<Option<String>>>,
     pub(crate) config: NodeConfig,
-    /// Runtime knobs read at request time (docs/diagnostics.md).
+    /// Runtime knobs read at request time.
     pub(in crate::node) knobs: Arc<crate::diagnostics::Knobs>,
     /// Shared scan queue for coalesced searches; the scheduler task is
     /// spawned on first use (shared across service clones).
@@ -40,20 +37,15 @@ pub struct NodeServiceImpl {
     /// to every ingest AnalyzeStream. `None` when vocabulary accumulation
     /// is off (the default) or its directory failed to initialize.
     pub(in crate::node) vocab: Option<Arc<crate::vocab::VocabularyListener>>,
-    /// Compiled materialization spec for the current ingest stream
-    /// (docs/cel-values.md): expressions compile once per spec CHANGE,
-    /// never per document — the ingest analog of the query rule.
+    /// Compiled materialization spec cached per distinct spec across ingest.
     pub(in crate::node) materialize_cache: Arc<std::sync::Mutex<Option<CompiledMaterialize>>>,
     /// Optional product-owned phrase vocabulary shared by ingest and query.
     pub(crate) phrase_index: Option<Arc<crate::phrases::PhraseIndex>>,
-    /// Seals on this shard run one at a time; the frozen part of a seal
-    /// in flight is the reason (`docs/immutable-segments.md`).
+    /// Mutex serializing tail seals on this shard while a frozen part is in flight.
     pub(crate) seal_lock: Arc<std::sync::Mutex<()>>,
-    /// One compaction at a time per shard (`docs/mutations.md`): a
-    /// second `CompactShard` refuses by name while this is set.
+    /// Single-compaction gate per shard; concurrent `CompactShard` calls refuse.
     pub(crate) compacting: Arc<std::sync::atomic::AtomicBool>,
-    /// Woken after every flush: the node agent reports the shard to the
-    /// control plane on it (`docs/cluster-control.md`).
+    /// Notification fired after each flush so the node agent reports to the control plane.
     pub(in crate::node) flush_notify: Option<Arc<tokio::sync::Notify>>,
     /// Optional per-poll sleep injected on streaming scans for deterministic
     /// straggler simulation in multi-shard tests and benchmarks.
@@ -164,8 +156,8 @@ impl NodeServiceImpl {
         self
     }
 
-    /// Inject a per-hop poll delay on streaming searches (used to simulate a
-    /// straggler shard deterministically in tests and benchmarks).
+    /// Inject a per-hop poll delay on streaming searches for deterministic
+    /// straggler simulation in tests and benchmarks.
     pub fn with_stream_poll_delay(mut self, delay: std::time::Duration) -> Self {
         self.stream_poll_delay = Some(delay);
         self
@@ -311,9 +303,7 @@ impl NodeServiceImpl {
             }
         }
         match self.config.index_path.as_ref() {
-            // A new persisted shard under the segment layout: the tail is a
-            // heap store, searchable at once, sealed into the catalog on
-            // flush (docs/immutable-segments.md).
+            // Segmented persisted shard: searchable heap tail sealed into the catalog on flush.
             Some(p) if self.config.layout == Layout::Segments && generation.is_none() => {
                 let root = segments_root(p);
                 let tail = heap_store(&self.config).map_err(Status::failed_precondition)?;
@@ -573,9 +563,8 @@ impl NodeServiceImpl {
         crate::diagnostics::NodeDiagnostics::new(self.clone()).into_server(max_message_bytes)
     }
 
-    /// This shard's layout for `GetShardDiagnostics`
-    /// (docs/diagnostics.md): the catalog's sealed segments with their
-    /// summaries, the tail, rows, tombstones, and the live knob values.
+    /// Collect layout diagnostics for `GetShardDiagnostics`: sealed segments
+    /// and summaries, tail rows, tombstones, and live knob values.
     pub fn shard_diagnostics(
         &self,
         shard: u32,
@@ -780,10 +769,8 @@ impl NodeServiceImpl {
         Self::adopt_layout(bm25, created)
     }
 
-    /// A fresh, empty exact-vector store for this shard: on disk beside
-    /// the generation's sidecar path when the shard persists, so an
-    /// ingest never holds its FP32 rows in heap (`docs/mmap-vectors.md`);
-    /// in memory for an in-memory shard.
+    /// Create an empty exact-vector store: disk-spilling beside the generation
+    /// sidecar path on persisted shards, or heap-backed for in-memory shards.
     pub(in crate::node) fn fresh_exact_store(
         &self,
         generation: Option<&PathBuf>,

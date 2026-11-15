@@ -52,10 +52,6 @@ pub(in crate::node) async fn stream_file(
 pub const SNAPSHOT_STREAM_CHUNK: usize = 1024 * 1024;
 
 impl NodeServiceImpl {
-    // -----------------------------------------------------------------
-    // Snapshot repository (docs/snapshots.md)
-    // -----------------------------------------------------------------
-
     /// The layout the shard's files form: the segment catalog, or one
     /// image plus sidecars (an installed generation is always the latter).
     pub(in crate::node) fn served_layout(guard: &ShardState) -> &'static str {
@@ -99,11 +95,9 @@ impl NodeServiceImpl {
         }
     }
 
-    /// `ExportSnapshot` (`docs/snapshots.md`): flush, then copy the
-    /// current generation into `directory` under the seal mutex and shard
-    /// read lock, then write the manifest beside it. Files must still match
-    /// the flushed state, and any WAL must be clean. Intervening mutations
-    /// trigger a bounded flush retry, including when WAL is disabled.
+    /// Export a consistent snapshot: flush, copy the current generation into
+    /// `directory` under the seal mutex and shard read lock, and write the
+    /// snapshot manifest, retrying bounded flushes on intervening mutations.
     pub fn export_snapshot_blocking(
         &self,
         directory: &Path,
