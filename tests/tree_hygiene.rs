@@ -46,10 +46,6 @@ const RATCHET: &[(&str, usize)] = &[
     ("src/hnsw/mod.rs", 1_735 + RATCHET_HEADROOM),
     ("src/source_authority.rs", 1_635 + RATCHET_HEADROOM),
     ("src/source_authority/capacity.rs", 1_527 + RATCHET_HEADROOM),
-    (
-        "crates/protomolt-search-embedded/src/mobile.rs",
-        1_505 + RATCHET_HEADROOM,
-    ),
 ];
 
 /// The directories walked, relative to the package root.

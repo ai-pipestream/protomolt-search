@@ -12,20 +12,9 @@ pub(super) fn health_span(report: &HealthResponse) -> u64 {
     report.num_vectors.max(report.bm25_docs)
 }
 
-/// Merge the children's health into the one shard the parent sees.
-/// Refuses by name when the children's slot ranges are not contiguous
-/// (a gap or an overlap would make the parent's derived range a lie),
-/// when they disagree on the provider identity, or when there are none.
-pub fn merge_health(
-    collection: &str,
-    children: &[String],
-    reports: &[HealthResponse],
-) -> Result<HealthResponse, Status> {
-    if reports.is_empty() {
-        return Err(Status::failed_precondition(
-            "relay: a relay coordinator has no children",
-        ));
-    }
+/// The children in slot order, refused by name when a child's range
+/// overlaps the next or leaves a gap before it.
+fn contiguous_order(children: &[String], reports: &[HealthResponse]) -> Result<Vec<usize>, Status> {
     let mut order: Vec<usize> = (0..reports.len()).collect();
     order.sort_by_key(|&i| reports[i].slot_offset);
     for pair in order.windows(2) {
@@ -48,6 +37,24 @@ pub fn merge_health(
             )));
         }
     }
+    Ok(order)
+}
+
+/// Merge the children's health into the one shard the parent sees.
+/// Refuses by name when the children's slot ranges are not contiguous
+/// (a gap or an overlap would make the parent's derived range a lie),
+/// when they disagree on the provider identity, or when there are none.
+pub fn merge_health(
+    collection: &str,
+    children: &[String],
+    reports: &[HealthResponse],
+) -> Result<HealthResponse, Status> {
+    if reports.is_empty() {
+        return Err(Status::failed_precondition(
+            "relay: a relay coordinator has no children",
+        ));
+    }
+    let order = contiguous_order(children, reports)?;
     let first = &reports[order[0]];
     let last = &reports[*order.last().expect("non-empty")];
     let mut merged = HealthResponse {
@@ -63,31 +70,7 @@ pub fn merge_health(
         ..Default::default()
     };
     for (shard, report) in reports.iter().enumerate() {
-        for (name, mine, theirs) in [
-            (
-                "vector_backend",
-                &merged.vector_backend,
-                &report.vector_backend,
-            ),
-            (
-                "scoring_fingerprint",
-                &merged.scoring_fingerprint,
-                &report.scoring_fingerprint,
-            ),
-            (
-                "quality_contract",
-                &merged.quality_contract,
-                &report.quality_contract,
-            ),
-        ] {
-            if mine != theirs {
-                return Err(Status::failed_precondition(format!(
-                    "relay: child {shard} reports {name} {theirs:?} while child {} reports \
-                     {mine:?}; one relay serves one score space",
-                    order[0]
-                )));
-            }
-        }
+        same_score_space(&merged, report, shard, order[0])?;
         if report.dim != 0 && merged.dim != 0 && report.dim != merged.dim {
             return Err(Status::failed_precondition(format!(
                 "relay: child {shard} has dimension {} while child {} has {}",
@@ -120,9 +103,42 @@ pub fn merge_health(
     Ok(merged)
 }
 
-/// The children's layouts as the one shard the root lists
-/// (`docs/diagnostics.md`): counts summed, the children's segments
-/// concatenated with the child index in front of each segment id, the
+/// A child must report the first child's provider and score identity.
+fn same_score_space(
+    merged: &HealthResponse,
+    report: &HealthResponse,
+    shard: usize,
+    first: usize,
+) -> Result<(), Status> {
+    for (name, mine, theirs) in [
+        (
+            "vector_backend",
+            &merged.vector_backend,
+            &report.vector_backend,
+        ),
+        (
+            "scoring_fingerprint",
+            &merged.scoring_fingerprint,
+            &report.scoring_fingerprint,
+        ),
+        (
+            "quality_contract",
+            &merged.quality_contract,
+            &report.quality_contract,
+        ),
+    ] {
+        if mine != theirs {
+            return Err(Status::failed_precondition(format!(
+                "relay: child {shard} reports {name} {theirs:?} while child {first} reports \
+                 {mine:?}; one relay serves one score space"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The children's layouts as the one shard the root lists: counts
+/// summed, the children's segments concatenated with the child index in front of each segment id, the
 /// knobs true only when every child has them, one placement code when
 /// the children agree and `placement_mixed` when they do not, and a
 /// child whose diagnostics are unserved named in `layout`. The root

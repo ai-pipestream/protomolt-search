@@ -1,15 +1,17 @@
-//! Composed bitmap routes: filter, lexical, and vector bitmaps, boolean evaluation.
+//! Composed bitmap routes: filter, lexical, and vector bitmaps.
+
+use std::time::Duration;
 
 use tonic::{Request, Response, Status};
 
 use crate::coordinator::{CoordinatorServiceImpl, RequestFilters};
 use crate::metrics::Route;
-use crate::pb::TermStatsRequest;
+use crate::pb::{MembershipBitmapResponse, TermStatsRequest};
 
-use super::merge_lexical::{add_count32, child_ranges, merge_boolean_responses, KnownFlags};
-use super::stream_search::child_error;
-use super::values::merge_aggregate_shares;
-use super::{grpc_timeout, read_metadata, RelayService};
+use super::fanout::{fan_out, read_metadata, same_requests, shares_only};
+use super::map::MapSnapshot;
+use super::merge_util::{KnownFlags, SegmentCounts};
+use super::{grpc_timeout, RelayService};
 
 /// One child's packed bitmap as it came back, or nothing for a child the
 /// placement mask skipped (it contributes no member).
@@ -130,7 +132,118 @@ fn or_bits(dst: &mut [u8], at: usize, src: &[u8], count: usize) {
     }
 }
 
+impl From<&MembershipBitmapResponse> for ChildBitmap {
+    fn from(share: &MembershipBitmapResponse) -> Self {
+        ChildBitmap {
+            base_label: share.base_label,
+            label_count: share.label_count,
+            bits: share.bits.clone(),
+        }
+    }
+}
+
+/// The filters a filter bitmap resolves: the request's geo filters and
+/// tree, none of the scan knobs.
+fn bitmap_filters(req: &crate::pb::FilterBitmapRequest) -> RequestFilters {
+    RequestFilters {
+        geo: req.geo_filters.clone(),
+        tree: req.filter.clone(),
+        enumerate_max_rows: None,
+        patience_saturation_ppm: None,
+        patience_hops: None,
+        finish_settle_us: None,
+        finish_deadline_us: None,
+        floor_prune: None,
+        floor_k: None,
+        parent_floor_share_ppm: None,
+        floor_greediness_ppm: None,
+        floor_clamp_min: None,
+        include_rerank_candidate: false,
+    }
+}
+
+/// One filter-bitmap request per child the placement mask keeps, each
+/// with that child's own tree; `None` for a child the mask skipped.
+fn filter_bitmap_requests(
+    req: &crate::pb::FilterBitmapRequest,
+    filters: &RequestFilters,
+    mask: Option<&crate::placement::ShardMask>,
+    children: usize,
+) -> Vec<Option<crate::pb::FilterBitmapRequest>> {
+    (0..children)
+        .map(|shard| {
+            let skipped = mask.is_some_and(|m| m.skipped[shard]);
+            (!skipped).then(|| crate::pb::FilterBitmapRequest {
+                visibility: req.visibility.clone(),
+                geo_filters: filters.geo.clone(),
+                filter: CoordinatorServiceImpl::shard_filter_tree(filters, mask, shard),
+            })
+        })
+        .collect()
+}
+
+/// The filter bitmap answer over the merged bitmap, flags, and receipt.
+fn filter_response(
+    receipt: crate::pb::VectorReadReceipt,
+    bitmap: (u64, u64, Vec<u8>),
+    known: KnownFlags,
+    segments: SegmentCounts,
+) -> crate::pb::FilterBitmapResponse {
+    let (base_label, label_count, bits) = bitmap;
+    crate::pb::FilterBitmapResponse {
+        stats_epoch: receipt.stats_epoch,
+        stats_incarnation: receipt.stats_incarnation,
+        visibility_fingerprint: receipt.visibility_fingerprint,
+        visibility_columns_known: receipt.visibility_columns_known,
+        base_label,
+        label_count,
+        bits,
+        geo_columns_known: known.geo,
+        filter_columns_known: known.tree,
+        segments_total: segments.total,
+        segments_skipped: segments.skipped,
+    }
+}
+
+/// The children's membership answers under one map reading.
+struct Membership {
+    pinned: MapSnapshot,
+    children: Vec<String>,
+    ranges: Vec<(u64, u64)>,
+    shares: Vec<MembershipBitmapResponse>,
+}
+
 impl RelayService {
+    /// A version-only read receipt from a child the placement mask
+    /// skipped: it contributes no member but its version still binds.
+    async fn skipped_child_receipt(
+        &self,
+        frozen: &CoordinatorServiceImpl,
+        addr: &str,
+        timeout: Option<Duration>,
+    ) -> Result<crate::pb::VectorReadReceipt, Status> {
+        let mut request = Request::new(TermStatsRequest {
+            version_only: true,
+            ..Default::default()
+        });
+        if let Some(timeout) = timeout {
+            request.set_timeout(timeout);
+        }
+        let share = frozen
+            .node_client(addr)?
+            .term_stats(request)
+            .await?
+            .into_inner();
+        crate::visibility::validate_stats_mode(true, &share)?;
+        Ok(crate::pb::VectorReadReceipt {
+            stats_epoch: share.stats_epoch,
+            stats_incarnation: share.stats_incarnation,
+            visibility_fingerprint: share.visibility_fingerprint,
+            visibility_columns_known: share.visibility_columns_known,
+            ..Default::default()
+        })
+    }
+
     pub(super) async fn handle_resolve_filter_bitmap(
         &self,
         request: Request<crate::pb::FilterBitmapRequest>,
@@ -143,96 +256,36 @@ impl RelayService {
             if let Some(f) = req.filter.as_ref() {
                 crate::filter::validate_filter(f)?;
             }
-            let filters = RequestFilters {
-                geo: req.geo_filters.clone(),
-                tree: req.filter.clone(),
-                enumerate_max_rows: None,
-                patience_saturation_ppm: None,
-                patience_hops: None,
-                finish_settle_us: None,
-                finish_deadline_us: None,
-                floor_prune: None,
-                floor_k: None,
-                parent_floor_share_ppm: None,
-                floor_greediness_ppm: None,
-                floor_clamp_min: None,
-                include_rerank_candidate: false,
-            };
-            let (pinned, frozen) = self.pin();
-            let children = frozen.node_addresses().to_vec();
-            if children.is_empty() {
-                return Err(Status::failed_precondition(
-                    "relay: a relay coordinator has no children",
-                ));
-            }
-            let reports = self.children_health(&frozen, timeout).await?;
-            let ranges = child_ranges(&self.collection, &children, &reports)?;
+            let filters = bitmap_filters(&req);
+            let (pinned, frozen, children) = self.pin_children()?;
+            let ranges = self.ranges_of(&frozen, &children, timeout).await?;
             let mask = req
                 .visibility
                 .is_none()
                 .then(|| frozen.shard_mask(filters.tree.as_ref()))
                 .flatten();
+            let requests = filter_bitmap_requests(&req, &filters, mask.as_ref(), children.len());
+            let mut answered = fan_out(
+                &frozen,
+                &children,
+                requests,
+                timeout,
+                "filter bitmap",
+                |mut link, request| async move { link.resolve_filter_bitmap(request).await },
+            )
+            .await?
+            .into_iter()
+            .peekable();
             let mut known = KnownFlags::new(&filters, mask.as_ref());
-            let mut tasks = Vec::with_capacity(children.len());
-            for (shard, addr) in children.iter().enumerate() {
-                if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
-                    tasks.push(None);
-                    continue;
-                }
-                let mut link = frozen.node_client(addr)?;
-                let child_req = crate::pb::FilterBitmapRequest {
-                    visibility: req.visibility.clone(),
-                    geo_filters: filters.geo.clone(),
-                    filter: CoordinatorServiceImpl::shard_filter_tree(
-                        &filters,
-                        mask.as_ref(),
-                        shard,
-                    ),
-                };
-                let addr = addr.clone();
-                tasks.push(Some(tokio::spawn(async move {
-                    let mut request = Request::new(child_req);
-                    if let Some(timeout) = timeout {
-                        request.set_timeout(timeout);
-                    }
-                    link.resolve_filter_bitmap(request)
-                        .await
-                        .map(|r| r.into_inner())
-                        .map_err(|status| child_error(shard, &addr, "filter bitmap", status))
-                })));
-            }
             let mut shares = Vec::with_capacity(children.len());
             let mut receipts = Vec::with_capacity(children.len());
-            let mut segments_total: u32 = 0;
-            let mut segments_skipped: u32 = 0;
-            for (shard, task) in tasks.into_iter().enumerate() {
-                let Some(task) = task else {
-                    let mut request = Request::new(TermStatsRequest {
-                        version_only: true,
-                        ..Default::default()
-                    });
-                    if let Some(timeout) = timeout {
-                        request.set_timeout(timeout);
-                    }
-                    let share = frozen
-                        .node_client(&children[shard])?
-                        .term_stats(request)
-                        .await?
-                        .into_inner();
-                    crate::visibility::validate_stats_mode(true, &share)?;
-                    receipts.push(crate::pb::VectorReadReceipt {
-                        stats_epoch: share.stats_epoch,
-                        stats_incarnation: share.stats_incarnation,
-                        visibility_fingerprint: share.visibility_fingerprint,
-                        visibility_columns_known: share.visibility_columns_known,
-                        ..Default::default()
-                    });
+            let mut segments = SegmentCounts::default();
+            for (shard, addr) in children.iter().enumerate() {
+                let Some((_, share)) = answered.next_if(|(child, _)| *child == shard) else {
+                    receipts.push(self.skipped_child_receipt(&frozen, addr, timeout).await?);
                     shares.push(None);
                     continue;
                 };
-                let share = task
-                    .await
-                    .map_err(|e| Status::internal(format!("relay filter bitmap task: {e}")))??;
                 receipts.push(read_metadata(&share));
                 known.merge(
                     shard,
@@ -240,18 +293,7 @@ impl RelayService {
                     &share.geo_columns_known,
                     &share.filter_columns_known,
                 )?;
-                add_count32(
-                    &mut segments_total,
-                    share.segments_total,
-                    shard,
-                    "segment count",
-                )?;
-                add_count32(
-                    &mut segments_skipped,
-                    share.segments_skipped,
-                    shard,
-                    "skipped segment count",
-                )?;
+                segments.add(shard, share.segments_total, share.segments_skipped)?;
                 shares.push(Some(ChildBitmap {
                     base_label: share.base_label,
                     label_count: share.label_count,
@@ -262,302 +304,136 @@ impl RelayService {
             self.still_current(&pinned, "ResolveFilterBitmap")?;
             let receipt =
                 self.read_receipt(&pinned, children, req.visibility.as_ref(), None, &receipts)?;
-            Ok(Response::new(crate::pb::FilterBitmapResponse {
-                stats_epoch: receipt.stats_epoch,
-                stats_incarnation: receipt.stats_incarnation,
-                visibility_fingerprint: receipt.visibility_fingerprint,
-                visibility_columns_known: receipt.visibility_columns_known,
-                base_label,
-                label_count,
-                bits,
-                geo_columns_known: known.geo,
-                filter_columns_known: known.tree,
-                segments_total,
-                segments_skipped,
-            }))
+            Ok(Response::new(filter_response(
+                receipt,
+                (base_label, label_count, bits),
+                known,
+                segments,
+            )))
         })
         .await
+    }
+
+    /// One membership request per child, unchanged, under one map
+    /// reading, with the children's slot ranges.
+    async fn membership_shares<Req, F, Fut>(
+        &self,
+        req: &Req,
+        timeout: Option<Duration>,
+        label: &'static str,
+        call: F,
+    ) -> Result<Membership, Status>
+    where
+        Req: Clone + Send + 'static,
+        F: Fn(crate::link::NodeLink, Request<Req>) -> Fut + Clone + Send + 'static,
+        Fut: std::future::Future<Output = Result<Response<MembershipBitmapResponse>, Status>>
+            + Send
+            + 'static,
+    {
+        let (pinned, frozen, children) = self.pin_children()?;
+        let ranges = self.ranges_of(&frozen, &children, timeout).await?;
+        let requests = same_requests(req, children.len());
+        let shares =
+            shares_only(fan_out(&frozen, &children, requests, timeout, label, call).await?);
+        Ok(Membership {
+            pinned,
+            children,
+            ranges,
+            shares,
+        })
+    }
+
+    /// The children's membership bitmaps laid over the relay's range,
+    /// their bindings checked against `field` (the lexical route has
+    /// none), and the receipt over the children's.
+    fn finish_membership(
+        &self,
+        m: Membership,
+        route: &str,
+        visibility: Option<&crate::pb::DocumentVisibility>,
+        field: Option<&str>,
+    ) -> Result<MembershipBitmapResponse, Status> {
+        let mut binding = None;
+        let mut segments = SegmentCounts::default();
+        let mut receipts = Vec::with_capacity(m.shares.len());
+        for (shard, share) in m.shares.iter().enumerate() {
+            match field {
+                Some(field) => crate::vector_read::check_binding(
+                    field,
+                    share.vector_binding.as_ref(),
+                    &mut binding,
+                )?,
+                None => {
+                    segments.add(shard, share.segments_total, share.segments_skipped)?;
+                    crate::vector_read::check_binding("", None, &mut binding)?;
+                }
+            }
+            receipts.push(read_metadata(share));
+        }
+        let bitmaps: Vec<Option<ChildBitmap>> = m.shares.iter().map(|s| Some(s.into())).collect();
+        let (base_label, label_count, bits) = concat_bitmaps(&m.children, &m.ranges, &bitmaps)?;
+        self.still_current(&m.pinned, route)?;
+        let receipt = self.read_receipt(&m.pinned, m.children, visibility, None, &receipts)?;
+        Ok(MembershipBitmapResponse {
+            vector_binding: binding.flatten(),
+            stats_incarnation: receipt.stats_incarnation,
+            visibility_fingerprint: receipt.visibility_fingerprint,
+            visibility_columns_known: receipt.visibility_columns_known,
+            base_label,
+            label_count,
+            bits,
+            stats_epoch: receipt.stats_epoch,
+            segments_total: segments.total,
+            segments_skipped: segments.skipped,
+        })
     }
 
     pub(super) async fn handle_resolve_lexical_bitmap(
         &self,
         request: Request<crate::pb::LexicalBitmapRequest>,
-    ) -> Result<Response<crate::pb::MembershipBitmapResponse>, Status> {
+    ) -> Result<Response<MembershipBitmapResponse>, Status> {
         let timeout = grpc_timeout(request.metadata());
         let req = request.into_inner();
         crate::visibility::VisibilityScope::new(req.visibility.as_ref())?;
-        let (pinned, frozen) = self.pin();
-        let children = frozen.node_addresses().to_vec();
-        if children.is_empty() {
-            return Err(Status::failed_precondition(
-                "relay: a relay coordinator has no children",
-            ));
-        }
-        let reports = self.children_health(&frozen, timeout).await?;
-        let ranges = child_ranges(&self.collection, &children, &reports)?;
-        let mut tasks = Vec::with_capacity(children.len());
-        for (shard, addr) in children.iter().enumerate() {
-            let mut link = frozen.node_client(addr)?;
-            let child_req = req.clone();
-            let addr = addr.clone();
-            tasks.push(tokio::spawn(async move {
-                let mut request = Request::new(child_req);
-                if let Some(timeout) = timeout {
-                    request.set_timeout(timeout);
-                }
-                link.resolve_lexical_bitmap(request)
-                    .await
-                    .map(|r| r.into_inner())
-                    .map_err(|status| child_error(shard, &addr, "lexical bitmap", status))
-            }));
-        }
-        let mut shares = Vec::with_capacity(children.len());
-        let mut receipts = Vec::with_capacity(children.len());
-        let mut binding = None;
-        let mut segments_total: u32 = 0;
-        let mut segments_skipped: u32 = 0;
-        for (shard, task) in tasks.into_iter().enumerate() {
-            let share = task
-                .await
-                .map_err(|e| Status::internal(format!("relay lexical bitmap task: {e}")))??;
-            add_count32(
-                &mut segments_total,
-                share.segments_total,
-                shard,
-                "segment count",
-            )?;
-            add_count32(
-                &mut segments_skipped,
-                share.segments_skipped,
-                shard,
-                "skipped segment count",
-            )?;
-            crate::vector_read::check_binding("", None, &mut binding)?;
-            receipts.push(read_metadata(&share));
-            shares.push(Some(ChildBitmap {
-                base_label: share.base_label,
-                label_count: share.label_count,
-                bits: share.bits,
-            }));
-        }
-        let (base_label, label_count, bits) = concat_bitmaps(&children, &ranges, &shares)?;
-        self.still_current(&pinned, "ResolveLexicalBitmap")?;
-        let receipt =
-            self.read_receipt(&pinned, children, req.visibility.as_ref(), None, &receipts)?;
-        Ok(Response::new(crate::pb::MembershipBitmapResponse {
-            vector_binding: binding.flatten(),
-            stats_incarnation: receipt.stats_incarnation,
-            visibility_fingerprint: receipt.visibility_fingerprint,
-            visibility_columns_known: receipt.visibility_columns_known,
-            base_label,
-            label_count,
-            bits,
-            stats_epoch: receipt.stats_epoch,
-            segments_total,
-            segments_skipped,
-        }))
+        let m = self
+            .membership_shares(
+                &req,
+                timeout,
+                "lexical bitmap",
+                |mut link, request| async move { link.resolve_lexical_bitmap(request).await },
+            )
+            .await?;
+        let visibility = req.visibility.as_ref();
+        Ok(Response::new(self.finish_membership(
+            m,
+            "ResolveLexicalBitmap",
+            visibility,
+            None,
+        )?))
     }
 
     pub(super) async fn handle_resolve_vector_bitmap(
         &self,
         request: Request<crate::pb::VectorBitmapRequest>,
-    ) -> Result<Response<crate::pb::MembershipBitmapResponse>, Status> {
+    ) -> Result<Response<MembershipBitmapResponse>, Status> {
         let timeout = grpc_timeout(request.metadata());
         let req = request.into_inner();
         crate::visibility::VisibilityScope::new(req.visibility.as_ref())?;
-        let (pinned, frozen) = self.pin();
-        let children = frozen.node_addresses().to_vec();
-        if children.is_empty() {
-            return Err(Status::failed_precondition(
-                "relay: a relay coordinator has no children",
-            ));
-        }
-        let reports = self.children_health(&frozen, timeout).await?;
-        let ranges = child_ranges(&self.collection, &children, &reports)?;
-        let mut tasks = Vec::with_capacity(children.len());
-        for (shard, addr) in children.iter().enumerate() {
-            let mut link = frozen.node_client(addr)?;
-            let addr = addr.clone();
-            let req = req.clone();
-            tasks.push(tokio::spawn(async move {
-                let mut request = Request::new(req);
-                if let Some(timeout) = timeout {
-                    request.set_timeout(timeout);
-                }
-                link.resolve_vector_bitmap(request)
-                    .await
-                    .map(|r| r.into_inner())
-                    .map_err(|status| child_error(shard, &addr, "vector bitmap", status))
-            }));
-        }
-        let mut shares = Vec::with_capacity(children.len());
-        let mut receipts = Vec::with_capacity(children.len());
-        let mut binding = None;
-        for task in tasks {
-            let share = task
-                .await
-                .map_err(|e| Status::internal(format!("relay vector bitmap task: {e}")))??;
-            crate::vector_read::check_binding(
-                &req.field,
-                share.vector_binding.as_ref(),
-                &mut binding,
-            )?;
-            receipts.push(read_metadata(&share));
-            shares.push(Some(ChildBitmap {
-                base_label: share.base_label,
-                label_count: share.label_count,
-                bits: share.bits,
-            }));
-        }
-        let (base_label, label_count, bits) = concat_bitmaps(&children, &ranges, &shares)?;
-        self.still_current(&pinned, "ResolveVectorBitmap")?;
-        let receipt =
-            self.read_receipt(&pinned, children, req.visibility.as_ref(), None, &receipts)?;
-        Ok(Response::new(crate::pb::MembershipBitmapResponse {
-            vector_binding: binding.flatten(),
-            stats_incarnation: receipt.stats_incarnation,
-            visibility_fingerprint: receipt.visibility_fingerprint,
-            visibility_columns_known: receipt.visibility_columns_known,
-            base_label,
-            label_count,
-            bits,
-            stats_epoch: receipt.stats_epoch,
-            segments_total: 0,
-            segments_skipped: 0,
-        }))
-    }
-
-    /// One shard-side Boolean evaluation over the children: the parent's
-    /// stats claim translates per child, each child answers its best
-    /// `depth`, and the merge is the ranked union cut to `depth` with the
-    /// counts summed and the known flags joined. An aggregate is not
-    /// composed here (the fold order is the root's) and refuses by name.
-    pub(super) async fn handle_evaluate_boolean(
-        &self,
-        request: Request<crate::pb::BooleanShardRequest>,
-    ) -> Result<Response<crate::pb::BooleanShardResponse>, Status> {
-        crate::metrics::timed(Route::EvaluateBoolean, request, |request| async move {
-            let timeout = grpc_timeout(request.metadata());
-            let req = request.into_inner();
-            if req.depth == 0 {
-                return Err(Status::invalid_argument(
-                    "EvaluateBoolean: depth 0 asks for no candidates",
-                ));
-            }
-            let (pinned, frozen) = self.pin();
-            let children = frozen.node_addresses().to_vec();
-            if children.is_empty() {
-                return Err(Status::failed_precondition(
-                    "relay: a relay coordinator has no children",
-                ));
-            }
-            let claims = self.child_claims(
-                req.expected_stats_epoch,
-                &req.expected_stats_incarnation,
-                children.len(),
-            )?;
-            let mut tasks = Vec::with_capacity(children.len());
-            for (shard, addr) in children.iter().enumerate() {
-                let mut link = frozen.node_client(addr)?;
-                let mut child_req = req.clone();
-                child_req.expected_stats_epoch = claims[shard].epoch;
-                child_req.expected_stats_incarnation = claims[shard].incarnation();
-                let addr = addr.clone();
-                tasks.push(tokio::spawn(async move {
-                    let mut request = Request::new(child_req);
-                    if let Some(timeout) = timeout {
-                        request.set_timeout(timeout);
-                    }
-                    link.evaluate_boolean(request)
-                        .await
-                        .map(|r| r.into_inner())
-                        .map_err(|status| child_error(shard, &addr, "boolean evaluation", status))
-                }));
-            }
-            let mut shares = Vec::with_capacity(children.len());
-            for task in tasks {
-                shares.push(
-                    task.await
-                        .map_err(|e| Status::internal(format!("relay boolean task: {e}")))??,
-                );
-            }
-            let mut merged = merge_boolean_responses(&req, &shares)?;
-            self.still_current(&pinned, "EvaluateBoolean")?;
-            let receipts = shares
-                .iter()
-                .map(|share| {
-                    let receipt = share.read_receipt.clone().ok_or_else(|| {
-                        Status::failed_precondition("relay child omitted Boolean read receipt")
-                    })?;
-                    if receipt.stats_epoch != share.stats_epoch {
-                        return Err(Status::failed_precondition(
-                            "Boolean receipt epoch mismatch",
-                        ));
-                    }
-                    Ok(receipt)
-                })
-                .collect::<Result<Vec<_>, Status>>()?;
-            let mut receipt = self.read_receipt(
-                &pinned,
-                children,
-                req.visibility.as_ref(),
-                Some(&claims),
-                &receipts,
-            )?;
-            let mut binding = None;
-            for leaf in &req.leaves {
-                if let Some(crate::pb::boolean_plan_leaf::Leaf::Dense(dense)) = leaf.leaf.as_ref() {
-                    for child in &receipts {
-                        crate::vector_read::check_binding(
-                            &dense.field,
-                            child.vector_binding.as_ref(),
-                            &mut binding,
-                        )?;
-                    }
-                }
-            }
-            receipt.vector_binding = binding.flatten();
-            merged.stats_epoch = receipt.stats_epoch;
-            merged.read_receipt = Some(receipt);
-            // The root aggregate each child folded over its match set,
-            // folded in child order, with a receipt of its own the root
-            // checks as it checks a shard's.
-            if let Some(spec) = req.aggregate.as_ref() {
-                let folds = shares
-                    .iter()
-                    .enumerate()
-                    .map(|(shard, share)| {
-                        share.aggregate.clone().ok_or_else(|| {
-                            Status::failed_precondition(format!(
-                                "relay: child {shard} answered no aggregate fold for a Boolean \
-                                 plan that asked for one"
-                            ))
-                        })
-                    })
-                    .collect::<Result<Vec<_>, Status>>()?;
-                let mut fold = merge_aggregate_shares(
-                    &spec.aggregations,
-                    &spec.group_by,
-                    spec.max_groups,
-                    &spec.histograms,
-                    &spec.percentiles,
-                    &folds,
-                )?;
-                let fold_receipt = self.read_receipt(
-                    &pinned,
-                    self.children(),
-                    req.visibility.as_ref(),
-                    Some(&claims),
-                    &folds,
-                )?;
-                fold.stats_epoch = fold_receipt.stats_epoch;
-                fold.stats_incarnation = fold_receipt.stats_incarnation;
-                fold.visibility_fingerprint = fold_receipt.visibility_fingerprint;
-                fold.visibility_columns_known = fold_receipt.visibility_columns_known;
-                merged.aggregate = Some(fold);
-            }
-            Ok(Response::new(merged))
-        })
-        .await
+        let m = self
+            .membership_shares(
+                &req,
+                timeout,
+                "vector bitmap",
+                |mut link, request| async move { link.resolve_vector_bitmap(request).await },
+            )
+            .await?;
+        let visibility = req.visibility.as_ref();
+        let field = Some(req.field.as_str());
+        Ok(Response::new(self.finish_membership(
+            m,
+            "ResolveVectorBitmap",
+            visibility,
+            field,
+        )?))
     }
 }

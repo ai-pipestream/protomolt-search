@@ -234,7 +234,7 @@ function ingest(raw) {
   setTile('cand_rate', fmtNum(Math.round(candRate))); state.tiles.get('cand_rate').push(candRate);
   setTile('floor_rate', floorRate.toFixed(1)); state.tiles.get('floor_rate').push(floorRate);
   setTile('in_flight', String(inFlight)); state.tiles.get('in_flight').push(inFlight);
-  // The scan budget's counters (docs/bandwidth-budget.md): bytes the
+  // The scan budget's counters: bytes the
   // provider scan processed and the kernel's active time, per second of
   // wall time. Their ratio is this process's observed scan rate.
   const bytesRate = rate('turbovec_scan_bytes_total');
@@ -417,7 +417,7 @@ function renderKnobs(r, err) {
 
 // A shard whose layout diagnostics came back as a relay's refusal is a
 // relay: the relay coordinator serves the node-facing surface only and
-// names itself in the refusal (docs/relay-coordinators.md). The children
+// names itself in the refusal. The children
 // behind it are its own shard map, which the coordinator's diagnostics
 // do not see.
 function isRelay(s) {
@@ -425,7 +425,7 @@ function isRelay(s) {
 }
 
 // The placement code as its path: one index per level, root first, in
-// the tree's fixed field width (docs/placement.md "The code"). The width
+// the tree's fixed field width. The width
 // is the default unless the map says otherwise; the raw code is shown
 // beside it so nothing is lost when the width differs.
 function codePath(code, levelBits = 9n) {
@@ -547,7 +547,7 @@ function renderRecent(r, err) {
 // The placement dry run
 // ---------------------------------------------------------------------------
 
-// The shard map's `[placement]` shape (docs/placement.md) as PlacementTree
+// The shard map's `[placement]` shape as PlacementTree
 // JSON. A `[[placement.nodes]]` header opens a root node, each further
 // `.children` opens a child of the last node one level up; a node with no
 // `cel` is its level's default. JSON input is passed through.

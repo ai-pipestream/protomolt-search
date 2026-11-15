@@ -139,3 +139,42 @@ pub(super) fn apply_datagram(
         }
     }
 }
+
+impl super::RelayService {
+    /// Bind the relay's parent-facing UDP signal lane on `addr` (the
+    /// same host:port as its gRPC listener) and fold typed floor and
+    /// cancel datagrams into the matching stream. The same acceptance
+    /// rule as a node's lane: signed when a key is configured, unsigned
+    /// on loopback only.
+    #[cfg(feature = "net")]
+    pub fn spawn_floor_listener(&self, addr: std::net::SocketAddr) {
+        let signals = Arc::clone(&self.signals);
+        let key = self.base().udp_key().cloned();
+        if key.is_none() && !crate::security::is_loopback(&addr) {
+            eprintln!(
+                "relay stream-signal UDP lane on {addr} stays closed: no --udp-hmac-key, and \
+                 unsigned datagrams are accepted on loopback only; signals ride the gRPC streams"
+            );
+            return;
+        }
+        tokio::spawn(async move {
+            let socket = match tokio::net::UdpSocket::bind(addr).await {
+                Ok(socket) => socket,
+                Err(e) => {
+                    eprintln!(
+                        "relay stream-signal UDP bind {addr}: {e}; signals ride the gRPC streams \
+                         only"
+                    );
+                    return;
+                }
+            };
+            let mut buf = [0u8; 64];
+            loop {
+                match socket.recv_from(&mut buf).await {
+                    Ok((n, _peer)) => apply_datagram(&signals, key.as_ref(), &buf[..n]),
+                    Err(_) => continue,
+                }
+            }
+        });
+    }
+}
