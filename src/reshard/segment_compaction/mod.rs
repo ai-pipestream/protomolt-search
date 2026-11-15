@@ -69,7 +69,7 @@ pub struct SegmentCompactionBuild {
 /// segments themselves, each document's analyzed fields transposed from
 /// the postings (`FieldView::transpose`), never the analyzer; the live
 /// rows are keyed by `spec.column` and cut into partitions of at most
-/// `spec.bound` rows by the split's cut-point selection ([`ChildCutPlan`],
+/// `spec.bound` rows by the split's cut-point selection (`ChildCutPlan`,
 /// the `--cut-column/--cut-rows` logic); rows without the column seal in
 /// one final unkeyed cut.
 ///

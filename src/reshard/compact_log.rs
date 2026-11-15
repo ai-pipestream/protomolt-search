@@ -9,9 +9,9 @@ use crate::wal::WalManifest;
 
 use super::child_build::{child_order, finish_child_ordered, ChildSchema, ChildSlot};
 #[cfg(doc)]
-use super::hash_split::split;
+use super::hash_split::split_logs_with;
 #[cfg(doc)]
-use super::hash_split::split_logs_segmented;
+use super::segmented_split::split_logs_segmented_with;
 use super::hnsw_sources::HnswCompactionSources;
 use super::replay::{
     read_gen_manifest, read_gens_binding, replay_buckets_through, require_backend_config,
@@ -322,8 +322,8 @@ impl RowCounts {
 /// `segmented` selects the bucket-bounded shape: one sealed image per
 /// non-empty WAL bucket, slots dense across them in bucket order, memory
 /// holding one bucket's replay at a time — the same shape
-/// [`split_logs_segmented`] gives a catalog. Otherwise one image over the
-/// whole replay, as [`split`] with a factor of one.
+/// [`split_logs_segmented_with`] gives a catalog. Otherwise one image over the
+/// whole replay, as [`split_logs_with`] with a factor of one.
 pub fn compact_log(
     request: &CompactionRequest<'_>,
     segmented: bool,
