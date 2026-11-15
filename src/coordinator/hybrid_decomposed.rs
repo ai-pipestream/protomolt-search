@@ -3,6 +3,7 @@
 use super::hybrid::accept_hybrid_receipt;
 use super::hybrid_context::HybridRound;
 use super::*;
+use crate::hnsw::distance::{dot_underflow_slack, simd_score_floor};
 
 /// Total-order f64 wrapper for heap keys.
 #[derive(PartialEq)]
@@ -37,7 +38,7 @@ pub(super) const SLACK_REL: f64 = 1.0 / (1u64 << 40) as f64;
 pub(super) fn decomposed_floor(s_lb: f64, wb_b1: f64, w_v: f64) -> f32 {
     let t = (s_lb - wb_b1) / w_v;
     let mag = t.abs() + (s_lb.abs() + wb_b1.abs()) / w_v;
-    let safe = t - mag * SLACK_REL - f64::MIN_POSITIVE;
+    let safe = t - mag * SLACK_REL - dot_underflow_slack(1);
     (safe as f32).next_down()
 }
 
@@ -98,10 +99,8 @@ impl LowerBounds {
             .lower
             .map(|lower| decomposed_floor(lower, self.weighted_bm25_max, self.vector_weight));
         let initial = match (floor, self.minimum_vector) {
-            (Some(floor), Some(minimum)) => Some(floor.max(minimum)),
-            (Some(floor), None) => Some(floor),
-            (None, Some(minimum)) => Some(minimum),
-            (None, None) => None,
+            (Some(f), Some(m)) => Some(f.max(m)),
+            (a, b) => a.or(b),
         };
         #[cfg(feature = "net")]
         {
@@ -324,11 +323,17 @@ impl<'a> DecomposedRun<'a> {
     }
 
     #[cfg(feature = "net")]
+    fn stream_floor(&self, floor: f32) -> f32 {
+        simd_score_floor(self.round.query().input().vector().len(), floor)
+    }
+
+    #[cfg(feature = "net")]
     async fn scan_vectors(
         &mut self,
         coordinator: &CoordinatorServiceImpl,
         initial_floor: Option<f32>,
     ) -> Result<(), Status> {
+        let initial_floor = initial_floor.map(|floor| self.stream_floor(floor));
         if coordinator.clustered_vectors.is_some() {
             self.scan_clustered(coordinator, initial_floor).await
         } else {
@@ -383,7 +388,7 @@ impl<'a> DecomposedRun<'a> {
                         self.observe_vector(candidate.label, candidate.score, shard);
                     }
                     if let Some(floor) = self.bounds.raised_floor() {
-                        stream.raise_floor(floor)?;
+                        stream.raise_floor(self.stream_floor(floor))?;
                     }
                 }
                 ClusteredCandidateEvent::Completion(completion) => break completion,
@@ -485,7 +490,7 @@ impl<'a> DecomposedRun<'a> {
                     self.observe_vector(doc, vector, shard as u32);
                 }
                 if let Some(floor) = self.bounds.raised_floor() {
-                    coordinator.push_stream_floor(fanout, floor);
+                    coordinator.push_stream_floor(fanout, self.stream_floor(floor));
                 }
                 return Ok(false);
             }
@@ -517,11 +522,7 @@ impl<'a> DecomposedRun<'a> {
         let mut exact = Vec::new();
         let mut unknown = Vec::new();
         for (&doc, &(vector, shard)) in &self.vectors {
-            if self
-                .bounds
-                .minimum_vector
-                .is_some_and(|minimum| vector < minimum)
-            {
+            if self.bounds.minimum_vector.is_some_and(|m| vector < m) {
                 continue;
             }
             match self.bm25.get(&doc) {
@@ -557,7 +558,7 @@ impl<'a> DecomposedRun<'a> {
             let magnitude = upper.abs()
                 + (self.bounds.vector_weight * f64::from(vector)).abs()
                 + self.bounds.bm25_weight * self.outside_bm25;
-            let safe_upper = upper + magnitude * SLACK_REL + f64::MIN_POSITIVE;
+            let safe_upper = upper + magnitude * SLACK_REL + dot_underflow_slack(1);
             if safe_upper >= known {
                 ids.entry(shard).or_default().push(doc);
                 docs.push((doc, shard, vector));
@@ -659,11 +660,9 @@ impl<'a> DecomposedRun<'a> {
                 .map(|(shard, summary)| HybridShardDebug {
                     shard: shard as u32,
                     rpc_ms: 0.0,
-                    vector_hits: summary
-                        .as_ref()
-                        .map_or(self.clustered_counts[shard], |summary| {
-                            u32::try_from(summary.emitted).unwrap_or(u32::MAX)
-                        }),
+                    vector_hits: summary.as_ref().map_or(self.clustered_counts[shard], |s| {
+                        u32::try_from(s.emitted).unwrap_or(u32::MAX)
+                    }),
                     bm25_hits: self
                         .lexical_counts
                         .get(&(shard as u32))

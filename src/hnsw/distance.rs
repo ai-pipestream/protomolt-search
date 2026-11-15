@@ -1028,212 +1028,61 @@ mod arm {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn rows(seed: u64, n: usize) -> (Vec<f32>, Vec<f32>) {
-        let mut state = seed;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            ((state >> 11) as f64 / (1u64 << 53) as f64) as f32 * 2.0 - 1.0
-        };
-        let a: Vec<f32> = (0..n).map(|_| next()).collect();
-        let b: Vec<f32> = (0..n).map(|_| next()).collect();
-        (a, b)
-    }
-
-    /// Every kernel this machine has agrees with the scalar kernel to
-    /// within accumulation rounding, and its 4-row and 8-row batch calls
-    /// match single-row `dot` bit for bit, at every length from 0 to 70.
-    #[test]
-    fn kernels_agree_with_scalar_and_batches_are_bit_identical_at_every_length() {
-        let kernels = Kernel::available();
-        assert!(kernels.contains(&Kernel::detect()));
-        for n in 0..=70 {
-            let (q, b0) = rows(0x5EED_0000 + n as u64, n);
-            let (b1, b2) = rows(0x5EED_1000 + n as u64, n);
-            let (b3, b4) = rows(0x5EED_2000 + n as u64, n);
-            let (b5, b6) = rows(0x5EED_3000 + n as u64, n);
-            let (_, b7) = rows(0x5EED_4000 + n as u64, n);
-            let all = [&b0[..], &b1, &b2, &b3, &b4, &b5, &b6, &b7];
-            let exact: f64 = q
-                .iter()
-                .zip(&b0)
-                .map(|(x, y)| f64::from(*x) * f64::from(*y))
-                .sum();
-            for kernel in &kernels {
-                let got = kernel.dot(&q, &b0);
-                assert!(
-                    (f64::from(got) - exact).abs() < 1.0e-4 * (1.0 + n as f64),
-                    "{} at n={n}: {got} vs {exact}",
-                    kernel.name()
-                );
-                let batch4 = kernel.dot_batch4(&q, [all[0], all[1], all[2], all[3]]);
-                let batch8 = kernel.dot_batch8(&q, all);
-                for (lane, &row) in all.iter().enumerate() {
-                    let single = kernel.dot(&q, row);
-                    assert_eq!(
-                        batch8[lane].to_bits(),
-                        single.to_bits(),
-                        "{} batch8[{lane}] at n={n}: {} vs {single}",
-                        kernel.name(),
-                        batch8[lane]
-                    );
-                    if lane < 4 {
-                        assert_eq!(
-                            batch4[lane].to_bits(),
-                            single.to_bits(),
-                            "{} batch4[{lane}] at n={n}: {} vs {single}",
-                            kernel.name(),
-                            batch4[lane]
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// `2·γ(d)·Σ|qᵢxᵢ|`, the documented bound on a kernel's distance from
-    /// the scalar row-order sum.
-    fn bound(q: &[f32], x: &[f32]) -> f64 {
-        let d = q.len() as f64;
-        let u = 2f64.powi(-24);
-        let gamma = d * u / (1.0 - d * u);
-        let mass: f64 = q
-            .iter()
-            .zip(x)
-            .map(|(a, b)| (f64::from(*a) * f64::from(*b)).abs())
-            .sum();
-        2.0 * gamma * mass
-    }
-
-    /// Every single-row and batch kernel stays within the documented bound
-    /// of the scalar sum (and matches `dot` bit for bit) on inputs built to
-    /// expose accumulation order: negative products, cancellation between
-    /// large terms of opposite sign, lengths that are odd or straddle every
-    /// lane width, and near ties. The scalar sum here is
-    /// `exact_vectors::dot`, the scorer every reported score comes from.
-    #[test]
-    fn kernels_stay_within_the_bound_of_the_scalar_scorer_on_adversarial_rows() {
-        let kernels = Kernel::available();
-        let dims = [
-            1usize, 2, 3, 4, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 1023,
-        ];
-        for &d in &dims {
-            let (a, b) = rows(0xADD_0000 + d as u64, d);
-            let (extra0, extra1) = rows(0xADD_8000 + d as u64, d);
-            // Plain random signs: negative scores and mixed products.
-            let negative: Vec<f32> = a.iter().map(|v| -v.abs()).collect();
-            // Cancellation: large terms of opposite sign around the
-            // small rest of the row.
-            let mut cancel_q = a.clone();
-            let mut cancel_x = b.clone();
-            cancel_q[0] = 1.0e6;
-            cancel_x[0] = 1.0;
-            if d > 1 {
-                cancel_q[d - 1] = -1.0e6;
-                cancel_x[d - 1] = 1.0;
-            }
-            if d > 2 {
-                cancel_q[d / 2] = 3.0e5;
-                cancel_x[d / 2] = -3.3333333;
-            }
-            // Near ties: two rows differing in one last-place bit.
-            let mut tie = b.clone();
-            tie[d / 2] = f32::from_bits(tie[d / 2].to_bits() ^ 1);
-            let cases: [(&str, &[f32], &[f32]); 5] = [
-                ("random", &a, &b),
-                ("negative", &negative, &b),
-                ("negative-both", &negative, &a),
-                ("cancellation", &cancel_q, &cancel_x),
-                ("near-tie", &a, &tie),
-            ];
-            for (name, q, x) in cases {
-                let scalar = crate::exact_vectors::dot(x, q);
-                let limit = bound(q, x);
-                let pack8: [&[f32]; 8] = [x, &b, &a, &negative, &cancel_x, &tie, &extra0, &extra1];
-                for kernel in &kernels {
-                    let got = kernel.dot(q, x);
-                    let delta = (f64::from(got) - f64::from(scalar)).abs();
-                    assert!(
-                        delta <= limit,
-                        "{} d={d} {name}: |{got} - {scalar}| = {delta} exceeds {limit}",
-                        kernel.name()
-                    );
-                    let got4 = kernel.dot_batch4(q, [pack8[0], pack8[1], pack8[2], pack8[3]]);
-                    let got8 = kernel.dot_batch8(q, pack8);
-                    for (lane, &rx) in pack8.iter().enumerate() {
-                        let single = kernel.dot(q, rx);
-                        let row_scalar = crate::exact_vectors::dot(rx, q);
-                        let row_limit = bound(q, rx);
-                        assert_eq!(
-                            got8[lane].to_bits(),
-                            single.to_bits(),
-                            "{} d={d} {name} batch8[{lane}] drifted from dot",
-                            kernel.name()
-                        );
-                        assert!(
-                            (f64::from(got8[lane]) - f64::from(row_scalar)).abs() <= row_limit,
-                            "{} d={d} {name} batch8[{lane}] exceeded bound",
-                            kernel.name()
-                        );
-                        if lane < 4 {
-                            assert_eq!(
-                                got4[lane].to_bits(),
-                                single.to_bits(),
-                                "{} d={d} {name} batch4[{lane}] drifted from dot",
-                                kernel.name()
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn score_nodes_matches_single_row_dot_across_lengths_and_list_sizes() {
-        let kernels = Kernel::available();
-        let list_sizes = [0usize, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 35];
-        let max_nodes = 36usize;
-        for d in 0..=70 {
-            let (q, _) = rows(0xBEEF_0000 + d as u64, d);
-            let mut table = Vec::with_capacity(max_nodes * d);
-            for idx in 0..max_nodes {
-                let (row, _) = rows(0xBEEF_8000 + (d * 64 + idx) as u64, d);
-                table.extend_from_slice(&row);
-            }
-            for &count in &list_sizes {
-                let nodes: Vec<u32> = (0..count)
-                    .map(|i| ((i * 5 + 3) % max_nodes) as u32)
-                    .collect();
-                for kernel in &kernels {
-                    for lines in [0usize, kernel.prefetch_lines(d)] {
-                        let mut got = vec![f32::NAN; count];
-                        kernel.score_nodes(&q, &table, d, &nodes, lines, &mut got);
-                        for (pos, &node) in nodes.iter().enumerate() {
-                            let start = node as usize * d;
-                            let want = kernel.dot(&q, &table[start..start + d]);
-                            assert_eq!(
-                                got[pos].to_bits(),
-                                want.to_bits(),
-                                "{} score_nodes(lines={lines}) mismatch at d={d} count={count} pos={pos}",
-                                kernel.name()
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn prefetch_accepts_short_rows() {
-        prefetch(&[], 4);
-        prefetch(&[1.0, 2.0], 4);
-        prefetch(&[0.0; 100], 8);
-    }
+/// Additive `f64` slack `(dim.max(1) as f64) * f64::from(f32::MIN_POSITIVE)`
+/// bounding IEEE-754 FP32 gradual-underflow and FMA-vs-scalar lane rounding
+/// across `dim` coordinates near `0.0`.
+///
+/// For normal-magnitude scores, `~1.18e-38 * dim` falls below the 53-bit `f64`
+/// mantissa horizon of the proportional Higham bound, leaving normal slack
+/// bit-for-bit unchanged.
+#[inline]
+pub(crate) const fn dot_underflow_slack(dim: usize) -> f64 {
+    let lanes = if dim == 0 { 1 } else { dim };
+    (lanes as f64) * (f32::MIN_POSITIVE as f64)
 }
+
+/// Proportional Higham error factor `4 * gamma(dim) * ||query||_2` bounding
+/// kernel-vs-scalar inner-product drift per unit row norm (`||row||_2`).
+#[inline]
+pub(crate) fn kernel_dot_slack_per_norm(dim: usize, query: &[f32]) -> f64 {
+    let du = dim as f64 / (1u64 << 24) as f64;
+    let gamma = du / (1.0 - du);
+    let query_norm = query
+        .iter()
+        .map(|&v| f64::from(v) * f64::from(v))
+        .sum::<f64>()
+        .sqrt();
+    4.0 * gamma * query_norm
+}
+
+/// Total conservative kernel-to-scalar error bound for a row with finite
+/// positive reciprocal norm `inv_norm`: proportional Higham slack
+/// `slack_per_norm / inv_norm` plus [`dot_underflow_slack`] outside the norm
+/// division so subnormal products (including split-exponent pairs where
+/// `inv_norm` is large) are never falsely pruned before scalar verification.
+#[inline]
+pub(crate) fn kernel_row_slack(dim: usize, slack_per_norm: f64, inv_norm: f32) -> f64 {
+    slack_per_norm / f64::from(inv_norm) + dot_underflow_slack(dim)
+}
+
+/// Conservative `f32` pre-filter floor for a `dim`-coordinate SIMD inner-product
+/// stream when exact scalar scores `>= exact_floor` must survive.
+#[inline]
+pub(crate) fn simd_score_floor(dim: usize, exact_floor: f32) -> f32 {
+    if !exact_floor.is_finite() {
+        return exact_floor;
+    }
+    let f = f64::from(exact_floor);
+    let du = dim as f64 / (1u64 << 24) as f64;
+    let prop = if du < 1.0 {
+        2.0 * (du / (1.0 - du)) * f.abs()
+    } else {
+        f.abs()
+    };
+    let safe = f - prop - dot_underflow_slack(dim);
+    (safe as f32).next_down()
+}
+
+#[cfg(test)]
+#[path = "distance_tests.rs"]
+mod tests;

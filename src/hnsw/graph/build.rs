@@ -216,40 +216,38 @@ impl Store {
     }
 
     pub fn view(&self) -> View<'_, [AtomicU32]> {
-        match &self.links {
-            Some(links) => {
-                let (entry, top) = links.entry_state();
-                View {
-                    dim: self.dim,
-                    m: self.m,
-                    m0: self.m0,
-                    rows: self.rows.values(),
-                    inv_norm: &self.inv_norm,
-                    level: &links.level,
-                    upper_slot: &links.upper_slot,
-                    upper_base: &links.upper_base,
-                    links0: links.links0.as_slice(),
-                    upper: links.upper.as_slice(),
-                    entry,
-                    top,
-                    kernel: self.kernel,
-                }
-            }
-            None => View {
-                dim: self.dim,
-                m: self.m,
-                m0: self.m0,
-                rows: self.rows.values(),
-                inv_norm: &self.inv_norm,
-                level: &[],
-                upper_slot: &[],
-                upper_base: &[],
-                links0: &EMPTY_CELLS,
-                upper: &EMPTY_CELLS,
-                entry: NO_NODE,
-                top: 0,
-                kernel: self.kernel,
-            },
+        let (level, upper_slot, upper_base, links0, upper, (entry, top)) = match &self.links {
+            Some(links) => (
+                links.level.as_slice(),
+                links.upper_slot.as_slice(),
+                links.upper_base.as_slice(),
+                links.links0.as_slice(),
+                links.upper.as_slice(),
+                links.entry_state(),
+            ),
+            None => (
+                &[][..],
+                &[][..],
+                &[][..],
+                &EMPTY_CELLS[..],
+                &EMPTY_CELLS[..],
+                (NO_NODE, 0),
+            ),
+        };
+        View {
+            dim: self.dim,
+            m: self.m,
+            m0: self.m0,
+            rows: self.rows.values(),
+            inv_norm: &self.inv_norm,
+            level,
+            upper_slot,
+            upper_base,
+            links0,
+            upper,
+            entry,
+            top,
+            kernel: self.kernel,
         }
     }
 
@@ -326,27 +324,15 @@ impl Store {
                 upper_cells += cells;
             }
         }
-        let links0: Vec<AtomicU32> = std::iter::repeat_with(|| AtomicU32::new(0))
-            .take(n * stride0)
-            .collect();
-        let upper: Vec<AtomicU32> = std::iter::repeat_with(|| AtomicU32::new(0))
-            .take(upper_cells)
-            .collect();
+        let links0: Vec<AtomicU32> = (0..n * stride0).map(|_| AtomicU32::new(0)).collect();
+        let upper: Vec<AtomicU32> = (0..upper_cells).map(|_| AtomicU32::new(0)).collect();
         let links =
             GraphLinks::from_parts(level, upper_slot, upper_base, links0, upper, NO_NODE, 0);
-        let builder = LinkBuilder {
-            dim: self.dim,
-            m: self.m,
-            m0: self.m0,
-            ef_construction: self.ef_construction,
-            kernel: self.kernel,
-            rows: self.rows.values(),
-            inv_norm: &self.inv_norm,
-            links: &links,
-        };
+        let builder = LinkBuilder::new(self, &links);
         let range = 0..n as u32;
         if parallel {
             builder.insert_parallel(range);
+            super::super::repair::repair_connectivity(&builder);
         } else {
             builder.insert_sequential(range);
         }
@@ -423,63 +409,65 @@ impl<'a> LinkBuilder<'a> {
         });
     }
 
-    fn insert_parallel(&self, range: std::ops::Range<u32>) {
-        use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
-        let boot = self.bootstrap_prefix_len(range.len()) as u32;
+    fn run_waves(&self, total: usize, mut step: impl FnMut(usize, usize, Option<&Locks>)) {
+        let boot = self.bootstrap_prefix_len(total);
         if boot > 0 {
-            self.insert_sequential(range.start..range.start + boot);
+            step(0, boot, None);
         }
-        let rest = range.start + boot..range.end;
-        if rest.is_empty() {
-            return;
-        }
-        if rest.len() < PARALLEL_MIN_TASK_LEN {
-            self.insert_sequential(rest);
+        let mut at = boot;
+        if at >= total {
             return;
         }
         let locks = Locks::default();
-        rest.into_par_iter()
-            .with_min_len(PARALLEL_MIN_TASK_LEN)
-            .for_each(|node| with_scratch(|scratch| self.insert(node, Some(&locks), scratch)));
+        let mut wave = if boot > 0 {
+            boot
+        } else {
+            super::super::repair::linked_node_count(self).max(1)
+        };
+        while at < total {
+            let end = total.min(at + wave);
+            step(
+                at,
+                end,
+                (end - at >= PARALLEL_MIN_TASK_LEN).then_some(&locks),
+            );
+            at = end;
+            wave = wave.saturating_mul(2);
+        }
+    }
+
+    fn insert_parallel(&self, range: std::ops::Range<u32>) {
+        use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+        let base = range.start;
+        self.run_waves(range.len(), |lo, hi, locks| {
+            let sub = base + lo as u32..base + hi as u32;
+            match locks {
+                None => self.insert_sequential(sub),
+                Some(locks) => sub
+                    .into_par_iter()
+                    .with_min_len(PARALLEL_MIN_TASK_LEN)
+                    .for_each(|n| with_scratch(|s| self.insert(n, Some(locks), s))),
+            }
+        });
     }
 
     pub(in crate::hnsw) fn insert_slice(&self, nodes: &[u32], parallel: bool) {
+        use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
         if nodes.is_empty() {
             return;
         }
         if !parallel {
-            with_scratch(|scratch| {
-                for &node in nodes {
-                    self.insert(node, None, scratch);
-                }
-            });
+            with_scratch(|s| nodes.iter().for_each(|&n| self.insert(n, None, s)));
             return;
         }
-        let boot = self.bootstrap_prefix_len(nodes.len());
-        if boot > 0 {
-            with_scratch(|scratch| {
-                for &node in &nodes[..boot] {
-                    self.insert(node, None, scratch);
-                }
-            });
-        }
-        let rest = &nodes[boot..];
-        if rest.is_empty() {
-            return;
-        }
-        if rest.len() < PARALLEL_MIN_TASK_LEN {
-            with_scratch(|scratch| {
-                for &node in rest {
-                    self.insert(node, None, scratch);
-                }
-            });
-            return;
-        }
-        use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
-        let locks = Locks::default();
-        rest.par_iter()
-            .with_min_len(PARALLEL_MIN_TASK_LEN)
-            .for_each(|&node| with_scratch(|scratch| self.insert(node, Some(&locks), scratch)));
+        self.run_waves(nodes.len(), |lo, hi, locks| match locks {
+            None => with_scratch(|s| nodes[lo..hi].iter().for_each(|&n| self.insert(n, None, s))),
+            Some(locks) => nodes[lo..hi]
+                .par_iter()
+                .with_min_len(PARALLEL_MIN_TASK_LEN)
+                .for_each(|&n| with_scratch(|s| self.insert(n, Some(locks), s))),
+        });
+        super::super::repair::repair_slice_connectivity(self, nodes);
     }
 
     pub(in crate::hnsw) fn write_links(

@@ -30,13 +30,12 @@
 use std::cell::RefCell;
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
-use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU32, Ordering as Atomic};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::vector::Mask;
 
-use super::distance::{prefetch, Kernel};
+use super::distance::{kernel_row_slack, prefetch, Kernel};
 
 /// The absent node: an empty graph's entry, a level-0 node's upper slot.
 pub const NO_NODE: u32 = u32::MAX;
@@ -441,9 +440,13 @@ impl Probe {
         expected >= FAR_PROBE_MIN_EXPECTED && (self.hits as f64) * FAR_PROBE_RATIO < expected
     }
 
-    /// The allowed share of the sample.
+    /// The allowed share of the sample (`0.0` when `sample == 0`).
     fn local_share(&self) -> f64 {
-        self.hits as f64 / self.sample as f64
+        if self.sample == 0 {
+            0.0
+        } else {
+            self.hits as f64 / self.sample as f64
+        }
     }
 }
 
@@ -604,7 +607,7 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
     }
 
     /// True when `node`'s exact scalar score is provably strictly below `floor`
-    /// under `#70`'s Higham `4 · γ(d) · |q| · |x|` error bound (`#72`).
+    /// under Higham proportional error plus subnormal gradual-underflow slack.
     #[inline]
     fn below_floor(&self, node: u32, kernel_score: f32, floor: f32, slack_per_norm: f64) -> bool {
         if !floor.is_finite() {
@@ -614,7 +617,7 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
         if !(inv > 0.0 && inv.is_finite()) {
             return false;
         }
-        f64::from(kernel_score) + slack_per_norm / f64::from(inv) < f64::from(floor)
+        f64::from(kernel_score) + kernel_row_slack(self.dim, slack_per_norm, inv) < f64::from(floor)
     }
 
     /// Paper Algorithm 2 at one layer. Leaves up to `ef` results (allowed
@@ -979,183 +982,6 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
         outcome
     }
 
-    /// The enumerate regime's pass over the mask: score every allowed row
-    /// with the traversal kernel, in row order, and leave in `out` the rows
-    /// that can still be among the exact top `k`, for the scalar scorer to
-    /// settle. Returns the rows scored.
-    ///
-    /// A kernel score differs from the scalar score by at most
-    /// `2·γ(d)·Σ|qᵢxᵢ| ≤ 2·γ(d)·|q|·|x|` (`distance.rs`). `slack_per_norm`
-    /// is `4·γ(d)·|q|` (the factor two covers the stored norm, itself a
-    /// kernel result), so `b = slack_per_norm·|x|` bounds the error of row
-    /// `x`, and `B`, the same with the longest allowed row, bounds every
-    /// row's. With `t` the k-th largest kernel score, k rows have an exact
-    /// score of at least `t − B`; a row whose kernel score is below
-    /// `t − 2B` has an exact score below that, so k rows beat it and it is
-    /// dropped. A row with no stored direction (a zero row, or one whose
-    /// norm overflowed) has no bound: it takes no part in `t` and is always
-    /// kept.
-    pub fn enumerate(
-        &self,
-        q: &[f32],
-        allow: Mask<'_>,
-        k: usize,
-        slack_per_norm: f64,
-        out: &mut Vec<Scored>,
-    ) -> u64 {
-        self.enumerate_skipping(
-            q,
-            allow,
-            k,
-            f32::NEG_INFINITY,
-            slack_per_norm,
-            &[],
-            |_| false,
-            out,
-        )
-    }
-
-    /// [`View::enumerate`] seeded with `already_scored` allowed rows from an
-    /// aborted or stranded filter-aware walk and an optional exact score
-    /// `floor`, scoring only allowed rows where `!skip(row)` in stack-sized
-    /// SIMD chunks and pruning candidates online against both `floor` and the
-    /// running `k`-th kernel score before pushing to `out`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn enumerate_skipping(
-        &self,
-        q: &[f32],
-        allow: Mask<'_>,
-        k: usize,
-        floor: f32,
-        slack_per_norm: f64,
-        already_scored: &[Scored],
-        skip: impl Fn(u32) -> bool,
-        out: &mut Vec<Scored>,
-    ) -> u64 {
-        out.clear();
-        let mut top: BinaryHeap<Reverse<Scored>> = BinaryHeap::with_capacity(k.saturating_add(1));
-        let mut shortest_inv = f32::INFINITY;
-        let consider =
-            |scored: Scored, top: &mut BinaryHeap<Reverse<Scored>>, shortest_inv: &mut f32| {
-                if k == 0 {
-                    return;
-                }
-                let inv = self.inv_norm[scored.node as usize];
-                if inv > 0.0 && inv.is_finite() {
-                    *shortest_inv = (*shortest_inv).min(inv);
-                    if top.len() < k {
-                        top.push(Reverse(scored));
-                    } else if top.peek().is_some_and(|worst| scored > worst.0) {
-                        top.pop();
-                        top.push(Reverse(scored));
-                    }
-                }
-            };
-        for &prior in already_scored {
-            consider(prior, &mut top, &mut shortest_inv);
-        }
-        let finite_floor = floor.is_finite().then(|| f64::from(floor));
-        let current_bar = |top: &BinaryHeap<Reverse<Scored>>, shortest_inv: f32| -> Option<f64> {
-            let top_bar = if k > 0 && top.len() == k {
-                top.peek().map(|Reverse(kth)| {
-                    f64::from(kth.score) - slack_per_norm / f64::from(shortest_inv)
-                })
-            } else {
-                None
-            };
-            match (finite_floor, top_bar) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (Some(a), None) => Some(a),
-                (None, Some(b)) => Some(b),
-                (None, None) => None,
-            }
-        };
-        let survives = |s: Scored, bar: Option<f64>| -> bool {
-            if k == 0 {
-                return false;
-            }
-            let Some(bar) = bar else {
-                return true;
-            };
-            let inv = self.inv_norm[s.node as usize];
-            if !(inv > 0.0 && inv.is_finite()) {
-                return true;
-            }
-            f64::from(s.score) + slack_per_norm / f64::from(inv) >= bar
-        };
-
-        let lines = self.prefetch_lines();
-        let batch = self.kernel.batch_width();
-        let mut cur = [0u32; SCORE_CHUNK_NODES];
-        let mut cur_len = 0usize;
-        let mut next = [0u32; SCORE_CHUNK_NODES];
-        let mut next_len = 0usize;
-        let mut scores = [0.0f32; SCORE_CHUNK_NODES];
-        let mut scored = 0u64;
-
-        // Allowed rows lie apart in filtered masks and contiguous in unlinked
-        // tails: double-buffering two stack chunks keeps seam prefetches hot
-        // without allocating a candidate vector proportional to mask size.
-        let mut flush_chunk = |chunk: &[u32], ahead: &[u32]| {
-            for &node in &ahead[..ahead.len().min(batch)] {
-                prefetch(self.row(node), lines);
-            }
-            self.kernel.score_nodes(
-                q,
-                self.rows,
-                self.dim,
-                chunk,
-                lines,
-                &mut scores[..chunk.len()],
-            );
-            for (&node, &score) in chunk.iter().zip(&scores[..chunk.len()]) {
-                let s = Scored { score, node };
-                consider(s, &mut top, &mut shortest_inv);
-                let bar = current_bar(&top, shortest_inv);
-                if survives(s, bar) {
-                    out.push(s);
-                }
-            }
-        };
-
-        let _ = allow.try_for_each(|row| {
-            let node = row as u32;
-            if skip(node) {
-                return ControlFlow::<()>::Continue(());
-            }
-            scored += 1;
-            if cur_len < SCORE_CHUNK_NODES {
-                cur[cur_len] = node;
-                cur_len += 1;
-            } else {
-                next[next_len] = node;
-                next_len += 1;
-                if next_len == SCORE_CHUNK_NODES {
-                    flush_chunk(&cur[..cur_len], &next[..next_len]);
-                    cur = next;
-                    cur_len = next_len;
-                    next_len = 0;
-                }
-            }
-            ControlFlow::Continue(())
-        });
-        if cur_len > 0 {
-            flush_chunk(&cur[..cur_len], &next[..next_len]);
-        }
-        if next_len > 0 {
-            flush_chunk(&next[..next_len], &[]);
-        }
-
-        let final_bar = current_bar(&top, shortest_inv);
-        out.retain(|&s| survives(s, final_bar));
-        for &prior in already_scored {
-            if survives(prior, final_bar) {
-                out.push(prior);
-            }
-        }
-        scored
-    }
-
     /// The far probe: how many of the rows around where the descent landed
     /// does the mask allow? The sample is `entry`'s layer-0 neighbors and
     /// theirs, read from the links alone (no row is touched), and no larger
@@ -1391,6 +1217,8 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
 mod build;
 #[cfg(test)]
 mod build_tests;
+mod enumerate;
 
 pub(super) use build::LinkBuilder;
 pub use build::{level_for, GraphLinks, Store};
+pub(in crate::hnsw) use enumerate::EnumerateQuery;
