@@ -118,7 +118,7 @@ mod tests {
 
     #[cfg(feature = "net")]
     #[test]
-    fn legacy_targets_accept_plain_rows_but_refuse_retention() {
+    fn targets_without_retention_accept_plain_rows_but_refuse_retention() {
         let retained = batch();
         assert!(require_supported(0, &retained).is_err());
         require_supported(1, &retained).unwrap();
@@ -128,15 +128,15 @@ mod tests {
     }
 
     #[test]
-    fn wal_publishes_version_gate_only_after_validating_materialized_rows() {
+    fn wal_refuses_invalid_materialized_rows_under_the_single_format_version() {
         let path = std::env::temp_dir().join(format!("retained-wal-gate-{}", std::process::id()));
         std::fs::create_dir(&path).unwrap();
         let index =
             crate::vector::VectorIndex::create(crate::vector::EMBEDDED_TURBOVEC, 8, 4).unwrap();
-        let mut manifest =
+        let manifest =
             crate::node::wal_manifest(Some(&index), &crate::node::NodeConfig::default(), 0, (0, 0));
-        manifest.format_version = 8;
         let mut writer = crate::wal::WalWriter::create(&path, manifest).unwrap();
+        assert_eq!(writer.manifest().format_version, crate::wal::FORMAT_VERSION);
         let mut invalid = batch();
         invalid.vectors[0] = -invalid.vectors[0];
         let op = |batch| {
@@ -147,13 +147,10 @@ mod tests {
             })
         };
         assert!(writer.append(op(invalid)).is_err());
-        assert_eq!(writer.manifest().format_version, 8);
+        assert_eq!(writer.high_watermark(), 0);
         writer.append(op(batch())).unwrap();
         writer.flush().unwrap();
-        assert_eq!(
-            writer.manifest().format_version,
-            crate::wal::MULTI_RES_FORMAT_VERSION
-        );
+        assert_eq!(writer.manifest().format_version, crate::wal::FORMAT_VERSION);
         let persisted = std::fs::read_to_string(crate::wal::manifest_path(writer.dir())).unwrap();
         assert!(persisted.contains("format_version = 9"));
         drop(writer);
