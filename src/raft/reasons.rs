@@ -1,5 +1,5 @@
-//! Stable reason identifiers for every named rejection the Raft
-//! documents describe (`docs/raft-error-registry.md`). A rejection
+//! Stable reason identifiers for every named rejection the Raft layer
+//! returns. A rejection
 //! carries its identifier as the `psearch-reason` metadata on the
 //! `Status`, the way the transport marks its answers with
 //! `psearch-raft-answer`: the gRPC code and the identifier are frozen,

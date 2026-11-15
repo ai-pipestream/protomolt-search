@@ -6,7 +6,7 @@ use crate::pb::AnalysisSpec;
 use crate::postings::AnalyzedDoc;
 use crate::vector::VectorIndex;
 
-use super::child_build::{finish_child, finish_child_ordered_with_sources};
+use super::child_build::{finish_child, finish_child_ordered, ChildSchema, ChildSlot};
 use super::compact_log::{emit_rows_in, CompactedRow};
 use super::replay::Replay;
 use crate::multi_res::RetainedVector;
@@ -98,20 +98,12 @@ fn child_reordering_publishes_full_resolution_bits_and_clears_reused_legacy_path
         |_: &[(&str, Option<&AnalysisSpec>, SessionLayers)]| -> Result<Vec<AnalyzedDoc>, String> {
             Err("vector-only reshard must not analyze".into())
         };
-    let image = finish_child_ordered_with_sources(
+    let image = finish_child_ordered(
         &manifest,
         replay,
         &[70, 11],
-        0,
-        &directory.0,
-        100,
-        0,
-        u64::MAX,
-        None,
-        None,
-        None,
-        None,
-        None,
+        ChildSlot::full_range(0, &directory.0, 100),
+        &ChildSchema::default(),
         None,
         &mut analyze,
     )
@@ -136,13 +128,8 @@ fn child_reordering_publishes_full_resolution_bits_and_clears_reused_legacy_path
     let replaced = finish_child(
         &manifest,
         legacy,
-        0,
-        &directory.0,
-        100,
-        0,
-        u64::MAX,
-        None,
-        None,
+        ChildSlot::full_range(0, &directory.0, 100),
+        &ChildSchema::default(),
         &mut analyze,
     )
     .unwrap();
@@ -169,13 +156,8 @@ fn materialized_row_without_vector_is_not_silently_discarded_by_child_build() {
     assert!(finish_child(
         &manifest,
         replay,
-        0,
-        &directory.0,
-        0,
-        0,
-        u64::MAX,
-        None,
-        None,
+        ChildSlot::full_range(0, &directory.0, 0),
+        &ChildSchema::default(),
         &mut analyze
     )
     .unwrap_err()

@@ -7,16 +7,16 @@ use crate::pb::AddDocumentsRequest;
 use crate::vector::VectorIndex;
 use crate::wal::WalManifest;
 
-use super::child_build::{child_order, finish_child_ordered_with_prebuilt};
+use super::child_build::{child_order, finish_child_ordered, ChildSchema, ChildSlot};
 #[cfg(doc)]
-use super::hash_split::split;
-#[cfg(doc)]
-use super::hash_split::split_logs_segmented;
+use super::hash_split::split_logs_with;
 use super::hnsw_sources::HnswCompactionSources;
 use super::replay::{
     read_gen_manifest, read_gens_binding, replay_buckets_through, require_backend_config,
     require_complete_history, Replay,
 };
+#[cfg(doc)]
+use super::segmented_split::split_logs_segmented_with;
 use super::{Analyzer, ChildImage, ColumnTables};
 
 /// One live row of a compaction's dense image, in the order the sink
@@ -36,7 +36,7 @@ pub struct CompactedRow<'a> {
 }
 
 /// Where a compaction's live rows go besides the image: the rewritten
-/// full-history WAL generation (`docs/mutations.md`). Called once per row
+/// full-history WAL generation. Called once per row
 /// in slot order, before the image is built from the same replay.
 pub type RowSink<'a> = dyn FnMut(CompactedRow<'_>) -> Result<(), String> + 'a;
 
@@ -105,53 +105,6 @@ pub(super) fn replay_counts(replay: &Replay) -> (u64, u64) {
         .filter(|id| present.contains(id))
         .count() as u64;
     (present.len() as u64, tombstoned)
-}
-
-/// Build the dense all-live image of ONE generation through
-/// `cutoff_clock`, the baseline of an online compaction
-/// (`docs/mutations.md`): the log prefix is replayed with its deletes and
-/// replacements applied, every live row is handed to `sink` in dense slot
-/// order (the rewritten log), and the image is written under `out_dir`.
-/// Local slots start at 0; the caller owns the global offset.
-///
-/// `segmented` selects the bucket-bounded shape: one sealed image per
-/// non-empty WAL bucket, slots dense across them in bucket order, memory
-/// holding one bucket's replay at a time — the same shape
-/// [`split_logs_segmented`] gives a catalog. Otherwise one image over the
-/// whole replay, as [`split`] with a factor of one.
-///
-/// The generation must be full history with a usable provider
-/// configuration, exactly as for a reshard; those checks refuse here
-/// before anything is read. `columns` gives each image the shard's
-/// column tables, so a bucket that holds no record of a declared column
-/// still declares it and the outputs open under the node's
-/// configuration.
-#[allow(clippy::too_many_arguments)]
-pub fn compact_log(
-    gen: &Path,
-    cutoff_clock: u64,
-    out_dir: &Path,
-    segmented: bool,
-    bm25_fields: Option<&[String]>,
-    pinned_fingerprints: Option<&[u64]>,
-    columns: Option<&ColumnTables>,
-    derived: Option<&crate::postings::StoredDerived>,
-    analyze: &mut Analyzer,
-    sink: &mut RowSink,
-) -> Result<CompactionBuild, String> {
-    compact_log_with_sources(
-        gen,
-        cutoff_clock,
-        out_dir,
-        segmented,
-        bm25_fields,
-        pinned_fingerprints,
-        columns,
-        derived,
-        None,
-        analyze,
-        sink,
-    )
 }
 
 /// When `manifest`'s backend is `hnsw` with a non-`None` `locality_order` and
@@ -227,127 +180,221 @@ fn prepare_compacted_replay_order(
     Ok((order, Some(hnsw.into_index())))
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn compact_log_with_sources(
-    gen: &Path,
-    cutoff_clock: u64,
-    out_dir: &Path,
+/// One compaction's source generation and how its outputs are written:
+/// the generation, the clock its dense image stops at, the output
+/// directory, and the tables every output declares.
+#[derive(Clone, Copy)]
+pub struct CompactionRequest<'a> {
+    pub gen: &'a Path,
+    pub cutoff_clock: u64,
+    pub out_dir: &'a Path,
+    /// The BM25 field table; derived from the records when `None`.
+    pub bm25_fields: Option<&'a [String]>,
+    /// The source shard's per-field analyzer fingerprints, pinned on
+    /// every output.
+    pub pinned_fingerprints: Option<&'a [u64]>,
+    /// The shard's column tables, so an output that holds no record of a
+    /// declared column still declares it.
+    pub columns: Option<&'a ColumnTables>,
+    pub derived: Option<&'a crate::postings::StoredDerived>,
+    pub(crate) hnsw_sources: Option<&'a HnswCompactionSources>,
+}
+
+impl<'a> CompactionRequest<'a> {
+    /// A request with every table derived from the records.
+    pub fn new(gen: &'a Path, cutoff_clock: u64, out_dir: &'a Path) -> Self {
+        Self {
+            gen,
+            cutoff_clock,
+            out_dir,
+            bm25_fields: None,
+            pinned_fingerprints: None,
+            columns: None,
+            derived: None,
+            hnsw_sources: None,
+        }
+    }
+
+    pub(super) fn schema(
+        &self,
+        binding: Option<&'a crate::postings::StoredBinding>,
+    ) -> ChildSchema<'a> {
+        ChildSchema {
+            bm25_fields: self.bm25_fields,
+            pinned_fingerprints: self.pinned_fingerprints,
+            binding,
+            derived: self.derived,
+            columns: self.columns,
+            hnsw_sources: self.hnsw_sources,
+        }
+    }
+}
+
+/// The source generation of a compaction, checked and opened: its
+/// manifest, its binding, and the generation number the output takes.
+pub(super) struct CompactionSource<'a> {
+    pub(super) request: &'a CompactionRequest<'a>,
+    pub(super) manifest: WalManifest,
+    pub(super) binding: Option<crate::postings::StoredBinding>,
+    pub(super) generation: u64,
+}
+
+impl<'a> CompactionSource<'a> {
+    /// The generation must be full history with a usable provider
+    /// configuration, exactly as for a reshard; those checks refuse here
+    /// before anything is read.
+    pub(super) fn open(request: &'a CompactionRequest<'a>) -> Result<Self, String> {
+        let gen = request.gen;
+        let manifest = read_gen_manifest(gen)?;
+        require_backend_config(&manifest, gen)?;
+        require_complete_history(&manifest, gen)?;
+        let binding = read_gens_binding(std::slice::from_ref(&gen.to_path_buf()))?;
+        std::fs::create_dir_all(request.out_dir)
+            .map_err(|error| format!("mkdir {}: {error}", request.out_dir.display()))?;
+        let generation = manifest
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| "compaction generation overflow".to_string())?;
+        Ok(Self {
+            request,
+            manifest,
+            binding,
+            generation,
+        })
+    }
+
+    /// The live and tombstoned rows of `buckets` through the cutoff.
+    pub(super) fn replay(&self, buckets: std::ops::Range<u32>) -> Result<Replay, String> {
+        let mut replay = Replay::default();
+        replay_buckets_through(
+            self.request.gen,
+            buckets,
+            self.manifest.bucket_count as usize,
+            self.manifest.dim as usize,
+            false,
+            self.request.cutoff_clock,
+            &mut replay,
+        )?;
+        Ok(replay)
+    }
+
+    pub(super) fn schema(&self) -> ChildSchema<'_> {
+        self.request.schema(self.binding.as_ref())
+    }
+
+    /// The build result from its parts, with the source's binding.
+    pub(super) fn build(self, counts: RowCounts, images: Vec<ChildImage>) -> CompactionBuild {
+        CompactionBuild {
+            generation: self.generation,
+            rows_before: counts.rows_before,
+            tombstones: counts.tombstones,
+            id_map: counts.id_map,
+            images,
+            binding: self.binding,
+        }
+    }
+}
+
+/// What a compaction counts as it replays: rows before tombstones, the
+/// tombstoned ones, and every live row's new local slot.
+#[derive(Default)]
+pub(super) struct RowCounts {
+    pub(super) rows_before: u64,
+    pub(super) tombstones: u64,
+    pub(super) id_map: BTreeMap<u64, u64>,
+}
+
+impl RowCounts {
+    pub(super) fn count(&mut self, replay: &Replay) {
+        let (present, tombstoned) = replay_counts(replay);
+        self.rows_before += present;
+        self.tombstones += tombstoned;
+    }
+}
+
+/// Build the dense all-live image of ONE generation through `cutoff_clock`, the
+/// baseline of an online compaction: the log prefix is replayed with its deletes
+/// and replacements applied, every live row is handed to `sink` in dense slot order
+/// (the rewritten log), and the image is written under `out_dir`. Local slots start
+/// at 0; the caller owns the global offset.
+///
+/// `segmented` selects the bucket-bounded shape: one sealed image per non-empty WAL
+/// bucket, slots dense across them in bucket order, memory holding one bucket's
+/// replay at a time — the same shape [`split_logs_segmented_with`] gives a catalog.
+/// Otherwise one image over the whole replay, as [`split_logs_with`] with a factor
+/// of one.
+pub fn compact_log(
+    request: &CompactionRequest<'_>,
     segmented: bool,
-    bm25_fields: Option<&[String]>,
-    pinned_fingerprints: Option<&[u64]>,
-    columns: Option<&ColumnTables>,
-    derived: Option<&crate::postings::StoredDerived>,
-    hnsw_sources: Option<&HnswCompactionSources>,
     analyze: &mut Analyzer,
     sink: &mut RowSink,
 ) -> Result<CompactionBuild, String> {
-    let manifest = read_gen_manifest(gen)?;
-    require_backend_config(&manifest, gen)?;
-    require_complete_history(&manifest, gen)?;
-    let binding = read_gens_binding(std::slice::from_ref(&gen.to_path_buf()))?;
-    std::fs::create_dir_all(out_dir)
-        .map_err(|error| format!("mkdir {}: {error}", out_dir.display()))?;
-    let bucket_count = manifest.bucket_count as usize;
-    let dim = manifest.dim as usize;
-    let generation = manifest
-        .generation
-        .checked_add(1)
-        .ok_or_else(|| "compaction generation overflow".to_string())?;
-    let mut id_map = BTreeMap::new();
-    let mut images = Vec::new();
-    let mut rows_before = 0u64;
-    let mut tombstones = 0u64;
-    if !segmented {
-        let mut replay = Replay::default();
-        replay_buckets_through(
-            gen,
-            0..manifest.bucket_count,
-            bucket_count,
-            dim,
-            false,
-            cutoff_clock,
-            &mut replay,
-        )?;
-        let (present, tombstoned) = replay_counts(&replay);
-        rows_before = present;
-        tombstones = tombstoned;
-        replay.compact();
-        let (order, prebuilt) = prepare_compacted_replay_order(&manifest, &replay, hnsw_sources)?;
-        emit_rows_in(&replay, &order, 0, &mut id_map, sink)?;
-        images.push(finish_child_ordered_with_prebuilt(
-            &manifest,
-            replay,
-            &order,
-            0,
-            out_dir,
-            0,
-            0,
-            u64::MAX,
-            bm25_fields,
-            pinned_fingerprints,
-            binding.as_ref(),
-            derived,
-            columns,
-            hnsw_sources,
-            prebuilt,
-            analyze,
-        )?);
+    let source = CompactionSource::open(request)?;
+    let mut counts = RowCounts::default();
+    let images = if segmented {
+        compact_buckets(&source, &mut counts, analyze, sink)?
     } else {
-        let mut next_slot = 0u64;
-        for bucket in 0..manifest.bucket_count {
-            let mut replay = Replay::default();
-            replay_buckets_through(
-                gen,
-                bucket..bucket + 1,
-                bucket_count,
-                dim,
-                false,
-                cutoff_clock,
-                &mut replay,
-            )?;
-            let (present, tombstoned) = replay_counts(&replay);
-            rows_before += present;
-            tombstones += tombstoned;
-            replay.compact();
-            if replay.vectors.is_empty() && replay.documents.is_empty() {
-                continue;
-            }
-            let (order, prebuilt) =
-                prepare_compacted_replay_order(&manifest, &replay, hnsw_sources)?;
-            let rows = emit_rows_in(&replay, &order, next_slot, &mut id_map, sink)?;
-            if rows == 0 {
-                continue;
-            }
-            let ordinal = images.len();
-            images.push(finish_child_ordered_with_prebuilt(
-                &manifest,
-                replay,
-                &order,
-                ordinal,
-                out_dir,
-                next_slot,
-                0,
-                u64::MAX,
-                bm25_fields,
-                pinned_fingerprints,
-                binding.as_ref(),
-                derived,
-                columns,
-                hnsw_sources,
-                prebuilt,
-                analyze,
-            )?);
-            next_slot = next_slot
-                .checked_add(rows)
-                .ok_or_else(|| "compaction slot overflow".to_string())?;
+        let mut replay = source.replay(0..source.manifest.bucket_count)?;
+        counts.count(&replay);
+        replay.compact();
+        let (image, _) = compact_image(&source, replay, 0, 0, &mut counts, analyze, sink)?;
+        vec![image]
+    };
+    Ok(source.build(counts, images))
+}
+
+/// One image per non-empty WAL bucket, slots dense across them.
+fn compact_buckets(
+    source: &CompactionSource<'_>,
+    counts: &mut RowCounts,
+    analyze: &mut Analyzer,
+    sink: &mut RowSink,
+) -> Result<Vec<ChildImage>, String> {
+    let mut images = Vec::new();
+    let mut next_slot = 0u64;
+    for bucket in 0..source.manifest.bucket_count {
+        let mut replay = source.replay(bucket..bucket + 1)?;
+        counts.count(&replay);
+        replay.compact();
+        if replay.vectors.is_empty() && replay.documents.is_empty() {
+            continue;
         }
+        let ordinal = images.len();
+        let (image, rows) =
+            compact_image(source, replay, ordinal, next_slot, counts, analyze, sink)?;
+        images.push(image);
+        next_slot = next_slot
+            .checked_add(rows)
+            .ok_or_else(|| "compaction slot overflow".to_string())?;
     }
-    Ok(CompactionBuild {
-        generation,
-        rows_before,
-        tombstones,
-        id_map,
-        images,
-        binding,
-    })
+    Ok(images)
+}
+
+/// The rows of one compacted replay: handed to the sink in slot order
+/// from `next_slot`, then built into image `ordinal`. Returns the image
+/// and the rows it holds.
+fn compact_image(
+    source: &CompactionSource<'_>,
+    replay: Replay,
+    ordinal: usize,
+    next_slot: u64,
+    counts: &mut RowCounts,
+    analyze: &mut Analyzer,
+    sink: &mut RowSink,
+) -> Result<(ChildImage, u64), String> {
+    let schema = source.schema();
+    let (order, prebuilt) =
+        prepare_compacted_replay_order(&source.manifest, &replay, schema.hnsw_sources)?;
+    let rows = emit_rows_in(&replay, &order, next_slot, &mut counts.id_map, sink)?;
+    let slot = ChildSlot::full_range(ordinal, source.request.out_dir, next_slot);
+    let image = finish_child_ordered(
+        &source.manifest,
+        replay,
+        &order,
+        slot,
+        &schema,
+        prebuilt,
+        analyze,
+    )?;
+    Ok((image, rows))
 }
