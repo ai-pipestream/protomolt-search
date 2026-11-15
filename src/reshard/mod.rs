@@ -31,11 +31,13 @@ mod child_build;
 mod compact_log;
 mod hash_split;
 mod hnsw_sources;
+mod merge_inputs;
 mod partitioned;
 mod placement_split;
 mod replay;
 mod segment_compaction;
 mod segment_sources;
+mod source_agreement;
 mod tree_logs;
 mod tree_split;
 

@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 
 use crate::pb::wal::wal_record;
 use crate::pb::AddDocumentsRequest;
-use crate::wal::{self, RecordReader};
+use crate::wal::{self, RecordReader, WalManifest};
 
 use super::replay::read_gen_manifest;
+use super::source_agreement::PinnedSources;
 use super::ColumnTables;
 
 /// One source shard's catalog beside its log, with the rows its shard
@@ -194,138 +195,129 @@ pub(crate) fn open_segment_sources(
     gens: &[PathBuf],
 ) -> Result<(Vec<SegmentSourceShard>, SourceTables), String> {
     let mut shards = Vec::with_capacity(gens.len());
-    let mut tables: Option<SourceTables> = None;
+    let mut pinned = PinnedSources::default();
     for gen in gens {
-        let root = segments_root_of_gen(gen)?;
-        if !root.exists() {
-            return Err(format!(
-                "{}: no segment catalog at {}; the source is a single image (or was never \
-                 flushed on the segment layout), split it from the logs",
-                gen.display(),
-                root.display()
-            ));
-        }
-        let set = std::sync::Arc::new(crate::segments::OpenedSegmentSet::open(&root)?);
-        let manifest = read_gen_manifest(gen)?;
-        let mut rows = 0u64;
-        for i in 0..set.len() {
-            let meta = set.metadata(i);
-            if meta.base_label != rows {
-                return Err(format!(
-                    "{}: segment {} starts at label {} but the segments before it end at {rows}",
-                    root.display(),
-                    meta.segment_id,
-                    meta.base_label
-                ));
-            }
-            rows = meta.end_label_exclusive()?;
-        }
-        let (watermark, deleted) = wal_row_watermark(gen, manifest.bucket_count)?;
-        // The log's ids are global (the shard's slot offset plus the
-        // local row); the catalog's labels are local. Compare in local
-        // terms, and name a log whose ids sit below its own offset.
-        let local_watermark = if watermark == 0 {
-            0
-        } else {
-            watermark.checked_sub(manifest.slot_offset).ok_or_else(|| {
-                format!(
-                    "{}: the log holds rows through {} but its manifest places the shard at slot \
-                     offset {}; the log and its manifest disagree",
-                    gen.display(),
-                    watermark - 1,
-                    manifest.slot_offset
-                )
-            })?
-        };
-        if local_watermark > rows {
-            return Err(format!(
-                "{}: the log holds rows through {} (local row {}) but the catalog at {} ends at \
-                 {rows}; the unsealed tail would be lost, flush the source first",
-                gen.display(),
-                watermark - 1,
-                local_watermark - 1,
-                root.display()
-            ));
-        }
-        for i in 0..set.len() {
-            let bm25 = set.bm25(i);
-            let this = segment_tables(bm25);
-            match &tables {
-                None => tables = Some(this),
-                Some(first) => {
-                    let what = format!("{} segment {}", root.display(), set.metadata(i).segment_id);
-                    if first.fields != this.fields {
-                        return Err(format!(
-                            "{what}: field table {:?} differs from the first source's {:?}; a \
-                             child is one store and cannot mix tables",
-                            this.fields, first.fields
-                        ));
-                    }
-                    if first.fingerprints != this.fingerprints {
-                        return Err(format!(
-                            "{what}: analysis fingerprints {:?} differ from the first source's \
-                             {:?}; a child cannot mix analyzers, split from the logs to re-analyze",
-                            this.fingerprints, first.fingerprints
-                        ));
-                    }
-                    if first.position_fields != this.position_fields {
-                        return Err(format!(
-                            "{what}: positional fields {:?} differ from the first source's {:?}",
-                            this.position_fields, first.position_fields
-                        ));
-                    }
-                    if first.sentence_fields != this.sentence_fields {
-                        return Err(format!(
-                            "{what}: sentence fields {:?} differ from the first source's {:?}",
-                            this.sentence_fields, first.sentence_fields
-                        ));
-                    }
-                    if first.columns != this.columns {
-                        return Err(format!(
-                            "{what}: column tables differ from the first source's; a child is \
-                             one store and cannot mix column tables"
-                        ));
-                    }
-                }
-            }
-        }
-        let overlay_path = crate::node::live_docs_sidecar_path(&index_path_of_root(&root));
-        let overlay = if overlay_path.exists() {
-            Some(
-                crate::live_docs::LiveDocs::open(&overlay_path)
-                    .map_err(|e| format!("open {}: {e}", overlay_path.display()))?,
-            )
-        } else {
-            None
-        };
-        // The log names deleted and replaced rows by global id; the
-        // catalog's labels are local, so the set is kept in local terms.
-        let deleted = deleted
-            .into_iter()
-            .map(|id| {
-                id.checked_sub(manifest.slot_offset).ok_or_else(|| {
-                    format!(
-                        "{}: the log deletes row {id}, below the shard's slot offset {}; the log \
-                         and its manifest disagree",
-                        gen.display(),
-                        manifest.slot_offset
-                    )
-                })
-            })
-            .collect::<Result<BTreeSet<u64>, String>>()?;
-        shards.push(SegmentSourceShard {
-            gen: gen.clone(),
-            root,
-            set,
-            overlay,
-            deleted,
-            slot_offset: manifest.slot_offset,
-        });
+        shards.push(open_source_shard(gen, &mut pinned)?);
     }
-    let tables = tables.ok_or_else(|| {
+    let tables = pinned.tables.ok_or_else(|| {
         "the sources have no sealed segment; there is nothing to transplant".to_string()
     })?;
     Ok((shards, tables))
+}
+
+/// One shard's catalog beside its log, checked against what the
+/// sources before it pinned.
+fn open_source_shard(gen: &Path, pinned: &mut PinnedSources) -> Result<SegmentSourceShard, String> {
+    let root = segments_root_of_gen(gen)?;
+    if !root.exists() {
+        return Err(format!(
+            "{}: no segment catalog at {}; the source is a single image (or was never \
+             flushed on the segment layout), split it from the logs",
+            gen.display(),
+            root.display()
+        ));
+    }
+    let set = std::sync::Arc::new(crate::segments::OpenedSegmentSet::open(&root)?);
+    let manifest = read_gen_manifest(gen)?;
+    let rows = contiguous_rows(&set, &root)?;
+    let deleted = sealed_tail_deletes(gen, &manifest, rows, &root)?;
+    pinned.admit(&set, &root, &manifest)?;
+    let overlay_path = crate::node::live_docs_sidecar_path(&index_path_of_root(&root));
+    let overlay = if overlay_path.exists() {
+        Some(
+            crate::live_docs::LiveDocs::open(&overlay_path)
+                .map_err(|e| format!("open {}: {e}", overlay_path.display()))?,
+        )
+    } else {
+        None
+    };
+    Ok(SegmentSourceShard {
+        gen: gen.to_path_buf(),
+        root,
+        set,
+        overlay,
+        deleted: local_labels(deleted, &manifest, gen)?,
+        slot_offset: manifest.slot_offset,
+    })
+}
+
+/// The catalog's row count, with every segment starting where the one
+/// before it ends.
+fn contiguous_rows(set: &crate::segments::OpenedSegmentSet, root: &Path) -> Result<u64, String> {
+    let mut rows = 0u64;
+    for i in 0..set.len() {
+        let meta = set.metadata(i);
+        if meta.base_label != rows {
+            return Err(format!(
+                "{}: segment {} starts at label {} but the segments before it end at {rows}",
+                root.display(),
+                meta.segment_id,
+                meta.base_label
+            ));
+        }
+        rows = meta.end_label_exclusive()?;
+    }
+    Ok(rows)
+}
+
+/// The rows the log deletes or replaces, by global id, once the log is
+/// shown to hold no row past the sealed catalog.
+fn sealed_tail_deletes(
+    gen: &Path,
+    manifest: &WalManifest,
+    rows: u64,
+    root: &Path,
+) -> Result<BTreeSet<u64>, String> {
+    let (watermark, deleted) = wal_row_watermark(gen, manifest.bucket_count)?;
+    // The log's ids are global (the shard's slot offset plus the
+    // local row); the catalog's labels are local. Compare in local
+    // terms, and name a log whose ids sit below its own offset.
+    let local_watermark = if watermark == 0 {
+        0
+    } else {
+        watermark.checked_sub(manifest.slot_offset).ok_or_else(|| {
+            format!(
+                "{}: the log holds rows through {} but its manifest places the shard at slot \
+                 offset {}; the log and its manifest disagree",
+                gen.display(),
+                watermark - 1,
+                manifest.slot_offset
+            )
+        })?
+    };
+    if local_watermark > rows {
+        return Err(format!(
+            "{}: the log holds rows through {} (local row {}) but the catalog at {} ends at \
+             {rows}; the unsealed tail would be lost, flush the source first",
+            gen.display(),
+            watermark - 1,
+            local_watermark - 1,
+            root.display()
+        ));
+    }
+    Ok(deleted)
+}
+
+/// The log's deleted rows as catalog-local labels: the log names rows by
+/// global id, the catalog by local label.
+fn local_labels(
+    deleted: BTreeSet<u64>,
+    manifest: &WalManifest,
+    gen: &Path,
+) -> Result<BTreeSet<u64>, String> {
+    deleted
+        .into_iter()
+        .map(|id| {
+            id.checked_sub(manifest.slot_offset).ok_or_else(|| {
+                format!(
+                    "{}: the log deletes row {id}, below the shard's slot offset {}; the log \
+                     and its manifest disagree",
+                    gen.display(),
+                    manifest.slot_offset
+                )
+            })
+        })
+        .collect()
 }
 
 /// The logged document row `row` of `bm25` stands for: its columns,

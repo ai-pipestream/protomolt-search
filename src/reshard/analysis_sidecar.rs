@@ -84,7 +84,10 @@ pub(super) fn write_analysis_entry(
     Ok(())
 }
 
-/// The sidecar of one spill bucket, keyed by source id.
+/// The sidecar of one spill bucket, keyed by source id. A sidecar with no
+/// entry is right only beside an empty log bucket: a populated bucket
+/// that lost its sidecar is refused, so the build never leaves transplant
+/// mode for rows whose fields were spilled.
 pub(super) fn read_analysis_file(path: &Path) -> Result<BTreeMap<u64, Vec<AnalyzedField>>, String> {
     use std::io::Read;
     let mut bytes = Vec::new();
@@ -92,115 +95,108 @@ pub(super) fn read_analysis_file(path: &Path) -> Result<BTreeMap<u64, Vec<Analyz
         Ok(mut file) => file
             .read_to_end(&mut bytes)
             .map_err(|e| format!("read {}: {e}", path.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
         Err(e) => return Err(format!("open {}: {e}", path.display())),
     };
-    let mut at = 0usize;
-    let take = |at: &mut usize, n: usize| -> Result<&[u8], String> {
-        let end = at
+    let fields = parse_analysis(path, &bytes)?;
+    if fields.is_empty() && bucket_log_holds_records(path)? {
+        return Err(format!(
+            "{}: the spill's analysis sidecar is missing or truncated beside a populated log \
+             bucket; the child is not built",
+            path.display()
+        ));
+    }
+    Ok(fields)
+}
+
+/// Whether the log bucket a sidecar describes holds any record: bucket
+/// `n` of the spill generation for `analysis-n.bin`, or the generation's
+/// only bucket when it has one.
+fn bucket_log_holds_records(sidecar: &Path) -> Result<bool, String> {
+    let spill_dir = sidecar.parent().unwrap_or(Path::new("."));
+    let named = sidecar
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.strip_prefix("analysis-"))
+        .and_then(|digits| digits.parse::<u32>().ok())
+        .ok_or_else(|| format!("{}: not an analysis sidecar name", sidecar.display()))?;
+    let manifest = crate::wal::read_manifest(spill_dir)
+        .map_err(|e| format!("read spill manifest in {}: {e}", spill_dir.display()))?;
+    let bucket = if manifest.bucket_count == 1 { 0 } else { named };
+    match std::fs::metadata(crate::wal::bucket_path(spill_dir, bucket)) {
+        Ok(metadata) => Ok(metadata.len() > 0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("stat spill bucket in {}: {e}", spill_dir.display())),
+    }
+}
+
+/// A read position over a sidecar's bytes; every read is bounds-checked.
+struct Cursor<'a> {
+    path: &'a Path,
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        let end = self
+            .at
             .checked_add(n)
-            .filter(|end| *end <= bytes.len())
-            .ok_or_else(|| format!("{}: truncated analysis sidecar", path.display()))?;
-        let out = &bytes[*at..end];
-        *at = end;
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or_else(|| format!("{}: truncated analysis sidecar", self.path.display()))?;
+        let out = &self.bytes[self.at..end];
+        self.at = end;
         Ok(out)
-    };
-    let u32_at = |at: &mut usize| -> Result<u32, String> {
-        Ok(u32::from_le_bytes(
-            take(at, 4)?.try_into().expect("four bytes"),
+    }
+
+    fn u16(&mut self) -> Result<u16, String> {
+        Ok(u16::from_le_bytes(
+            self.take(2)?.try_into().expect("two bytes"),
         ))
-    };
+    }
+
+    fn u32(&mut self) -> Result<u32, String> {
+        Ok(u32::from_le_bytes(
+            self.take(4)?.try_into().expect("four bytes"),
+        ))
+    }
+
+    fn u32s(&mut self, n: usize) -> Result<Vec<u32>, String> {
+        let mut values = Vec::with_capacity(n);
+        for _ in 0..n {
+            values.push(self.u32()?);
+        }
+        Ok(values)
+    }
+
+    fn spans(&mut self, n: usize) -> Result<Vec<(u32, u32)>, String> {
+        let mut spans = Vec::with_capacity(n);
+        for _ in 0..n {
+            let start = self.u32()?;
+            let end = self.u32()?;
+            spans.push((start, end));
+        }
+        Ok(spans)
+    }
+
+    fn term(&mut self) -> Result<String, String> {
+        let len = self.u16()? as usize;
+        std::str::from_utf8(self.take(len)?)
+            .map(str::to_string)
+            .map_err(|e| format!("{}: term is not UTF-8: {e}", self.path.display()))
+    }
+}
+
+/// Every entry of a sidecar's bytes, keyed by source id.
+fn parse_analysis(path: &Path, bytes: &[u8]) -> Result<BTreeMap<u64, Vec<AnalyzedField>>, String> {
+    let mut cursor = Cursor { path, bytes, at: 0 };
     let mut out = BTreeMap::new();
-    while at < bytes.len() {
-        let id = u64::from_le_bytes(take(&mut at, 8)?.try_into().expect("eight bytes"));
-        let n_fields = u32_at(&mut at)? as usize;
+    while cursor.at < bytes.len() {
+        let id = u64::from_le_bytes(cursor.take(8)?.try_into().expect("eight bytes"));
+        let n_fields = cursor.u32()? as usize;
         let mut fields = Vec::with_capacity(n_fields);
         for _ in 0..n_fields {
-            let length = u32_at(&mut at)?;
-            let flags = take(&mut at, 2)?;
-            let extended = flags[0] & 0x80 != 0;
-            let has_lengths = extended && flags[0] & 2 != 0;
-            if flags[0] & !0x83 != 0
-                || (!extended && flags[0] > 1)
-                || flags[1] > 1
-                || (has_lengths && flags[0] & 1 == 0)
-            {
-                return Err(format!("{}: invalid analysis flags", path.display()));
-            }
-            let (has_positions, has_sentences) = (flags[0] & 1 != 0, flags[1] != 0);
-            let n_terms = u32_at(&mut at)? as usize;
-            let mut terms = Vec::with_capacity(n_terms);
-            let mut positions = has_positions.then(|| Vec::with_capacity(n_terms));
-            let mut pos_lengths = has_lengths.then(|| Vec::with_capacity(n_terms));
-            for _ in 0..n_terms {
-                let len =
-                    u16::from_le_bytes(take(&mut at, 2)?.try_into().expect("two bytes")) as usize;
-                let term = std::str::from_utf8(take(&mut at, len)?)
-                    .map_err(|e| format!("{}: term is not UTF-8: {e}", path.display()))?
-                    .to_string();
-                let tf = u32_at(&mut at)?;
-                let n_occ = u32_at(&mut at)? as usize;
-                let mut spans = Vec::with_capacity(n_occ);
-                for _ in 0..n_occ {
-                    let start = u32_at(&mut at)?;
-                    let end = u32_at(&mut at)?;
-                    spans.push((start, end));
-                }
-                if let Some(positions) = positions.as_mut() {
-                    let mut ordinals = Vec::with_capacity(n_occ);
-                    for _ in 0..n_occ {
-                        ordinals.push(u32_at(&mut at)?);
-                    }
-                    positions.push(ordinals);
-                }
-                if let Some(lengths) = &mut pos_lengths {
-                    let mut values = Vec::with_capacity(n_occ);
-                    for _ in 0..n_occ {
-                        values.push(u32_at(&mut at)?);
-                    }
-                    lengths.push(values);
-                }
-                terms.push((term, tf, spans));
-            }
-            let sentences = if has_sentences {
-                let n = u32_at(&mut at)? as usize;
-                let mut table = Vec::with_capacity(n);
-                for _ in 0..n {
-                    let start = u32_at(&mut at)?;
-                    let end = u32_at(&mut at)?;
-                    table.push((start, end));
-                }
-                Some(table)
-            } else {
-                None
-            };
-            let mut splade = Vec::new();
-            let splade_scale_bits = if extended {
-                let scale = u32_at(&mut at)?;
-                let count = u32_at(&mut at)?;
-                for _ in 0..count {
-                    let len = u16::from_le_bytes(take(&mut at, 2)?.try_into().unwrap()) as usize;
-                    let term = std::str::from_utf8(take(&mut at, len)?)
-                        .map_err(|e| e.to_string())?
-                        .to_owned();
-                    let impact = u16::from_le_bytes(take(&mut at, 2)?.try_into().unwrap());
-                    splade.push((term, impact));
-                }
-                scale
-            } else {
-                0
-            };
-            let field = AnalyzedField {
-                terms,
-                length,
-                positions,
-                sentences,
-                pos_lengths,
-                splade,
-                splade_scale_bits,
-            };
-            field.check_positions()?;
-            fields.push(field);
+            fields.push(parse_field(&mut cursor)?);
         }
         if out.insert(id, fields).is_some() {
             return Err(format!(
@@ -210,6 +206,69 @@ pub(super) fn read_analysis_file(path: &Path) -> Result<BTreeMap<u64, Vec<Analyz
         }
     }
     Ok(out)
+}
+
+/// One analyzed field: its terms with spans, then the optional position,
+/// arc-length, sentence, and SPLADE payloads its flags name.
+fn parse_field(cursor: &mut Cursor<'_>) -> Result<AnalyzedField, String> {
+    let length = cursor.u32()?;
+    let flags = cursor.take(2)?;
+    let extended = flags[0] & 0x80 != 0;
+    let has_lengths = extended && flags[0] & 2 != 0;
+    if flags[0] & !0x83 != 0
+        || (!extended && flags[0] > 1)
+        || flags[1] > 1
+        || (has_lengths && flags[0] & 1 == 0)
+    {
+        return Err(format!("{}: invalid analysis flags", cursor.path.display()));
+    }
+    let (has_positions, has_sentences) = (flags[0] & 1 != 0, flags[1] != 0);
+    let n_terms = cursor.u32()? as usize;
+    let mut terms = Vec::with_capacity(n_terms);
+    let mut positions = has_positions.then(|| Vec::with_capacity(n_terms));
+    let mut pos_lengths = has_lengths.then(|| Vec::with_capacity(n_terms));
+    for _ in 0..n_terms {
+        let term = cursor.term()?;
+        let tf = cursor.u32()?;
+        let n_occ = cursor.u32()? as usize;
+        let spans = cursor.spans(n_occ)?;
+        if let Some(positions) = positions.as_mut() {
+            positions.push(cursor.u32s(n_occ)?);
+        }
+        if let Some(lengths) = pos_lengths.as_mut() {
+            lengths.push(cursor.u32s(n_occ)?);
+        }
+        terms.push((term, tf, spans));
+    }
+    let sentences = if has_sentences {
+        let n = cursor.u32()? as usize;
+        Some(cursor.spans(n)?)
+    } else {
+        None
+    };
+    let mut splade = Vec::new();
+    let splade_scale_bits = if extended {
+        let scale = cursor.u32()?;
+        let count = cursor.u32()?;
+        for _ in 0..count {
+            let term = cursor.term()?;
+            splade.push((term, cursor.u16()?));
+        }
+        scale
+    } else {
+        0
+    };
+    let field = AnalyzedField {
+        terms,
+        length,
+        positions,
+        sentences,
+        pos_lengths,
+        splade,
+        splade_scale_bits,
+    };
+    field.check_positions()?;
+    Ok(field)
 }
 
 /// The sidecar file of spill bucket `bucket` under a child's spill dir.

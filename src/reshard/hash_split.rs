@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::wal;
 
 use super::child_build::finish_child;
+use super::merge_inputs::load_merge_manifests;
 use super::replay::{
     read_gen_manifest, read_gens_binding, replay_buckets, require_backend_config,
     require_complete_history, same_backend_config, Replay,
@@ -669,31 +670,7 @@ pub fn merge(
     if gens.is_empty() {
         return Err("merge requires at least one --logs generation".to_string());
     }
-    let mut manifests = Vec::with_capacity(gens.len());
-    for gen in gens {
-        let manifest = read_gen_manifest(gen)?;
-        require_backend_config(&manifest, gen)?;
-        require_complete_history(&manifest, gen)?;
-        if let Some(first) = manifests.first() {
-            if !same_backend_config(first, &manifest) {
-                return Err(format!(
-                    "{}: vector backend configuration differs from the first input; \
-                     split/merge requires one scoring configuration",
-                    gen.display()
-                ));
-            }
-            if first.bucket_count != manifest.bucket_count {
-                return Err(format!(
-                    "{}: bucket count {} differs from the first input's {}; merge inputs \
-                     must share one bucket geometry",
-                    gen.display(),
-                    manifest.bucket_count,
-                    first.bucket_count
-                ));
-            }
-        }
-        manifests.push(manifest);
-    }
+    let manifests = load_merge_manifests(gens)?;
     let bucket_count = manifests[0].bucket_count;
     let dim = manifests[0].dim as usize;
     let binding = read_gens_binding(gens)?;
