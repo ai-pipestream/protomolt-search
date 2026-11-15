@@ -114,8 +114,12 @@ fn assert_query_parity(store: &Bm25Store, reader: &Bm25Reader, rng: &mut Lcg, vo
             store, &terms, &stats, params, k,
         ));
         let disk = sig(&crate::bm25::top_k(reader, &terms, &stats, params, k));
-        let pruned = sig(&crate::bm25::top_k_pruned(
-            reader, &terms, &stats, params, k, 0.0,
+        let pruned = sig(&crate::bm25::top_k(
+            reader,
+            &terms,
+            &stats,
+            params,
+            crate::bm25::TopK::new(k).floor(0.0),
         ));
         assert_eq!(heap, oracle, "top_k diverged from exhaustive oracle");
         assert_eq!(heap, disk, "reader top_k diverged from heap");
@@ -654,6 +658,7 @@ fn fused_scoring_v6_reader_matches_store() {
                 },
             ],
             15,
+            None,
         )
     };
     let want = queries(&store.field(0), &store.field(1));

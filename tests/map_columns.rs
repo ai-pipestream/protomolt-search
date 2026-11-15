@@ -515,17 +515,22 @@ fn map_keyed_chain_pruned_matches_exhaustive_bitwise() {
         docs.iter().map(|d| (d.doc_id, d.score.to_bits())).collect()
     };
     for k in [1usize, 10, 100] {
-        let exhaustive = bm25::top_k_exhaustive_chained(&body, &terms, &stats, params, k, ctx);
-        let pruned =
-            bm25::top_k_pruned_chained(&body, &terms, &stats, params, k, f64::NEG_INFINITY, ctx);
+        let exhaustive =
+            bm25::top_k_exhaustive(&body, &terms, &stats, params, bm25::TopK::new(k).chain(ctx));
+        let pruned = bm25::top_k(&body, &terms, &stats, params, bm25::TopK::new(k).chain(ctx));
         assert_eq!(
             signature(&exhaustive),
             signature(&pruned),
             "k={k}: map-keyed pruned != exhaustive"
         );
         if let Some(kth) = exhaustive.last() {
-            let seeded =
-                bm25::top_k_pruned_chained(&body, &terms, &stats, params, k, kth.score, ctx);
+            let seeded = bm25::top_k(
+                &body,
+                &terms,
+                &stats,
+                params,
+                bm25::TopK::new(k).floor(kth.score).chain(ctx),
+            );
             assert_eq!(signature(&exhaustive), signature(&seeded), "k={k}: seeded");
         }
     }

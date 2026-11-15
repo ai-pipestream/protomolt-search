@@ -1,27 +1,20 @@
-//! Flat and fused lexical scans share a rounded-score top-k contract.
+//! Flat and fused block-max scans share one loop and one emission path.
 
 use super::pruned_scan::{Cutoff, Scan};
 use super::ranking::HeapEntry;
-use super::{
-    passes, CandidateHook, ChainCtx, FieldQuery, FilterCtx, LiveFloorHook, PruneStats, TopKOptions,
-};
+use super::request::{Controls, Flat, Hooks, TopK};
+use super::{exhaustive, passes, FieldQuery, FusedDoc, PruneStats, ScoredDoc};
 
-pub(super) struct Controls<'a> {
-    pub k: usize,
-    pub floor: f64,
-    pub chain: ChainCtx<'a>,
-    pub filter: FilterCtx<'a>,
-}
-
-pub(super) fn run(
+/// The block-max loop over every (field, term) pair, or `None` when
+/// pruning is unavailable and the caller must fall back.
+fn run(
     fields: &[FieldQuery<'_>],
     mut controls: Controls<'_>,
     prune: &mut PruneStats,
-    live: &mut Option<LiveFloorHook<'_>>,
-    candidate: &mut Option<CandidateHook<'_>>,
+    hooks: &mut Hooks<'_>,
 ) -> Option<Vec<HeapEntry>> {
-    if controls.k == 0 {
-        return Some(Vec::new());
+    if !controls.block_max {
+        return None;
     }
     let pairs = super::pruned_cursor::open(fields, prune)?;
     let count = fields.iter().map(|field| field.terms.len()).sum();
@@ -29,7 +22,7 @@ pub(super) fn run(
     while !scan.pairs.is_empty() {
         let kth = (scan.heap.len() >= controls.k)
             .then(|| super::ranking::wire_score(scan.heap.peek().expect("full heap").score));
-        if let Some(hook) = live.as_mut() {
+        if let Some(hook) = hooks.live.as_mut() {
             if let Some(external) = hook(kth.map(f32::next_down)) {
                 if f64::from(external) > controls.floor {
                     controls.floor = f64::from(external);
@@ -56,34 +49,64 @@ pub(super) fn run(
         }
         let entry = scan.score(doc, controls.chain, prune);
         if passes(controls.filter, doc) && entry.score >= controls.floor {
-            if let Some(sink) = candidate.as_mut() {
-                sink(doc, entry.score as f32);
-            }
-            if scan.heap.len() < controls.k {
-                scan.heap.push(entry);
-            } else if entry < *scan.heap.peek().expect("full heap") {
-                scan.heap.pop();
-                scan.heap.push(entry);
-            }
+            admit(&mut scan, entry, controls.k, hooks);
         }
         scan.advance(doc, false);
     }
     Some(scan.finish(prune))
 }
 
-pub(super) fn flat(
-    query: super::exhaustive::Query<'_>,
-    options: TopKOptions,
-    prune: &mut PruneStats,
-    mut live: Option<LiveFloorHook<'_>>,
-    mut candidate: Option<CandidateHook<'_>>,
-) -> Vec<super::ScoredDoc> {
-    let TopKOptions {
-        k,
-        floor,
-        block_max,
-    } = options;
-    if k == 0 {
+/// Emit `entry` as a candidate and keep it if it beats the heap's worst.
+fn admit(scan: &mut Scan<'_>, entry: HeapEntry, k: usize, hooks: &mut Hooks<'_>) {
+    if let Some(sink) = hooks.candidate.as_mut() {
+        sink(entry.doc_id, entry.score as f32);
+    }
+    if scan.heap.len() < k {
+        scan.heap.push(entry);
+    } else if entry < *scan.heap.peek().expect("full heap") {
+        scan.heap.pop();
+        scan.heap.push(entry);
+    }
+}
+
+/// The (field, term, offsets) triples `entry`'s membership mask records,
+/// in pair order.
+fn matched(fields: &[FieldQuery<'_>], entry: &HeapEntry) -> Vec<super::FusedTermOffset> {
+    let pairs = fields
+        .iter()
+        .enumerate()
+        .flat_map(|(field, query)| (0..query.terms.len()).map(move |term| (field, term)));
+    pairs
+        .enumerate()
+        .filter(|&(position, _)| entry.mask >> position & 1 == 1)
+        .map(|(_, (field, term))| {
+            let query = &fields[field];
+            let offsets = query
+                .index
+                .posting_offsets(&query.terms[term], entry.doc_id);
+            (field, term, offsets)
+        })
+        .collect()
+}
+
+/// Run the block-max loop with the request's skip counters, if any.
+fn scan(
+    fields: &[FieldQuery<'_>],
+    controls: Controls<'_>,
+    prune: Option<&mut PruneStats>,
+    hooks: &mut Hooks<'_>,
+) -> Option<Vec<HeapEntry>> {
+    let mut scratch = PruneStats::default();
+    let prune = match prune {
+        Some(prune) => prune,
+        None => &mut scratch,
+    };
+    run(fields, controls, prune, hooks)
+}
+
+pub(super) fn flat(query: &Flat<'_>, request: TopK<'_>) -> Vec<ScoredDoc> {
+    let (controls, mut hooks, prune) = request.split();
+    if controls.k == 0 {
         return Vec::new();
     }
     let fields = [FieldQuery {
@@ -93,102 +116,40 @@ pub(super) fn flat(
         params: query.params,
         weight: 1.0,
     }];
-    let controls = Controls {
-        k,
-        floor,
-        chain: query.chain,
-        filter: query.filter,
-    };
-    let entries = block_max
-        .then(|| run(&fields, controls, prune, &mut live, &mut candidate))
-        .flatten();
-    let Some(entries) = entries else {
-        let docs = query.above(k, floor);
-        if let Some(sink) = candidate.as_mut() {
-            for doc in &docs {
-                sink(doc.doc_id, doc.score as f32);
-            }
-        }
+    let Some(entries) = scan(&fields, controls, prune, &mut hooks) else {
+        let docs = exhaustive::flat(query, &controls);
+        hooks.emit_all(docs.iter().map(|doc| (doc.doc_id, doc.score)));
         return docs;
     };
     entries
-        .into_iter()
-        .map(|entry| super::ScoredDoc {
+        .iter()
+        .map(|entry| ScoredDoc {
             doc_id: entry.doc_id,
             score: entry.score,
-            term_offsets: (0..query.terms.len())
-                .filter(|&term| entry.mask >> term & 1 == 1)
-                .map(|term| {
-                    (
-                        term,
-                        query
-                            .store
-                            .posting_offsets(&query.terms[term], entry.doc_id),
-                    )
-                })
+            term_offsets: matched(&fields, entry)
+                .into_iter()
+                .map(|(_, term, offsets)| (term, offsets))
                 .collect(),
         })
         .collect()
 }
 
-pub(super) fn fused(
-    fields: &[FieldQuery<'_>],
-    options: TopKOptions,
-    filter: FilterCtx<'_>,
-    prune: &mut PruneStats,
-    mut live: Option<LiveFloorHook<'_>>,
-    mut candidate: Option<CandidateHook<'_>>,
-) -> Vec<super::FusedDoc> {
-    let TopKOptions {
-        k,
-        floor,
-        block_max,
-    } = options;
-    if k == 0 {
+pub(super) fn fused(fields: &[FieldQuery<'_>], request: TopK<'_>) -> Vec<FusedDoc> {
+    let (controls, mut hooks, prune) = request.split();
+    if controls.k == 0 {
         return Vec::new();
     }
-    let controls = Controls {
-        k,
-        floor,
-        chain: None,
-        filter,
-    };
-    let entries = block_max
-        .then(|| run(fields, controls, prune, &mut live, &mut candidate))
-        .flatten();
-    let Some(entries) = entries else {
-        let docs = super::exhaustive::fused(fields, k, filter, floor.is_finite().then_some(floor));
-        if let Some(sink) = candidate.as_mut() {
-            for doc in &docs {
-                sink(doc.doc_id, doc.score as f32);
-            }
-        }
+    let Some(entries) = scan(fields, controls, prune, &mut hooks) else {
+        let docs = exhaustive::fused(fields, &controls, None);
+        hooks.emit_all(docs.iter().map(|doc| (doc.doc_id, doc.score)));
         return docs;
     };
-    let pairs: Vec<_> = fields
-        .iter()
-        .enumerate()
-        .flat_map(|(field, query)| (0..query.terms.len()).map(move |term| (field, term)))
-        .collect();
     entries
-        .into_iter()
-        .map(|entry| super::FusedDoc {
+        .iter()
+        .map(|entry| FusedDoc {
             doc_id: entry.doc_id,
             score: entry.score,
-            term_offsets: pairs
-                .iter()
-                .enumerate()
-                .filter(|&(position, _)| entry.mask >> position & 1 == 1)
-                .map(|(_, &(field, term))| {
-                    (
-                        field,
-                        term,
-                        fields[field]
-                            .index
-                            .posting_offsets(&fields[field].terms[term], entry.doc_id),
-                    )
-                })
-                .collect(),
+            term_offsets: matched(fields, entry),
         })
         .collect()
 }

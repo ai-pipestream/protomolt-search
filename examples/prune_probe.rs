@@ -150,14 +150,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if fi == 0 {
         let mut p = PruneStats::default();
         let t = Instant::now();
-        let hits = bm25::top_k_pruned_stats(
+        let hits = bm25::top_k(
             &reader,
             &terms,
             &stats,
             params,
-            k,
-            f64::NEG_INFINITY,
-            &mut p,
+            bm25::TopK::new(k).prune_stats(&mut p),
         );
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         let top: Vec<(u32, f64)> = hits.iter().map(|h| (h.doc_id, h.score)).collect();
@@ -176,7 +174,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }];
     let mut p = PruneStats::default();
     let t = Instant::now();
-    let hits = bm25::top_k_fused_pruned_stats(&queries, k, f64::NEG_INFINITY, &mut p);
+    let hits = bm25::top_k_fused(&queries, bm25::TopK::new(k).prune_stats(&mut p));
     let ms = t.elapsed().as_secs_f64() * 1000.0;
     let top: Vec<(u32, f64)> = hits.iter().map(|h| (h.doc_id, h.score)).collect();
     show("fused", ms, &p, &top, &view, show_text);

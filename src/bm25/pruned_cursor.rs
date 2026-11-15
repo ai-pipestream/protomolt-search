@@ -1,6 +1,6 @@
 //! Ordered impact cursors and conservative per-field bounds.
 
-use super::{block_max, idf, tf_norm, Bm25Params, FieldQuery, PruneStats};
+use super::{block_max, frontier_max, idf, tf_norm, Bm25Params, FieldQuery, PruneStats};
 
 pub(super) struct Pair<'a> {
     pub order: usize,
@@ -25,13 +25,12 @@ impl Pair<'_> {
         self.block_max = block_max(&self.cursor, self.scale, self.params, self.avgdl);
         if self.cursor.l1_group() != self.l1_group {
             self.l1_group = self.cursor.l1_group();
-            self.l1_max = self.scale
-                * self
-                    .cursor
-                    .l1_frontier()
-                    .iter()
-                    .map(|&(tf, dl)| tf_norm(self.params, tf, dl, self.avgdl))
-                    .fold(0.0, f64::max);
+            self.l1_max = frontier_max(
+                self.cursor.l1_frontier(),
+                self.scale,
+                self.params,
+                self.avgdl,
+            );
         }
     }
 
@@ -68,18 +67,8 @@ pub(super) fn open<'a>(fields: &[FieldQuery<'a>], prune: &mut PruneStats) -> Opt
             let cursor = query.index.impacts(text)?;
             let avgdl = query.stats.avgdl();
             let scale = query.weight * idf(query.stats.doc_count, query.stats.dfs[term]);
-            let l1_max = scale
-                * cursor
-                    .l1_frontier()
-                    .iter()
-                    .map(|&(tf, dl)| tf_norm(query.params, tf, dl, avgdl))
-                    .fold(0.0, f64::max);
-            let term_max = scale
-                * cursor
-                    .term_frontier()
-                    .iter()
-                    .map(|&(tf, dl)| tf_norm(query.params, tf, dl, avgdl))
-                    .fold(0.0, f64::max);
+            let l1_max = frontier_max(cursor.l1_frontier(), scale, query.params, avgdl);
+            let term_max = frontier_max(cursor.term_frontier(), scale, query.params, avgdl);
             prune.blocks_total += u64::from(cursor.n_blocks());
             pairs.push(Pair {
                 order: position,

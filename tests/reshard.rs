@@ -1297,7 +1297,7 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
     let name_terms = vec!["smith".to_string(), "alpha".to_string()];
     let k = 25;
     let run = |r: &Bm25Reader| {
-        bm25::top_k_fused_pruned(
+        bm25::top_k_fused(
             &[
                 bm25::FieldQuery {
                     index: &r.field(0),
@@ -1323,7 +1323,6 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
                 },
             ],
             k,
-            f64::NEG_INFINITY,
         )
     };
     let want: Vec<(u64, u64)> = run(&parent)

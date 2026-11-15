@@ -195,13 +195,12 @@ fn unsigned_chain_bounds_and_pruning_preserve_the_declared_float_arithmetic() {
         };
         let ctx = Some((&chain, &cols as &dyn NumericRead));
         for k in [1, 5, 50] {
-            let expected = bm25::top_k_exhaustive_chained(
+            let expected = bm25::top_k_exhaustive(
                 &body,
                 &terms,
                 &stats,
                 Bm25Params::default(),
-                k,
-                ctx,
+                bm25::TopK::new(k).chain(ctx),
             );
             let sig = |hits: &[bm25::ScoredDoc]| {
                 hits.iter()
@@ -209,14 +208,12 @@ fn unsigned_chain_bounds_and_pruning_preserve_the_declared_float_arithmetic() {
                     .collect::<Vec<_>>()
             };
             for floor in [f64::NEG_INFINITY, expected.last().unwrap().score] {
-                let actual = bm25::top_k_pruned_chained(
+                let actual = bm25::top_k(
                     &body,
                     &terms,
                     &stats,
                     Bm25Params::default(),
-                    k,
-                    floor,
-                    ctx,
+                    bm25::TopK::new(k).floor(floor).chain(ctx),
                 );
                 assert_eq!(sig(&actual), sig(&expected));
             }

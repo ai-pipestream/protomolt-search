@@ -875,16 +875,14 @@ impl OpenedSegmentSet {
                 ..Default::default()
             };
             let mut pruning = bm25::PruneStats::default();
-            let hits = bm25::top_k_pruned_chained_filtered_stats(
+            let hits = bm25::top_k(
                 segment.bm25.as_ref(),
                 terms,
                 &stats,
                 params,
-                k,
-                f64::NEG_INFINITY,
-                None,
-                Some((&filter, &columns)),
-                &mut pruning,
+                bm25::TopK::new(k)
+                    .filter(Some((&filter, &columns)))
+                    .prune_stats(&mut pruning),
             );
             for hit in hits {
                 all.push(SegmentHit {

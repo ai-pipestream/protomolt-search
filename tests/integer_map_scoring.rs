@@ -500,23 +500,20 @@ mod pruning {
                 };
                 let ctx = Some((&chain, &columns as &dyn NumericRead));
                 for k in [1, 5, 50] {
-                    let expected = bm25::top_k_exhaustive_chained(
+                    let expected = bm25::top_k_exhaustive(
                         &body,
                         &terms,
                         &stats,
                         Bm25Params::default(),
-                        k,
-                        ctx,
+                        bm25::TopK::new(k).chain(ctx),
                     );
                     for floor in [f64::NEG_INFINITY, expected.last().unwrap().score] {
-                        let actual = bm25::top_k_pruned_chained(
+                        let actual = bm25::top_k(
                             &body,
                             &terms,
                             &stats,
                             Bm25Params::default(),
-                            k,
-                            floor,
-                            ctx,
+                            bm25::TopK::new(k).floor(floor).chain(ctx),
                         );
                         let signature = |hits: Vec<bm25::ScoredDoc>| {
                             hits.into_iter()

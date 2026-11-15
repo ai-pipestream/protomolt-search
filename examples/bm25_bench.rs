@@ -234,9 +234,13 @@ fn bench_mode_row(
     let run = |ps: &mut bm25::PruneStats| match mode {
         BenchMode::Exhaustive => bm25::top_k_exhaustive(reader, terms, stats, params, k),
         BenchMode::Plain => bm25::top_k(reader, terms, stats, params, k),
-        BenchMode::Pruned(_, floor) => {
-            bm25::top_k_pruned_stats(reader, terms, stats, params, k, floor, ps)
-        }
+        BenchMode::Pruned(_, floor) => bm25::top_k(
+            reader,
+            terms,
+            stats,
+            params,
+            bm25::TopK::new(k).floor(floor).prune_stats(ps),
+        ),
     };
     let mut last_stats = bm25::PruneStats::default();
     for _ in 0..2 {
@@ -296,16 +300,9 @@ fn bench_query_shape(reader: &Bm25Reader, label: &str, terms: &[String], k: usiz
         total_doc_length: reader.total_doc_length(),
         dfs,
     };
-    let seed = bm25::top_k_pruned(
-        reader,
-        terms,
-        &stats,
-        Bm25Params::default(),
-        k,
-        f64::NEG_INFINITY,
-    )
-    .last()
-    .map_or(f64::NEG_INFINITY, |h| h.score);
+    let seed = bm25::top_k(reader, terms, &stats, Bm25Params::default(), k)
+        .last()
+        .map_or(f64::NEG_INFINITY, |h| h.score);
     let modes = [
         BenchMode::Exhaustive,
         BenchMode::Plain,

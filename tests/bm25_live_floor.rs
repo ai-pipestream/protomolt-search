@@ -76,17 +76,15 @@ fn run_live(
     hook: &mut dyn FnMut(Option<f32>) -> Option<f32>,
 ) -> Vec<ScoredDoc> {
     let mut prune = PruneStats::default();
-    bm25::top_k_pruned_chained_filtered_stats_live(
+    bm25::top_k(
         reader,
         terms,
         stats,
         params,
-        k,
-        floor,
-        None,
-        None,
-        &mut prune,
-        Some(hook),
+        bm25::TopK::new(k)
+            .floor(floor)
+            .prune_stats(&mut prune)
+            .live(Some(hook)),
     )
 }
 
@@ -114,8 +112,7 @@ fn live_floor_matches_the_seeded_contract_exactly() {
             dfs: terms.iter().map(|t| Bm25Index::df(&reader, t)).collect(),
         };
         for k in [1usize, 10, 100] {
-            let reference =
-                bm25::top_k_pruned(&reader, terms, &stats, params, k, f64::NEG_INFINITY);
+            let reference = bm25::top_k(&reader, terms, &stats, params, k);
 
             // A hook that never raises is the plain scorer, bit for bit,
             // and the seeds it is offered are monotone and never exceed
@@ -159,7 +156,13 @@ fn live_floor_matches_the_seeded_contract_exactly() {
             // deliver, arriving at the earliest possible moment.
             if reference.len() == k {
                 let seed = bm25::floor_seed(reference[k - 1].score as f32);
-                let seeded = bm25::top_k_pruned(&reader, terms, &stats, params, k, f64::from(seed));
+                let seeded = bm25::top_k(
+                    &reader,
+                    terms,
+                    &stats,
+                    params,
+                    bm25::TopK::new(k).floor(f64::from(seed)),
+                );
                 let mut eager = |_seed: Option<f32>| Some(seed);
                 let live = run_live(
                     &reader,

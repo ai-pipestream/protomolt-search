@@ -176,10 +176,19 @@ fn pruned_matches_exhaustive_property() {
                 floors.push(oracle[oracle.len() / 2].score); // mid-range
             }
             for floor in floors {
-                let want = bm25::filter_to_floor(oracle.clone(), floor);
+                // Rounded-score ranking can order a raw score below the
+                // floor ahead of one above it, so filter before truncating.
+                let all = bm25::top_k_exhaustive(&store, &terms, &stats, params, usize::MAX);
+                let mut want = bm25::filter_to_floor(all, floor);
+                want.truncate(k);
                 let mut prune = PruneStats::default();
-                let got =
-                    bm25::top_k_pruned_stats(&reader, &terms, &stats, params, k, floor, &mut prune);
+                let got = bm25::top_k(
+                    &reader,
+                    &terms,
+                    &stats,
+                    params,
+                    bm25::TopK::new(k).floor(floor).prune_stats(&mut prune),
+                );
                 assert_eq!(
                     sig(&want),
                     sig(&got),
@@ -227,7 +236,13 @@ fn ties_at_floor_and_kth_slot() {
     let want_ids: Vec<u32> = oracle.iter().map(|h| h.doc_id).collect();
     // Unseeded, exact-floor, and mid-tie floors all return the same ten.
     for floor in [f64::NEG_INFINITY, tie_score] {
-        let got = bm25::top_k_pruned(&reader, &terms, &stats, params, 10, floor);
+        let got = bm25::top_k(
+            &reader,
+            &terms,
+            &stats,
+            params,
+            bm25::TopK::new(10).floor(floor),
+        );
         assert_eq!(
             sig(&oracle),
             sig(&got),
@@ -236,7 +251,13 @@ fn ties_at_floor_and_kth_slot() {
         assert_eq!(got.iter().map(|h| h.doc_id).collect::<Vec<_>>(), want_ids);
     }
     // A hair above the tie: nothing survives.
-    let got = bm25::top_k_pruned(&reader, &terms, &stats, params, 10, tie_score + 1e-9);
+    let got = bm25::top_k(
+        &reader,
+        &terms,
+        &stats,
+        params,
+        bm25::TopK::new(10).floor(tie_score + 1e-9),
+    );
     assert!(
         got.is_empty(),
         "floor above every score must return nothing"
@@ -278,7 +299,13 @@ fn ties_at_floor_and_kth_slot() {
     // ten tied winners; everything else is inert on arrival).
     for (floor, want_evals) in [(f64::NEG_INFINITY, 19u64), (oracle[9].score, 10)] {
         let mut prune = PruneStats::default();
-        let got = bm25::top_k_pruned_stats(&reader, &terms, &stats, params, 10, floor, &mut prune);
+        let got = bm25::top_k(
+            &reader,
+            &terms,
+            &stats,
+            params,
+            bm25::TopK::new(10).floor(floor).prune_stats(&mut prune),
+        );
         assert_eq!(sig(&oracle), sig(&got), "cross-block tie, floor {floor:e}");
         assert_eq!(
             prune.candidates_evaluated, want_evals,
@@ -330,7 +357,13 @@ fn blocks_actually_skip() {
     let oracle = bm25::top_k_exhaustive(&store, &terms, &stats, params, k);
     let seed = oracle[k - 1].score;
     let mut seeded = PruneStats::default();
-    let got = bm25::top_k_pruned_stats(&reader, &terms, &stats, params, k, seed, &mut seeded);
+    let got = bm25::top_k(
+        &reader,
+        &terms,
+        &stats,
+        params,
+        bm25::TopK::new(k).floor(seed).prune_stats(&mut seeded),
+    );
     assert_eq!(sig(&oracle), sig(&got), "seeded result diverged");
     let seeded_frac = seeded.blocks_skipped as f64 / seeded.blocks_total as f64;
     assert!(
@@ -344,14 +377,12 @@ fn blocks_actually_skip() {
     // Same query unseeded: fewer skips (the floor starts at -inf), but
     // the result is identical.
     let mut unseeded = PruneStats::default();
-    let got = bm25::top_k_pruned_stats(
+    let got = bm25::top_k(
         &reader,
         &terms,
         &stats,
         params,
-        k,
-        f64::NEG_INFINITY,
-        &mut unseeded,
+        bm25::TopK::new(k).prune_stats(&mut unseeded),
     );
     assert_eq!(sig(&oracle), sig(&got));
     assert!(
@@ -369,14 +400,12 @@ fn blocks_actually_skip() {
         ..stats.clone()
     };
     let mut rare = PruneStats::default();
-    let got = bm25::top_k_pruned_stats(
+    let got = bm25::top_k(
         &reader,
         &rare_terms,
         &rare_stats,
         params,
-        k,
-        f64::NEG_INFINITY,
-        &mut rare,
+        bm25::TopK::new(k).prune_stats(&mut rare),
     );
     assert_eq!(rare.blocks_skipped, 0, "rare unseeded query must not skip");
     let oracle = bm25::top_k_exhaustive(&store, &rare_terms, &rare_stats, params, k);
@@ -477,14 +506,19 @@ fn seeded_round_trip_never_loses_boundary_hits() {
         };
         let k_max = (store.doc_count() as usize).min(60);
         for k in 1..=k_max {
-            let unseeded =
-                bm25::top_k_pruned(&reader, &terms, &stats, params, k, f64::NEG_INFINITY);
+            let unseeded = bm25::top_k(&reader, &terms, &stats, params, k);
             if unseeded.len() < k {
                 break; // heap cannot fill: no kth_best emitted for larger k
             }
             // The wire emission: f32 of the k-th score, one ULP down.
             let emitted = bm25::floor_seed(unseeded[k - 1].score as f32);
-            let seeded = bm25::top_k_pruned(&reader, &terms, &stats, params, k, f64::from(emitted));
+            let seeded = bm25::top_k(
+                &reader,
+                &terms,
+                &stats,
+                params,
+                bm25::TopK::new(k).floor(f64::from(emitted)),
+            );
             assert_eq!(
                 sig(&unseeded),
                 sig(&seeded),
@@ -516,14 +550,20 @@ fn seeded_round_trip_never_loses_boundary_hits() {
         dfs: vec![200],
     };
     let params = Bm25Params::default();
-    let unseeded = bm25::top_k_pruned(&reader, &terms, &stats, params, 10, f64::NEG_INFINITY);
+    let unseeded = bm25::top_k(&reader, &terms, &stats, params, 10);
     assert!(unseeded.iter().all(|h| h.score == unseeded[0].score));
     let emitted = bm25::floor_seed(unseeded[9].score as f32);
     assert!(
         f64::from(emitted) < unseeded[9].score,
         "seed must sit strictly below the tie score"
     );
-    let seeded = bm25::top_k_pruned(&reader, &terms, &stats, params, 10, f64::from(emitted));
+    let seeded = bm25::top_k(
+        &reader,
+        &terms,
+        &stats,
+        params,
+        bm25::TopK::new(10).floor(f64::from(emitted)),
+    );
     assert_eq!(sig(&unseeded), sig(&seeded), "tie cluster at the boundary");
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -608,10 +648,19 @@ fn pruned_level1_scale_fuzz() {
                 floors.push(oracle[oracle.len() / 2].score); // mid-range
             }
             for floor in floors {
-                let want = bm25::filter_to_floor(oracle.clone(), floor);
+                // Rounded-score ranking can order a raw score below the
+                // floor ahead of one above it, so filter before truncating.
+                let all = bm25::top_k_exhaustive(&store, &terms, &stats, params, usize::MAX);
+                let mut want = bm25::filter_to_floor(all, floor);
+                want.truncate(k);
                 let mut prune = PruneStats::default();
-                let got =
-                    bm25::top_k_pruned_stats(&reader, &terms, &stats, params, k, floor, &mut prune);
+                let got = bm25::top_k(
+                    &reader,
+                    &terms,
+                    &stats,
+                    params,
+                    bm25::TopK::new(k).floor(floor).prune_stats(&mut prune),
+                );
                 assert_eq!(
                     sig(&want),
                     sig(&got),
@@ -669,14 +718,12 @@ fn a_term_absent_from_this_shard_does_not_disable_pruning() {
 
     let oracle = bm25::top_k_exhaustive(&store, &terms, &stats, params, 10);
     let mut prune = PruneStats::default();
-    let got = bm25::top_k_pruned_stats(
+    let got = bm25::top_k(
         &reader,
         &terms,
         &stats,
         params,
-        10,
-        f64::NEG_INFINITY,
-        &mut prune,
+        bm25::TopK::new(10).prune_stats(&mut prune),
     );
 
     // Correctness first: skipping a locally-absent term is only valid
@@ -699,7 +746,13 @@ fn a_term_absent_from_this_shard_does_not_disable_pruning() {
     // was that the pruned scorer was never ENTERED, and blocks_total
     // proves entry (the exhaustive fallback walks no blocks and reports
     // none). Other gates in this file cover skip effectiveness.
-    let seeded = bm25::top_k_pruned(&reader, &terms, &stats, params, 10, oracle[9].score);
+    let seeded = bm25::top_k(
+        &reader,
+        &terms,
+        &stats,
+        params,
+        bm25::TopK::new(10).floor(oracle[9].score),
+    );
     assert_eq!(
         sig(&bm25::filter_to_floor(oracle.clone(), oracle[9].score)),
         sig(&seeded),
@@ -709,7 +762,7 @@ fn a_term_absent_from_this_shard_does_not_disable_pruning() {
     // The single-term query is the control: it always pruned, and adding
     // a term this shard does not hold must not make things worse.
     let mut solo = PruneStats::default();
-    let _ = bm25::top_k_pruned_stats(
+    let _ = bm25::top_k(
         &reader,
         &["court".to_string()],
         &CorpusStats {
@@ -718,9 +771,7 @@ fn a_term_absent_from_this_shard_does_not_disable_pruning() {
             dfs: vec![2000],
         },
         params,
-        10,
-        f64::NEG_INFINITY,
-        &mut solo,
+        bm25::TopK::new(10).prune_stats(&mut solo),
     );
     assert_eq!(
         prune.blocks_total, solo.blocks_total,

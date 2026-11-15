@@ -214,17 +214,15 @@ fn rounded_score_ties_survive_pruning_and_live_floors() {
     let floor = bm25::floor_seed(shorter as f32);
     let mut live = |_| Some(floor);
     let mut prune = PruneStats::default();
-    let actual = bm25::top_k_pruned_chained_filtered_stats_live(
+    let actual = bm25::top_k(
         &reader,
         &terms,
         &stats,
         PARAMS,
-        1,
-        0.0,
-        None,
-        None,
-        &mut prune,
-        Some(&mut live),
+        bm25::TopK::new(1)
+            .floor(0.0)
+            .prune_stats(&mut prune)
+            .live(Some(&mut live)),
     );
     assert_eq!(actual.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(), [0]);
     assert_eq!(actual[0].score.to_bits(), longer.to_bits());
@@ -239,7 +237,7 @@ fn rounded_score_ties_survive_pruning_and_live_floors() {
         params: PARAMS,
         weight: 1.0,
     }];
-    let fused = bm25::top_k_fused_pruned(&fields, 1, f64::from(floor));
+    let fused = bm25::top_k_fused(&fields, bm25::TopK::new(1).floor(f64::from(floor)));
     assert_eq!(fused[0].doc_id, 0);
     assert_eq!(fused[0].score.to_bits(), actual[0].score.to_bits());
     assert_eq!(
@@ -272,7 +270,13 @@ fn raw_floor_filters_before_rounded_tie_truncation() {
     assert_eq!((longer as f32).to_bits(), (shorter as f32).to_bits());
     let indexes: [&dyn pipestream_search::postings::Bm25Index; 2] = [&store, &reader];
     for index in indexes {
-        let flat = bm25::top_k_pruned(index, &terms, &stats, PARAMS, 1, floor);
+        let flat = bm25::top_k(
+            index,
+            &terms,
+            &stats,
+            PARAMS,
+            bm25::TopK::new(1).floor(floor),
+        );
         assert_eq!(flat.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(), [1]);
         let fields = [FieldQuery {
             index,
@@ -281,7 +285,7 @@ fn raw_floor_filters_before_rounded_tie_truncation() {
             params: PARAMS,
             weight: 1.0,
         }];
-        let fused = bm25::top_k_fused_pruned(&fields, 1, floor);
+        let fused = bm25::top_k_fused(&fields, bm25::TopK::new(1).floor(floor));
         assert_eq!(fused.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(), [1]);
     }
 }

@@ -889,20 +889,22 @@ fn cel_filtered_pruned_matches_exhaustive_bitwise() {
     let filter_ctx: bm25::FilterCtx = Some((&doc_filter, &cols as &dyn NumericRead));
 
     for k in [1usize, 5, 50] {
-        let exhaustive = bm25::top_k_exhaustive_chained_filtered(
-            &body, &terms, &stats, params, k, None, filter_ctx,
-        );
-        let mut prune = bm25::PruneStats::default();
-        let pruned = bm25::top_k_pruned_chained_filtered_stats(
+        let exhaustive = bm25::top_k_exhaustive(
             &body,
             &terms,
             &stats,
             params,
-            k,
-            f64::NEG_INFINITY,
-            None,
-            filter_ctx,
-            &mut prune,
+            bm25::TopK::new(k).filter(filter_ctx),
+        );
+        let mut prune = bm25::PruneStats::default();
+        let pruned = bm25::top_k(
+            &body,
+            &terms,
+            &stats,
+            params,
+            bm25::TopK::new(k)
+                .filter(filter_ctx)
+                .prune_stats(&mut prune),
         );
         assert_eq!(
             signature(&exhaustive),
@@ -911,16 +913,15 @@ fn cel_filtered_pruned_matches_exhaustive_bitwise() {
         );
         // Seeding with the k-th best must not change the answer.
         if let Some(kth) = exhaustive.last() {
-            let seeded = bm25::top_k_pruned_chained_filtered_stats(
+            let seeded = bm25::top_k(
                 &body,
                 &terms,
                 &stats,
                 params,
-                k,
-                kth.score,
-                None,
-                filter_ctx,
-                &mut bm25::PruneStats::default(),
+                bm25::TopK::new(k)
+                    .floor(kth.score)
+                    .filter(filter_ctx)
+                    .prune_stats(&mut bm25::PruneStats::default()),
             );
             assert_eq!(
                 signature(&exhaustive),
@@ -938,16 +939,12 @@ fn cel_filtered_pruned_matches_exhaustive_bitwise() {
                 d.doc_id
             );
         }
-        let unfiltered = bm25::top_k_pruned_chained_filtered_stats(
+        let unfiltered = bm25::top_k(
             &body,
             &terms,
             &stats,
             params,
-            k,
-            f64::NEG_INFINITY,
-            None,
-            None,
-            &mut bm25::PruneStats::default(),
+            bm25::TopK::new(k).prune_stats(&mut bm25::PruneStats::default()),
         );
         assert_ne!(
             signature(&unfiltered),

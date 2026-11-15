@@ -268,11 +268,12 @@ fn fused_pruned_matches_fused_exhaustive_property() {
                     },
                 ],
                 k,
+                None,
             );
             for floor in floor_palette(&oracle, k) {
                 let want = bm25::filter_fused_to_floor(oracle.clone(), floor);
                 let mut prune = PruneStats::default();
-                let got = bm25::top_k_fused_pruned_stats(
+                let got = bm25::top_k_fused(
                     &[
                         FieldQuery {
                             index: &reader.field(0),
@@ -289,9 +290,7 @@ fn fused_pruned_matches_fused_exhaustive_property() {
                             weight: w_name,
                         },
                     ],
-                    k,
-                    floor,
-                    &mut prune,
+                    bm25::TopK::new(k).floor(floor).prune_stats(&mut prune),
                 );
                 assert_eq!(
                     sig(&want),
@@ -338,7 +337,7 @@ fn fused_pruned_single_field_degenerate_identity() {
     };
     let params = Bm25Params::default();
     for k in [1usize, 7, 40] {
-        let single = bm25::top_k_pruned(&reader, &terms, &stats, params, k, f64::NEG_INFINITY);
+        let single = bm25::top_k(&reader, &terms, &stats, params, k);
         let floors = [
             f64::NEG_INFINITY,
             single.last().map_or(1e9, |h| h.score),
@@ -346,7 +345,7 @@ fn fused_pruned_single_field_degenerate_identity() {
         ];
         for floor in floors {
             let want = bm25::filter_to_floor(single.clone(), floor);
-            let got = bm25::top_k_fused_pruned(
+            let got = bm25::top_k_fused(
                 &[FieldQuery {
                     index: &reader,
                     terms: &terms,
@@ -354,8 +353,7 @@ fn fused_pruned_single_field_degenerate_identity() {
                     params,
                     weight: 1.0,
                 }],
-                k,
-                floor,
+                bm25::TopK::new(k).floor(floor),
             );
             assert_eq!(want.len(), got.len(), "k {k}, floor {floor:e}");
             for (w, g) in want.iter().zip(&got) {
@@ -440,6 +438,7 @@ fn fused_ties_at_floor_and_kth_slot() {
             },
         ],
         10,
+        None,
     );
     assert_eq!(oracle.len(), 10);
     let tie_score = oracle[0].score;
@@ -450,7 +449,7 @@ fn fused_ties_at_floor_and_kth_slot() {
         want_ids
     );
     let pruned = |floor: f64| {
-        bm25::top_k_fused_pruned(
+        bm25::top_k_fused(
             &[
                 FieldQuery {
                     index: &reader.field(0),
@@ -467,8 +466,7 @@ fn fused_ties_at_floor_and_kth_slot() {
                     weight: 2.0,
                 },
             ],
-            10,
-            floor,
+            bm25::TopK::new(10).floor(floor),
         )
     };
     for floor in [f64::NEG_INFINITY, tie_score] {
@@ -539,6 +537,7 @@ fn fused_ties_at_floor_and_kth_slot() {
             },
         ],
         10,
+        None,
     );
     let want_ids: Vec<u32> = (0..10u32).map(|i| i * 25).collect();
     assert_eq!(
@@ -548,7 +547,7 @@ fn fused_ties_at_floor_and_kth_slot() {
     );
     assert!(oracle.iter().all(|h| h.score == oracle[0].score));
     for floor in [f64::NEG_INFINITY, oracle[9].score] {
-        let got = bm25::top_k_fused_pruned(
+        let got = bm25::top_k_fused(
             &[
                 FieldQuery {
                     index: &reader.field(0),
@@ -565,8 +564,7 @@ fn fused_ties_at_floor_and_kth_slot() {
                     weight: 2.0,
                 },
             ],
-            10,
-            floor,
+            bm25::TopK::new(10).floor(floor),
         );
         assert_eq!(sig(&oracle), sig(&got), "cross-block tie, floor {floor:e}");
     }
@@ -640,9 +638,10 @@ fn fused_blocks_actually_skip() {
             },
         ],
         k,
+        None,
     );
     let pruned = |floor: f64, prune: &mut PruneStats| {
-        bm25::top_k_fused_pruned_stats(
+        bm25::top_k_fused(
             &[
                 FieldQuery {
                     index: &reader.field(0),
@@ -659,9 +658,7 @@ fn fused_blocks_actually_skip() {
                     weight: 0.5,
                 },
             ],
-            k,
-            floor,
-            prune,
+            bm25::TopK::new(k).floor(floor).prune_stats(prune),
         )
     };
 
@@ -694,7 +691,7 @@ fn fused_blocks_actually_skip() {
     let rare_terms = vec!["rare3".to_string()];
     let rare_stats = field_stats(&store, 0, &rare_terms);
     let mut rare = PruneStats::default();
-    let got = bm25::top_k_fused_pruned_stats(
+    let got = bm25::top_k_fused(
         &[FieldQuery {
             index: &reader.field(0),
             terms: &rare_terms,
@@ -702,9 +699,7 @@ fn fused_blocks_actually_skip() {
             params: Bm25Params::default(),
             weight: 1.0,
         }],
-        k,
-        f64::NEG_INFINITY,
-        &mut rare,
+        bm25::TopK::new(k).prune_stats(&mut rare),
     );
     assert_eq!(rare.blocks_skipped, 0, "rare unseeded query must not skip");
     let rare_oracle = bm25::top_k_fused_exhaustive(
@@ -716,6 +711,7 @@ fn fused_blocks_actually_skip() {
             weight: 1.0,
         }],
         k,
+        None,
     );
     assert_eq!(sig(&rare_oracle), sig(&got));
 
@@ -757,6 +753,7 @@ fn fused_fallbacks_match_exhaustive() {
                 },
             ],
             k,
+            None,
         )
     };
 
@@ -764,7 +761,7 @@ fn fused_fallbacks_match_exhaustive() {
     let oracle = exhaustive(2.0);
     for floor in floor_palette(&oracle, k) {
         let want = bm25::filter_fused_to_floor(oracle.clone(), floor);
-        let got = bm25::top_k_fused_pruned(
+        let got = bm25::top_k_fused(
             &[
                 FieldQuery {
                     index: &store.field(0),
@@ -781,8 +778,7 @@ fn fused_fallbacks_match_exhaustive() {
                     weight: 2.0,
                 },
             ],
-            k,
-            floor,
+            bm25::TopK::new(k).floor(floor),
         );
         assert_eq!(
             sig(&want),
@@ -798,7 +794,7 @@ fn fused_fallbacks_match_exhaustive() {
     let oracle = exhaustive(-1.0);
     for floor in [f64::NEG_INFINITY, 0.0] {
         let want = bm25::filter_fused_to_floor(oracle.clone(), floor);
-        let got = bm25::top_k_fused_pruned(
+        let got = bm25::top_k_fused(
             &[
                 FieldQuery {
                     index: &reader.field(0),
@@ -815,8 +811,7 @@ fn fused_fallbacks_match_exhaustive() {
                     weight: -1.0,
                 },
             ],
-            k,
-            floor,
+            bm25::TopK::new(k).floor(floor),
         );
         assert_eq!(
             sig(&want),
@@ -913,7 +908,7 @@ fn fused_pruned_distributed_equals_monolithic() {
 
     let k = 12;
     let run = |reader: &Bm25Reader, floor: f64| {
-        bm25::top_k_fused_pruned(
+        bm25::top_k_fused(
             &[
                 FieldQuery {
                     index: &reader.field(0),
@@ -930,8 +925,7 @@ fn fused_pruned_distributed_equals_monolithic() {
                     weight: weights[1],
                 },
             ],
-            k,
-            floor,
+            bm25::TopK::new(k).floor(floor),
         )
     };
     let merge = |mut hits: Vec<FusedDoc>| {
@@ -965,6 +959,7 @@ fn fused_pruned_distributed_equals_monolithic() {
             },
         ],
         k,
+        None,
     );
     assert_eq!(sig(&oracle), sig(&want), "monolith pruned vs exhaustive");
 
@@ -1098,13 +1093,11 @@ fn a_term_absent_from_this_shard_does_not_disable_fused_pruning() {
         };
     }
 
-    let oracle = bm25::top_k_fused_exhaustive(&q!(store.field(0), store.field(1)), 10);
+    let oracle = bm25::top_k_fused_exhaustive(&q!(store.field(0), store.field(1)), 10, None);
     let mut prune = PruneStats::default();
-    let got = bm25::top_k_fused_pruned_stats(
+    let got = bm25::top_k_fused(
         &q!(reader.field(0), reader.field(1)),
-        10,
-        f64::NEG_INFINITY,
-        &mut prune,
+        bm25::TopK::new(10).prune_stats(&mut prune),
     );
 
     // Correctness first: skipping a locally-absent pair is only valid
@@ -1129,8 +1122,10 @@ fn a_term_absent_from_this_shard_does_not_disable_fused_pruning() {
     );
 
     // A seeded floor must still hold the filtered-oracle contract.
-    let seeded =
-        bm25::top_k_fused_pruned(&q!(reader.field(0), reader.field(1)), 10, oracle[9].score);
+    let seeded = bm25::top_k_fused(
+        &q!(reader.field(0), reader.field(1)),
+        bm25::TopK::new(10).floor(oracle[9].score),
+    );
     assert_eq!(
         sig(&bm25::filter_fused_to_floor(
             oracle.clone(),
@@ -1144,7 +1139,7 @@ fn a_term_absent_from_this_shard_does_not_disable_fused_pruning() {
     // blocks. If it does not, the absent term is still costing work.
     let present_only = vec!["court".to_string()];
     let mut solo = PruneStats::default();
-    let _ = bm25::top_k_fused_pruned_stats(
+    let _ = bm25::top_k_fused(
         &[
             FieldQuery {
                 index: &reader.field(0),
@@ -1165,9 +1160,7 @@ fn a_term_absent_from_this_shard_does_not_disable_fused_pruning() {
                 weight: 2.0,
             },
         ],
-        10,
-        f64::NEG_INFINITY,
-        &mut solo,
+        bm25::TopK::new(10).prune_stats(&mut solo),
     );
     assert_eq!(
         prune.blocks_total, solo.blocks_total,

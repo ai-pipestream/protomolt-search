@@ -1281,20 +1281,23 @@ fn geo_filtered_decayed_pruned_matches_exhaustive_bitwise() {
             };
             let filter_ctx = Some((&filters, &cols as &dyn NumericRead));
             for k in [1usize, 5, 50] {
-                let exhaustive = bm25::top_k_exhaustive_chained_filtered(
-                    &body, &terms, &stats, params, k, chain_ctx, filter_ctx,
-                );
-                let mut prune = bm25::PruneStats::default();
-                let pruned = bm25::top_k_pruned_chained_filtered_stats(
+                let exhaustive = bm25::top_k_exhaustive(
                     &body,
                     &terms,
                     &stats,
                     params,
-                    k,
-                    f64::NEG_INFINITY,
-                    chain_ctx,
-                    filter_ctx,
-                    &mut prune,
+                    bm25::TopK::new(k).chain(chain_ctx).filter(filter_ctx),
+                );
+                let mut prune = bm25::PruneStats::default();
+                let pruned = bm25::top_k(
+                    &body,
+                    &terms,
+                    &stats,
+                    params,
+                    bm25::TopK::new(k)
+                        .chain(chain_ctx)
+                        .filter(filter_ctx)
+                        .prune_stats(&mut prune),
                 );
                 assert_eq!(
                     signature(&exhaustive),
@@ -1306,9 +1309,16 @@ fn geo_filtered_decayed_pruned_matches_exhaustive_bitwise() {
                 // the filter never raised it.
                 if let Some(kth) = exhaustive.last() {
                     let mut prune = bm25::PruneStats::default();
-                    let seeded = bm25::top_k_pruned_chained_filtered_stats(
-                        &body, &terms, &stats, params, k, kth.score, chain_ctx, filter_ctx,
-                        &mut prune,
+                    let seeded = bm25::top_k(
+                        &body,
+                        &terms,
+                        &stats,
+                        params,
+                        bm25::TopK::new(k)
+                            .floor(kth.score)
+                            .chain(chain_ctx)
+                            .filter(filter_ctx)
+                            .prune_stats(&mut prune),
                     );
                     assert_eq!(
                         signature(&exhaustive),
@@ -1327,16 +1337,14 @@ fn geo_filtered_decayed_pruned_matches_exhaustive_bitwise() {
                 // ...and the filter is not vacuous: the unfiltered
                 // top-k differs, so the assertions above have something
                 // to be about.
-                let unfiltered = bm25::top_k_pruned_chained_filtered_stats(
+                let unfiltered = bm25::top_k(
                     &body,
                     &terms,
                     &stats,
                     params,
-                    k,
-                    f64::NEG_INFINITY,
-                    chain_ctx,
-                    None,
-                    &mut bm25::PruneStats::default(),
+                    bm25::TopK::new(k)
+                        .chain(chain_ctx)
+                        .prune_stats(&mut bm25::PruneStats::default()),
                 );
                 assert_ne!(
                     signature(&unfiltered),
@@ -1351,18 +1359,14 @@ fn geo_filtered_decayed_pruned_matches_exhaustive_bitwise() {
     // bit-identical to the plain ones: the additions are gated, not
     // forked.
     for k in [1usize, 10] {
-        let plain = bm25::top_k_pruned(&body, &terms, &stats, params, k, f64::NEG_INFINITY);
+        let plain = bm25::top_k(&body, &terms, &stats, params, k);
         let mut prune = bm25::PruneStats::default();
-        let gated = bm25::top_k_pruned_chained_filtered_stats(
+        let gated = bm25::top_k(
             &body,
             &terms,
             &stats,
             params,
-            k,
-            f64::NEG_INFINITY,
-            None,
-            None,
-            &mut prune,
+            bm25::TopK::new(k).prune_stats(&mut prune),
         );
         assert_eq!(signature(&plain), signature(&gated), "k={k}: ungated drift");
     }
@@ -1637,14 +1641,14 @@ fn geo_filtered_fused_pruned_matches_exhaustive_bitwise() {
         };
         let filter_ctx = Some((&filters, &cols as &dyn NumericRead));
         for k in [1usize, 5, 50] {
-            let exhaustive = bm25::top_k_fused_exhaustive_filtered(&fields, k, filter_ctx);
+            let exhaustive =
+                bm25::top_k_fused_exhaustive(&fields, bm25::TopK::new(k).filter(filter_ctx), None);
             let mut prune = bm25::PruneStats::default();
-            let pruned = bm25::top_k_fused_pruned_filtered_stats(
+            let pruned = bm25::top_k_fused(
                 &fields,
-                k,
-                f64::NEG_INFINITY,
-                filter_ctx,
-                &mut prune,
+                bm25::TopK::new(k)
+                    .filter(filter_ctx)
+                    .prune_stats(&mut prune),
             );
             assert_eq!(
                 signature(&exhaustive),
@@ -1655,12 +1659,12 @@ fn geo_filtered_fused_pruned_matches_exhaustive_bitwise() {
             // score is >= the k-th survivor's, and the filter never
             // raised the floor.
             if let Some(kth) = exhaustive.last() {
-                let seeded = bm25::top_k_fused_pruned_filtered_stats(
+                let seeded = bm25::top_k_fused(
                     &fields,
-                    k,
-                    kth.score,
-                    filter_ctx,
-                    &mut bm25::PruneStats::default(),
+                    bm25::TopK::new(k)
+                        .floor(kth.score)
+                        .filter(filter_ctx)
+                        .prune_stats(&mut bm25::PruneStats::default()),
                 );
                 assert_eq!(
                     signature(&exhaustive),
@@ -1674,12 +1678,9 @@ fn geo_filtered_fused_pruned_matches_exhaustive_bitwise() {
                 assert!(region.contains(dlat, dlon), "survivor outside the region");
             }
             // ...and the filter is not vacuous.
-            let unfiltered = bm25::top_k_fused_pruned_filtered_stats(
+            let unfiltered = bm25::top_k_fused(
                 &fields,
-                k,
-                f64::NEG_INFINITY,
-                None,
-                &mut bm25::PruneStats::default(),
+                bm25::TopK::new(k).prune_stats(&mut bm25::PruneStats::default()),
             );
             assert_ne!(
                 signature(&unfiltered),
@@ -1692,13 +1693,10 @@ fn geo_filtered_fused_pruned_matches_exhaustive_bitwise() {
     // With no filter the filtered entry point is bit-identical to the
     // plain fused pruned scorer: the addition is gated, not forked.
     for k in [1usize, 10] {
-        let plain = bm25::top_k_fused_pruned(&fields, k, f64::NEG_INFINITY);
-        let gated = bm25::top_k_fused_pruned_filtered_stats(
+        let plain = bm25::top_k_fused(&fields, k);
+        let gated = bm25::top_k_fused(
             &fields,
-            k,
-            f64::NEG_INFINITY,
-            None,
-            &mut bm25::PruneStats::default(),
+            bm25::TopK::new(k).prune_stats(&mut bm25::PruneStats::default()),
         );
         assert_eq!(signature(&plain), signature(&gated), "k={k}: ungated drift");
     }
