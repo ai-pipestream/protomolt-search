@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 
 use crate::pb::wal::wal_record;
 use crate::pb::AddDocumentsRequest;
+use crate::postings::AnalyzedField;
 use crate::wal::{self, RecordReader, WalManifest};
 
-use super::analysis_sidecar::SpillAnalysis;
 use super::bucket_of;
 
 /// Vectors and documents replayed out of bucket files, keyed by their
@@ -29,7 +29,7 @@ pub(super) struct Replay {
     /// the replay carries a transplant sidecar
     /// (`docs/replay-from-segments.md`) and the child build takes the
     /// fields from here instead of the analyzer.
-    pub(super) analyzed: SpillAnalysis,
+    pub(super) analyzed: BTreeMap<u64, Vec<AnalyzedField>>,
 }
 
 impl Replay {

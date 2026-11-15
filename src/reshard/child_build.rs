@@ -1112,7 +1112,7 @@ pub(super) fn finish_child_ordered_with_prebuilt(
             replay.vectors.len() + replay.documents.len()
         ));
     }
-    let transplanted = replay.analyzed.take_transplant(&documents)?;
+    let transplanted = (!replay.analyzed.is_empty()).then(|| std::mem::take(&mut replay.analyzed));
     let mut child = build_child(
         manifest,
         vectors,

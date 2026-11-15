@@ -3,7 +3,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::pb::AddDocumentsRequest;
 use crate::postings::AnalyzedField;
 
 /// One row's analyzed fields in the spill's analysis sidecar.
@@ -85,52 +84,11 @@ pub(super) fn write_analysis_entry(
     Ok(())
 }
 
-/// Analyzed fields transplanted from a spill's sidecars, by source id.
-/// Reading a sidecar, present or not, puts the replay in transplant mode:
-/// every document it then builds takes its fields from here.
-#[derive(Default)]
-pub(super) struct SpillAnalysis {
-    sidecar: Option<PathBuf>,
-    fields: BTreeMap<u64, Vec<AnalyzedField>>,
-}
-
-impl SpillAnalysis {
-    pub(super) fn remove(&mut self, id: &u64) {
-        self.fields.remove(id);
-    }
-
-    /// Fold in another bucket's sidecar.
-    pub(super) fn extend(&mut self, other: SpillAnalysis) {
-        self.sidecar = self.sidecar.take().or(other.sidecar);
-        self.fields.extend(other.fields);
-    }
-
-    /// The transplanted fields for a build over `documents`, or `None`
-    /// when no sidecar was read. A document without an entry means its
-    /// bucket's sidecar is missing or cut short, and the build is refused.
-    pub(super) fn take_transplant(
-        &mut self,
-        documents: &[(u64, AddDocumentsRequest)],
-    ) -> Result<Option<BTreeMap<u64, Vec<AnalyzedField>>>, String> {
-        let Some(sidecar) = self.sidecar.take() else {
-            return Ok(None);
-        };
-        let missing = documents.iter().map(|(id, _)| id);
-        if let Some(id) = missing.into_iter().find(|id| !self.fields.contains_key(id)) {
-            return Err(format!(
-                "{}: the spill's analysis sidecar is missing or truncated: document {id} has no \
-                 transplanted fields; the child is not built",
-                sidecar.display()
-            ));
-        }
-        Ok(Some(std::mem::take(&mut self.fields)))
-    }
-}
-
-/// The sidecar of one spill bucket. An absent file reads as no entries,
-/// which is right only for a bucket that holds no documents;
-/// [`SpillAnalysis::take_transplant`] refuses any other.
-pub(super) fn read_analysis_file(path: &Path) -> Result<SpillAnalysis, String> {
+/// The sidecar of one spill bucket, keyed by source id. A sidecar with no
+/// entry is right only beside an empty log bucket: a populated bucket
+/// that lost its sidecar is refused, so the build never leaves transplant
+/// mode for rows whose fields were spilled.
+pub(super) fn read_analysis_file(path: &Path) -> Result<BTreeMap<u64, Vec<AnalyzedField>>, String> {
     use std::io::Read;
     let mut bytes = Vec::new();
     match std::fs::File::open(path) {
@@ -140,10 +98,36 @@ pub(super) fn read_analysis_file(path: &Path) -> Result<SpillAnalysis, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
         Err(e) => return Err(format!("open {}: {e}", path.display())),
     };
-    Ok(SpillAnalysis {
-        sidecar: Some(path.to_path_buf()),
-        fields: parse_analysis(path, &bytes)?,
-    })
+    let fields = parse_analysis(path, &bytes)?;
+    if fields.is_empty() && bucket_log_holds_records(path)? {
+        return Err(format!(
+            "{}: the spill's analysis sidecar is missing or truncated beside a populated log \
+             bucket; the child is not built",
+            path.display()
+        ));
+    }
+    Ok(fields)
+}
+
+/// Whether the log bucket a sidecar describes holds any record: bucket
+/// `n` of the spill generation for `analysis-n.bin`, or the generation's
+/// only bucket when it has one.
+fn bucket_log_holds_records(sidecar: &Path) -> Result<bool, String> {
+    let spill_dir = sidecar.parent().unwrap_or(Path::new("."));
+    let named = sidecar
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.strip_prefix("analysis-"))
+        .and_then(|digits| digits.parse::<u32>().ok())
+        .ok_or_else(|| format!("{}: not an analysis sidecar name", sidecar.display()))?;
+    let manifest = crate::wal::read_manifest(spill_dir)
+        .map_err(|e| format!("read spill manifest in {}: {e}", spill_dir.display()))?;
+    let bucket = if manifest.bucket_count == 1 { 0 } else { named };
+    match std::fs::metadata(crate::wal::bucket_path(spill_dir, bucket)) {
+        Ok(metadata) => Ok(metadata.len() > 0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("stat spill bucket in {}: {e}", spill_dir.display())),
+    }
 }
 
 /// A read position over a sidecar's bytes; every read is bounds-checked.
@@ -341,7 +325,7 @@ mod analysis_payload_tests {
         let mut bytes = vec![];
         write_analysis_entry(&mut bytes, 0, std::slice::from_ref(&field)).unwrap();
         std::fs::write(&path, bytes).unwrap();
-        let rows = read_analysis_file(&path).unwrap().fields;
+        let rows = read_analysis_file(&path).unwrap();
         std::fs::remove_file(path).unwrap();
         assert_eq!(
             rows[&0][0], field,
@@ -373,7 +357,7 @@ mod legacy_analysis_tests {
         bytes[16] &= 1;
         bytes.truncate(bytes.len() - 8);
         std::fs::write(&path, bytes).unwrap();
-        assert_eq!(read_analysis_file(&path).unwrap().fields[&9], vec![field]);
+        assert_eq!(read_analysis_file(&path).unwrap()[&9], vec![field]);
         std::fs::remove_file(path).unwrap();
     }
 }
