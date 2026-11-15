@@ -15,7 +15,9 @@ use pipestream_search::harness::{fit_calibration, seeded_index, unit_vectors};
 use pipestream_search::hnsw::HNSW;
 use pipestream_search::vector::{VectorIndex, EMBEDDED_TURBOVEC};
 
-use crate::collab_harness::jmh::{default_receipt_dir, Bench, TrialConfig, SCHEMA};
+use crate::collab_harness::jmh::{
+    default_receipt_dir, Bench, RemoveOnDrop, TrialConfig, FORK_ENV, SCHEMA,
+};
 
 const DIM: usize = 64;
 const ROWS: usize = 2_000;
@@ -79,6 +81,10 @@ fn validate(receipt: &Value, config: &TrialConfig) {
         sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
         "{sha}"
     );
+    assert!(
+        provenance["git_dirty"].is_boolean(),
+        "git_dirty is recorded"
+    );
     assert!(provenance["cpu_model"].is_string() || provenance["cpu_model"].is_null());
     assert!(provenance["rustflags"].is_string() || provenance["rustflags"].is_null());
     assert!(number(provenance, &["available_parallelism"]) >= 1.0);
@@ -113,6 +119,10 @@ fn validate(receipt: &Value, config: &TrialConfig) {
 fn dense_and_hnsw_search_receipts() {
     let config = TrialConfig::from_env(TrialConfig::smoke());
     let keep = std::env::var_os("COLLAB_JMH_RECEIPT_DIR").is_some();
+    // The parent owns the temporary receipt directory and removes it on
+    // every exit, panics included; forked children never touch it.
+    let parent = std::env::var_os(FORK_ENV).is_none();
+    let _remove = (parent && !keep).then(|| RemoveOnDrop(default_receipt_dir()));
     let dir = default_receipt_dir().join("dense-probe");
     let module = module_path!().split_once("::").expect("crate prefix").1;
     let bench = |name: &str| Bench {
@@ -141,7 +151,4 @@ fn dense_and_hnsw_search_receipts() {
     let path = dir.join(format!("dense-comparison-{}.json", std::process::id()));
     std::fs::write(&path, serde_json::to_string_pretty(&comparison).unwrap()).unwrap();
     eprintln!("dense probe receipts: {}", path.display());
-    if !keep {
-        std::fs::remove_dir_all(default_receipt_dir()).unwrap();
-    }
 }

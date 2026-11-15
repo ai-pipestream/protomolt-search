@@ -28,6 +28,7 @@ use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use pipestream_search::test_support::ForkGuarded;
 use serde_json::{json, Value};
 
 /// Names the benchmark a re-executed child must measure.
@@ -167,17 +168,37 @@ pub struct Summary {
     pub ci99: (f64, f64),
 }
 
-/// Two-sided 99% Student t critical values for 1 to 30 degrees of freedom.
+/// Two-sided 99% Student t critical values for 1 to 30 degrees of freedom,
+/// to three decimals.
 const T99: [f64; 30] = [
     63.657, 9.925, 5.841, 4.604, 4.032, 3.707, 3.499, 3.355, 3.250, 3.169, 3.106, 3.055, 3.012,
     2.977, 2.947, 2.921, 2.898, 2.878, 2.861, 2.845, 2.831, 2.819, 2.807, 2.797, 2.787, 2.779,
     2.771, 2.763, 2.756, 2.750,
 ];
 
+/// The 0.995 quantile of the standard normal distribution.
+const Z995: f64 = 2.575_829_303_548_900_4;
+
+/// Two-sided 99% Student t critical value. Past the table this is the
+/// Cornish-Fisher expansion of the t quantile in powers of `1 / df`
+/// through the fourth term; against the exact quantile its largest error
+/// for `df >= 31` is 3.0e-7, at `df = 31`.
 fn t99(degrees_of_freedom: usize) -> f64 {
-    T99.get(degrees_of_freedom.saturating_sub(1))
-        .copied()
-        .unwrap_or(2.576)
+    if let Some(value) = T99.get(degrees_of_freedom.saturating_sub(1)) {
+        return *value;
+    }
+    let (z, df) = (Z995, degrees_of_freedom as f64);
+    let terms = [
+        (z.powi(3) + z) / 4.0,
+        (5.0 * z.powi(5) + 16.0 * z.powi(3) + 3.0 * z) / 96.0,
+        (3.0 * z.powi(7) + 19.0 * z.powi(5) + 17.0 * z.powi(3) - 15.0 * z) / 384.0,
+        (79.0 * z.powi(9) + 776.0 * z.powi(7) + 1482.0 * z.powi(5)
+            - 1920.0 * z.powi(3)
+            - 945.0 * z)
+            / 92160.0,
+    ];
+    let correction: f64 = (1..).zip(terms).map(|(i, t)| t / df.powi(i)).sum();
+    z + correction
 }
 
 /// Nearest-rank percentile of an ascending, non-empty slice.
@@ -224,15 +245,25 @@ pub fn default_receipt_dir() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join(format!("collab-jmh-{}", std::process::id())))
 }
 
-/// Build-host and source facts recorded in every receipt.
-pub fn provenance() -> Value {
-    let git_sha = Command::new("git")
-        .args(["rev-parse", "HEAD"])
+/// Stdout of `git` run in the package root, through the fork guard so a
+/// sibling test's file locks never leak into the child.
+fn git(args: &[&str]) -> Option<String> {
+    Command::new("git")
+        .args(args)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
+        .output_guarded()
         .ok()
         .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Build-host and source facts recorded in every receipt. `git_dirty` is
+/// true when tracked files are modified or untracked files exist, so a
+/// receipt from uncommitted code never passes for one from `git_sha`.
+pub fn provenance() -> Value {
+    let git_sha = git(&["rev-parse", "HEAD"]).map(|sha| sha.trim().to_string());
+    let git_dirty = git(&["status", "--porcelain", "--untracked-files=normal"])
+        .map(|status| !status.trim().is_empty());
     let cpu_model = std::fs::read_to_string("/proc/cpuinfo")
         .ok()
         .and_then(|info| {
@@ -243,12 +274,37 @@ pub fn provenance() -> Value {
         });
     json!({
         "git_sha": git_sha,
+        "git_dirty": git_dirty,
         "cpu_model": cpu_model,
         "rustflags": std::env::var("RUSTFLAGS").ok().or(option_env!("RUSTFLAGS").map(String::from)),
         "available_parallelism": std::thread::available_parallelism().map_or(0, |n| n.get()),
         "measurement_threads": 1,
         "debug_assertions": cfg!(debug_assertions),
     })
+}
+
+/// Removes a file or directory tree when dropped, on success, on an early
+/// return and while unwinding from a panic alike.
+pub struct RemoveOnDrop(pub PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = if self.0.is_dir() {
+            std::fs::remove_dir_all(&self.0)
+        } else {
+            std::fs::remove_file(&self.0)
+        };
+    }
+}
+
+/// Thread-CPU over wall time; 0.0 rather than NaN when no wall time was
+/// measured.
+fn cpu_to_wall(cpu_mean: f64, wall_mean: f64) -> f64 {
+    if wall_mean > 0.0 {
+        cpu_mean / wall_mean
+    } else {
+        0.0
+    }
 }
 
 /// One forked benchmark. `test_path` is the libtest name of the test
@@ -283,6 +339,12 @@ impl Bench {
     }
 
     fn run_forks(&self) -> (PathBuf, Value) {
+        let (forks, iterations) = (self.config.forks, self.config.iterations);
+        assert!(
+            forks >= 1 && forks * iterations >= 2,
+            "{}: {forks} forks x {iterations} iterations gives no summary",
+            self.name
+        );
         std::fs::create_dir_all(&self.receipt_dir).expect("create receipt dir");
         let forks: Vec<ForkSamples> = (0..self.config.forks).map(|i| self.fork(i)).collect();
         let receipt = self.receipt(&forks);
@@ -300,6 +362,7 @@ impl Bench {
             self.name,
             std::process::id()
         ));
+        let _remove = RemoveOnDrop(out.clone());
         let child = Command::new(std::env::current_exe().expect("test binary path"))
             .args([
                 self.test_path.as_str(),
@@ -309,7 +372,7 @@ impl Bench {
             ])
             .env(FORK_ENV, &self.name)
             .env(FORK_OUT_ENV, &out)
-            .output()
+            .output_guarded()
             .expect("spawn fork");
         assert!(
             child.status.success(),
@@ -319,9 +382,8 @@ impl Bench {
             String::from_utf8_lossy(&child.stdout),
             String::from_utf8_lossy(&child.stderr),
         );
-        let samples = read_samples(&out);
-        let _ = std::fs::remove_file(&out);
-        samples.unwrap_or_else(|| panic!("fork {index} of {} wrote no samples", self.name))
+        read_samples(&out)
+            .unwrap_or_else(|| panic!("fork {index} of {} wrote no samples", self.name))
     }
 
     fn receipt(&self, forks: &[ForkSamples]) -> Value {
@@ -343,7 +405,7 @@ impl Bench {
             },
             "wall_ns_per_op": summary_json(&wall_s),
             "cpu_ns_per_op": summary_json(&cpu_s),
-            "cpu_to_wall_ratio": cpu_s.mean / wall_s.mean,
+            "cpu_to_wall_ratio": cpu_to_wall(cpu_s.mean, wall_s.mean),
             "forks": forks.iter().map(ForkSamples::to_json).collect::<Vec<_>>(),
         })
     }
@@ -366,8 +428,53 @@ fn summary_statistics_match_hand_computed_values() {
     let half = 3.250 * stddev / 10f64.sqrt();
     assert!((s.ci99.0 - (5.5 - half)).abs() < 1e-12);
     assert!((s.ci99.1 - (5.5 + half)).abs() < 1e-12);
-    assert_eq!(t99(1), 63.657);
-    assert_eq!(t99(500), 2.576);
+}
+
+#[test]
+fn t99_past_the_table_tracks_the_exact_student_t_quantile() {
+    assert_eq!((t99(1), t99(30)), (63.657, 2.750));
+    // Exact two-sided 99% quantiles, from the regularized incomplete beta.
+    let exact = [
+        (31, 2.744_042),
+        (40, 2.704_459),
+        (60, 2.660_283),
+        (120, 2.617_421),
+        (1_000, 2.580_755),
+        (100_000, 2.575_878),
+    ];
+    for (df, want) in exact {
+        let error = (t99(df) - want).abs();
+        assert!(error < 2e-6, "df {df}: off by {error}");
+    }
+    assert!(t99(31) < t99(30) && t99(1_000_000) > Z995);
+}
+
+#[test]
+fn guards_cover_cleanup_and_degenerate_trials() {
+    let path = std::env::temp_dir().join(format!("collab-jmh-guard-{}", std::process::id()));
+    std::fs::write(&path, b"x").unwrap();
+    let guarded = path.clone();
+    let unwound = std::panic::catch_unwind(move || {
+        let _remove = RemoveOnDrop(guarded);
+        panic!("child failed");
+    });
+    assert!(unwound.is_err() && !path.exists(), "removed on unwind");
+    assert_eq!(cpu_to_wall(5.0, 0.0), 0.0);
+    assert_eq!(cpu_to_wall(5.0, 10.0), 0.5);
+    let bench = Bench {
+        name: "degenerate".into(),
+        test_path: "unused".into(),
+        config: TrialConfig {
+            forks: 1,
+            warmup: 0,
+            iterations: 1,
+            target_batch_ns: 1,
+        },
+        receipt_dir: path,
+    };
+    let refused = std::panic::catch_unwind(|| bench.run_forks());
+    // One sample is refused before anything is created.
+    assert!(refused.is_err() && !bench.receipt_dir.exists());
 }
 
 #[test]

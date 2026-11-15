@@ -194,8 +194,8 @@ fn per_node(spans: &[CallSpan]) -> Vec<(String, Vec<(usize, String)>)> {
 /// Unary `Query`: every node sees, in order, a version probe pinning the
 /// read set, a statistics read when the coordinator's cache is `cold`,
 /// exactly one `shard_rpc`, one `FetchValues` for hit identities, and a
-/// closing version probe validating the pinned set. Each phase completes
-/// on every node before any node sees the next.
+/// closing version probe validating the pinned set. Each phase arrives in
+/// order and completes on every node before any node sees the next.
 fn assert_unary_fanout(spans: &[CallSpan], shard_rpc: &str, cold: bool) {
     let mut want = vec!["version", "stats", shard_rpc, "FetchValues", "version"];
     if !cold {
@@ -211,8 +211,31 @@ fn assert_unary_fanout(spans: &[CallSpan], shard_rpc: &str, cold: bool) {
     let phases: Vec<usize> = phase_of.iter().map(|(_, phase)| *phase).collect();
     assert!(
         phases.is_sorted(),
-        "a phase started before the last one finished: {phases:?}"
+        "a phase arrived before the last one did: {phases:?}"
     );
+    let phased: Vec<(usize, &CallSpan)> = phase_of
+        .iter()
+        .map(|(id, phase)| (*phase, spans.iter().find(|s| s.id == *id).unwrap()))
+        .collect();
+    assert_phase_barrier(&phased);
+}
+
+/// Every call of phase `p` ended no later than the first call of phase
+/// `p + 1` started.
+fn assert_phase_barrier(phased: &[(usize, &CallSpan)]) {
+    let last = phased.iter().map(|(phase, _)| *phase).max().unwrap_or(0);
+    for p in 0..last {
+        let of = |q: usize| phased.iter().filter(move |(phase, _)| *phase == q);
+        let ended = of(p).map(|(_, s)| s.end_ns.expect("closed")).max();
+        let next = of(p + 1).map(|(_, s)| s.start_ns).min();
+        if let (Some(ended), Some(next)) = (ended, next) {
+            assert!(
+                ended <= next,
+                "phase {p} ended at {ended} ns, after phase {} started at {next} ns",
+                p + 1
+            );
+        }
+    }
 }
 
 /// `QueryStream`: the unary execution runs over `Bm25QueryStream`, and
@@ -305,4 +328,38 @@ async fn cursor_pages_stitch_across_unary_and_streaming_calls() {
     }
     assert_eq!(pages, 3, "9 hits in pages of 4");
     assert_eq!(stitched, full, "pages stitch bitwise with absolute ranks");
+}
+
+fn synthetic(id: usize, start_ns: u64, end_ns: u64) -> CallSpan {
+    CallSpan {
+        id,
+        node: "shard0".into(),
+        method: "TermStats".into(),
+        start_ns,
+        end_ns: Some(end_ns),
+        request_bytes: 7,
+        request_messages: 1,
+        response_bytes: 7,
+        response_messages: 1,
+        grpc_status: Some(0),
+        outcome: Outcome::Finished,
+        first_request: Vec::new(),
+    }
+}
+
+#[test]
+fn the_phase_barrier_accepts_completed_phases() {
+    let (a, b, c) = (synthetic(0, 1, 5), synthetic(1, 2, 6), synthetic(2, 6, 9));
+    assert_phase_barrier(&[(0, &a), (0, &b), (1, &c)]);
+}
+
+#[test]
+#[should_panic(expected = "phase 0 ended at 10000 ns, after phase 1 started at 3 ns")]
+fn the_phase_barrier_rejects_a_phase_that_overlaps_the_next() {
+    let (a, b, c) = (
+        synthetic(0, 1, 2),
+        synthetic(1, 2, 10_000),
+        synthetic(2, 3, 4),
+    );
+    assert_phase_barrier(&[(0, &a), (0, &b), (1, &c)]);
 }

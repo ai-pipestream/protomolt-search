@@ -5,10 +5,13 @@
 //! route name, so it drops into `Server::add_service` unchanged. Each
 //! call opens a [`CallSpan`] in a shared [`TraceRecorder`] in arrival
 //! order and the request and response bodies are wrapped to count wire
-//! bytes and gRPC messages as they pass. The span closes when the
-//! response body ends ([`Outcome::Finished`], with the `grpc-status`
-//! trailer) or is dropped before its end ([`Outcome::Dropped`], for
-//! example on client cancellation). Nothing in `src/` is touched: the
+//! bytes and gRPC messages as they pass. The span closes as
+//! [`Outcome::Finished`] when the `grpc-status` trailer is handed to the
+//! transport, before the client can see it, so a later call that depends
+//! on the response always starts after this one ended. It closes as
+//! [`Outcome::Dropped`] when the response body, or the call itself before
+//! any response headers, is dropped first, as on client cancellation.
+//! Nothing in `src/` is touched: the
 //! node is served by [`serve_traced`], which mirrors
 //! `harness::serve_node` with the wrapper added.
 //!
@@ -255,6 +258,7 @@ impl CountingBody {
             let status = status_of(trailers);
             self.recorder
                 .update(self.id, |span, _| span.grpc_status = status);
+            self.close(Outcome::Finished);
         }
     }
 
@@ -305,6 +309,33 @@ impl Drop for CountingBody {
             Outcome::Dropped
         };
         self.close(outcome);
+    }
+}
+
+/// Closes a call's span as [`Outcome::Dropped`] if the call is dropped
+/// before it has response headers, unless disarmed first.
+struct PendingSpan {
+    recorder: Arc<TraceRecorder>,
+    id: usize,
+    armed: bool,
+}
+
+impl PendingSpan {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingSpan {
+    fn drop(&mut self) {
+        if self.armed {
+            self.recorder.update(self.id, |span, now| {
+                if span.outcome == Outcome::Open {
+                    span.end_ns = Some(now);
+                    span.outcome = Outcome::Dropped;
+                }
+            });
+        }
     }
 }
 
@@ -366,6 +397,11 @@ where
         };
         let request = request.map(|body| Body::new(counting(body, Side::Request)));
         let response = self.inner.call(request);
+        let pending = PendingSpan {
+            recorder: recorder.clone(),
+            id,
+            armed: true,
+        };
         Box::pin(async move {
             let response = response.await?;
             if let Some(status) = status_of(response.headers()) {
@@ -376,9 +412,13 @@ where
                     span.end_ns = Some(now);
                     span.outcome = Outcome::Finished;
                 });
+                pending.disarm();
                 return Ok(response);
             }
-            Ok(response.map(|body| Body::new(counting(body, Side::Response))))
+            let response = response.map(|body| Body::new(counting(body, Side::Response)));
+            // The response body owns the span from here.
+            pending.disarm();
+            Ok(response)
         })
     }
 }

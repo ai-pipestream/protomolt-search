@@ -62,9 +62,9 @@ impl Drop for Fixture {
 
 /// A seeded 512-row image on disk and a node holding 64 rows under the
 /// image's calibration.
-async fn fixture() -> Fixture {
+async fn fixture(tag: &str) -> Fixture {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("collab_seal_race_{}", std::process::id()));
+        .join(format!("collab_seal_race_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let corpus = unit_vectors(IMAGE_ROWS, DIM, 0x5EA1_0001);
     let (shift, scale) = fit_calibration(DIM, BITS, &corpus);
@@ -223,7 +223,7 @@ impl Fixture {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn flush_inside_a_parked_install_persists_the_pre_install_shard() {
-    let mut fx = fixture().await;
+    let mut fx = fixture("flush").await;
     let gen_tv = generation_vector(&generation_dir(&fx.node_tv));
 
     // Schedule 1: complete install.
@@ -262,4 +262,48 @@ async fn flush_inside_a_parked_install_persists_the_pre_install_shard() {
         recover_generation(&fx.node_tv),
         Some(generation_dir(&fx.node_tv))
     );
+}
+
+/// An install aborted by its client mid-stream, before any response
+/// headers, closes its span with an end time and leaves the shard as it
+/// was. Two transport orders are legitimate: the node sees the reset
+/// stream fail and answers with an error status (`Finished`, non-zero
+/// status), or the server drops the call first (`Dropped`, no status);
+/// `cancelled_call` pins the second path down deterministically.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_install_aborted_mid_stream_closes_its_span_and_keeps_the_shard() {
+    let mut fx = fixture("abort").await;
+    let gate = GateHook::new(WAIT);
+    let checkpoint = fx.recorder.checkpoint();
+    let stream = install_stream(fx.image.clone(), gate.clone(), false);
+    let mut client = fx.client.clone();
+    let call = tokio::spawn(async move { client.install_snapshot(stream).await });
+    gate.wait_until_entered(MID_STREAM).await.unwrap();
+    let parked = |spans: &[CallSpan]| spans.iter().any(|s| s.request_messages >= 2);
+    let spans = fx
+        .recorder
+        .wait_for(checkpoint, WAIT, parked)
+        .await
+        .unwrap();
+    assert_eq!(spans[0].outcome, Outcome::Open);
+    assert_eq!(spans[0].response_bytes, 0, "no response has started");
+
+    call.abort();
+    let closed = |spans: &[CallSpan]| spans.iter().all(|s| s.outcome != Outcome::Open);
+    let spans = fx
+        .recorder
+        .wait_for(checkpoint, WAIT, closed)
+        .await
+        .unwrap();
+    assert_eq!(spans.len(), 1);
+    let aborted = &spans[0];
+    assert_eq!(aborted.method, "InstallSnapshot");
+    assert!(aborted.end_ns.is_some_and(|end| end >= aborted.start_ns));
+    match aborted.outcome {
+        Outcome::Dropped => assert_eq!(aborted.grpc_status, None),
+        Outcome::Finished => assert!(aborted.grpc_status.is_some_and(|s| s != 0)),
+        Outcome::Open => unreachable!("waited for the span to close"),
+    }
+    gate.release(MID_STREAM);
+    assert_eq!(fx.rows_served().await, LIVE_ROWS as u64);
 }
