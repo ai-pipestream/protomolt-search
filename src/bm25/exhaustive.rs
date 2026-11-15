@@ -85,8 +85,8 @@ fn flat_with<M: Members>(query: &Flat<'_>, controls: &Controls<'_>) -> Vec<Score
 }
 
 /// The exactness oracle: walks every posting with its occurrence offsets
-/// and attaches them as it goes. Honors `k`, the chain, and the filter;
-/// the floor is left to the caller.
+/// and attaches them as it goes. Honors `k`, the chain, the filter, and a
+/// finite floor, which drops hits below it before ranking and truncation.
 pub(super) fn oracle(query: &Flat<'_>, controls: &Controls<'_>) -> Vec<ScoredDoc> {
     let Flat {
         store,
@@ -124,6 +124,7 @@ pub(super) fn oracle(query: &Flat<'_>, controls: &Controls<'_>) -> Vec<ScoredDoc
             score: controls.finish(score, doc_id),
             term_offsets,
         })
+        .filter(|doc| !controls.floor.is_finite() || doc.score >= controls.floor)
         .collect();
     docs.sort_by(|a, b| super::ranking::compare((a.doc_id, a.score), (b.doc_id, b.score)));
     docs.truncate(controls.k);

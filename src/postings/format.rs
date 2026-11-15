@@ -15,8 +15,8 @@ use super::Bm25Reader;
 /// pointers (`text_index` entries and directory run offsets) are relative
 /// to their section's start so sections survive relocation.
 pub(super) const MAGIC_V6: &[u8; 8] = b"TVBM2506";
-/// v7 layout: v6 plus a kinded per-document column table
-///. The header gains a
+/// v7 layout: v6 plus a kinded per-document column table.
+/// The header gains a
 /// column table after the field table (u32 n_columns, then per column:
 /// name, u8 kind, kind-specific payload); the column sections follow
 /// the last field group in table order. Kind 0 is a dictionary-encoded
@@ -37,8 +37,8 @@ pub(super) const MAGIC_V7: &[u8; 8] = b"TVBM2507";
 pub(super) const COLUMN_KIND_FACET: u8 = 0;
 /// v7 column-table kind: f64 numeric column (NaN = absent).
 pub(super) const COLUMN_KIND_F64: u8 = 1;
-/// v7 column-table kind: map<string, string> column
-///: key dict + value dict + per-doc
+/// v7 column-table kind: map<string, string> column:
+/// key dict + value dict + per-doc
 /// (key_ord, value_ord) pair lists behind a fixed-stride offsets
 /// section. ONE column regardless of key cardinality — the structural
 /// answer to the field-per-key explosion flattening causes.

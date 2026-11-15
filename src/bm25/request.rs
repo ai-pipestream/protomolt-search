@@ -208,7 +208,8 @@ pub fn top_k_fused<'a>(fields: &[FieldQuery], request: impl Into<TopK<'a>>) -> V
 }
 
 /// The single-field exactness oracle: walks every posting with offsets.
-/// Honors `k`, the chain, and the filter; ignores the floor and hooks.
+/// Honors `k`, the chain, the filter, and the floor (applied before
+/// truncating to `k`); ignores the hooks and skip accounting.
 pub fn top_k_exhaustive<'a>(
     store: &dyn Bm25Index,
     terms: &[String],

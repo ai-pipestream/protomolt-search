@@ -176,11 +176,13 @@ fn pruned_matches_exhaustive_property() {
                 floors.push(oracle[oracle.len() / 2].score); // mid-range
             }
             for floor in floors {
-                // Rounded-score ranking can order a raw score below the
-                // floor ahead of one above it, so filter before truncating.
-                let all = bm25::top_k_exhaustive(&store, &terms, &stats, params, usize::MAX);
-                let mut want = bm25::filter_to_floor(all, floor);
-                want.truncate(k);
+                let want = bm25::top_k_exhaustive(
+                    &store,
+                    &terms,
+                    &stats,
+                    params,
+                    bm25::TopK::new(k).floor(floor),
+                );
                 let mut prune = PruneStats::default();
                 let got = bm25::top_k(
                     &reader,
@@ -648,11 +650,13 @@ fn pruned_level1_scale_fuzz() {
                 floors.push(oracle[oracle.len() / 2].score); // mid-range
             }
             for floor in floors {
-                // Rounded-score ranking can order a raw score below the
-                // floor ahead of one above it, so filter before truncating.
-                let all = bm25::top_k_exhaustive(&store, &terms, &stats, params, usize::MAX);
-                let mut want = bm25::filter_to_floor(all, floor);
-                want.truncate(k);
+                let want = bm25::top_k_exhaustive(
+                    &store,
+                    &terms,
+                    &stats,
+                    params,
+                    bm25::TopK::new(k).floor(floor),
+                );
                 let mut prune = PruneStats::default();
                 let got = bm25::top_k(
                     &reader,

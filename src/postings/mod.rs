@@ -65,8 +65,8 @@ pub struct Posting {
     /// Occurrence spans `(start, end)` in original-text UTF-8 bytes
     /// (half-open). Empty when ingested with SCORING_ONLY term vectors.
     pub offsets: Vec<(u32, u32)>,
-    /// Token ordinal per occurrence, parallel to `offsets`
-    ///. Populated only in a field declared
+    /// Token ordinal per occurrence, parallel to `offsets`.
+    /// Populated only in a field declared
     /// positional; every other field stores none, so the payload costs
     /// nothing where nobody asked for it.
     pub positions: Vec<u32>,

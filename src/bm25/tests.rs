@@ -149,3 +149,86 @@ fn fused_single_field_matches_exhaustive_bitwise() {
         assert_eq!(f.term_offsets, mapped, "doc {}", w.doc_id);
     }
 }
+
+/// One numeric column per document, read by doc id; every other column
+/// kind is absent.
+struct Offsets(Vec<f64>);
+
+impl crate::scorefn::NumericRead for Offsets {
+    fn value(&self, _ni: usize, doc_id: u32) -> Option<f64> {
+        self.0.get(doc_id as usize).copied()
+    }
+    fn map_value(&self, _: usize, _: u32, _: u32) -> Option<f64> {
+        None
+    }
+    fn map_int_value(&self, _: usize, _: u32, _: u32) -> Option<i64> {
+        None
+    }
+    fn map_uint_value(&self, _: usize, _: u32, _: u32) -> Option<u64> {
+        None
+    }
+    fn int_value(&self, _: usize, _: u32) -> Option<i64> {
+        None
+    }
+    fn uint_value(&self, _: usize, _: u32) -> Option<u64> {
+        None
+    }
+    fn geo_value(&self, _: usize, _: u32) -> Option<(f64, f64)> {
+        None
+    }
+    fn facet_ord(&self, _: usize, _: u32) -> Option<u32> {
+        None
+    }
+    fn map_facet_value_ord(&self, _: usize, _: u32, _: u32) -> Option<u32> {
+        None
+    }
+}
+
+/// Two documents tie on the rounded wire score while their raw scores sit
+/// on either side of the floor, and the lower id holds the raw score below
+/// it. The oracle must drop that document before truncating to `k`, so
+/// the survivor above the floor is returned rather than nothing.
+#[test]
+fn exhaustive_oracle_floors_before_truncating_a_wire_tie() {
+    use crate::scorefn::{ColumnRef, ScoreChain, Stage, StageOp};
+    let mut store = Bm25Store::new();
+    for doc in 0..2 {
+        let analyzed = AnalyzedDoc::body(vec![("x".into(), 1, vec![(0, 1)])], 1);
+        store.add_document(doc, "x".into(), analyzed);
+    }
+    let stats = CorpusStats {
+        doc_count: 2,
+        total_doc_length: 2,
+        dfs: vec![2],
+    };
+    let terms = vec!["x".to_string()];
+    let columns = Offsets(vec![0.0, 1e-12]);
+    let chain = ScoreChain {
+        stages: vec![Stage {
+            op: StageOp::AddLinear { weight: 1.0 },
+            column: Some(ColumnRef::Numeric(0)),
+            min_max: (0.0, 1e-12),
+        }],
+    };
+    let ctx: ChainCtx = Some((&chain, &columns));
+    let all = top_k_exhaustive(
+        &store,
+        &terms,
+        &stats,
+        Bm25Params::default(),
+        TopK::new(2).chain(ctx),
+    );
+    let (low, high) = (all[0].score, all[1].score);
+    assert_eq!((all[0].doc_id, all[1].doc_id), (0, 1));
+    assert!(
+        low < high && low as f32 == high as f32,
+        "fixture must tie on the wire"
+    );
+    let request = TopK::new(1).chain(ctx).floor(high);
+    let hits = top_k_exhaustive(&store, &terms, &stats, Bm25Params::default(), request);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        (hits[0].doc_id, hits[0].score.to_bits()),
+        (1, high.to_bits())
+    );
+}

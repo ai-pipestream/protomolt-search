@@ -250,28 +250,29 @@ fn fused_pruned_matches_fused_exhaustive_property() {
             let w_body = weights[rng.below(5) as usize];
             let w_name = weights[rng.below(5) as usize];
             let k = 1 + rng.below(40) as usize;
-            let oracle = bm25::top_k_fused_exhaustive(
-                &[
-                    FieldQuery {
-                        index: &store.field(0),
-                        terms: &body_terms,
-                        stats: body_stats.clone(),
-                        params: body_params,
-                        weight: w_body,
-                    },
-                    FieldQuery {
-                        index: &store.field(1),
-                        terms: &name_terms,
-                        stats: name_stats.clone(),
-                        params: name_params,
-                        weight: w_name,
-                    },
-                ],
-                k,
-                None,
-            );
+            let store_fields = [
+                FieldQuery {
+                    index: &store.field(0),
+                    terms: &body_terms,
+                    stats: body_stats.clone(),
+                    params: body_params,
+                    weight: w_body,
+                },
+                FieldQuery {
+                    index: &store.field(1),
+                    terms: &name_terms,
+                    stats: name_stats.clone(),
+                    params: name_params,
+                    weight: w_name,
+                },
+            ];
+            let oracle = bm25::top_k_fused_exhaustive(&store_fields, k, None);
             for floor in floor_palette(&oracle, k) {
-                let want = bm25::filter_fused_to_floor(oracle.clone(), floor);
+                let want = bm25::top_k_fused_exhaustive(
+                    &store_fields,
+                    bm25::TopK::new(k).floor(floor),
+                    None,
+                );
                 let mut prune = PruneStats::default();
                 let got = bm25::top_k_fused(
                     &[

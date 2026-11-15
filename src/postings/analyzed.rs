@@ -28,8 +28,8 @@ pub struct AnalyzedField {
     pub positions: Option<DocPositions>,
     /// Sentence spans of the field's text in UTF-8 bytes, sorted and
     /// non-overlapping, or `None` when the analysis carried no sentence
-    /// layer. A sentence field refuses a `None` document by name
-    ///; every occurrence must lie inside one
+    /// layer. A sentence field refuses a `None` document by name;
+    /// every occurrence must lie inside one
     /// sentence, which [`Self::check_sentences`] enforces at ingest so
     /// the query path can trust the table.
     pub sentences: Option<Vec<(u32, u32)>>,
@@ -126,22 +126,22 @@ impl AnalyzedField {
 pub struct AnalyzedDoc {
     /// Per-field analyzed data, indexed by field id.
     pub fields: Vec<AnalyzedField>,
-    /// The body's cased term identity from the SAME analysis pass
-    ///, when the ingest asked for one: the same
+    /// The body's cased term identity from the SAME analysis pass,
+    /// when the ingest asked for one: the same
     /// tokens under the same chain minus case folding, spans and
     /// ordinals coinciding with the body's. The node places it at the
     /// field the request named; it is never a second analysis.
     pub cased: Option<AnalyzedField>,
     /// Per-document quality scalars from the sidecar's noise and
-    /// artifact layers, when the ingest asked for them
-    ///. `None` means they were not
+    /// artifact layers, when the ingest asked for them.
+    /// `None` means they were not
     /// requested, which is deliberately distinct from a clean document
     /// (all zeros): the ingest writes a column only when it has a real
     /// measurement for it.
     pub quality: Option<DocQuality>,
     /// Per-document geography reduction from the sidecar's geocoding
-    /// layer, when the ingest asked for it
-    ///. `None` means not requested;
+    /// layer, when the ingest asked for it.
+    /// `None` means not requested;
     /// `Some` with empty fields means measured-and-found-nothing,
     /// which materializes as column ABSENCE (there is no neutral
     /// coordinate to write).

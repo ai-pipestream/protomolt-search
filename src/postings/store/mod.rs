@@ -39,16 +39,16 @@ pub(in crate::postings) struct FieldStore {
     pub(in crate::postings) doc_lengths: Vec<u32>,
     /// Sum of this field's document lengths (for avgdl).
     pub(in crate::postings) total_length: u64,
-    /// Whether this field keeps token positions per occurrence
-    ///. Declared at construction (or read
+    /// Whether this field keeps token positions per occurrence.
+    /// Declared at construction (or read
     /// from the file's kind-7 entry); a positional field refuses a
     /// document without positions instead of storing a hole.
     positions: bool,
     /// Whether at least one document in this positional field carried
     /// token-lattice arc lengths (`COLUMN_KIND_POS_LENGTHS`).
     has_lattice: bool,
-    /// Whether this field keeps sentence spans per document
-    ///, declared at construction or read from
+    /// Whether this field keeps sentence spans per document,
+    /// declared at construction or read from
     /// the file's kind-8 entry.
     sentences: bool,
     /// Per-document sentence spans, indexed by local doc id, populated
@@ -237,8 +237,8 @@ impl Bm25Store {
             .collect()
     }
 
-    /// Declare the fields that keep sentence spans per document
-    ///. Must precede any document, and every
+    /// Declare the fields that keep sentence spans per document.
+    /// Must precede any document, and every
     /// name must be in the field table.
     pub fn with_sentences(mut self, names: &[&str]) -> Self {
         assert!(

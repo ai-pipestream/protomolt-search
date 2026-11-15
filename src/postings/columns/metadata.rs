@@ -33,8 +33,8 @@ pub struct StoredBinding {
     pub index_contract: Vec<u8>,
 }
 
-/// The index's derived-column declaration as a store persists it
-///: the kind-17 column-table entry. A store
+/// The index's derived-column declaration as a store persists it:
+/// the kind-17 column-table entry. A store
 /// pairs with one declaration; where it is attached, a differing
 /// fingerprint is an index compatibility event, refused by name.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

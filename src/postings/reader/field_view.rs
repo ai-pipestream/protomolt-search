@@ -4,8 +4,8 @@ use super::super::codec::{FileImpacts, ImpactCursor};
 use super::super::{AnalyzedField, Bm25Index, DocLineage, DocPositions, DocTerms, PostingCallback};
 use super::{Bm25Reader, FieldSlice};
 
-/// One field of an open `.bm25` file as its own [`Bm25Index`]
-///: directory lookups, postings walks, and
+/// One field of an open `.bm25` file as its own [`Bm25Index`]:
+/// directory lookups, postings walks, and
 /// impact cursors run against the field's sections; texts, lineages,
 /// and the document count are the file's shared ones.
 #[derive(Clone, Copy)]
@@ -548,8 +548,7 @@ impl FieldView<'_> {
     /// Binary search to the prefix's lower bound, then scan forward
     /// while the prefix holds, calling `visit(ordinal, directory index,
     /// term bytes)` on each match; returns the exact match count.
-    /// O(log n) plus O(matches), never the whole dictionary
-    ///.
+    /// O(log n) plus O(matches), never the whole dictionary.
     fn scan_prefix(&self, prefix: &str, mut visit: impl FnMut(usize, u32, &[u8])) -> usize {
         let n = self.field.n_terms;
         let mut count = 0usize;

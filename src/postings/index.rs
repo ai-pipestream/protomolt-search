@@ -67,8 +67,8 @@ pub trait Bm25Index {
     fn text(&self, doc_id: u32) -> Option<String>;
     /// The lineage of a document, if ingested with one.
     fn lineage(&self, doc_id: u32) -> Option<DocLineage>;
-    /// Whether this field keeps token positions
-    ///. A phrase or proximity query on a
+    /// Whether this field keeps token positions.
+    /// A phrase or proximity query on a
     /// field answering false is refused by name; nothing approximates
     /// it from character offsets.
     fn has_positions(&self) -> bool {
@@ -128,8 +128,8 @@ pub trait Bm25Index {
     ) {
         (Vec::new(), initial_floor.max(0.0), Default::default())
     }
-    /// Whether this field stores sentence spans per document
-    ///. Sentence-mode snippets over a field
+    /// Whether this field stores sentence spans per document.
+    /// Sentence-mode snippets over a field
     /// answering false refuse by name.
     fn has_sentences(&self) -> bool {
         false
@@ -150,8 +150,8 @@ pub trait Bm25Index {
     fn expand_prefix(&self, prefix: &str, cap: usize) -> Result<Vec<String>, usize>;
     /// Every term of this field starting with `prefix` with its posting
     /// document frequency, in byte order, when there are at most
-    /// `max_scan` of them; `Err(count)` with the exact count otherwise
-    ///. The df is the posting list's length as
+    /// `max_scan` of them; `Err(count)` with the exact count otherwise.
+    /// The df is the posting list's length as
     /// stored — tombstoned rows included until compaction — so it costs
     /// one directory read per term and no posting walk. The scan is the
     /// prefix scan: lower bound, then forward while the prefix holds,
