@@ -196,7 +196,7 @@ impl ClockedTail {
 /// Ids are assigned monotonically per shard and appended in assignment
 /// order, so within each bucket file ids ascend and the cut is a prefix
 /// cut. Markers carry no id and are untouched. A torn tail is left for
-/// [`WalWriter::resume`], which truncates it anyway.
+/// [`WalWriter::resume`](super::WalWriter::resume), which truncates it anyway.
 pub fn truncate_records_at_or_above(gen_dir: &Path, cutoff_id: u64) -> io::Result<u64> {
     let mut dropped = 0u64;
     for entry in std::fs::read_dir(gen_dir)? {

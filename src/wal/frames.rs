@@ -108,7 +108,7 @@ impl RecordReader {
 
     /// Resume a sequential read at `offset`, where the next frame carries
     /// seq `next_seq` — the position a previous reader stopped at
-    /// ([`ClockedTail`]). Validation continues from there exactly as a
+    /// ([`ClockedTail`](super::ClockedTail)). Validation continues from there exactly as a
     /// read from the start would.
     pub fn open_at(path: &Path, offset: u64, next_seq: u64) -> io::Result<Self> {
         let mut file = File::open(path)?;
