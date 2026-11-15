@@ -159,7 +159,14 @@ impl CoordinatorServiceImpl {
     async fn execute_bm25_round(&self, round: PreparedRound<'_>) -> Result<AggregatedHits, Status> {
         let stream_enabled = self.bm25_stream && round.phrase.is_none();
         let relay = stream_enabled
-            .then(|| watch::channel(round.request.min_score))
+            .then(|| {
+                let floor = if round.request.min_score == 0.0 {
+                    f32::NEG_INFINITY
+                } else {
+                    round.request.min_score
+                };
+                watch::channel(floor)
+            })
             .map(|(tx, rx)| (Arc::new(tx), rx));
         let stream_heap = stream_enabled.then(|| {
             Arc::new(Mutex::new(Bm25StreamHeap {
@@ -243,15 +250,11 @@ impl CoordinatorServiceImpl {
         fingerprint: Option<&String>,
     ) {
         if let (Some(heap), Some(fingerprint)) = (heap, fingerprint) {
-            let snapshot = heap
-                .lock()
-                .expect("BM25 stream heap poisoned")
-                .heap
-                .iter()
-                .map(|entry| (entry.0.vector_id, entry.0.score))
-                .collect();
-            self.publish_progress(
-                crate::pb::QueryStreamPhase::Lexical,
+            let snapshot = super::lexical_stream::lexical_snapshot(
+                &heap.lock().expect("BM25 stream heap poisoned"),
+            );
+            super::lexical_stream::publish_lexical_progress(
+                self.query_progress.as_deref(),
                 snapshot,
                 fingerprint.clone(),
             );
@@ -327,7 +330,7 @@ pub(super) fn finish_bm25_hits(
         let winners: Vec<MergedHit> = {
             let state = stream_heap.lock().expect("BM25 stream heap poisoned");
             let mut winners: Vec<MergedHit> = state.heap.iter().map(|entry| entry.0).collect();
-            winners.sort_by(cmp_hits);
+            winners.sort_by(crate::merge::cmp_lexical_hits);
             winners
         };
         let mut details: HashMap<(u32, u64), Bm25Hit> = all
@@ -359,8 +362,8 @@ pub(super) fn finish_bm25_hits(
                 .collect::<Result<_, _>>()?;
     } else {
         all.sort_by(|(sa, a), (sb, b)| {
-            b.score
-                .total_cmp(&a.score)
+            (b.score + 0.0)
+                .total_cmp(&(a.score + 0.0))
                 .then_with(|| sa.cmp(sb))
                 .then_with(|| a.doc_id.cmp(&b.doc_id))
         });

@@ -1,12 +1,9 @@
 //! BM25 term/phrase queries, rescoring, highlighting, and dictionary scans.
 
 use crate::node::*;
+use crate::scorefn::NumericRead;
 
-/// Identity of one BM25 score space. The canonical request keeps only
-/// fields that can change a document's score; delivery depth, floors,
-/// filters, projections, aggregations, and the per-shard epoch claim are
-/// excluded so every shard in one globally scored round reports the same
-/// value.
+/// Identify the score space, excluding delivery, filters, projections, and epoch claims.
 pub(in crate::node) fn bm25_scoring_fingerprint(req: &Bm25QueryRequest) -> String {
     let mut canonical = req.clone();
     canonical.k = 0;
@@ -24,13 +21,7 @@ pub(in crate::node) fn bm25_scoring_fingerprint(req: &Bm25QueryRequest) -> Strin
     crate::sha256::hex_digest(&prost::Message::encode_to_vec(&canonical))
 }
 
-/// The explain breakdown of one scored document (docs/explain.md):
-/// each present (field, term) pair's inputs and contribution, computed
-/// with the scorers' own `idf` and `tf_norm` in the scorers' own
-/// operand order, and the pre-stage sum recomposed from them in
-/// accumulation order. `names[fi]` is the field name reported for
-/// `fields[fi]`; `phrase` is the phrase leg's view index and parallel
-/// term weights when the phrase scorer ran.
+/// Explain term contributions in scoring order, with optional phrase weights.
 pub(in crate::node) fn explain_terms(
     fields: &[bm25::FieldQuery<'_>],
     names: &[&str],
@@ -84,9 +75,7 @@ pub(in crate::node) fn explain_terms(
     }
 }
 
-/// The score-stage rows of an explain breakdown: the chain replayed
-/// stage by stage from the pre-stage sum with the same reads and the
-/// same float expressions `ScoreChain::eval` uses.
+/// Replay the score chain using the scorer's column reads and arithmetic.
 fn explain_stages(
     explain: &mut crate::pb::Bm25Explain,
     chain: &crate::scorefn::ScoreChain,
@@ -212,16 +201,7 @@ impl NodeServiceImpl {
     }
 }
 
-/// Request-carried BM25 params: 0 selects the default (proto3 "absent").
-///
-/// Values are RANGE CHECKED, not just defaulted. `b` outside [0, 1]
-/// breaks the monotonicity precondition the block-max bounds rest on
-/// (see `postings::SkipRun`), so a bound can fall below a real score and
-/// the pruned scorer silently drops hits the exhaustive one keeps. A NaN
-/// is worse: BM25's `partial_cmp(..).unwrap_or(Equal)` degrades to
-/// insertion order, which makes the ranking depend on shard layout. Both
-/// arrive straight off the wire, so both are refused here rather than
-/// discovered as an unreproducible ranking difference.
+/// Validate BM25 parameters required for sound bounds; zero selects the default.
 pub(in crate::node) fn params_from(k1: f32, b: f32) -> Result<Bm25Params, Status> {
     if !k1.is_finite() || k1 < 0.0 {
         return Err(Status::invalid_argument(format!(
@@ -247,11 +227,7 @@ pub(in crate::node) fn params_from(k1: f32, b: f32) -> Result<Bm25Params, Status
     })
 }
 
-/// Validate a request's `HighlightSpec` against this shard's storage
-/// (`docs/highlighting.md`): every named field must be the one with
-/// stored text (the body), and sentence mode needs the body's kind-8
-/// table. Both refuse by name before any hit is scored, so a shard with
-/// no matching document refuses exactly like one with a thousand.
+/// Validate highlight fields and the sentence table required by sentence mode.
 pub(in crate::node) fn highlight_plan(
     store: &Bm25Shard,
     spec: Option<&crate::pb::HighlightSpec>,
@@ -279,9 +255,7 @@ pub(in crate::node) fn highlight_plan(
     Ok(Some(plan))
 }
 
-/// Cut one hit's snippets from the shard's stored text and sentence
-/// table, around the occurrence spans the scorer already collected
-/// (`(distinct term key, span)` pairs). No analyzer runs here.
+/// Cut snippets from stored text and scored offsets without rerunning analysis.
 pub(in crate::node) fn cut_snippets(
     plan: &crate::highlight::Plan,
     index: &dyn Bm25Index,
@@ -326,11 +300,6 @@ pub(in crate::node) fn cut_snippets(
         })
         .collect())
 }
-
-// The synchronous BM25 scan bodies. The `NodeService` handlers wrap
-// these in `spawn_blocking`: a postings walk is CPU-bound for as long
-// as the highest-df term takes, and it must not occupy an async runtime
-// worker -- the same discipline every vector scan path follows.
 
 impl NodeServiceImpl {
     pub(in crate::node) fn run_bm25_query(
@@ -394,10 +363,7 @@ impl NodeServiceImpl {
         )
     }
 
-    /// [`Self::run_bm25_query`] with a mid-scan floor exchange for the
-    /// streaming route. Only the flat pruned scorer consumes the hook;
-    /// the fused multi-field route and the exhaustive fallbacks ignore
-    /// it (no skip surface, so a mid-scan floor saves nothing there).
+    /// Execute lexical scoring with optional live floors and compact candidates.
     pub(in crate::node) fn run_bm25_query_live(
         &self,
         req: Bm25QueryRequest,
@@ -409,8 +375,6 @@ impl NodeServiceImpl {
                 "min_score must be finite (NaN and -inf are not valid floors)",
             ));
         }
-        // Fused multi-field legs replace the flat single-field query
-        // (docs/multi-field.md).
         if !req.fields.is_empty() {
             if !req.score_stages.is_empty() {
                 return Err(Status::invalid_argument(
@@ -420,430 +384,7 @@ impl NodeServiceImpl {
             }
             return self.bm25_query_fused(&req, None, live, candidate);
         }
-        let stage_specs = parse_score_stages(&req.score_stages)?;
-        validate_range_facet_fields(&req.range_facet_fields)?;
-        let geo_regions = validate_geo_filters(&req.geo_filters)?;
-        if let Some(f) = req.filter.as_ref() {
-            crate::filter::validate_filter(f)?;
-        }
-        let params = params_from(req.k1, req.b)?;
-        let stats = bm25::CorpusStats {
-            doc_count: req.global_doc_count,
-            total_doc_length: req.global_total_doc_length,
-            dfs: req.global_doc_frequencies.clone(),
-        };
-        if req.terms.len() != stats.dfs.len() {
-            return Err(Status::invalid_argument(
-                "terms and global_doc_frequencies must have the same length",
-            ));
-        }
-        let guard = read_shard(&self.state);
-        guard.check_stats_epoch(req.expected_stats_epoch, &req.expected_stats_incarnation)?;
-        guard.check_query_analysis("body", req.analysis_fingerprint)?;
-        // The request's filters, resolved ONCE against this shard's
-        // tables and shared by facet counting and the scorers below —
-        // one resolution, one truth (docs/geo-columns.md,
-        // docs/cel-filters.md). `None` when the request has none, and
-        // every path below is then bit-identical to its unfiltered
-        // form.
-        let doc_filter: Option<crate::filter::DocFilter<'_>> = match guard.bm25.as_ref() {
-            Some(store)
-                if !req.geo_filters.is_empty()
-                    || req.filter.is_some()
-                    || req.phrase.is_some()
-                    || guard.live_docs.has_deletes() =>
-            {
-                // The flat route's phrase gate over the body
-                // (docs/phrase-proximity.md); same contract as the fused
-                // route's per-leg gate.
-                let mut phrase = Vec::new();
-                if let Some(constraint) = req.phrase.as_ref() {
-                    let index = store.as_index().ok_or_else(|| {
-                        Status::failed_precondition("bm25 bulk build in progress; Flush first")
-                    })?;
-                    if !index.has_positions() {
-                        return Err(Status::failed_precondition(
-                            "field \"body\" has no token positions on this shard; a phrase or \
-                             slop query needs --position-fields=body and a rebuilt generation",
-                        ));
-                    }
-                    crate::proximity::validate_leg(constraint, req.terms.len())
-                        .map_err(Status::invalid_argument)?;
-                    phrase.push(crate::filter::PhraseGate {
-                        index,
-                        terms: &req.terms,
-                        sequence: constraint.sequence.iter().map(|&i| i as usize).collect(),
-                        alternatives: constraint
-                            .alternatives
-                            .iter()
-                            .map(|p| p.terms.iter().map(|&i| i as usize).collect())
-                            .collect(),
-                        slop: constraint.slop,
-                    });
-                }
-                Some(crate::filter::DocFilter {
-                    deleted: guard.live_docs.words(),
-                    geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
-                    pred: req
-                        .filter
-                        .as_ref()
-                        .map(|f| store.resolve_filter(f))
-                        .transpose()?,
-                    phrase,
-                })
-            }
-            _ => None,
-        };
-        // Sealed segments the predicate rules out (docs/segment-pruning.md)
-        // leave the postings walks below: the scorers and the facet
-        // counts take the masked reader, whose per-document reads still
-        // cover the whole shard.
-        let prune = match guard.bm25.as_ref() {
-            Some(store) => prune_segments(
-                store,
-                doc_filter.as_ref().and_then(|f| f.pred.as_ref()),
-                self.knobs.segment_pruning(),
-            ),
-            None => SegmentPrune::default(),
-        };
-        let masked_index = match (guard.bm25.as_ref(), prune.mask.as_ref()) {
-            (Some(Bm25Shard::Segmented(segmented)), Some(mask)) => {
-                Some(segmented.masked(Arc::clone(mask)))
-            }
-            _ => None,
-        };
-        // Count-then-rank facets over the match set — term matches
-        // that survive the filters — before any k/floor narrowing
-        // (see count_facets). A shard with no lexical half has no
-        // facet table: every requested field is legitimately unknown
-        // here.
-        let (facets, range_facets, column_stats, distinct) = match guard.bm25.as_ref() {
-            Some(store)
-                if !req.facet_fields.is_empty()
-                    || !req.map_facet_fields.is_empty()
-                    || !req.range_facet_fields.is_empty()
-                    || !req.stats_fields.is_empty()
-                    || !req.cardinality_fields.is_empty() =>
-            {
-                let index: &dyn Bm25Index = match masked_index.as_ref() {
-                    Some(masked) => masked,
-                    None => store.as_index().ok_or_else(|| {
-                        Status::failed_precondition("bm25 bulk build in progress; Flush first")
-                    })?,
-                };
-                let numeric_read = ShardNumericRead(store);
-                let filter_ctx: bm25::FilterCtx = doc_filter
-                    .as_ref()
-                    .map(|f| (f, &numeric_read as &dyn crate::scorefn::NumericRead));
-                store.count_facets(
-                    &[(index, &req.terms)],
-                    &req.facet_fields,
-                    &req.map_facet_fields,
-                    &req.range_facet_fields,
-                    &req.stats_fields,
-                    &req.cardinality_fields,
-                    filter_ctx,
-                )?
-            }
-            _ => (
-                req.facet_fields
-                    .iter()
-                    .map(|name| (name.clone(), None))
-                    .chain(
-                        req.map_facet_fields
-                            .iter()
-                            .map(|m| (m.column.clone(), Some(m.key.clone()))),
-                    )
-                    .map(|(field, key)| crate::pb::FacetFieldCounts {
-                        field,
-                        known: false,
-                        counts: Vec::new(),
-                        key: key.clone().unwrap_or_default(),
-                        map_key: key,
-                    })
-                    .collect(),
-                unknown_range_counts(&req.range_facet_fields),
-                req.stats_fields
-                    .iter()
-                    .map(|name| crate::pb::ColumnStats {
-                        field: name.clone(),
-                        known: false,
-                        ..Default::default()
-                    })
-                    .collect(),
-                req.cardinality_fields
-                    .iter()
-                    .map(|name| crate::pb::FacetDistinct {
-                        field: name.clone(),
-                        known: false,
-                        values: Vec::new(),
-                    })
-                    .collect(),
-            ),
-        };
-        // Which stage columns this shard's numeric table has —
-        // computed regardless of k, like the facet known flags: a
-        // shard lacking a column answers identity (exact), and the
-        // coordinator refuses a column NO shard knows.
-        let stage_columns_known: Vec<bool> = match guard.bm25.as_ref() {
-            Some(Bm25Shard::Spilling(_)) if !stage_specs.is_empty() => {
-                return Err(Status::failed_precondition(
-                    "bm25 bulk build in progress; Flush first",
-                ));
-            }
-            Some(store) => store
-                .resolve_chain(&stage_specs)
-                .stages
-                .iter()
-                .map(|stage| stage.column.is_some())
-                .collect(),
-            None => vec![false; stage_specs.len()],
-        };
-        // Which geo columns this shard has, computed regardless of k
-        // for the same reason: a shard without the column contributes
-        // no hits through the filter (exact — its documents hold no
-        // locations), but a column NO shard knows must refuse.
-        let geo_columns_known = match guard.bm25.as_ref() {
-            Some(store) => store.geo_columns_known(&req.geo_filters),
-            None => vec![false; req.geo_filters.len()],
-        };
-        // And the filter tree's per-leaf flags, same contract.
-        let filter_columns_known = match (guard.bm25.as_ref(), req.filter.as_ref()) {
-            (Some(store), Some(f)) => store.filter_columns_known(f),
-            (None, Some(f)) => vec![false; crate::filter::leaf_count(f)],
-            (_, None) => Vec::new(),
-        };
-        // Projection column-read leaves, same contract again: a leaf
-        // this shard lacks reads absent (exact), a leaf NO shard knows
-        // is a typo the coordinator refuses (docs/cel-values.md).
-        let projection_leaves: Vec<crate::values::ValueLeaf> = {
-            let mut leaves = Vec::new();
-            for p in &req.projections {
-                if let Some(expr) = p.expr.as_ref() {
-                    crate::values::column_leaves(expr, &mut leaves);
-                }
-            }
-            leaves
-        };
-        let projection_leaves_known: Vec<bool> = match guard.bm25.as_ref() {
-            Some(store) => projection_leaves
-                .iter()
-                .map(|leaf| crate::values::leaf_known(leaf, store))
-                .collect(),
-            None => vec![false; projection_leaves.len()],
-        };
-        // Resolve independently of k and matches so empty shards still
-        // participate in the distributed type agreement. Even a shard with
-        // no lexical store validates literal expressions and malformed trees.
-        let empty_columns = crate::values::NumericTypes {
-            numerics: &[],
-            integers: &[],
-            unsigned_integers: &[],
-            map_numerics: &[],
-            map_integers: &[],
-            map_unsigned_integers: &[],
-            facets: &[],
-        };
-        let columns: &dyn crate::values::ColumnLookup = match guard.bm25.as_ref() {
-            Some(store) => store,
-            None => &empty_columns,
-        };
-        let (resolved_projections, projection_types): (Vec<_>, Vec<i32>) = req
-            .projections
-            .iter()
-            .map(|p| {
-                let expr = p.expr.as_ref().ok_or_else(|| {
-                    Status::invalid_argument("projection: empty compiled expression")
-                })?;
-                crate::values::resolve(expr, columns)
-                    .map(|(rv, ty)| (rv, crate::pb::ScalarValueType::from(ty) as i32))
-            })
-            .collect::<Result<Vec<_>, Status>>()?
-            .into_iter()
-            .unzip();
-        let hits = match guard.bm25.as_ref() {
-            Some(store) if req.k > 0 => {
-                let index: &dyn Bm25Index = match masked_index.as_ref() {
-                    Some(masked) => masked,
-                    None => store.as_index().ok_or_else(|| {
-                        Status::failed_precondition("bm25 bulk build in progress; Flush first")
-                    })?,
-                };
-                // 0/absent means no supplied score floor (scores are positive).
-                let floor = if req.min_score == 0.0 {
-                    f64::NEG_INFINITY
-                } else {
-                    f64::from(req.min_score)
-                };
-                // The score-function chain, resolved against this
-                // shard's numeric table (docs/score-functions.md).
-                // With no stages the ctx is None and every scorer below
-                // is bit-identical to its unchained form.
-                let chain = store.resolve_chain(&stage_specs);
-                let numeric_read = ShardNumericRead(store);
-                let chain_ctx: bm25::ChainCtx = if stage_specs.is_empty() {
-                    None
-                } else {
-                    Some((&chain, &numeric_read))
-                };
-                // The filters resolved above, paired with this arm's
-                // read surface (docs/geo-columns.md,
-                // docs/cel-filters.md).
-                let filter_ctx: bm25::FilterCtx = doc_filter
-                    .as_ref()
-                    .map(|f| (f, &numeric_read as &dyn crate::scorefn::NumericRead));
-                // Block-max path when every scored term has impacts (v5
-                // shards) and the node flag allows it; the heap store,
-                // v3/v4 files, and --block-max=false keep top_k with the
-                // floor applied as a filter — same contract.
-                let prunable = self.config.block_max
-                    && req
-                        .terms
-                        .iter()
-                        .enumerate()
-                        // Local absence is not a missing impact surface:
-                        // see top_k_pruned. Global df alone would forfeit
-                        // pruning on every shard lacking a rare term.
-                        .all(|(ti, t)| {
-                            stats.dfs[ti] == 0 || index.df(t) == 0 || index.has_impacts(t)
-                        });
-                let docs = if prunable {
-                    let mut prune = bm25::PruneStats::default();
-                    bm25::top_k_pruned_chained_filtered_stats_streaming(
-                        index,
-                        &req.terms,
-                        &stats,
-                        params,
-                        req.k as usize,
-                        floor,
-                        chain_ctx,
-                        filter_ctx,
-                        &mut prune,
-                        live,
-                        candidate,
-                    )
-                } else {
-                    let docs = bm25::filter_to_floor(
-                        bm25::top_k_chained_filtered(
-                            index,
-                            &req.terms,
-                            &stats,
-                            params,
-                            req.k as usize,
-                            chain_ctx,
-                            filter_ctx,
-                        ),
-                        floor,
-                    );
-                    if let Some(sink) = candidate {
-                        for doc in &docs {
-                            sink(doc.doc_id, doc.score as f32);
-                        }
-                    }
-                    docs
-                };
-                let highlight = highlight_plan(store, req.highlight.as_ref())?;
-                let body = store.field_name(0);
-                // The explain breakdown, only for the hits that survived
-                // the top-k (docs/explain.md): the flat route is one
-                // field at weight 1 in the fused scorer's terms.
-                let flat_query = [bm25::FieldQuery {
-                    index,
-                    terms: &req.terms,
-                    stats: stats.clone(),
-                    params,
-                    weight: 1.0,
-                }];
-                let presence = req.explain.then(|| {
-                    let ids: Vec<u32> = docs.iter().map(|doc| doc.doc_id).collect();
-                    bm25::breakdown(&flat_query, &ids)
-                });
-                docs.into_iter()
-                    .enumerate()
-                    .map(|(hit_index, doc)| -> Result<Bm25Hit, Status> {
-                        let explain = presence.as_ref().map(|presence| {
-                            let mut explain =
-                                explain_terms(&flat_query, &[body], &presence[hit_index], None);
-                            explain_stages(
-                                &mut explain,
-                                &chain,
-                                &req.score_stages,
-                                doc.doc_id,
-                                &numeric_read,
-                            );
-                            explain
-                        });
-                        let snippets = match highlight.as_ref() {
-                            Some(plan) => {
-                                let occurrences: Vec<(usize, (u32, u32))> = doc
-                                    .term_offsets
-                                    .iter()
-                                    .flat_map(|(ti, offsets)| {
-                                        offsets.iter().map(move |&span| (*ti, span))
-                                    })
-                                    .collect();
-                                cut_snippets(plan, index, body, doc.doc_id, &occurrences)?
-                            }
-                            None => Vec::new(),
-                        };
-                        Ok(Bm25Hit {
-                            identity: store.document_identity(doc.doc_id),
-                            explain,
-                            snippets,
-                            projected: resolved_projections
-                                .iter()
-                                .map(|rv| {
-                                    projected_value(
-                                        crate::values::eval(rv, doc.doc_id, &numeric_read),
-                                        store,
-                                    )
-                                })
-                                .collect(),
-                            doc_id: self.config.slot_offset + u64::from(doc.doc_id),
-                            score: doc.score as f32,
-                            terms: doc
-                                .term_offsets
-                                .into_iter()
-                                .map(|(ti, offsets)| TermOccurrences {
-                                    term: req.terms[ti].clone(),
-                                    offsets: offsets
-                                        .into_iter()
-                                        .map(|(start, end)| OffsetSpan { start, end })
-                                        .collect(),
-                                    field: String::new(),
-                                })
-                                .collect(),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, Status>>()?
-            }
-            _ => Vec::new(),
-        };
-        // The shard's k-th best: one f32 ULP below the last hit's score
-        // when the heap filled (so a later f32 seed never exceeds the
-        // true k-th best — ties at the floor survive), 0 otherwise.
-        let kth_best = if hits.len() == req.k as usize {
-            hits.last()
-                .map(|h| bm25::floor_seed(h.score))
-                .unwrap_or(0.0)
-        } else {
-            0.0
-        };
-        Ok(Bm25QueryResponse {
-            segments_total: prune.stats.segments_total,
-            segments_skipped: prune.stats.segments_skipped,
-            projection_leaves_known,
-            projection_types,
-            hits,
-            kth_best,
-            facets,
-            stage_columns_known,
-            stats: column_stats,
-            distinct,
-            range_facets,
-            geo_columns_known,
-            filter_columns_known,
-        })
+        FlatRun::new(self, &req)?.execute(live, candidate)
     }
 
     pub(in crate::node) fn run_bm25_rescore(
@@ -931,6 +472,465 @@ impl NodeServiceImpl {
             stats_incarnation: guard.stats_incarnation.bytes()?,
             visibility_fingerprint: scope.fingerprint().to_vec(),
             visibility_columns_known,
+        })
+    }
+}
+
+const BULK_BUILD: &str = "bm25 bulk build in progress; Flush first";
+
+struct FlatRun<'a> {
+    node: &'a NodeServiceImpl,
+    req: &'a Bm25QueryRequest,
+    stages: Vec<ScoreStageSpec>,
+    regions: Vec<crate::geo::GeoRegion>,
+    params: Bm25Params,
+    stats: bm25::CorpusStats,
+}
+
+impl<'a> FlatRun<'a> {
+    fn new(node: &'a NodeServiceImpl, request: &'a Bm25QueryRequest) -> Result<Self, Status> {
+        let stages = parse_score_stages(&request.score_stages)?;
+        validate_range_facet_fields(&request.range_facet_fields)?;
+        let regions = validate_geo_filters(&request.geo_filters)?;
+        if let Some(filter) = request.filter.as_ref() {
+            crate::filter::validate_filter(filter)?;
+        }
+        let params = params_from(request.k1, request.b)?;
+        let stats = bm25::CorpusStats {
+            doc_count: request.global_doc_count,
+            total_doc_length: request.global_total_doc_length,
+            dfs: request.global_doc_frequencies.clone(),
+        };
+        if request.terms.len() != stats.dfs.len() {
+            return Err(Status::invalid_argument(
+                "terms and global_doc_frequencies must have the same length",
+            ));
+        }
+        Ok(Self {
+            node,
+            req: request,
+            stages,
+            regions,
+            params,
+            stats,
+        })
+    }
+
+    fn execute(
+        self,
+        live: Option<bm25::LiveFloorHook>,
+        candidate: Option<bm25::CandidateHook>,
+    ) -> Result<Bm25QueryResponse, Status> {
+        let guard = read_shard(&self.node.state);
+        guard.check_stats_epoch(
+            self.req.expected_stats_epoch,
+            &self.req.expected_stats_incarnation,
+        )?;
+        guard.check_query_analysis("body", self.req.analysis_fingerprint)?;
+        let filter = self.filter(&guard)?;
+        let store = guard.bm25.as_ref();
+        let prune = store.map_or_else(SegmentPrune::default, |store| {
+            prune_segments(
+                store,
+                filter.as_ref().and_then(|f| f.pred.as_ref()),
+                self.node.knobs.segment_pruning(),
+            )
+        });
+        let masked = match (store, prune.mask.as_ref()) {
+            (Some(Bm25Shard::Segmented(segmented)), Some(mask)) => {
+                Some(segmented.masked(Arc::clone(mask)))
+            }
+            _ => None,
+        };
+        let masked = masked.as_ref().map(|index| index as &dyn Bm25Index);
+        let mut response = self.facets(store, masked, filter.as_ref())?;
+        self.known_columns(store, &mut response)?;
+        let projections = self.projections(store, &mut response)?;
+        response.hits = match store {
+            Some(store) if self.req.k > 0 => self.hits(
+                FlatView {
+                    store,
+                    index: flat_index(store, masked)?,
+                    filter: filter.as_ref(),
+                    projections: &projections,
+                },
+                live,
+                candidate,
+            )?,
+            _ => Vec::new(),
+        };
+        response.kth_best = if response.hits.len() == self.req.k as usize {
+            response
+                .hits
+                .last()
+                .map(|hit| bm25::floor_seed(hit.score))
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        response.segments_total = prune.stats.segments_total;
+        response.segments_skipped = prune.stats.segments_skipped;
+        Ok(response)
+    }
+
+    fn filter<'b>(
+        &'b self,
+        guard: &'b ShardState,
+    ) -> Result<Option<crate::filter::DocFilter<'b>>, Status> {
+        let req = self.req;
+        let Some(store) = guard.bm25.as_ref().filter(|_| {
+            !req.geo_filters.is_empty()
+                || req.filter.is_some()
+                || req.phrase.is_some()
+                || guard.live_docs.has_deletes()
+        }) else {
+            return Ok(None);
+        };
+        let phrase = self.phrases(store)?;
+        Ok(Some(crate::filter::DocFilter {
+            deleted: guard.live_docs.words(),
+            geo: store.resolve_geo_filters(&req.geo_filters, &self.regions),
+            pred: req
+                .filter
+                .as_ref()
+                .map(|filter| store.resolve_filter(filter))
+                .transpose()?,
+            phrase,
+        }))
+    }
+
+    fn phrases<'b>(
+        &'b self,
+        store: &'b Bm25Shard,
+    ) -> Result<Vec<crate::filter::PhraseGate<'b>>, Status> {
+        let Some(constraint) = self.req.phrase.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let index = flat_index(store, None)?;
+        if !index.has_positions() {
+            return Err(Status::failed_precondition(
+                "field \"body\" has no token positions on this shard; a phrase or \
+                 slop query needs --position-fields=body and a rebuilt generation",
+            ));
+        }
+        crate::proximity::validate_leg(constraint, self.req.terms.len())
+            .map_err(Status::invalid_argument)?;
+        Ok(vec![crate::filter::PhraseGate {
+            index,
+            terms: &self.req.terms,
+            sequence: constraint.sequence.iter().map(|&i| i as usize).collect(),
+            alternatives: constraint
+                .alternatives
+                .iter()
+                .map(|path| path.terms.iter().map(|&i| i as usize).collect())
+                .collect(),
+            slop: constraint.slop,
+        }])
+    }
+
+    fn facets(
+        &self,
+        store: Option<&Bm25Shard>,
+        masked: Option<&dyn Bm25Index>,
+        filter: Option<&crate::filter::DocFilter<'_>>,
+    ) -> Result<Bm25QueryResponse, Status> {
+        let req = self.req;
+        let Some(store) = store.filter(|_| {
+            !req.facet_fields.is_empty()
+                || !req.map_facet_fields.is_empty()
+                || !req.range_facet_fields.is_empty()
+                || !req.stats_fields.is_empty()
+                || !req.cardinality_fields.is_empty()
+        }) else {
+            return Ok(self.empty_facets());
+        };
+        let columns = ShardNumericRead(store);
+        let (facets, range_facets, stats, distinct) = store.count_facets(
+            &[(flat_index(store, masked)?, &req.terms)],
+            &req.facet_fields,
+            &req.map_facet_fields,
+            &req.range_facet_fields,
+            &req.stats_fields,
+            &req.cardinality_fields,
+            filter.map(|filter| (filter, &columns as &dyn NumericRead)),
+        )?;
+        Ok(Bm25QueryResponse {
+            facets,
+            range_facets,
+            stats,
+            distinct,
+            ..Default::default()
+        })
+    }
+
+    fn empty_facets(&self) -> Bm25QueryResponse {
+        let req = self.req;
+        Bm25QueryResponse {
+            facets: req
+                .facet_fields
+                .iter()
+                .map(|name| (name.clone(), None))
+                .chain(
+                    req.map_facet_fields
+                        .iter()
+                        .map(|map| (map.column.clone(), Some(map.key.clone()))),
+                )
+                .map(|(field, key)| crate::pb::FacetFieldCounts {
+                    field,
+                    key: key.clone().unwrap_or_default(),
+                    map_key: key,
+                    ..Default::default()
+                })
+                .collect(),
+            range_facets: unknown_range_counts(&req.range_facet_fields),
+            stats: req
+                .stats_fields
+                .iter()
+                .map(|field| crate::pb::ColumnStats {
+                    field: field.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+            distinct: req
+                .cardinality_fields
+                .iter()
+                .map(|field| crate::pb::FacetDistinct {
+                    field: field.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn known_columns(
+        &self,
+        store: Option<&Bm25Shard>,
+        response: &mut Bm25QueryResponse,
+    ) -> Result<(), Status> {
+        response.stage_columns_known = match store {
+            Some(Bm25Shard::Spilling(_)) if !self.stages.is_empty() => {
+                return Err(Status::failed_precondition(BULK_BUILD));
+            }
+            Some(store) => store
+                .resolve_chain(&self.stages)
+                .stages
+                .iter()
+                .map(|stage| stage.column.is_some())
+                .collect(),
+            None => vec![false; self.stages.len()],
+        };
+        response.geo_columns_known = store.map_or_else(
+            || vec![false; self.req.geo_filters.len()],
+            |store| store.geo_columns_known(&self.req.geo_filters),
+        );
+        response.filter_columns_known = match (store, self.req.filter.as_ref()) {
+            (Some(store), Some(filter)) => store.filter_columns_known(filter),
+            (None, Some(filter)) => vec![false; crate::filter::leaf_count(filter)],
+            (_, None) => Vec::new(),
+        };
+        let mut leaves = Vec::new();
+        for projection in &self.req.projections {
+            if let Some(expression) = projection.expr.as_ref() {
+                crate::values::column_leaves(expression, &mut leaves);
+            }
+        }
+        response.projection_leaves_known = store.map_or_else(
+            || vec![false; leaves.len()],
+            |store| {
+                leaves
+                    .iter()
+                    .map(|leaf| crate::values::leaf_known(leaf, store))
+                    .collect()
+            },
+        );
+        Ok(())
+    }
+
+    fn projections(
+        &self,
+        store: Option<&Bm25Shard>,
+        response: &mut Bm25QueryResponse,
+    ) -> Result<Vec<crate::values::ResolvedValue>, Status> {
+        let empty = crate::values::NumericTypes {
+            numerics: &[],
+            integers: &[],
+            unsigned_integers: &[],
+            map_numerics: &[],
+            map_integers: &[],
+            map_unsigned_integers: &[],
+            facets: &[],
+        };
+        let columns: &dyn crate::values::ColumnLookup =
+            store.map_or(&empty as &dyn crate::values::ColumnLookup, |store| store);
+        let (projections, types) = self
+            .req
+            .projections
+            .iter()
+            .map(|projection| {
+                let expression = projection.expr.as_ref().ok_or_else(|| {
+                    Status::invalid_argument("projection: empty compiled expression")
+                })?;
+                crate::values::resolve(expression, columns)
+                    .map(|(value, ty)| (value, crate::pb::ScalarValueType::from(ty) as i32))
+            })
+            .collect::<Result<Vec<_>, Status>>()?
+            .into_iter()
+            .unzip();
+        response.projection_types = types;
+        Ok(projections)
+    }
+
+    fn hits(
+        &self,
+        view: FlatView<'_>,
+        live: Option<bm25::LiveFloorHook>,
+        candidate: Option<bm25::CandidateHook>,
+    ) -> Result<Vec<Bm25Hit>, Status> {
+        let req = self.req;
+        let chain = view.store.resolve_chain(&self.stages);
+        let columns = ShardNumericRead(view.store);
+        let filter = view.filter.map(|f| (f, &columns as &dyn NumericRead));
+        let query = bm25::ScoringQuery {
+            store: view.index,
+            terms: &req.terms,
+            stats: &self.stats,
+            params: self.params,
+            chain: (!self.stages.is_empty()).then_some((&chain, &columns)),
+            filter,
+        };
+        let options = bm25::TopKOptions {
+            k: req.k as usize,
+            floor: if req.min_score == 0.0 {
+                f64::NEG_INFINITY
+            } else {
+                f64::from(req.min_score)
+            },
+            block_max: self.node.config.block_max,
+        };
+        let docs = bm25::top_k_pruned_chained_filtered_stats_streaming(
+            query,
+            options,
+            &mut bm25::PruneStats::default(),
+            live,
+            candidate,
+        );
+        FlatHits {
+            req,
+            slot_offset: self.node.config.slot_offset,
+            store: view.store,
+            chain,
+            highlight: highlight_plan(view.store, req.highlight.as_ref())?,
+            projections: view.projections,
+            query: [bm25::FieldQuery {
+                index: view.index,
+                terms: &req.terms,
+                stats: self.stats.clone(),
+                params: self.params,
+                weight: 1.0,
+            }],
+        }
+        .collect(docs)
+    }
+}
+
+fn flat_index<'a>(
+    store: &'a Bm25Shard,
+    masked: Option<&'a dyn Bm25Index>,
+) -> Result<&'a dyn Bm25Index, Status> {
+    masked
+        .or_else(|| store.as_index())
+        .ok_or_else(|| Status::failed_precondition(BULK_BUILD))
+}
+
+struct FlatView<'a> {
+    store: &'a Bm25Shard,
+    index: &'a dyn Bm25Index,
+    filter: Option<&'a crate::filter::DocFilter<'a>>,
+    projections: &'a [crate::values::ResolvedValue],
+}
+
+struct FlatHits<'a> {
+    req: &'a Bm25QueryRequest,
+    slot_offset: u64,
+    store: &'a Bm25Shard,
+    chain: crate::scorefn::ScoreChain,
+    highlight: Option<crate::highlight::Plan>,
+    projections: &'a [crate::values::ResolvedValue],
+    query: [bm25::FieldQuery<'a>; 1],
+}
+
+impl FlatHits<'_> {
+    fn collect(self, docs: Vec<bm25::ScoredDoc>) -> Result<Vec<Bm25Hit>, Status> {
+        let presence = self.req.explain.then(|| {
+            let ids: Vec<u32> = docs.iter().map(|doc| doc.doc_id).collect();
+            bm25::breakdown(&self.query, &ids)
+        });
+        docs.into_iter()
+            .enumerate()
+            .map(|(index, doc)| {
+                self.hit(
+                    doc,
+                    presence.as_ref().map(|presence| presence[index].as_slice()),
+                )
+            })
+            .collect()
+    }
+
+    fn hit(
+        &self,
+        doc: bm25::ScoredDoc,
+        presence: Option<&[bm25::TermPresence]>,
+    ) -> Result<Bm25Hit, Status> {
+        let body = self.store.field_name(0);
+        let columns = ShardNumericRead(self.store);
+        let explain = presence.map(|presence| {
+            let mut explain = explain_terms(&self.query, &[body], presence, None);
+            explain_stages(
+                &mut explain,
+                &self.chain,
+                &self.req.score_stages,
+                doc.doc_id,
+                &columns,
+            );
+            explain
+        });
+        let snippets = match self.highlight.as_ref() {
+            Some(plan) => {
+                let occurrences: Vec<_> = doc
+                    .term_offsets
+                    .iter()
+                    .flat_map(|(term, offsets)| offsets.iter().map(move |&span| (*term, span)))
+                    .collect();
+                cut_snippets(plan, self.query[0].index, body, doc.doc_id, &occurrences)?
+            }
+            None => Vec::new(),
+        };
+        Ok(Bm25Hit {
+            identity: self.store.document_identity(doc.doc_id),
+            explain,
+            snippets,
+            projected: self
+                .projections
+                .iter()
+                .map(|value| {
+                    projected_value(crate::values::eval(value, doc.doc_id, &columns), self.store)
+                })
+                .collect(),
+            doc_id: self.slot_offset + u64::from(doc.doc_id),
+            score: doc.score as f32,
+            terms: doc
+                .term_offsets
+                .into_iter()
+                .map(|(term, offsets)| TermOccurrences {
+                    term: self.req.terms[term].clone(),
+                    field: String::new(),
+                    offsets: offsets
+                        .into_iter()
+                        .map(|(start, end)| OffsetSpan { start, end })
+                        .collect(),
+                })
+                .collect(),
         })
     }
 }

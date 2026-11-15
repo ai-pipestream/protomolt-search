@@ -11,13 +11,15 @@ use crate::pb::{CompactShardRequest, CompactShardResponse};
 use crate::segments::{SegmentCatalog, SegmentMetadata, SegmentSetManifest, SegmentSource};
 use crate::vector::VectorIndex;
 
-use super::recovery::{recover_interrupted, write_marker, CommitMarker, PendingCommit};
 #[cfg(test)]
 use super::segment_staging_hook;
 use super::{
-    layout_name, manifest_backup_path, PreparedSegmentCutover, SegmentPreflight, CUTOVER_RETRIES,
-    MARKER_FORMAT, MAX_TAIL_PASSES, PAIRED_APPEND_PAUSE, PAIRED_APPEND_WAIT, STALLED_TAIL_PASSES,
+    layout_name, PreparedSegmentCutover, SegmentPreflight, CUTOVER_RETRIES, MAX_TAIL_PASSES,
+    PAIRED_APPEND_PAUSE, PAIRED_APPEND_WAIT, STALLED_TAIL_PASSES,
 };
+
+#[path = "segment_cutover_install.rs"]
+mod install;
 
 impl NodeServiceImpl {
     /// The from-segments compaction of a catalog without a WAL, start to
@@ -539,93 +541,5 @@ impl NodeServiceImpl {
         shard.snapshot().epoch() == prepared.epoch
             && guard.live_docs.revision() == prepared.revision
             && Self::segment_tail_is_clear(guard)
-    }
-
-    /// The on-disk cutover, under the write lock the caller holds: the
-    /// manifest backup, the commit marker, one manifest publish through
-    /// the catalog's own path, the state swap. No WAL moves: this path
-    /// writes none.
-    fn install_segments(
-        &self,
-        pre: &SegmentPreflight,
-        mut prepared: PreparedSegmentCutover,
-        guard: &mut ShardState,
-    ) -> Result<(), Status> {
-        let root = crate::node::segments_root(&pre.index_path);
-        let current = SegmentCatalog::read_manifest(&root)
-            .map_err(Status::internal)?
-            .unwrap_or_default();
-        crate::segments::write_manifest_file(&manifest_backup_path(&root), &current)
-            .map_err(Status::internal)?;
-        let marker = CommitMarker {
-            format: MARKER_FORMAT,
-            layout: layout_name(true).to_string(),
-            old_wal_generation: 0,
-            new_wal_generation: 0,
-            walless: true,
-            work_dir: pre.work_dir.clone(),
-            previous_snapshot: false,
-            legacy_files: Vec::new(),
-            staged_segments: prepared.staged_ids.clone(),
-            replaced_segments: prepared.replaced_ids.clone(),
-        };
-        write_marker(&pre.index_path, &marker)
-            .map_err(|e| Status::internal(format!("write the compaction marker: {e}")))?;
-        // From here every failure leaves the marker, and a restart rolls
-        // back; a failure returned here also rolls back at once.
-        let result = (|| -> Result<(), Status> {
-            let epoch = prepared
-                .epoch
-                .checked_add(1)
-                .ok_or_else(|| Status::out_of_range("compaction publication epoch exhausted"))?;
-            let published = prepared
-                .catalog
-                .commit_current(epoch)
-                .map_err(|e| Status::internal(format!("publish the compacted set: {e}")))?;
-            let shard = prepared.shard.as_mut().expect("prepared once");
-            shard
-                .republish(published.clone())
-                .map_err(|e| Status::internal(format!("adopt compacted documents: {e}")))?;
-            if let Some(provider) = prepared
-                .index
-                .as_mut()
-                .and_then(VectorIndex::as_segmented_mut)
-            {
-                provider
-                    .republish(published)
-                    .map_err(|e| Status::internal(format!("adopt compacted vectors: {e}")))?;
-            }
-            let shard = prepared.shard.take().expect("checked above");
-            let mapped_binding = shard.binding().cloned();
-            let mut state = ShardState {
-                multi_res_vectors: std::mem::take(&mut prepared.multi_res_vectors),
-                index: prepared.index.take(),
-                exact_vectors: prepared.exact_vectors.take(),
-                bm25: Some(Bm25Shard::Segmented(shard)),
-                live_docs: prepared.overlay.clone(),
-                generation: None,
-                wal: None,
-                parents: None,
-                mapped_binding,
-                stats_epoch: guard.stats_epoch,
-                files_current: false,
-                stats_incarnation: Default::default(),
-                pending_compaction: Some(PendingCommit {
-                    index_path: pre.index_path.clone(),
-                    marker,
-                }),
-            };
-            state.advance_stats_epoch();
-            let previous = std::mem::replace(guard, state);
-            drop(previous);
-            Ok(())
-        })();
-        match result {
-            Ok(()) => Ok(()),
-            Err(status) => {
-                recover_interrupted(&pre.index_path);
-                Err(status)
-            }
-        }
     }
 }
