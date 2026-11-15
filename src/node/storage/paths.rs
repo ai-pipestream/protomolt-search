@@ -172,34 +172,65 @@ pub(in crate::node) fn export_staging_dir(index_path: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
+fn probe_path_exists_io(path: &Path, context: &str) -> std::io::Result<bool> {
+    probe_path_exists(path, context)
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidData, message))
+}
+
+fn remove_dir_if_present(path: &Path, context: &str) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(std::io::Error::new(
+            error.kind(),
+            format!("{context} {}: {error}", path.display()),
+        )),
+    }
+}
+
 /// Crash recovery for a segment-layout snapshot install, the catalog
-/// twin of [`recover_generation`]: the swap renames the live catalog to
+/// twin of [`try_recover_generation`]: the swap renames the live catalog to
 /// `.segments.snap-old` and the staged one into place. `snap-old`
 /// present with no live catalog means the crash fell between the two
 /// renames — the previous catalog is whole, rename it back; both present
 /// means the new catalog is live — delete the old one. Stray export
 /// staging directories are unreceived garbage and are removed.
-pub fn recover_segments_swap(index_path: &Path) {
+pub fn recover_segments_swap(index_path: &Path) -> std::io::Result<()> {
     let root = segments_root(index_path);
     let old = segments_old_dir(index_path);
-    if old.exists() {
-        if root.join("segments.json").exists() {
-            let _ = std::fs::remove_dir_all(&old);
+    if probe_path_exists_io(&old, "segment catalog backup")? {
+        if probe_path_exists_io(&root.join("segments.json"), "segment catalog manifest")? {
+            remove_dir_if_present(&old, "remove retired segment catalog backup")?;
         } else {
-            let _ = std::fs::remove_dir_all(&root);
-            let _ = std::fs::rename(&old, &root);
+            remove_dir_if_present(&root, "remove incomplete segment catalog")?;
+            std::fs::rename(&old, &root).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "restore segment catalog backup {} to {}: {error}",
+                        old.display(),
+                        root.display()
+                    ),
+                )
+            })?;
         }
     }
     if let (Some(parent), Some(name)) = (index_path.parent(), index_path.file_name()) {
         let prefix = format!("{}.snap-export-", name.to_string_lossy());
-        if let Ok(entries) = std::fs::read_dir(parent) {
-            for entry in entries.flatten() {
-                if entry.file_name().to_string_lossy().starts_with(&prefix) {
-                    let _ = std::fs::remove_dir_all(entry.path());
+        match std::fs::read_dir(parent) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                        remove_dir_if_present(&entry.path(), "remove stray snapshot export")?;
+                    }
                 }
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
     }
+    Ok(())
 }
 
 /// Where the shard's files live: the active snapshot generation when one
@@ -244,41 +275,52 @@ pub(in crate::node) fn probe_path_exists(path: &Path, context: &str) -> Result<b
     }
 }
 
-/// Crash recovery for the generation swap, and the startup answer to
-/// "does this shard have an installed snapshot?". Every interleave of the
-/// two swap renames has a defined outcome:
+/// Fallible crash recovery for the snapshot generation swap.
 ///
-/// - `snap-old` present, `snap` missing: crashed between the renames —
-///   the previous generation is whole, rename it back.
-/// - both present: crashed after the second rename — the new generation
-///   is live, delete the old one.
-/// - a stray `snap-tmp` is always deleted: only a COMPLETE staging dir is
-///   ever renamed into place, so a leftover one is unreceived garbage.
-///
-/// Returns the active generation directory when it holds an index.
-pub fn recover_generation(index_path: &Path) -> Option<PathBuf> {
-    if refuse_retired_generation(index_path).is_err() {
-        return None;
-    }
-    // A compaction cutover that never reached its closing flush rolls
-    // back to the generation it replaced BEFORE the swap rules below
-    // run, or they would retire the very files the rollback restores
-    // (docs/mutations.md).
+/// Propagates retired-layout/metadata refusals and any filesystem error while
+/// removing `.snap-tmp` / `.snap-old` or restoring `.snap-old` to `.snap` so
+/// shard open fails closed rather than serving over half-recovered state.
+pub fn try_recover_generation(index_path: &Path) -> std::io::Result<Option<PathBuf>> {
+    refuse_retired_generation(index_path)
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidData, message))?;
+    // Roll back any interrupted compaction cutover before snapshot swap rules
+    // run, so recovery never retires files the compaction rollback restores.
     crate::compaction::recover_interrupted(index_path);
     let snap = generation_dir(index_path);
     let old = generation_old_dir(index_path);
     let tmp = generation_tmp_dir(index_path);
-    let _ = std::fs::remove_dir_all(&tmp);
-    if probe_path_exists(&old, "snapshot backup").ok()? {
-        if probe_path_exists(&snap, "snapshot generation").ok()? {
-            let _ = std::fs::remove_dir_all(&old);
+    remove_dir_if_present(&tmp, "remove stray snapshot staging")?;
+    if probe_path_exists_io(&old, "snapshot backup")? {
+        if probe_path_exists_io(&snap, "snapshot generation")? {
+            remove_dir_if_present(&old, "remove retired snapshot backup")?;
         } else {
-            let _ = std::fs::rename(&old, &snap);
+            std::fs::rename(&old, &snap).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "restore snapshot backup {} to {}: {error}",
+                        old.display(),
+                        snap.display()
+                    ),
+                )
+            })?;
         }
     }
-    let has_vector = probe_path_exists(&generation_vector(&snap), "snapshot vector").ok()?;
-    let has_bm25 = probe_path_exists(&generation_bm25(&snap), "snapshot bm25").ok()?;
-    (has_vector || has_bm25).then_some(snap)
+    let has_vector = probe_path_exists_io(&generation_vector(&snap), "snapshot vector")?;
+    let has_bm25 = probe_path_exists_io(&generation_bm25(&snap), "snapshot bm25")?;
+    Ok((has_vector || has_bm25).then_some(snap))
+}
+
+/// Crash recovery for the generation swap, returning `None` when no active
+/// generation exists or when [`try_recover_generation`] refuses recovery.
+pub fn recover_generation(index_path: &Path) -> Option<PathBuf> {
+    match try_recover_generation(index_path) {
+        Ok(generation) => generation,
+        Err(error) => {
+            eprintln!("recover_generation {}: {error}", index_path.display());
+            None
+        }
+    }
 }
 
 /// File names of the retired snapshot generation layout. Nothing reads

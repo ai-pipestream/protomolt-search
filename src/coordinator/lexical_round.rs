@@ -66,39 +66,18 @@ impl CoordinatorServiceImpl {
         })
         .await
     }
-    pub(super) async fn bm25_fused_round(
-        &self,
-        round: FusedRound<'_>,
-    ) -> Result<(FacetedHits, crate::segment_prune::PruneStats), Status> {
-        let FusedRound {
-            query,
-            fields,
-            field_terms,
-            globals,
-            claims,
-            phrase,
-            phrase_legs,
-            fingerprints,
-            timing,
-        } = round;
-        let k = query.k();
-        let min_score = query.request().min_score;
-        let trace = timing.trace;
-
-        let doc_count = globals.doc_count;
-        let totals = &globals.totals;
-        let dfs = &globals.dfs;
-        // (c) Bm25Query fan-out with per-field legs in entry order.
-        // Entry k1/b of 0 pick up the coordinator's configured params,
-        // so tuning reaches this path too.
-        let legs: Vec<crate::pb::Bm25FieldLeg> = fields
+    fn build_fused_legs(&self, round: &FusedRound<'_>) -> Vec<crate::pb::Bm25FieldLeg> {
+        debug_assert_eq!(round.phrase_legs.len(), round.fields.len());
+        debug_assert_eq!(round.fingerprints.len(), round.fields.len());
+        round
+            .fields
             .iter()
             .enumerate()
             .map(|(fi, f)| crate::pb::Bm25FieldLeg {
                 field: f.field.clone(),
-                terms: field_terms[fi].clone(),
-                global_total_doc_length: totals[fi],
-                global_doc_frequencies: dfs[fi].clone(),
+                terms: round.field_terms[fi].clone(),
+                global_total_doc_length: round.globals.totals[fi],
+                global_doc_frequencies: round.globals.dfs[fi].clone(),
                 weight: f.weight,
                 k1: if f.k1 == 0.0 {
                     self.bm25_params.k1 as f32
@@ -110,18 +89,31 @@ impl CoordinatorServiceImpl {
                 } else {
                     f.b
                 },
-                // Declare which analyzer produced these terms so the
-                // shard can refuse a column built under a different one.
-                // The caller computed it from THE SPEC ACTUALLY USED,
-                // not from what the caller meant.
-                analysis_fingerprint: fingerprints[fi],
-                phrase: phrase_legs[fi].clone(),
+                analysis_fingerprint: round.fingerprints[fi],
+                phrase: round.phrase_legs[fi].clone(),
             })
-            .collect();
-        debug_assert_eq!(phrase_legs.len(), fields.len());
-        debug_assert_eq!(fingerprints.len(), fields.len());
-        let _ = phrase.map(|(leg, _, _)| leg);
-        if trace {
+            .collect()
+    }
+
+    pub(super) async fn bm25_fused_round(
+        &self,
+        round: FusedRound<'_>,
+    ) -> Result<(FacetedHits, crate::segment_prune::PruneStats), Status> {
+        let legs = self.build_fused_legs(&round);
+        let FusedRound {
+            query,
+            fields,
+            field_terms,
+            globals,
+            claims,
+            phrase,
+            timing,
+            ..
+        } = round;
+        let k = query.k();
+        let min_score = query.request().min_score;
+        let doc_count = globals.doc_count;
+        if timing.trace {
             for l in &legs {
                 eprintln!(
                     "bm25-fused leg: field={:?} terms={:?} dfs={:?} total_len={} w={} k1={} b={} \

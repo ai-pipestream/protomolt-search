@@ -46,6 +46,7 @@ pub use self::storage::{
     bm25_build_dir, bm25_sidecar_path, exact_vector_sidecar_path, generation_bm25, generation_dir,
     generation_exact_vectors, generation_live_docs, generation_vector, live_docs_sidecar_path,
     recover_generation, recover_segments_swap, refuse_retired_generation, segments_root,
+    try_recover_generation,
 };
 
 pub(crate) use self::aggregate::{agg_op_name, agg_op_of};

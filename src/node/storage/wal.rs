@@ -117,7 +117,8 @@ fn persisted_doc_tip(index_path: &Path) -> u64 {
     if let Err(error) = refuse_retired_generation(index_path) {
         panic!("{error}");
     }
-    let generation = recover_generation(index_path);
+    let generation = try_recover_generation(index_path)
+        .unwrap_or_else(|error| panic!("wal reconciliation: {error}"));
     let (_, _, bm25_path) = storage_paths(index_path, generation.as_ref());
     match probe_path_exists(&bm25_path, "persisted BM25 sidecar") {
         Ok(false) => return 0,

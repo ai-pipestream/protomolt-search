@@ -97,61 +97,42 @@ pub(crate) fn physical_rows(guard: &ShardState) -> u64 {
     active_artifact_rows(guard).into_iter().max().unwrap_or(0)
 }
 
-/// The shard's two indexes behind one lock: the turbovec vector index and
-/// the BM25 postings store. Either may be absent (vector-only shards,
-/// docs-only shards, from-scratch shards).
+/// Synchronized shard state holding the vector index, BM25 store, tombstones,
+/// WAL, and stats-epoch fence.
 #[derive(Default)]
 pub(crate) struct ShardState {
     pub(crate) index: Option<VectorIndex>,
-    /// Original row-major FP32 vectors, aligned one-for-one with provider
-    /// slots. Legacy generations may lack this sidecar; native provider
-    /// search remains available, while FP32 rerank refuses by name.
+    /// Row-major FP32 vectors aligned one-for-one with provider slots.
     pub(crate) exact_vectors: Option<ExactVectorStore>,
-    /// Multi-resolution rows belong to this physical generation, including
-    /// private compaction shadows; publication swaps them with the indexes.
+    /// Generation-bound multi-resolution rows swapped atomically on publication.
     pub(crate) multi_res_vectors: crate::multi_res::MultiResVectors,
     pub(crate) bm25: Option<Bm25Shard>,
     /// Generation tombstones shared by every lexical and vector read path.
     pub(crate) live_docs: LiveDocs,
-    /// The active snapshot generation directory, when the shard's files
-    /// came from (or were replaced by) an `InstallSnapshot` image.
-    /// `Flush` and the AddDocuments reload path read/write THERE, never
-    /// the legacy `<index path>` layout, so the two never split-brain.
+    /// Active snapshot generation directory when installed via `InstallSnapshot`.
     pub(crate) generation: Option<PathBuf>,
-    /// The write-ahead log (`<index path>.wal/`), behind the same lock as
-    /// the index it precedes. `None` when the shard runs without one.
+    /// Write-ahead log (`<index path>.wal/`), or `None` when WAL is disabled.
     pub(crate) wal: Option<WalWriter>,
     /// Cached slot -> parent map for collapse scans (lineage parent_id
     /// per slot), bound to the physical version that supplied the lineage.
     pub(crate) parents: Option<ParentMap>,
-    /// The shard's mapped-plan binding (`docs/descriptor-mappings.md`
-    /// section 4a): RAM authority for the identity every mapped stream
-    /// must match. Loaded from the store's kind-6 entry on attach,
-    /// recorded to the WAL (markers) on first bind, written back into
-    /// the store at flush. `None` = never bound.
+    /// RAM authority for the mapped-plan identity every mapped stream must
+    /// match; loaded on attach, recorded in WAL markers, persisted at flush.
     pub(crate) mapped_binding: Option<crate::postings::StoredBinding>,
-    /// Advances on every mutation of `bm25` (ingest, flush, snapshot
-    /// install, startup attach). `TermStats` reports it and the scoring
-    /// RPCs enforce a caller's claim against it, which is what lets a
-    /// coordinator cache term stats without ever scoring against a
-    /// store the stats no longer describe. Starts at 1: 0 is the wire's
-    /// "no claim". Over-bumping is safe (a cache refetches); a missed
-    /// bump is the only unsound direction.
+    /// Monotonic BM25 mutation counter enforced via `TermStats` claims; starts
+    /// at 1 (`0` means no claim).
     pub(crate) stats_epoch: u64,
     /// True only after Flush persisted the current mutation state.
     pub(crate) files_current: bool,
     pub(crate) stats_incarnation: crate::stats_identity::StatsIncarnation,
-    /// A compaction cutover whose closing flush has not run yet
-    /// (`docs/mutations.md`): the marker on disk says "roll back on
-    /// restart" until the next flush writes the new generation's images
-    /// and retires what the marker lists. `Flush` completes it.
+    /// Compaction cutover awaiting its closing flush; rolls back on restart
+    /// until `Flush` retires its marker.
     pub(crate) pending_compaction: Option<crate::compaction::PendingCommit>,
 }
 
 /// Message prefix of a stats-epoch refusal. The coordinator's retry
-/// distinguishes this refusal from every other FAILED_PRECONDITION by
-/// this prefix, so it and [`ShardState::check_stats_epoch`] must move
-/// together.
+/// distinguishes this refusal from every other `FAILED_PRECONDITION` by
+/// this prefix, so it and [`ShardState::check_stats_epoch`] move together.
 pub(crate) const STALE_STATS_EPOCH: &str = "stale stats epoch";
 
 #[derive(Clone)]
