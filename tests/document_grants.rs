@@ -191,18 +191,14 @@ fn policy_version_and_scope_semantics_are_explicit() {
     let mut mixed = policy();
     mixed.grants[0].actions.push(AccessAction::Admin as i32);
     let authority = Arc::new(PolicyAuthority::new(mixed.clone()).unwrap());
-    assert_eq!(
-        authority
-            .authorize("public", "", AccessAction::Search)
-            .unwrap()
-            .document_visibility,
-        Some(view("public"))
-    );
-    assert!(authority
+    let search_grant = authority
+        .authorize("public", "", AccessAction::Search)
+        .unwrap();
+    assert_eq!(search_grant.document_visibility, Some(view("public")));
+    let admin_grant = authority
         .authorize("public", "", AccessAction::Admin)
-        .unwrap()
-        .document_visibility
-        .is_none());
+        .unwrap();
+    assert!(admin_grant.document_visibility.is_none());
     let permit =
         AccessPermit::acquire(authority.clone(), "public", "", AccessAction::Search).unwrap();
     mixed.revision = 2;

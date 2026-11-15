@@ -628,80 +628,67 @@ fn tempdir(tag: &str) -> PathBuf {
     dir
 }
 
+type CfgResult = Result<pipestream_search::config::Config, String>;
+
+fn run_cfg(dir: &std::path::Path, name: &str, body: &str) -> CfgResult {
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    pipestream_search::config::parse(&[format!("--config={}", path.display())])
+}
+
+fn assert_incomplete_tls_refusals(dir: &std::path::Path, cert: &str, key: &str, ca: &str) {
+    let check_err = |name: &str, body: String, needle: &str| {
+        let error = run_cfg(dir, name, &body).unwrap_err();
+        assert!(error.contains(needle), "{error}");
+    };
+    let s_loop = "[[shards]]\nlisten = \"127.0.0.1:0\"\nindex = \"/tmp/x.tv\"\n";
+    let s_ext = "[[shards]]\nlisten = \"0.0.0.0:59300\"\nindex = \"/tmp/x.tv\"\n";
+    let half = format!("role = \"node\"\ntls_cert = \"{cert}\"\n{s_loop}");
+    check_err("half.toml", half, "both --tls-cert and --tls-key");
+    let noca = format!("role = \"node\"\ntls_cert = \"{cert}\"\ntls_key = \"{key}\"\n{s_ext}");
+    check_err("node-no-ca.toml", noca, "--tls-client-ca");
+    let coord = format!("role = \"coordinator\"\nnodes = [\"10.0.0.1:1\"]\ntls_cert = \"{cert}\"\ntls_key = \"{key}\"\ntls_client_ca = \"{ca}\"\n");
+    check_err("coord-no-ca.toml", coord.clone(), "--tls-ca");
+    let contra = format!("{coord}tls_ca = \"{ca}\"\nallow_plaintext = true\n");
+    check_err("contradiction.toml", contra, "contradicts");
+}
+
 #[test]
 fn configuration_refuses_plaintext_off_loopback_and_incomplete_material() {
     let dir = tempdir("config");
     let certs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/certs");
-    let write = |name: &str, body: &str| {
-        let path = dir.join(name);
-        std::fs::write(&path, body).unwrap();
-        path.display().to_string()
-    };
-    let parse = |file: &str| pipestream_search::config::parse(&[format!("--config={file}")]);
-    let node_off_loopback =
+    let node_ext =
         "role = \"node\"\n[[shards]]\nlisten = \"0.0.0.0:59300\"\nindex = \"/tmp/x.tv\"\n";
-    let error = parse(&write("plain.toml", node_off_loopback)).unwrap_err();
+    let error = run_cfg(&dir, "plain.toml", node_ext).unwrap_err();
     assert!(error.contains("--allow-plaintext"), "{error}");
-    let cfg = parse(&write(
-        "allowed.toml",
-        &format!("allow_plaintext = true\n{node_off_loopback}"),
-    ))
-    .unwrap();
+    let allowed = format!("allow_plaintext = true\n{node_ext}");
+    let cfg = run_cfg(&dir, "allowed.toml", &allowed).unwrap();
     assert!(cfg.allow_plaintext && cfg.tls.is_none());
-    let loopback = parse(&write(
-        "loop.toml",
-        "role = \"node\"\n[[shards]]\nlisten = \"127.0.0.1:0\"\nindex = \"/tmp/x.tv\"\n",
-    ))
-    .unwrap();
+    let loop_body =
+        "role = \"node\"\n[[shards]]\nlisten = \"127.0.0.1:0\"\nindex = \"/tmp/x.tv\"\n";
+    let loopback = run_cfg(&dir, "loop.toml", loop_body).unwrap();
     assert!(!loopback.allow_plaintext);
 
-    let cert = certs.join("server.pem").display().to_string();
-    let key = certs.join("server.key.pem").display().to_string();
-    let ca = certs.join("ca.pem").display().to_string();
-    let error = parse(&write(
-        "half.toml",
-        &format!("role = \"node\"\ntls_cert = \"{cert}\"\n[[shards]]\nlisten = \"127.0.0.1:0\"\nindex = \"/tmp/x.tv\"\n"),
-    ))
-    .unwrap_err();
-    assert!(error.contains("both --tls-cert and --tls-key"), "{error}");
-    let error = parse(&write(
-        "node-no-ca.toml",
-        &format!("role = \"node\"\ntls_cert = \"{cert}\"\ntls_key = \"{key}\"\n[[shards]]\nlisten = \"0.0.0.0:59300\"\nindex = \"/tmp/x.tv\"\n"),
-    ))
-    .unwrap_err();
-    assert!(error.contains("--tls-client-ca"), "{error}");
-    let error = parse(&write(
-        "coord-no-ca.toml",
-        &format!("role = \"coordinator\"\nnodes = [\"10.0.0.1:1\"]\ntls_cert = \"{cert}\"\ntls_key = \"{key}\"\ntls_client_ca = \"{ca}\"\n"),
-    ))
-    .unwrap_err();
-    assert!(error.contains("--tls-ca"), "{error}");
-    let error = parse(&write(
-        "contradiction.toml",
-        &format!("role = \"coordinator\"\nnodes = [\"10.0.0.1:1\"]\ntls_cert = \"{cert}\"\ntls_key = \"{key}\"\ntls_client_ca = \"{ca}\"\ntls_ca = \"{ca}\"\nallow_plaintext = true\n"),
-    ))
-    .unwrap_err();
-    assert!(error.contains("contradicts"), "{error}");
+    let pem = |n: &str| certs.join(n).display().to_string();
+    let (cert, key, ca) = (pem("server.pem"), pem("server.key.pem"), pem("ca.pem"));
+    assert_incomplete_tls_refusals(&dir, &cert, &key, &ca);
 
     // The complete material, principals, and a UDP key all load.
-    let tokens = write(
-        "tokens.toml",
-        "[[principals]]\nname = \"console\"\ntoken = \"console-token-0123456789\"\nmax_k = 10\n\n[policy]\nformat_version = 3\nrevision = 1\n[[policy.resources]]\nworkspace = \"test\"\ncollection = \"\"\n[[policy.grants]]\nprincipal = \"console\"\nworkspace = \"test\"\ncollection = \"\"\nactions = [\"search\"]\n",
+    let tokens = dir.join("tokens.toml");
+    std::fs::write(&tokens, "[[principals]]\nname = \"console\"\ntoken = \"console-token-0123456789\"\nmax_k = 10\n\n[policy]\nformat_version = 3\nrevision = 1\n[[policy.resources]]\nworkspace = \"test\"\ncollection = \"\"\n[[policy.grants]]\nprincipal = \"console\"\nworkspace = \"test\"\ncollection = \"\"\nactions = [\"search\"]\n").unwrap();
+    let udp = dir.join("udp.key");
+    std::fs::write(&udp, "000102030405060708090a0b0c0d0e0f\n").unwrap();
+    let (cc, ck) = (pem("client.pem"), pem("client.key.pem"));
+    let full = format!(
+        "role = \"both\"\nnodes = [\"10.0.0.1:1\"]\ntls_cert = \"{cert}\"\ntls_key = \"{key}\"\n\
+         tls_client_ca = \"{ca}\"\ntls_ca = \"{ca}\"\ntls_client_cert = \"{cc}\"\n\
+         tls_client_key = \"{ck}\"\ntls_domain = \"localhost\"\n\
+         bearer_tokens = \"{}\"\nudp_hmac_key = \"{}\"\n\
+         [[shards]]\nlisten = \"0.0.0.0:59300\"\nindex = \"/tmp/x.tv\"\n",
+        tokens.display(),
+        udp.display(),
     );
-    let udp = write("udp.key", "000102030405060708090a0b0c0d0e0f\n");
-    let client_cert = certs.join("client.pem").display().to_string();
-    let client_key = certs.join("client.key.pem").display().to_string();
-    let cfg = parse(&write(
-        "full.toml",
-        &format!(
-            "role = \"both\"\nnodes = [\"10.0.0.1:1\"]\ntls_cert = \"{cert}\"\ntls_key = \"{key}\"\n\
-             tls_client_ca = \"{ca}\"\ntls_ca = \"{ca}\"\ntls_client_cert = \"{client_cert}\"\n\
-             tls_client_key = \"{client_key}\"\ntls_domain = \"localhost\"\n\
-             bearer_tokens = \"{tokens}\"\nudp_hmac_key = \"{udp}\"\n\
-             [[shards]]\nlisten = \"0.0.0.0:59300\"\nindex = \"/tmp/x.tv\"\n"
-        ),
-    ))
-    .unwrap();
+    let cfg = run_cfg(&dir, "full.toml", &full).unwrap();
     assert!(cfg.tls.as_ref().is_some_and(|t| t.client_ca_pem.is_some()));
     assert!(cfg
         .client_tls
@@ -709,11 +696,9 @@ fn configuration_refuses_plaintext_off_loopback_and_incomplete_material() {
         .is_some_and(|t| t.identity_pem.is_some() && t.domain.as_deref() == Some("localhost")));
     assert_eq!(cfg.principals.as_ref().map(|p| p.len()), Some(1));
     assert!(cfg.udp_hmac_key.is_some());
-    assert_eq!(
-        UdpKey::from_bytes(b"000102030405060708090a0b0c0d0e0f")
-            .unwrap()
-            .tag(b"x"),
-        cfg.udp_hmac_key.as_ref().unwrap().tag(b"x")
-    );
+    let expected_tag = UdpKey::from_bytes(b"000102030405060708090a0b0c0d0e0f")
+        .unwrap()
+        .tag(b"x");
+    assert_eq!(expected_tag, cfg.udp_hmac_key.as_ref().unwrap().tag(b"x"));
     let _ = std::fs::remove_dir_all(&dir);
 }
