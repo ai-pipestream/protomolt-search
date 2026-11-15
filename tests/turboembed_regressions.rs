@@ -192,13 +192,14 @@ fn sparse_block_max_matches_exhaustive_scores_with_mixed_scales() {
 }
 
 #[test]
-fn uniform_splade_v1_bytes_remain_readable_and_mixed_scales_survive_transpose() {
+fn canonical_splade_v2_bytes_reject_v1_magic_and_mixed_scales_survive_transpose() {
     use pipestream_search::postings::{AnalyzedDoc, AnalyzedField, Bm25Reader, Bm25Store};
+    use pipestream_search::turbo_bridge::splade::{SpladeSectionReader, SPLADE_SECTION_MAGIC};
     let mut uniform = SpladeFieldIndex::default();
     uniform.insert_doc(3, 1.0_f32.to_bits(), &[("x".into(), 7)]);
     let mut bytes = Vec::new();
     uniform.write(&mut bytes).unwrap();
-    let mut expected = b"TVSPLD01".to_vec();
+    let mut expected = SPLADE_SECTION_MAGIC.to_vec();
     expected.extend_from_slice(&1.0_f32.to_le_bytes());
     expected.extend_from_slice(&1_u32.to_le_bytes());
     expected.extend_from_slice(&1_u16.to_le_bytes());
@@ -208,10 +209,23 @@ fn uniform_splade_v1_bytes_remain_readable_and_mixed_scales_survive_transpose() 
     }
     expected.extend_from_slice(&7_u16.to_le_bytes());
     expected.extend_from_slice(&1_u16.to_le_bytes());
+    expected.extend_from_slice(&1.0_f32.to_le_bytes());
     expected.extend_from_slice(&3_u32.to_le_bytes());
     expected.extend_from_slice(&7_u16.to_le_bytes());
+    expected.extend_from_slice(&1.0_f32.to_le_bytes());
     assert_eq!(bytes, expected);
     assert_eq!(SpladeFieldIndex::decode(&expected).unwrap(), uniform);
+
+    let mut bad_v1 = expected.clone();
+    bad_v1[..8].copy_from_slice(b"TVSPLD01");
+    assert_eq!(
+        SpladeFieldIndex::decode(&bad_v1).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert_eq!(
+        SpladeSectionReader::open(&bad_v1).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
 
     let dir = std::env::temp_dir().join(format!("splade-scales-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

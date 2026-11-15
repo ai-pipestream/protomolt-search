@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io;
 
 use super::format::{v6v7_section_starts, MAGIC_V6, MAGIC_V7, MAGIC_V8};
 use super::format_tests::{test_dir, two_field_corpus};
@@ -641,38 +641,6 @@ fn positions_validation_refuses_a_lying_base_table_and_an_orphan_entry() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// Same byte-identity contract on the legacy v4 path (bench/migration
-/// writer): the store and the spill builder must agree there too.
-#[test]
-fn v4_writers_are_byte_identical() {
-    let base = std::env::temp_dir().join(format!("spill-eq-v4-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
-
-    let mut store = Bm25Store::new();
-    let mut builder = SpillBuilder::create_v4_for_bench(&base.join("build"))
-        .unwrap()
-        .with_buffer_bytes(256);
-    for (id, text, doc, lineage) in synthetic_corpus() {
-        store.add_document_with_lineage(id, text.clone(), doc.clone(), lineage);
-        builder
-            .add_document_with_lineage(id, text, doc, lineage)
-            .unwrap();
-    }
-    let store_path = base.join("store.bm25");
-    let spill_path = base.join("spill.bm25");
-    {
-        let mut w = io::BufWriter::new(std::fs::File::create(&store_path).unwrap());
-        store.write_v4_for_bench(&mut w).unwrap();
-        w.flush().unwrap();
-    }
-    builder.finish(&spill_path).unwrap();
-    let a = std::fs::read(&store_path).unwrap();
-    let b = std::fs::read(&spill_path).unwrap();
-    assert!(a == b, "v4 spill output is not byte-identical to the store");
-    let _ = std::fs::remove_dir_all(&base);
-}
-
 fn doc_a() -> AnalyzedDoc {
     AnalyzedDoc::body(
         vec![
@@ -739,10 +707,7 @@ fn sparse_slots_for_shared_id_space() {
 
 #[test]
 fn round_trip_through_disk() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target/tmp")
-        .join(format!("tvbm25_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = test_dir("roundtrip");
     let path = dir.join("shard.tv.bm25");
 
     let mut store = Bm25Store::new();
@@ -801,13 +766,11 @@ fn reader_lineage_with_gaps_and_missing_entries() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The v3/v4 reader's posting_offsets walks with early exit over the
-/// doc-id-ordered postings (the trait default full-scans — O(df) per
-/// survivor). Correctness across first/middle/last/absent targets;
-/// the win itself is the bench's v4 k=1000 column.
+/// Binary-searched posting_offsets lookup over the fixed-stride doc run
+/// across first, middle, last, gap, out-of-range, and unknown-term probes.
 #[test]
-fn v4_posting_offsets_early_exit_correctness() {
-    let dir = test_dir("v4early");
+fn posting_offsets_lookup_correctness() {
+    let dir = test_dir("posting_offsets");
     let path = dir.join("shard.bm25");
     let mut store = Bm25Store::new();
     let n = 5000u32;
@@ -818,14 +781,9 @@ fn v4_posting_offsets_early_exit_correctness() {
             AnalyzedDoc::body(vec![("court".to_string(), 1, vec![(i, i + 3)])], 5),
         );
     }
-    {
-        let mut w = io::BufWriter::new(std::fs::File::create(&path).unwrap());
-        store.write_v4_for_bench(&mut w).unwrap();
-        w.flush().unwrap();
-    }
+    store.save(&path).unwrap();
     let reader = Bm25Reader::open(&path).unwrap();
-    assert!(!reader.v5_runs, "expected the v4 path");
-    // First posting of the list (early exit after one record).
+    // First posting of the list.
     assert_eq!(reader.posting_offsets("court", 0), vec![(0, 3)]);
     // Middle and last.
     assert_eq!(reader.posting_offsets("court", 4998), vec![(2499, 2502)]);
@@ -839,10 +797,7 @@ fn v4_posting_offsets_early_exit_correctness() {
 
 #[test]
 fn load_rejects_garbage() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target/tmp")
-        .join(format!("tvbm25_bad_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = test_dir("bad_garbage");
     let path = dir.join("bad.bm25");
     std::fs::write(&path, b"not a postings file").unwrap();
     assert!(Bm25Store::load(&path).is_err());

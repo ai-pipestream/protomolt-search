@@ -1,11 +1,11 @@
-//! Skip-run Pareto frontiers, v5 posting encoder, and impact cursors.
+//! Skip-run Pareto frontiers, block-max posting encoder, and impact cursors.
 
 use std::io::{self, Write};
 
 use super::format::{write_u32, write_u64};
 use super::{BLOCK, LEVEL1_FACTOR, MAX_FRONTIER};
 
-// --- v5 skip-run machinery ---------------------------------------------
+// --- block-max skip-run machinery --------------------------------------
 
 /// The `(tf, dl)` Pareto frontier of one block of postings, sorted by tf
 /// ascending (dl ascending with it, strictly), dominated pairs pruned,
@@ -201,22 +201,19 @@ pub(super) fn skip_run_size(l0_bytes: u64, l1: &[L1Record]) -> u64 {
     8 + l0_bytes + l1.iter().map(L1Record::encoded_len).sum::<u64>()
 }
 
-/// Feed one posting into the three v5 runs: doc-run entry to `doc_out`,
-/// occurrence pairs to `occ_out`, `(tf, dl)` to the skip builder (whose
-/// level-0 records stream to `skip_l0_out`). `occ_start` is the running
-/// occurrence count; returns the new count.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn push_posting_v5<D: Write, O: Write, S: Write>(
-    doc_out: &mut D,
-    occ_out: &mut O,
-    skip: &mut SkipRunBuilder,
-    skip_l0_out: &mut S,
-    doc_id: u32,
-    tf: u32,
-    offsets: &[(u32, u32)],
+/// Feed one posting into the three block-max runs: doc-run entry to `runs.0`,
+/// occurrence pairs to `runs.1`, and `(tf, dl)` to `skip.0` (whose level-0
+/// records stream to `skip.1`). Returns the updated occurrence count.
+pub(super) fn push_block_max_posting<D: Write, O: Write, S: Write>(
+    runs: (&mut D, &mut O),
+    skip: (&mut SkipRunBuilder, &mut S),
+    posting: (u32, u32, &[(u32, u32)]),
     dl: u32,
     occ_start: u32,
 ) -> io::Result<u32> {
+    let (doc_out, occ_out) = runs;
+    let (skip_builder, skip_l0_out) = skip;
+    let (doc_id, tf, offsets) = posting;
     write_u32(doc_out, doc_id)?;
     write_u32(doc_out, tf)?;
     write_u32(doc_out, occ_start)?;
@@ -224,7 +221,7 @@ pub(super) fn push_posting_v5<D: Write, O: Write, S: Write>(
         write_u32(occ_out, start)?;
         write_u32(occ_out, end)?;
     }
-    skip.push(tf, dl, doc_id, skip_l0_out)?;
+    skip_builder.push(tf, dl, doc_id, skip_l0_out)?;
     Ok(occ_start + offsets.len() as u32)
 }
 

@@ -51,9 +51,6 @@ fn source_bytes_survive_heap_spill_and_mapped_storage() {
             assert_eq!(reader.protobuf_source(row).unwrap(), expected);
             assert_eq!(loaded.protobuf_source(row).unwrap(), expected);
         }
-        assert!(loaded.save_v5(&directory.join("old.bm25")).is_err());
-        let mut bytes = Vec::new();
-        assert!(loaded.write_v4_for_bench(&mut bytes).is_err());
         let rewritten = directory.join("rewritten.bm25");
         loaded.save(&rewritten).unwrap();
         assert_eq!(

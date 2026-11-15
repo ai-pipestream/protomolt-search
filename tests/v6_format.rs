@@ -1,16 +1,16 @@
-//! Format v6 (TVBM2506) increment-1 query contract
-//! (`docs/multi-field.md` build order step 1): a single-field v6 file
-//! answers every query identically to the v5 file of the same corpus,
-//! bit for bit, through every scorer — the plain scored walk, the
-//! exhaustive oracle, and the block-max pruned path (whose impact
-//! cursors run over the v6 file's rebased run offsets).
+//! Format v6/v8 query contract: a `.bm25` shard produced via either
+//! `Bm25Store::save` or `SpillBuilder::finish` emits identical bytes and
+//! answers every query identically to the heap store, bit for bit, across
+//! the plain scored walk, the exhaustive oracle, and the block-max pruned
+//! scorer (unseeded and floor-seeded).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use pipestream_search::bm25::{self, Bm25Params, CorpusStats, ScoredDoc};
-use pipestream_search::postings::{AnalyzedDoc, Bm25Index, Bm25Reader, Bm25Store, DocTerms};
+use pipestream_search::postings::{
+    AnalyzedDoc, Bm25Index, Bm25Reader, Bm25Store, DocTerms, SpillBuilder,
+};
 
-/// Hand-rolled deterministic RNG (LCG, same style as the unit tests).
 struct Lcg(u64);
 
 impl Lcg {
@@ -30,19 +30,24 @@ impl Lcg {
 }
 
 fn test_dir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target/tmp")
-        .join(format!("v6fmt_{name}_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("v6fmt_{name}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
 
-/// A random corpus big enough that common terms span multiple 128-
-/// posting skip blocks: gappy ids, tf skew, mixed empty offsets, some
-/// docs without lineage.
-fn build_store(rng: &mut Lcg, n_docs: u64, vocab: &[String]) -> Bm25Store {
+/// Build a random multi-block corpus in both `Bm25Store` and `SpillBuilder`:
+/// gappy ids, tf skew, and mixed empty/populated offsets.
+fn build_store_and_spill(
+    rng: &mut Lcg,
+    n_docs: u64,
+    vocab: &[String],
+    work_dir: &Path,
+) -> (Bm25Store, SpillBuilder) {
     let mut store = Bm25Store::new();
+    let mut spill = SpillBuilder::create(work_dir)
+        .unwrap()
+        .with_buffer_bytes(2048);
     let mut id = 0u32;
     for _ in 0..n_docs {
         id += 1 + rng.below(3) as u32;
@@ -61,9 +66,14 @@ fn build_store(rng: &mut Lcg, n_docs: u64, vocab: &[String]) -> Bm25Store {
             length += tf;
             terms.push((term.clone(), tf, offsets));
         }
-        store.add_document(id, format!("doc {id}"), AnalyzedDoc::body(terms, length));
+        let doc = AnalyzedDoc::body(terms, length);
+        let text = format!("doc {id}");
+        store.add_document(id, text.clone(), doc.clone());
+        spill
+            .add_document_with_lineage(id, text, doc, None)
+            .unwrap();
     }
-    store
+    (store, spill)
 }
 
 type Sig = Vec<(u32, u64, Vec<(usize, Vec<(u32, u32)>)>)>;
@@ -74,30 +84,60 @@ fn sig(hits: &[ScoredDoc]) -> Sig {
         .collect()
 }
 
+fn assert_scorer_parity(store: &Bm25Store, reader: &Bm25Reader, terms: &[String]) {
+    let params = Bm25Params::default();
+    let stats = CorpusStats {
+        doc_count: store.doc_count(),
+        total_doc_length: store.total_doc_length(),
+        dfs: terms.iter().map(|t| Bm25Index::df(store, t)).collect(),
+    };
+    for k in [1usize, 10, 100] {
+        let heap = bm25::top_k(store, terms, &stats, params, k);
+        let disk = bm25::top_k(reader, terms, &stats, params, k);
+        assert_eq!(sig(&heap), sig(&disk), "top_k({terms:?}, k={k})");
+
+        let heap_ex = bm25::top_k_exhaustive(store, terms, &stats, params, k);
+        let disk_ex = bm25::top_k_exhaustive(reader, terms, &stats, params, k);
+        assert_eq!(sig(&heap), sig(&heap_ex), "exhaustive({terms:?}, k={k})");
+        assert_eq!(
+            sig(&heap_ex),
+            sig(&disk_ex),
+            "reader exhaustive({terms:?}, k={k})"
+        );
+
+        for floor in [
+            f64::NEG_INFINITY,
+            heap.last().map_or(f64::NEG_INFINITY, |h| h.score),
+        ] {
+            let pruned = bm25::top_k_pruned(reader, terms, &stats, params, k, floor);
+            assert_eq!(
+                sig(&heap),
+                sig(&pruned),
+                "top_k_pruned({terms:?}, k={k}, floor={floor})"
+            );
+        }
+    }
+}
+
 #[test]
-fn v6_reader_answers_identically_to_v5() {
+fn v6_reader_answers_identically_to_store_and_spill() {
     let dir = test_dir("identity");
     let vocab: Vec<String> = (0..10).map(|i| format!("t{i}")).collect();
     let mut rng = Lcg::new(0x51F0_0D06);
-    let store = build_store(&mut rng, 3000, &vocab);
+    let (store, mut spill) = build_store_and_spill(&mut rng, 3000, &vocab, &dir.join("spill_work"));
 
-    let v5_path = dir.join("shard.v5.bm25");
-    let v6_path = dir.join("shard.v6.bm25");
-    store.save_v5(&v5_path).unwrap();
-    store.save(&v6_path).unwrap();
-    let v5 = Bm25Reader::open(&v5_path).unwrap();
-    let v6 = Bm25Reader::open(&v6_path).unwrap();
+    let store_path = dir.join("shard.store.bm25");
+    let spill_path = dir.join("shard.spill.bm25");
+    store.save(&store_path).unwrap();
+    spill.finish(&spill_path).unwrap();
+    assert_eq!(
+        std::fs::read(&store_path).unwrap(),
+        std::fs::read(&spill_path).unwrap(),
+    );
+    let reader = Bm25Reader::open(&spill_path).unwrap();
 
-    // Common terms span several skip blocks, so the pruned path runs
-    // the real cursor machinery, not a trivial single block.
-    assert!(
-        Bm25Index::df(&store, "t0") > 256,
-        "corpus too small to be honest"
-    );
-    assert!(
-        v6.has_impacts("t0"),
-        "v6 reader must expose the block-max surface"
-    );
+    assert!(Bm25Index::df(&store, "t0") > 256, "corpus too small");
+    assert!(reader.has_impacts("t0"), "reader must expose block-max");
 
     let queries: Vec<Vec<String>> = vec![
         vec!["t0".into()],
@@ -112,51 +152,19 @@ fn v6_reader_answers_identically_to_v5() {
         ],
         vec!["missing".into()],
     ];
-    let params = Bm25Params::default();
     for terms in &queries {
-        let stats = CorpusStats {
-            doc_count: store.doc_count(),
-            total_doc_length: store.total_doc_length(),
-            dfs: terms.iter().map(|t| Bm25Index::df(&store, t)).collect(),
-        };
-        for k in [1usize, 10, 100] {
-            let a = bm25::top_k(&v5, terms, &stats, params, k);
-            let b = bm25::top_k(&v6, terms, &stats, params, k);
-            assert_eq!(sig(&a), sig(&b), "top_k({terms:?}, k={k})");
-
-            let ae = bm25::top_k_exhaustive(&v5, terms, &stats, params, k);
-            let be = bm25::top_k_exhaustive(&v6, terms, &stats, params, k);
-            assert_eq!(sig(&ae), sig(&be), "top_k_exhaustive({terms:?}, k={k})");
-
-            // Pruned, unseeded and seeded with the true kth-best score
-            // (the coordinator's floor-seed shape). The v5-vs-v6
-            // identity is the contract here; pruned-vs-exhaustive
-            // exactness is blockmax.rs's.
-            for floor in [
-                f64::NEG_INFINITY,
-                a.last().map_or(f64::NEG_INFINITY, |h| h.score),
-            ] {
-                let ap = bm25::top_k_pruned(&v5, terms, &stats, params, k, floor);
-                let bp = bm25::top_k_pruned(&v6, terms, &stats, params, k, floor);
-                assert_eq!(
-                    sig(&ap),
-                    sig(&bp),
-                    "top_k_pruned({terms:?}, k={k}, floor={floor})"
-                );
-            }
-        }
+        assert_scorer_parity(&store, &reader, terms);
     }
 
-    // The document plane agrees too.
     for slot in (0..store.next_doc_id()).step_by(97) {
         assert_eq!(
-            Bm25Index::text(&v5, slot),
-            Bm25Index::text(&v6, slot),
+            Bm25Index::text(&reader, slot),
+            store.text(slot).map(str::to_string),
             "text({slot})"
         );
         assert_eq!(
-            Bm25Index::lineage(&v5, slot),
-            Bm25Index::lineage(&v6, slot),
+            Bm25Index::lineage(&reader, slot),
+            store.lineage(slot),
             "lineage({slot})"
         );
     }

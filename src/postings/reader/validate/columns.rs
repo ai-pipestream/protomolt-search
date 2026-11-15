@@ -4,12 +4,12 @@ use std::io;
 
 use super::super::super::columns::{decode_binding_entry, decode_derived_entry};
 use super::super::super::format::{
-    compatible_column_kind, u16_at, BINDING_ENTRY_NAME, COLUMN_KIND_ANALYSIS_BINDING,
-    COLUMN_KIND_BINDING, COLUMN_KIND_DERIVED, COLUMN_KIND_F64, COLUMN_KIND_FACET, COLUMN_KIND_GEO,
-    COLUMN_KIND_I64, COLUMN_KIND_I64_PRESENT, COLUMN_KIND_INDEX_BINDING, COLUMN_KIND_MAP_F64,
-    COLUMN_KIND_MAP_FACET, COLUMN_KIND_MAP_I64, COLUMN_KIND_MAP_U64, COLUMN_KIND_POSITIONS,
-    COLUMN_KIND_POS_LENGTHS, COLUMN_KIND_SENTENCES, COLUMN_KIND_SOURCES, COLUMN_KIND_SPLADE,
-    COLUMN_KIND_U64, COLUMN_KIND_VECTOR_BINDING, DERIVED_ENTRY_NAME, POSITIONS_ENTRY_PREFIX,
+    u16_at, BINDING_ENTRY_NAME, COLUMN_KIND_ANALYSIS_BINDING, COLUMN_KIND_BINDING,
+    COLUMN_KIND_DERIVED, COLUMN_KIND_F64, COLUMN_KIND_FACET, COLUMN_KIND_GEO, COLUMN_KIND_I64,
+    COLUMN_KIND_I64_PRESENT, COLUMN_KIND_INDEX_BINDING, COLUMN_KIND_MAP_F64, COLUMN_KIND_MAP_FACET,
+    COLUMN_KIND_MAP_I64, COLUMN_KIND_MAP_U64, COLUMN_KIND_POSITIONS, COLUMN_KIND_POS_LENGTHS,
+    COLUMN_KIND_SENTENCES, COLUMN_KIND_SOURCES, COLUMN_KIND_SPLADE, COLUMN_KIND_U64,
+    COLUMN_KIND_VECTOR_BINDING, DERIVED_ENTRY_NAME, POSITIONS_ENTRY_PREFIX,
     POS_LENGTHS_ENTRY_PREFIX, SENTENCES_ENTRY_PREFIX, SOURCES_ENTRY_NAME, SPLADE_ENTRY_PREFIX,
 };
 use super::{invalid, MapView};
@@ -187,15 +187,9 @@ impl V7Columns {
             return Err(invalid(format!("column {col_idx}: duplicate name")));
         }
         column_names.push(name);
-        let raw_kind = view.bytes_at(cursor + 2 + name_len, 1)?[0];
+        let kind = view.bytes_at(cursor + 2 + name_len, 1)?[0];
         let base = cursor + 2 + name_len + 1;
         let col_name = column_names.last().expect("pushed above");
-        let kind = compatible_column_kind(
-            raw_kind,
-            col_name,
-            &view.as_slice()[base as usize..],
-            view.len(),
-        );
         if let Some(next) = self.parse_value_column_entry(view, kind, base)? {
             return Ok(next);
         }

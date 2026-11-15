@@ -7,13 +7,13 @@ The enclosing section CRC covers both payloads.
 
 ## Sparse scales and traversal
 
-Uniform-scale fields retain the original `TVSPLD01` bytes. A field containing
-multiple document scales uses `TVSPLD02`: each block header appends a positive
-finite maximum scale (`f32` bits), and each posting appends its original
-document scale (`f32` bits). Integer impacts are never requantized or clipped
-when documents are grouped into segments or compacted. This reader accepts
-both versions; readers predating v2 cannot serve newly written mixed-scale
-sections. Upgrade readers before publishing those sections.
+Every `COLUMN_KIND_SPLADE` section uses the canonical `TVSPLD02` format: each
+12-byte block header stores `(max_doc, max_impact, block_len, max_scale_bits)`
+with a positive finite maximum scale (`f32` bits), and each 10-byte posting
+stores `(doc_id, impact, doc_scale_bits)` with its document's quantization
+scale (`f32` bits). Integer impacts are never requantized or clipped when
+documents are grouped into segments or compacted. Non-`TVSPLD02` section
+headers fail closed with `InvalidData`.
 
 A mixed-scale block bound is query weight times maximum integer impact times
 maximum scale. The maxima may come from different documents, which makes the

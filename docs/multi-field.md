@@ -275,11 +275,10 @@ are comparable end to end, by construction.
    served by the unchanged v5 machinery), the fused weighted-sum scorer
    `top_k_fused_exhaustive` (accumulation pinned field-id then
    term-index; contract 3 proven at the store level against per-field
-   merged global stats), the per-field `SpillBuilder`, and v6 IS the
-   format: `save` and `finish` write v6 everywhere, dual-writer byte
-   identity holds on multi-field corpora, and the v5 writer survives
-   only as `save_v5`, the oracle for the parity and query-identity
-   tests.
+   merged global stats), the per-field `SpillBuilder`, and `save` / `finish`
+   emit the v6/v7 payload inside the v8 integrity envelope with dual-writer
+   byte identity and heap-store vs `Bm25Reader` query parity across single-
+   and multi-field corpora.
 3. Per-field skip runs + pruned fused scorer; contract 2 tests. LANDED:
    the v6 writer already emits v5-shaped skip runs per field (pulled
    forward in step 2), so this step is the scorer: `top_k_fused_pruned`

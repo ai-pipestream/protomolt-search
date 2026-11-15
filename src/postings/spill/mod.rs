@@ -76,7 +76,7 @@ pub struct SpillBuilder {
     /// Total bytes buffered across every field's `buf`.
     buf_bytes: usize,
     cap_bytes: usize,
-    /// Texts spill, encoded exactly as the v3+ texts section.
+    /// Texts spill (`u32 len` + UTF-8 bytes per slot; `u32::MAX` = absent).
     texts: io::BufWriter<std::fs::File>,
     texts_bytes: u64,
     /// Per-slot text byte length (`u32::MAX` = absent).
@@ -87,8 +87,6 @@ pub struct SpillBuilder {
     /// Per-document typed column tables and inline binding/derived metadata.
     columns: ColumnSet,
     sources: crate::source_archive::SourceArchive,
-    /// Write the v4 format instead of v6/v7 (benchmarking/migration only).
-    v4_only: bool,
 }
 
 impl SpillBuilder {
@@ -125,26 +123,12 @@ impl SpillBuilder {
 
     /// Create a single-field ("body") builder spilling into `dir`.
     pub fn create(dir: &Path) -> io::Result<Self> {
-        Self::create_format(dir, &["body"], false)
+        Self::create_with_fields(dir, &["body"])
     }
 
     /// Create a builder with the given field table; same contract as
     /// [`Bm25Store::with_fields`].
     pub fn create_with_fields(dir: &Path, names: &[&str]) -> io::Result<Self> {
-        Self::create_format(dir, names, false)
-    }
-
-    /// Unified text-field table constructor matching [`Bm25Store::with_text_fields`].
-    pub fn create_with_text_fields(dir: &Path, names: &[&str]) -> io::Result<Self> {
-        Self::create_with_fields(dir, names)
-    }
-
-    /// A builder whose `finish` writes the v4 format (benchmarking/migration only).
-    pub fn create_v4_for_bench(dir: &Path) -> io::Result<Self> {
-        Self::create_format(dir, &["body"], true)
-    }
-
-    fn create_format(dir: &Path, names: &[&str], v4_only: bool) -> io::Result<Self> {
         validate_text_field_names(names, "builder");
         std::fs::create_dir_all(dir)?;
         let texts = io::BufWriter::new(std::fs::File::create(dir.join("texts.spill"))?);
@@ -160,8 +144,12 @@ impl SpillBuilder {
             doc_count: 0,
             columns: ColumnSet::default(),
             sources: crate::source_archive::SourceArchive::spilling(&dir.join("sources.spill"))?,
-            v4_only,
         })
+    }
+
+    /// Unified text-field table constructor matching [`Bm25Store::with_text_fields`].
+    pub fn create_with_text_fields(dir: &Path, names: &[&str]) -> io::Result<Self> {
+        Self::create_with_fields(dir, names)
     }
 
     /// Declare a typed column table for `kind` before any documents are added.
@@ -171,7 +159,6 @@ impl SpillBuilder {
             "{} must be declared before documents are added",
             kind.plural_label()
         );
-        assert!(!self.v4_only, "the v4 format carries no columns");
         self.columns.configure(kind, names);
         self
     }
@@ -204,7 +191,6 @@ impl SpillBuilder {
             self.fields[0].doc_lengths.is_empty(),
             "positional fields must be declared before documents are added"
         );
-        assert!(!self.v4_only, "the v4 format carries no token positions");
         for name in names {
             let fi = self
                 .fields
@@ -223,7 +209,6 @@ impl SpillBuilder {
             self.fields[0].doc_lengths.is_empty(),
             "sentence fields must be declared before documents are added"
         );
-        assert!(!self.v4_only, "the v4 format carries no sentence spans");
         for name in names {
             let fi = self
                 .fields

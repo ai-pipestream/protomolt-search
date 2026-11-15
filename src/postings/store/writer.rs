@@ -1,17 +1,15 @@
-//! Serialization of `Bm25Store` into `.bm25` v4, v5, v6/v7, and v8 formats.
+//! Serialization of `Bm25Store` into `.bm25` v6/v7 payloads and v8 envelopes.
 
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use super::super::codec::{push_posting_v5, skip_run_size, write_skip_run, SkipRunBuilder};
+use super::super::codec::{push_block_max_posting, skip_run_size, write_skip_run, SkipRunBuilder};
 #[cfg(doc)]
 use super::super::columns::FACET_ABSENT;
-use super::super::format::{
-    fsync_parent, write_str, write_u16, write_u32, write_u64, MAGIC_V4, MAGIC_V5,
-};
+use super::super::format::write_u32;
 use super::super::section_writer::{
-    save_v8_atomic, write_lineages, write_text_index_from_lens, write_v5_directory,
-    write_v6v7_payload, FieldSectionDesc, V6PayloadParams, V6SectionSource,
+    save_v8_atomic, write_block_max_directory, write_text_index_from_lens, write_v6v7_payload,
+    FieldSectionDesc, V6PayloadParams, V6SectionSource,
 };
 use super::{Bm25Store, FieldStore};
 
@@ -31,34 +29,12 @@ impl Bm25Store {
         save_v8_atomic(path, |w| self.write_v6_first_seen_dictionaries(w))
     }
 
-    /// Persist in the v5 format. Correctness oracle only — the
-    /// v5-vs-v6 section-parity and query-identity tests; production
-    /// saves are v6 and multi-field stores are refused here.
-    pub fn save_v5(&self, path: &Path) -> io::Result<()> {
-        let tmp: PathBuf = path.with_extension("bm25tmp");
-        {
-            let mut w = io::BufWriter::new(std::fs::File::create(&tmp)?);
-            self.write_to(&mut w)?;
-            w.flush()?;
-            w.get_ref().sync_all()?;
-        }
-        std::fs::rename(&tmp, path)?;
-        fsync_parent(path)
-    }
-
-    /// Sizes of the shared sections (`texts`, `text_index`, `lineages`).
-    fn shared_section_sizes(&self) -> (u64, u64, u64) {
-        let texts_size: u64 = self
-            .texts
+    /// Byte size of the shared `texts` section.
+    fn texts_section_size(&self) -> u64 {
+        self.texts
             .iter()
             .map(|t| 4 + t.as_ref().map_or(0, |s| s.len() as u64))
-            .sum();
-        let lineages_size: u64 = self
-            .lineages
-            .iter()
-            .map(|l| if l.is_some() { 25 } else { 1 })
-            .sum();
-        (texts_size, 12 * self.texts.len() as u64, lineages_size)
+            .sum()
     }
 
     /// One field's term list in byte order — the on-disk directory order.
@@ -84,7 +60,7 @@ impl Bm25Store {
         Ok(run_sizes)
     }
 
-    /// Byte size of one field's postings section (v5 shape).
+    /// Byte size of one field's postings section.
     fn field_postings_size(field: &FieldStore, terms: &[&String], run_sizes: &[(u64, u64)]) -> u64 {
         4 + terms
             .iter()
@@ -96,7 +72,7 @@ impl Bm25Store {
             .sum::<u64>()
     }
 
-    /// Byte size of one field's directory section (v5 shape).
+    /// Byte size of one field's 34-byte directory section.
     fn field_directory_size(terms: &[&String]) -> u64 {
         4 + 34 * terms.len() as u64 + terms.iter().map(|t| t.len() as u64).sum::<u64>()
     }
@@ -110,25 +86,6 @@ impl Bm25Store {
                 }
                 None => write_u32(w, u32::MAX)?,
             }
-        }
-        Ok(())
-    }
-
-    fn write_shared_sections<W: Write>(&self, w: &mut W, index_base: u64) -> io::Result<()> {
-        self.write_texts_section(w)?;
-        write_text_index_from_lens(
-            w,
-            index_base,
-            self.texts
-                .iter()
-                .map(|t| t.as_ref().map_or(u32::MAX, |s| s.len() as u32)),
-        )?;
-        write_lineages(w, &self.lineages)
-    }
-
-    fn write_field_doc_lengths<W: Write>(w: &mut W, field: &FieldStore) -> io::Result<()> {
-        for &len in &field.doc_lengths {
-            write_u32(w, len)?;
         }
         Ok(())
     }
@@ -157,14 +114,10 @@ impl Bm25Store {
             let mut occ_start = 0u32;
             for p in postings {
                 let dl = field.doc_lengths[p.doc_id as usize];
-                occ_start = push_posting_v5(
-                    w,
-                    &mut occ_stage,
-                    &mut skip,
-                    &mut skip_l0,
-                    p.doc_id,
-                    p.tf,
-                    &p.offsets,
+                occ_start = push_block_max_posting(
+                    (w, &mut occ_stage),
+                    (&mut skip, &mut skip_l0),
+                    (p.doc_id, p.tf, &p.offsets),
                     dl,
                     occ_start,
                 )?;
@@ -185,7 +138,7 @@ impl Bm25Store {
         terms: &[&String],
         directory: &[(u64, u64, u64, u32)],
     ) -> io::Result<()> {
-        write_v5_directory(
+        write_block_max_directory(
             w,
             terms.len(),
             terms
@@ -193,73 +146,6 @@ impl Bm25Store {
                 .zip(directory)
                 .map(|(t, &(doc, skip, occ, df))| (t.as_str(), doc, skip, occ, df)),
         )
-    }
-
-    /// Write the v5 layout (`TVBM2505`, `docs/block-max.md`).
-    pub(in crate::postings) fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        if !self.columns.map_integers.is_empty() || !self.columns.map_unsigned_integers.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "legacy format cannot preserve integer map columns",
-            ));
-        }
-        if !self.columns.unsigned_integers.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "legacy format cannot preserve unsigned integer columns",
-            ));
-        }
-        if !self.sources.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "v5 cannot preserve protobuf sources",
-            ));
-        }
-        if self.fields.len() > 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "v5 carries exactly one field; multi-field stores write v6",
-            ));
-        }
-        if !self.columns.facets.is_empty() || !self.columns.numerics.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "v5 carries no columns; column-bearing stores write v7",
-            ));
-        }
-        if self.fields[0].positions {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "v5 carries no token positions; positional stores write v7",
-            ));
-        }
-        let field = &self.fields[0];
-        let n_slots = self.texts.len() as u64;
-        let header_size = 8 + 8 + 8 * 4 + 4;
-        let (texts_size, text_index_size, lineages_size) = self.shared_section_sizes();
-        let terms = Self::sorted_terms(field);
-        let run_sizes = Self::field_run_sizes(field, &terms)?;
-        let postings_size = Self::field_postings_size(field, &terms, &run_sizes);
-
-        let doc_lengths_off = header_size as u64;
-        let texts_off = doc_lengths_off + 4 * n_slots;
-        let text_index_off = texts_off + texts_size;
-        let lineages_off = text_index_off + text_index_size;
-        let postings_off = lineages_off + lineages_size;
-        let directory_off = postings_off + postings_size;
-
-        w.write_all(MAGIC_V5)?;
-        write_u64(w, field.total_length)?;
-        write_u64(w, texts_off)?;
-        write_u64(w, lineages_off)?;
-        write_u64(w, postings_off)?;
-        write_u64(w, directory_off)?;
-        write_u32(w, n_slots as u32)?;
-        Self::write_field_doc_lengths(w, field)?;
-        self.write_shared_sections(w, texts_off)?;
-        let directory = Self::write_field_postings(w, field, &terms, &run_sizes, postings_off)?;
-        Self::write_field_directory(w, &terms, &directory)?;
-        Ok(())
     }
 
     /// Write the v6 (`TVBM2506`) or v7 (`TVBM2507`) payload to `w`.
@@ -279,7 +165,7 @@ impl Bm25Store {
 
     fn write_v6_ordered<W: Write>(&self, w: &mut W, byte_order: bool) -> io::Result<()> {
         let n_slots = self.texts.len() as u64;
-        let (texts_size, _, _) = self.shared_section_sizes();
+        let texts_size = self.texts_section_size();
 
         let mut field_terms: Vec<Vec<&String>> = Vec::with_capacity(self.fields.len());
         let mut field_runs: Vec<Vec<(u64, u64)>> = Vec::with_capacity(self.fields.len());
@@ -339,132 +225,6 @@ impl Bm25Store {
             field_runs: &field_runs,
         };
         write_v6v7_payload(w, &params, &mut source)
-    }
-
-    /// Write the v4 format. Exists for benchmarking (v4-vs-v5 scorer
-    /// comparisons) and migration checks; new shards are always v5+.
-    pub fn write_v4_for_bench<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        self.write_v4_to(w)
-    }
-
-    fn validate_v4_store(&self) -> io::Result<()> {
-        if !self.columns.map_integers.is_empty() || !self.columns.map_unsigned_integers.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "legacy format cannot preserve integer map columns",
-            ));
-        }
-        if !self.columns.unsigned_integers.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "legacy format cannot preserve unsigned integer columns",
-            ));
-        }
-        if !self.sources.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "legacy writer cannot preserve protobuf sources",
-            ));
-        }
-        if self.fields.len() > 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "v4 carries exactly one field",
-            ));
-        }
-        if self.fields[0].positions {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "v4 carries no token positions; positional stores write v7",
-            ));
-        }
-        if !self.columns.facets.is_empty() || !self.columns.numerics.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "v4 carries no columns; column-bearing stores write v7",
-            ));
-        }
-        Ok(())
-    }
-
-    fn write_v4_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        self.validate_v4_store()?;
-        let field = &self.fields[0];
-        let n_slots = self.texts.len() as u64;
-        let header_size = 8 + 8 + 8 * 4 + 4;
-        let doc_lengths_size = 4 * n_slots;
-        let (texts_size, text_index_size, lineages_size) = self.shared_section_sizes();
-        let terms = Self::sorted_terms(field);
-        let postings_size: u64 = 4 + terms
-            .iter()
-            .map(|t| {
-                4 + t.len() as u64
-                    + 4
-                    + field.postings[*t]
-                        .iter()
-                        .map(|p| 12 + 8 * p.offsets.len() as u64)
-                        .sum::<u64>()
-            })
-            .sum::<u64>();
-
-        let doc_lengths_off = header_size as u64;
-        let texts_off = doc_lengths_off + doc_lengths_size;
-        let text_index_off = texts_off + texts_size;
-        let lineages_off = text_index_off + text_index_size;
-        let postings_off = lineages_off + lineages_size;
-        let directory_off = postings_off + postings_size;
-
-        w.write_all(MAGIC_V4)?;
-        write_u64(w, field.total_length)?;
-        write_u64(w, texts_off)?;
-        write_u64(w, lineages_off)?;
-        write_u64(w, postings_off)?;
-        write_u64(w, directory_off)?;
-        write_u32(w, n_slots as u32)?;
-        Self::write_field_doc_lengths(w, field)?;
-        self.write_shared_sections(w, texts_off)?;
-        Self::write_v4_postings_and_directory(w, field, &terms, postings_off)
-    }
-
-    fn write_v4_postings_and_directory<W: Write>(
-        w: &mut W,
-        field: &FieldStore,
-        terms: &[&String],
-        postings_off: u64,
-    ) -> io::Result<()> {
-        write_u32(w, terms.len() as u32)?;
-        let mut directory: Vec<(u64, u32)> = Vec::with_capacity(terms.len());
-        let mut cursor = postings_off + 4;
-        for term in terms {
-            let postings = &field.postings[*term];
-            directory.push((cursor, postings.len() as u32));
-            write_str(w, term)?;
-            write_u32(w, postings.len() as u32)?;
-            cursor += 4 + term.len() as u64 + 4;
-            for p in postings {
-                write_u32(w, p.doc_id)?;
-                write_u32(w, p.tf)?;
-                write_u32(w, p.offsets.len() as u32)?;
-                for &(start, end) in &p.offsets {
-                    write_u32(w, start)?;
-                    write_u32(w, end)?;
-                }
-                cursor += 12 + 8 * p.offsets.len() as u64;
-            }
-        }
-        write_u32(w, terms.len() as u32)?;
-        let mut blob_off = 0u64;
-        for (term, &(offset, df)) in terms.iter().zip(directory.iter()) {
-            write_u64(w, offset)?;
-            write_u32(w, df)?;
-            write_u32(w, u32::try_from(blob_off).expect("term blob exceeds u32"))?;
-            write_u16(w, term.len() as u16)?;
-            blob_off += term.len() as u64;
-        }
-        for term in terms {
-            w.write_all(term.as_bytes())?;
-        }
-        Ok(())
     }
 }
 

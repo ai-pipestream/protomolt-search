@@ -19,6 +19,90 @@ fn analyzed(positional: bool) -> AnalyzedDoc {
     doc
 }
 
+fn build_unsigned_pair(dir: &std::path::Path, tag: &str, mixed: bool) -> (Bm25Store, SpillBuilder) {
+    let mut heap = Bm25Store::new().with_unsigned_integers(&["unsigned", "missing"]);
+    let mut spill = SpillBuilder::create(&dir.join(format!("{tag}.build")))
+        .unwrap()
+        .with_unsigned_integer_fields(&["unsigned", "missing"])
+        .with_buffer_bytes(32);
+    if mixed {
+        heap = heap
+            .with_facets(&["facet"])
+            .with_numerics(&["float"])
+            .with_map_facets(&["map_facet"])
+            .with_map_numerics(&["map_float"])
+            .with_integers(&["signed"])
+            .with_geos(&["geo"])
+            .with_positions(&["body"])
+            .with_sentences(&["body"]);
+        spill = spill
+            .with_facet_fields(&["facet"])
+            .with_numeric_fields(&["float"])
+            .with_map_facet_fields(&["map_facet"])
+            .with_map_numeric_fields(&["map_float"])
+            .with_integer_fields(&["signed"])
+            .with_geo_fields(&["geo"])
+            .with_position_fields(&["body"])
+            .with_sentence_fields(&["body"]);
+        let binding = StoredBinding {
+            plan_fingerprint: "test-plan".into(),
+            body_path: "body".into(),
+            materialize_sha: String::new(),
+            analysis_sha: String::new(),
+            analysis_contract: Vec::new(),
+            vector_binding: Vec::new(),
+            index_contract: Vec::new(),
+        };
+        heap.set_binding(Some(binding.clone()));
+        spill.set_binding(Some(binding));
+    }
+    (heap, spill)
+}
+
+fn assert_unsigned_image(
+    path: &std::path::Path,
+    heap: &Bm25Store,
+    expected: &[Option<u64>],
+    source: Option<&pipestream_search::pb::ProtobufSource>,
+    rewritten: &std::path::Path,
+) {
+    let bytes = std::fs::read(path).unwrap();
+    let loaded = Bm25Store::load(path).unwrap();
+    let mapped = Bm25Reader::open(path).unwrap();
+    mapped.verify_integrity().unwrap();
+    assert_eq!(mapped.unsigned_integer_count(), 2);
+    assert_eq!(mapped.unsigned_integer_name(0), "unsigned");
+    assert_eq!(mapped.unsigned_integer_index("unsigned"), Some(0));
+    assert_eq!(mapped.integer_index("unsigned"), None);
+    let range = (
+        expected.iter().flatten().min().copied().unwrap_or(u64::MAX),
+        expected.iter().flatten().max().copied().unwrap_or(0),
+    );
+    assert_eq!(mapped.unsigned_integer_min_max(0), range);
+    assert_eq!(loaded.unsigned_integer_min_max(0), range);
+    assert_eq!(mapped.unsigned_integer_min_max(1), (u64::MAX, 0));
+    for (row, exp) in expected.iter().enumerate() {
+        let row = row as u32;
+        assert_eq!(mapped.unsigned_integer_value(0, row), *exp);
+        assert_eq!(loaded.unsigned_integer_value(0, row), *exp);
+        assert_eq!(heap.unsigned_integer_value(0, row), *exp);
+        assert_eq!(mapped.unsigned_integer_value(1, row), None);
+        if let Some(src) = source {
+            assert_eq!(mapped.integer_value(0, row), Some(i64::MIN));
+            assert_eq!(
+                mapped.protobuf_source(row).unwrap(),
+                Some((src.clone(), Some(row)))
+            );
+        }
+    }
+    assert_eq!(
+        mapped.unsigned_integer_value(0, expected.len() as u32),
+        None
+    );
+    loaded.save(rewritten).unwrap();
+    assert_eq!(bytes, std::fs::read(rewritten).unwrap());
+}
+
 #[test]
 fn full_unsigned_domain_survives_both_writers_readers_and_other_column_kinds() {
     let dir = directory("roundtrip");
@@ -36,42 +120,7 @@ fn full_unsigned_domain_survives_both_writers_readers_and_other_column_kinds() {
         for slots in [0, 1, 7, 8, 9, 65] {
             let tag = format!("{mixed}-{slots}");
             let expected: Vec<_> = (0..slots).map(|row| domain[row % domain.len()]).collect();
-            let mut heap = Bm25Store::new().with_unsigned_integers(&["unsigned", "missing"]);
-            let mut spill = SpillBuilder::create(&dir.join(format!("{tag}.build")))
-                .unwrap()
-                .with_unsigned_integer_fields(&["unsigned", "missing"])
-                .with_buffer_bytes(32);
-            if mixed {
-                heap = heap
-                    .with_facets(&["facet"])
-                    .with_numerics(&["float"])
-                    .with_map_facets(&["map_facet"])
-                    .with_map_numerics(&["map_float"])
-                    .with_integers(&["signed"])
-                    .with_geos(&["geo"])
-                    .with_positions(&["body"])
-                    .with_sentences(&["body"]);
-                spill = spill
-                    .with_facet_fields(&["facet"])
-                    .with_numeric_fields(&["float"])
-                    .with_map_facet_fields(&["map_facet"])
-                    .with_map_numeric_fields(&["map_float"])
-                    .with_integer_fields(&["signed"])
-                    .with_geo_fields(&["geo"])
-                    .with_position_fields(&["body"])
-                    .with_sentence_fields(&["body"]);
-                let binding = StoredBinding {
-                    plan_fingerprint: "test-plan".into(),
-                    body_path: "body".into(),
-                    materialize_sha: String::new(),
-                    analysis_sha: String::new(),
-                    analysis_contract: Vec::new(),
-                    vector_binding: Vec::new(),
-                    index_contract: Vec::new(),
-                };
-                heap.set_binding(Some(binding.clone()));
-                spill.set_binding(Some(binding));
-            }
+            let (mut heap, mut spill) = build_unsigned_pair(&dir, &tag, mixed);
             let source_ids = mixed.then(|| {
                 (
                     heap.source_archive_mut().insert(&source).unwrap(),
@@ -114,42 +163,19 @@ fn full_unsigned_domain_survives_both_writers_readers_and_other_column_kinds() {
             let spilled = dir.join(format!("spill-{tag}.bm25"));
             heap.save(&path).unwrap();
             spill.finish(&spilled).unwrap();
-            let bytes = std::fs::read(&path).unwrap();
-            assert_eq!(bytes, std::fs::read(&spilled).unwrap(), "{tag}");
-            let loaded = Bm25Store::load(&path).unwrap();
-            let mapped = Bm25Reader::open(&path).unwrap();
-            mapped.verify_integrity().unwrap();
-            assert_eq!(mapped.unsigned_integer_count(), 2);
-            assert_eq!(mapped.unsigned_integer_name(0), "unsigned");
-            assert_eq!(mapped.unsigned_integer_index("unsigned"), Some(0));
-            assert_eq!(mapped.integer_index("unsigned"), None);
-            let range = (
-                expected.iter().flatten().min().copied().unwrap_or(u64::MAX),
-                expected.iter().flatten().max().copied().unwrap_or(0),
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                std::fs::read(&spilled).unwrap(),
+                "{tag}"
             );
-            assert_eq!(mapped.unsigned_integer_min_max(0), range);
-            assert_eq!(loaded.unsigned_integer_min_max(0), range);
-            assert_eq!(mapped.unsigned_integer_min_max(1), (u64::MAX, 0));
-            for (row, expected) in expected.iter().enumerate() {
-                let row = row as u32;
-                assert_eq!(mapped.unsigned_integer_value(0, row), *expected);
-                assert_eq!(loaded.unsigned_integer_value(0, row), *expected);
-                assert_eq!(heap.unsigned_integer_value(0, row), *expected);
-                assert_eq!(mapped.unsigned_integer_value(1, row), None);
-                if mixed {
-                    assert_eq!(mapped.integer_value(0, row), Some(i64::MIN));
-                    assert_eq!(
-                        mapped.protobuf_source(row).unwrap(),
-                        Some((source.clone(), Some(row)))
-                    );
-                }
-            }
-            assert_eq!(mapped.unsigned_integer_value(0, slots as u32), None);
             let rewritten = dir.join(format!("rewrite-{tag}.bm25"));
-            loaded.save(&rewritten).unwrap();
-            assert_eq!(bytes, std::fs::read(rewritten).unwrap());
-            assert!(loaded.save_v5(&dir.join("legacy.bm25")).is_err());
-            assert!(loaded.write_v4_for_bench(&mut Vec::new()).is_err());
+            assert_unsigned_image(
+                &path,
+                &heap,
+                &expected,
+                mixed.then_some(&source),
+                &rewritten,
+            );
         }
     }
     std::fs::remove_dir_all(dir).unwrap();
