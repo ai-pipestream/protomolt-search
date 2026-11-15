@@ -284,71 +284,39 @@ fn chained_pruned_matches_chained_exhaustive_bitwise() {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("chain_pruned_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-
-    // 3000 docs; "a" everywhere with varying tf, "b" on thirds, "c"
-    // rare. Dates pseudo-random but deterministic; every 7th doc has
-    // no value.
-    let n = 3000u32;
-    let tf_a = |d: u32| 1 + (u64::from(d) * 2654435761 % 7) as u32;
-    let date_of = |d: u32| (u64::from(d) * 48271 % 1000) as f64;
-    let mut store = Bm25Store::with_fields(&["body"]).with_numerics(&["date"]);
-    for doc in 0..n {
-        let mut terms = vec![("a".to_string(), tf_a(doc), Vec::new())];
-        if doc % 3 == 0 {
-            terms.push(("b".to_string(), 1 + doc % 3, Vec::new()));
-        }
-        if doc % 61 == 0 {
-            terms.push(("c".to_string(), 1, Vec::new()));
-        }
-        let len: u32 = terms.iter().map(|(_, tf, _)| tf).sum();
-        store.add_document(doc, ".".to_string(), AnalyzedDoc::body(terms, len));
-        if doc % 7 != 0 {
-            store.set_numeric(0, doc, date_of(doc));
-        }
-    }
     let path = dir.join("chain.bm25");
-    store.save(&path).unwrap();
+    let stats = build_numeric_chain_store(&path);
     let reader = Bm25Reader::open(&path).unwrap();
     let body = reader.field(0);
     let cols = ReaderNumerics(&reader);
+    let min_max = reader.numeric_min_max(0);
+    let col = Some(ColumnRef::Numeric(0));
     let chain = ScoreChain {
         stages: vec![
             Stage {
                 op: StageOp::AddLinear { weight: -0.002 },
-                column: Some(ColumnRef::Numeric(0)),
-                min_max: reader.numeric_min_max(0),
+                column: col,
+                min_max,
             },
             Stage {
                 op: StageOp::MultExpDecay {
                     origin: 500.0,
                     scale: 250.0,
                 },
-                column: Some(ColumnRef::Numeric(0)),
-                min_max: reader.numeric_min_max(0),
+                column: col,
+                min_max,
             },
             Stage {
                 op: StageOp::MultLog { weight: 0.4 },
-                column: Some(ColumnRef::Numeric(0)),
-                min_max: reader.numeric_min_max(0),
+                column: col,
+                min_max,
             },
         ],
     };
     let ctx = Some((&chain, &cols as &dyn NumericRead));
-
-    let stats = CorpusStats {
-        doc_count: u64::from(n),
-        total_doc_length: (0..n).map(|d| u64::from(tf_a(d))).sum::<u64>()
-            + (0..n)
-                .filter(|d| d % 3 == 0)
-                .map(|d| u64::from(1 + d % 3))
-                .sum::<u64>()
-            + (0..n).filter(|d| d % 61 == 0).count() as u64,
-        dfs: vec![n, n.div_ceil(3), n.div_ceil(61)],
-    };
     let terms: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
     let params = Bm25Params::default();
-
-    let signature = |docs: &[bm25::ScoredDoc]| -> Vec<(u32, u64)> {
+    let sig = |docs: &[bm25::ScoredDoc]| -> Vec<(u32, u64)> {
         docs.iter().map(|d| (d.doc_id, d.score.to_bits())).collect()
     };
     for k in [1usize, 5, 50] {
@@ -356,29 +324,45 @@ fn chained_pruned_matches_chained_exhaustive_bitwise() {
             bm25::top_k_exhaustive(&body, &terms, &stats, params, bm25::TopK::new(k).chain(ctx));
         let pruned = bm25::top_k(&body, &terms, &stats, params, bm25::TopK::new(k).chain(ctx));
         assert_eq!(
-            signature(&exhaustive),
-            signature(&pruned),
-            "k={k}: chained pruned != chained exhaustive"
+            sig(&exhaustive),
+            sig(&pruned),
+            "k={k}: chained pruned != exhaustive"
         );
-        // Seed the floor with the k-th best FINAL score: ties at the
-        // floor survive, so the seeded run returns the same set.
         if let Some(kth) = exhaustive.last() {
-            let seeded = bm25::top_k(
-                &body,
-                &terms,
-                &stats,
-                params,
-                bm25::TopK::new(k).floor(kth.score).chain(ctx),
-            );
-            assert_eq!(
-                signature(&exhaustive),
-                signature(&seeded),
-                "k={k}: final-scale floor changed the chained result"
-            );
+            let q = bm25::TopK::new(k).floor(kth.score).chain(ctx);
+            let seeded = bm25::top_k(&body, &terms, &stats, params, q);
+            assert_eq!(sig(&exhaustive), sig(&seeded), "k={k}: seeded");
         }
     }
-
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn build_numeric_chain_store(path: &std::path::Path) -> CorpusStats {
+    let n = 3000u32;
+    let mut total = 0u64;
+    let mut store = Bm25Store::with_fields(&["body"]).with_numerics(&["date"]);
+    for doc in 0..n {
+        let tf_a = 1 + (u64::from(doc) * 2654435761 % 7) as u32;
+        let mut terms = vec![("a".to_string(), tf_a, Vec::new())];
+        if doc % 3 == 0 {
+            terms.push(("b".to_string(), 1 + doc % 3, Vec::new()));
+        }
+        if doc % 61 == 0 {
+            terms.push(("c".to_string(), 1, Vec::new()));
+        }
+        let len: u32 = terms.iter().map(|(_, tf, _)| tf).sum();
+        total += u64::from(len);
+        store.add_document(doc, ".".to_string(), AnalyzedDoc::body(terms, len));
+        if doc % 7 != 0 {
+            store.set_numeric(0, doc, (u64::from(doc) * 48271 % 1000) as f64);
+        }
+    }
+    store.save(path).unwrap();
+    CorpusStats {
+        doc_count: u64::from(n),
+        total_doc_length: total,
+        dfs: vec![n, n.div_ceil(3), n.div_ceil(61)],
+    }
 }
 
 /// Distributed == monolith bitwise with a chain, the chain actually

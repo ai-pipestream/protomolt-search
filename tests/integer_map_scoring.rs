@@ -385,11 +385,7 @@ mod pruning {
             self.0.map_facet_value_ord(c, k, d)
         }
     }
-    #[test]
-    fn integer_map_bounds_preserve_exhaustive_top_k_with_seeded_floors() {
-        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("map-score-prune-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+    fn build_integer_map_store(path: &std::path::Path) -> CorpusStats {
         let mut store = Bm25Store::with_fields(&["body"])
             .with_map_integers(&["signed"])
             .with_map_unsigned_integers(&["unsigned"]);
@@ -413,17 +409,77 @@ mod pruning {
                 store.set_map_unsigned_integer(0, row, "", value).unwrap();
             }
         }
+        store.save(path).unwrap();
+        CorpusStats {
+            doc_count: u64::from(n),
+            total_doc_length: total,
+            dfs: vec![n, n.div_ceil(3), n.div_ceil(61)],
+        }
+    }
+
+    fn resolve_map_col(r: &Bm25Reader, name: &str) -> (ColumnRef, (f64, f64)) {
+        let pf = |s: String| s.parse::<f64>().unwrap();
+        if name == "signed" {
+            let key_ord = r.map_integer_key_ord(0, "").unwrap();
+            let (lo, hi) = r.map_integer_key_min_max(0, key_ord).unwrap();
+            return (
+                ColumnRef::MapIntegerKey { column: 0, key_ord },
+                (pf(lo.to_string()), pf(hi.to_string())),
+            );
+        }
+        let key_ord = r.map_unsigned_integer_key_ord(0, "").unwrap();
+        let (lo, hi) = r.map_unsigned_integer_key_min_max(0, key_ord).unwrap();
+        (
+            ColumnRef::MapUnsignedIntegerKey { column: 0, key_ord },
+            (pf(lo.to_string()), pf(hi.to_string())),
+        )
+    }
+
+    fn assert_map_stage_bounds(
+        c: &Columns<'_>,
+        name: &str,
+        col: ColumnRef,
+        mm: (f64, f64),
+        ops: &[StageOp],
+    ) {
+        for (i, &op) in ops.iter().enumerate() {
+            let stage = Stage {
+                op,
+                column: Some(col),
+                min_max: mm,
+            };
+            let chain = ScoreChain {
+                stages: vec![stage],
+            };
+            for row in 0..8 {
+                let x = input(name, row);
+                assert_eq!(stage.input(row as u32, c), x);
+                let contrib = x.map(|x| if i == 3 { 2e-19 * x } else { effect(i, x) });
+                assert_eq!(stage.contribution(row as u32, c), contrib);
+                for base in [-10.0, 0.0, 20.0] {
+                    let expected =
+                        contrib
+                            .map_or(base, |v| if i == 0 || i == 3 { base + v } else { base * v });
+                    let actual = chain.eval(base, row as u32, c);
+                    assert_eq!(actual, expected);
+                    assert!(chain.bound(20.0) >= actual);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn integer_map_bounds_preserve_exhaustive_top_k_with_seeded_floors() {
+        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("map-score-prune-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("score.bm25");
-        store.save(&path).unwrap();
+        let stats = build_integer_map_store(&path);
         let reader = Bm25Reader::open(&path).unwrap();
         let columns = Columns(&reader);
         let body = reader.field(0);
         let terms = ["a", "b", "c"].map(str::to_owned);
-        let stats = CorpusStats {
-            doc_count: u64::from(n),
-            total_doc_length: total,
-            dfs: vec![n, n.div_ceil(3), n.div_ceil(61)],
-        };
+        let p = Bm25Params::default();
         let ops = [
             StageOp::AddLinear { weight: -2e-19 },
             StageOp::MultLog { weight: 0.4 },
@@ -433,94 +489,30 @@ mod pruning {
             },
             StageOp::AddLinear { weight: 2e-19 },
         ];
+        let sig = |hits: &[bm25::ScoredDoc]| -> Vec<(u32, u64)> {
+            hits.iter().map(|h| (h.doc_id, h.score.to_bits())).collect()
+        };
         for name in ["signed", "unsigned"] {
-            let (column, min_max) = if name == "signed" {
-                let k = reader.map_integer_key_ord(0, "").unwrap();
-                let (lo, hi) = reader.map_integer_key_min_max(0, k).unwrap();
-                (
-                    ColumnRef::MapIntegerKey {
-                        column: 0,
-                        key_ord: k,
-                    },
-                    (
-                        lo.to_string().parse::<f64>().unwrap(),
-                        hi.to_string().parse::<f64>().unwrap(),
-                    ),
-                )
-            } else {
-                let k = reader.map_unsigned_integer_key_ord(0, "").unwrap();
-                let (lo, hi) = reader.map_unsigned_integer_key_min_max(0, k).unwrap();
-                (
-                    ColumnRef::MapUnsignedIntegerKey {
-                        column: 0,
-                        key_ord: k,
-                    },
-                    (
-                        lo.to_string().parse::<f64>().unwrap(),
-                        hi.to_string().parse::<f64>().unwrap(),
-                    ),
-                )
-            };
-            for (i, op) in ops.iter().enumerate() {
-                let stage = Stage {
-                    op: *op,
-                    column: Some(column),
-                    min_max,
-                };
-                let chain = ScoreChain {
-                    stages: vec![stage],
-                };
-                for row in 0..8 {
-                    let x = input(name, row);
-                    assert_eq!(stage.input(row as u32, &columns), x);
-                    let contribution = x.map(|x| if i == 3 { 2e-19 * x } else { effect(i, x) });
-                    assert_eq!(stage.contribution(row as u32, &columns), contribution);
-                    for base in [-10.0, 0.0, 20.0] {
-                        let expected = match contribution {
-                            None => base,
-                            Some(c) if i == 0 || i == 3 => base + c,
-                            Some(c) => base * c,
-                        };
-                        let actual = chain.eval(base, row as u32, &columns);
-                        assert_eq!(actual, expected);
-                        assert!(chain.bound(20.0) >= actual);
-                    }
-                }
-            }
+            let (col, min_max) = resolve_map_col(&reader, name);
+            assert_map_stage_bounds(&columns, name, col, min_max, &ops);
             for selected in [ops.to_vec(), ops[..3].to_vec(), vec![ops[3]]] {
-                let chain = ScoreChain {
-                    stages: selected
-                        .into_iter()
-                        .map(|op| Stage {
-                            op,
-                            column: Some(column),
-                            min_max,
-                        })
-                        .collect(),
-                };
+                let stages = selected
+                    .into_iter()
+                    .map(|op| Stage {
+                        op,
+                        column: Some(col),
+                        min_max,
+                    })
+                    .collect();
+                let chain = ScoreChain { stages };
                 let ctx = Some((&chain, &columns as &dyn NumericRead));
                 for k in [1, 5, 50] {
-                    let expected = bm25::top_k_exhaustive(
-                        &body,
-                        &terms,
-                        &stats,
-                        Bm25Params::default(),
-                        bm25::TopK::new(k).chain(ctx),
-                    );
+                    let q = bm25::TopK::new(k).chain(ctx);
+                    let expected = bm25::top_k_exhaustive(&body, &terms, &stats, p, q);
                     for floor in [f64::NEG_INFINITY, expected.last().unwrap().score] {
-                        let actual = bm25::top_k(
-                            &body,
-                            &terms,
-                            &stats,
-                            Bm25Params::default(),
-                            bm25::TopK::new(k).floor(floor).chain(ctx),
-                        );
-                        let signature = |hits: Vec<bm25::ScoredDoc>| {
-                            hits.into_iter()
-                                .map(|h| (h.doc_id, h.score.to_bits()))
-                                .collect::<Vec<_>>()
-                        };
-                        assert_eq!(signature(actual), signature(expected.clone()));
+                        let q = bm25::TopK::new(k).floor(floor).chain(ctx);
+                        let actual = bm25::top_k(&body, &terms, &stats, p, q);
+                        assert_eq!(sig(&actual), sig(&expected));
                     }
                 }
             }

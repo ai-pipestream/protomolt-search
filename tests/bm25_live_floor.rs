@@ -88,6 +88,98 @@ fn run_live(
     )
 }
 
+fn assert_seeded_live_hooks(
+    reader: &Bm25Reader,
+    terms: &[String],
+    stats: &CorpusStats,
+    params: Bm25Params,
+    k: usize,
+    reference: &[ScoredDoc],
+) {
+    let seed = bm25::floor_seed(reference[k - 1].score as f32);
+    let q = bm25::TopK::new(k).floor(f64::from(seed));
+    let seeded = bm25::top_k(reader, terms, stats, params, q);
+    let mut eager = |_seed: Option<f32>| Some(seed);
+    let eager_live = run_live(
+        reader,
+        terms,
+        stats,
+        params,
+        k,
+        f64::NEG_INFINITY,
+        &mut eager,
+    );
+    assert_eq!(
+        sig(&seeded),
+        sig(&eager_live),
+        "eager hook ({terms:?}, k={k})"
+    );
+    assert_eq!(
+        sig(reference),
+        sig(&eager_live),
+        "emission-safe seed ({terms:?}, k={k})"
+    );
+    let mut late = |polled: Option<f32>| polled.is_some().then_some(seed);
+    let late_live = run_live(
+        reader,
+        terms,
+        stats,
+        params,
+        k,
+        f64::NEG_INFINITY,
+        &mut late,
+    );
+    assert_eq!(
+        sig(reference),
+        sig(&late_live),
+        "late hook ({terms:?}, k={k})"
+    );
+}
+
+fn assert_live_floor_for_k(
+    reader: &Bm25Reader,
+    terms: &[String],
+    stats: &CorpusStats,
+    params: Bm25Params,
+    k: usize,
+) {
+    let reference = bm25::top_k(reader, terms, stats, params, k);
+    let mut offered: Vec<f32> = Vec::new();
+    let mut silent = |seed: Option<f32>| {
+        if let Some(s) = seed {
+            offered.push(s);
+        }
+        None
+    };
+    let live = run_live(
+        reader,
+        terms,
+        stats,
+        params,
+        k,
+        f64::NEG_INFINITY,
+        &mut silent,
+    );
+    assert_eq!(
+        sig(&reference),
+        sig(&live),
+        "silent hook ({terms:?}, k={k})"
+    );
+    assert!(
+        offered.windows(2).all(|w| w[0] <= w[1]),
+        "offered seeds must be monotone ({terms:?}, k={k})"
+    );
+    if reference.len() < k {
+        return;
+    }
+    let seed = bm25::floor_seed(reference[k - 1].score as f32);
+    assert!(
+        offered.iter().all(|&s| s <= seed),
+        "an offered seed exceeded the true k-th best's seed ({terms:?}, k={k})"
+    );
+    assert_seeded_live_hooks(reader, terms, stats, params, k, &reference);
+}
+
 #[test]
 fn live_floor_matches_the_seeded_contract_exactly() {
     let dir = test_dir("contract");
@@ -112,93 +204,7 @@ fn live_floor_matches_the_seeded_contract_exactly() {
             dfs: terms.iter().map(|t| Bm25Index::df(&reader, t)).collect(),
         };
         for k in [1usize, 10, 100] {
-            let reference = bm25::top_k(&reader, terms, &stats, params, k);
-
-            // A hook that never raises is the plain scorer, bit for bit,
-            // and the seeds it is offered are monotone and never exceed
-            // the true k-th best's emission-safe seed.
-            let mut offered: Vec<f32> = Vec::new();
-            let mut silent = |seed: Option<f32>| {
-                if let Some(s) = seed {
-                    offered.push(s);
-                }
-                None
-            };
-            let live = run_live(
-                &reader,
-                terms,
-                &stats,
-                params,
-                k,
-                f64::NEG_INFINITY,
-                &mut silent,
-            );
-            assert_eq!(
-                sig(&reference),
-                sig(&live),
-                "silent hook ({terms:?}, k={k})"
-            );
-            assert!(
-                offered.windows(2).all(|w| w[0] <= w[1]),
-                "offered seeds must be monotone ({terms:?}, k={k})"
-            );
-            if reference.len() == k {
-                let kth_seed = bm25::floor_seed(reference[k - 1].score as f32);
-                assert!(
-                    offered.iter().all(|&s| s <= kth_seed),
-                    "an offered seed exceeded the true k-th best's seed ({terms:?}, k={k})"
-                );
-            }
-
-            // A hook that answers the true k-th best's seed from the very
-            // first poll (before any insertion) is exactly the seeded
-            // scorer: this is the strongest floor the relay could ever
-            // deliver, arriving at the earliest possible moment.
-            if reference.len() == k {
-                let seed = bm25::floor_seed(reference[k - 1].score as f32);
-                let seeded = bm25::top_k(
-                    &reader,
-                    terms,
-                    &stats,
-                    params,
-                    bm25::TopK::new(k).floor(f64::from(seed)),
-                );
-                let mut eager = |_seed: Option<f32>| Some(seed);
-                let live = run_live(
-                    &reader,
-                    terms,
-                    &stats,
-                    params,
-                    k,
-                    f64::NEG_INFINITY,
-                    &mut eager,
-                );
-                assert_eq!(sig(&seeded), sig(&live), "eager hook ({terms:?}, k={k})");
-                assert_eq!(
-                    sig(&reference),
-                    sig(&live),
-                    "an emission-safe seed must lose nothing ({terms:?}, k={k})"
-                );
-            }
-
-            // A raise that arrives mid-scan (after the first poll but at
-            // a deterministic point: once the heap has filled) can only
-            // skip work, never change what the coordinator would merge:
-            // every hit at or above the floor survives identically.
-            if reference.len() == k {
-                let seed = bm25::floor_seed(reference[k - 1].score as f32);
-                let mut late = |offered: Option<f32>| offered.is_some().then_some(seed);
-                let live = run_live(
-                    &reader,
-                    terms,
-                    &stats,
-                    params,
-                    k,
-                    f64::NEG_INFINITY,
-                    &mut late,
-                );
-                assert_eq!(sig(&reference), sig(&live), "late hook ({terms:?}, k={k})");
-            }
+            assert_live_floor_for_k(&reader, terms, &stats, params, k);
         }
     }
     let _ = std::fs::remove_dir_all(&dir);

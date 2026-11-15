@@ -1086,7 +1086,6 @@ async fn split_logs_redistributes_two_shards_into_four() {
 /// ranking bit for bit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn split_preserves_multi_field_postings_and_fused_ranking() {
-    use pipestream_search::pb::DocumentField;
     use protomolt_analyzer::GlossaryEntry;
 
     let dir = tempdir("multifield");
@@ -1096,7 +1095,6 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
     let (analysis_addr, analysis) = mock_analysis::start_mock_analysis().await;
     std::mem::forget(analysis);
 
-    // A two-field node: same shape as start_wal_node plus the table.
     let index_path = dir.join("shard.tv");
     let phrases = Arc::new(
         PhraseIndex::new(
@@ -1111,122 +1109,22 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
         )
         .unwrap(),
     );
-    let (addr, _node) = pipestream_search::harness::start_empty_phrase_node(
-        NodeConfig {
-            slot_offset: 0,
-            index_path: Some(index_path.clone()),
-            layout: pipestream_search::node::Layout::SingleImage,
-            analysis_addr: Some(analysis_addr.to_string()),
-            bm25_fields: vec![
-                "body".to_string(),
-                "case_name".to_string(),
-                "phrases".to_string(),
-            ],
-            wal: true,
-            wal_buckets: 64,
-            ..Default::default()
-        },
+    ingest_multifield_parent(
+        &index_path,
+        &analysis_addr.to_string(),
         phrases.clone(),
+        n,
+        &corpus,
+        (&shift, &scale),
     )
     .await;
-    let mut client = NodeServiceClient::connect(addr).await.unwrap();
-    client
-        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-            DIM, BIT_WIDTH, &shift, &scale,
-        ))
-        .await
-        .unwrap();
 
-    // Every third document carries a case name; names reuse body terms
-    // ("alpha") plus name-only terms ("smith", "acme").
-    let name_of = |i: usize| -> Option<String> {
-        i.is_multiple_of(3).then(|| {
-            format!(
-                "{} v {}",
-                ["smith", "acme", "alpha"][i % 4 % 3],
-                ["jones", "smith"][i % 2]
-            )
-        })
-    };
-    let (tx, rx) = mpsc::channel(8);
-    let names: Vec<Option<String>> = (0..n).map(name_of).collect();
-    let names_feed = names.clone();
-    tokio::spawn(async move {
-        for (i, name) in names_feed.iter().enumerate() {
-            tx.send(AddDocumentsRequest {
-                nlp_materialization: String::new(),
-                unsigned_integers: Vec::new(),
-                map_integers: Vec::new(),
-                map_unsigned_integers: Vec::new(),
-                derived_fingerprint: String::new(),
-                original_source: None,
-                source_chunk_ordinal: None,
-                identity: None,
-                collection: String::new(),
-                cased_field: String::new(),
-                sentence_fields: Vec::new(),
-                materialize: None,
-                map_numerics: Vec::new(),
-                map_facets: Vec::new(),
-                numerics: Vec::new(),
-                facets: Vec::new(),
-                text: doc_text(i),
-                analysis: None,
-                lineage: None,
-                fields: name
-                    .as_ref()
-                    .map(|name| {
-                        vec![DocumentField {
-                            field: "case_name".to_string(),
-                            text: name.clone(),
-                            analysis: None,
-                        }]
-                    })
-                    .unwrap_or_default(),
-                integers: Vec::new(),
-                timestamps: Vec::new(),
-                geo_points: Vec::new(),
-                quality: None,
-                geography: None,
-                phrases: Vec::new(),
-                phrase_fingerprint: 0,
-                phrase_field: String::new(),
-                position_fields: Vec::new(),
-                bigram_fields: Vec::new(),
-            })
-            .await
-            .unwrap();
-        }
-    });
-    let resp = client.add_documents(ReceiverStream::new(rx)).await.unwrap();
-    assert_eq!(resp.into_inner().added as usize, n);
-    let (tx, rx) = mpsc::channel(8);
-    let flat = corpus.clone();
-    tokio::spawn(async move {
-        for chunk in flat.chunks(500 * DIM) {
-            tx.send(AddVectorsRequest {
-                materialized_rows: Vec::new(),
-                vectors: chunk.to_vec(),
-                dim: 0,
-            })
-            .await
-            .unwrap();
-        }
-    });
-    client.add_vectors(ReceiverStream::new(rx)).await.unwrap();
-    let flushed = client.flush(FlushRequest {}).await.unwrap().into_inner();
-    assert!(flushed.written);
-
-    // Parent reference: the flushed two-field sidecar.
     let parent =
         Bm25Reader::open(&pipestream_search::node::bm25_sidecar_path(&index_path)).unwrap();
     assert_eq!(parent.field_count(), 3);
     assert_eq!(parent.field_name(1), "case_name");
     assert_eq!(parent.field_name(2), "phrases");
     assert_eq!(parent.analysis_fingerprint(2), phrases.fingerprint());
-    let phrase_term = protomolt_analyzer::phrase_posting_term("alpha-gamma");
-    let parent_phrase_df = parent.field(2).df(&phrase_term);
-    assert!(parent_phrase_df > 0);
 
     let output = reshard::split(
         &reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap(),
@@ -1241,8 +1139,95 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
     .unwrap();
     assert_eq!(output.children.len(), 2);
 
-    let children: Vec<(&reshard::ChildImage, Bm25Reader)> = output
-        .children
+    let children = verify_multifield_children(&parent, &output.children, phrases.fingerprint());
+    assert_multifield_fused_ranking(&parent, &children);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn case_name_fields(i: usize) -> Vec<pipestream_search::pb::DocumentField> {
+    if !i.is_multiple_of(3) {
+        return Vec::new();
+    }
+    let text = format!(
+        "{} v {}",
+        ["smith", "acme", "alpha"][i % 4 % 3],
+        ["jones", "smith"][i % 2]
+    );
+    vec![pipestream_search::pb::DocumentField {
+        field: "case_name".into(),
+        text,
+        analysis: None,
+    }]
+}
+
+async fn ingest_multifield_parent(
+    index_path: &std::path::Path,
+    analysis_addr: &str,
+    phrases: Arc<PhraseIndex>,
+    n: usize,
+    corpus: &[f32],
+    calibration: (&[f32], &[f32]),
+) {
+    let cfg = NodeConfig {
+        slot_offset: 0,
+        index_path: Some(index_path.to_path_buf()),
+        layout: pipestream_search::node::Layout::SingleImage,
+        analysis_addr: Some(analysis_addr.to_string()),
+        bm25_fields: vec!["body".into(), "case_name".into(), "phrases".into()],
+        wal: true,
+        wal_buckets: 64,
+        ..Default::default()
+    };
+    let (addr, _node) = pipestream_search::harness::start_empty_phrase_node(cfg, phrases).await;
+    let mut client = NodeServiceClient::connect(addr).await.unwrap();
+    let backend_req = pipestream_search::harness::embedded_backend_request(
+        DIM,
+        BIT_WIDTH,
+        calibration.0,
+        calibration.1,
+    );
+    client.configure_vector_backend(backend_req).await.unwrap();
+
+    let (tx, rx) = mpsc::channel(8);
+    tokio::spawn(async move {
+        for i in 0..n {
+            let req = AddDocumentsRequest {
+                text: doc_text(i),
+                fields: case_name_fields(i),
+                ..Default::default()
+            };
+            tx.send(req).await.unwrap();
+        }
+    });
+    let resp = client.add_documents(ReceiverStream::new(rx)).await.unwrap();
+    assert_eq!(resp.into_inner().added as usize, n);
+
+    let (tx, rx) = mpsc::channel(8);
+    let flat = corpus.to_vec();
+    tokio::spawn(async move {
+        for chunk in flat.chunks(500 * DIM) {
+            let req = AddVectorsRequest {
+                materialized_rows: Vec::new(),
+                vectors: chunk.to_vec(),
+                dim: 0,
+            };
+            tx.send(req).await.unwrap();
+        }
+    });
+    client.add_vectors(ReceiverStream::new(rx)).await.unwrap();
+    let flushed = client.flush(FlushRequest {}).await.unwrap().into_inner();
+    assert!(flushed.written);
+}
+
+fn verify_multifield_children<'a>(
+    parent: &Bm25Reader,
+    raw_children: &'a [reshard::ChildImage],
+    phrase_fp: u64,
+) -> Vec<(&'a reshard::ChildImage, Bm25Reader)> {
+    let phrase_term = protomolt_analyzer::phrase_posting_term("alpha-gamma");
+    let parent_phrase_df = parent.field(2).df(&phrase_term);
+    assert!(parent_phrase_df > 0);
+    let children: Vec<(&reshard::ChildImage, Bm25Reader)> = raw_children
         .iter()
         .map(|c| {
             let reader = Bm25Reader::open(c.bm25_path.as_ref().unwrap()).unwrap();
@@ -1250,74 +1235,68 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
             assert_eq!(reader.field_name(0), "body");
             assert_eq!(reader.field_name(1), "case_name");
             assert_eq!(reader.field_name(2), "phrases");
-            assert_eq!(reader.analysis_fingerprint(2), phrases.fingerprint());
+            assert_eq!(reader.analysis_fingerprint(2), phrase_fp);
             (c, reader)
         })
         .collect();
     assert_eq!(
         children
             .iter()
-            .map(|(_, reader)| reader.field(2).df(&phrase_term))
+            .map(|(_, r)| r.field(2).df(&phrase_term))
             .sum::<u32>(),
         parent_phrase_df,
         "durable phrase postings must survive WAL split"
     );
-
-    // Per-field conservation: shard shares sum to the parent's stats.
     for (f, terms) in [
         (0usize, vec!["alpha", "gamma", "one"]),
         (1usize, vec!["smith", "acme", "alpha", "jones"]),
     ] {
-        let parent_view = parent.field(f);
-        assert_eq!(
-            children
-                .iter()
-                .map(|(_, r)| r.field(f).total_doc_length())
-                .sum::<u64>(),
-            parent_view.total_doc_length(),
-            "field {f} total length"
-        );
+        let pv = parent.field(f);
+        let child_len: u64 = children
+            .iter()
+            .map(|(_, r)| r.field(f).total_doc_length())
+            .sum();
+        assert_eq!(child_len, pv.total_doc_length(), "field {f} total length");
         for term in terms {
-            assert_eq!(
-                children
-                    .iter()
-                    .map(|(_, r)| r.field(f).df(term))
-                    .sum::<u32>(),
-                parent_view.df(term),
-                "field {f} df({term})"
-            );
+            let child_df: u32 = children.iter().map(|(_, r)| r.field(f).df(term)).sum();
+            assert_eq!(child_df, pv.df(term), "field {f} df({term})");
         }
     }
     assert!(parent.field(1).df("smith") > 0, "name postings must exist");
+    children
+}
 
-    // Fused ranking: parent fused pruned == merged children, bitwise,
-    // with the parent's stats as the shared globals (they ARE the
-    // merged shares, checked above).
+fn assert_multifield_fused_ranking(
+    parent: &Bm25Reader,
+    children: &[(&reshard::ChildImage, Bm25Reader)],
+) {
     let body_terms = vec!["alpha".to_string(), "one".to_string()];
     let name_terms = vec!["smith".to_string(), "alpha".to_string()];
     let k = 25;
+    let body_stats = CorpusStats {
+        doc_count: Bm25Index::doc_count(parent),
+        total_doc_length: parent.field(0).total_doc_length(),
+        dfs: body_terms.iter().map(|t| parent.field(0).df(t)).collect(),
+    };
+    let name_stats = CorpusStats {
+        doc_count: Bm25Index::doc_count(parent),
+        total_doc_length: parent.field(1).total_doc_length(),
+        dfs: name_terms.iter().map(|t| parent.field(1).df(t)).collect(),
+    };
     let run = |r: &Bm25Reader| {
         bm25::top_k_fused(
             &[
                 bm25::FieldQuery {
                     index: &r.field(0),
                     terms: &body_terms,
-                    stats: CorpusStats {
-                        doc_count: Bm25Index::doc_count(&parent),
-                        total_doc_length: parent.field(0).total_doc_length(),
-                        dfs: body_terms.iter().map(|t| parent.field(0).df(t)).collect(),
-                    },
+                    stats: body_stats.clone(),
                     params: bm25::Bm25Params::default(),
                     weight: 1.0,
                 },
                 bm25::FieldQuery {
                     index: &r.field(1),
                     terms: &name_terms,
-                    stats: CorpusStats {
-                        doc_count: Bm25Index::doc_count(&parent),
-                        total_doc_length: parent.field(1).total_doc_length(),
-                        dfs: name_terms.iter().map(|t| parent.field(1).df(t)).collect(),
-                    },
+                    stats: name_stats.clone(),
                     params: bm25::Bm25Params { k1: 0.9, b: 0.2 },
                     weight: 1.75,
                 },
@@ -1325,7 +1304,7 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
             k,
         )
     };
-    let want: Vec<(u64, u64)> = run(&parent)
+    let want: Vec<(u64, u64)> = run(parent)
         .into_iter()
         .map(|d| (u64::from(d.doc_id), d.score.to_bits()))
         .collect();
@@ -1340,6 +1319,4 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
     merged.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     merged.truncate(k);
     assert_eq!(want, merged, "fused ranking must survive the reshard");
-
-    std::fs::remove_dir_all(&dir).ok();
 }
