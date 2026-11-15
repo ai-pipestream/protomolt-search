@@ -304,9 +304,9 @@ impl NodeServiceImpl {
 #[cfg(test)]
 pub(crate) mod segment_staging_hook {
     //! A test seam in the from-segments compaction: called on the
-    /// compaction thread once the outputs are staged, before the tail
-    /// catch-up, so a test can write through the node exactly then (or
-    /// fail the build there). Keyed by index path; one-shot.
+    //! compaction thread once the outputs are staged, before the tail
+    //! catch-up, so a test can write through the node exactly then (or
+    //! fail the build there). Keyed by index path; one-shot.
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 

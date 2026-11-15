@@ -1,8 +1,7 @@
-//! Regression tests for Wave 2b `#142` crash-recovery filesystem error
-//! propagation: `recover_segments_swap` and `try_recover_generation` /
-//! `NodeServiceImpl::open` must propagate real filesystem errors and fail
-//! closed instead of silently swallowing failed `remove_dir_all` or `rename`
-//! calls and opening an empty or half-swapped shard.
+//! Regression tests for crash-recovery filesystem error propagation:
+//! `recover_segments_swap`, `try_recover_generation`, and `NodeServiceImpl::open`
+//! must propagate real filesystem errors and fail closed rather than opening an
+//! empty or half-swapped shard when `remove_dir_all` or `rename` fails.
 
 mod common;
 
@@ -17,7 +16,7 @@ use pipestream_search::segments::{SegmentCatalog, SegmentSetManifest};
 
 fn tempdir(tag: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("wave2b_142_{tag}_{}", std::process::id()));
+        .join(format!("recovery_io_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -45,7 +44,7 @@ fn write_single_doc_bm25(path: &Path, text: &str) {
     store.add_document_with_lineage(0, text.to_string(), AnalyzedDoc::body(terms, length), None);
     store
         .source_archive_mut()
-        .attach_source(0, &common::protobuf_source(text, "wave2b"), None)
+        .attach_source(0, &common::protobuf_source(text, "recovery"), None)
         .unwrap();
     store.save(path).unwrap();
 }
@@ -62,8 +61,8 @@ fn segments_swap_cleanup_io_error_refuses_shard_open() {
     std::fs::write(SegmentCatalog::manifest_path(&root), &manifest_bytes).unwrap();
 
     // A regular file at `.segments.snap-old` makes `remove_dir_all(&old)` fail
-    // deterministically with `ENOTDIR` (even under UID 0). Previously the error
-    // was discarded (`let _ = remove_dir_all(&old)`) and `open` succeeded.
+    // deterministically with `ENOTDIR` (even under UID 0), requiring `open` to
+    // surface the cleanup error and refuse shard initialization.
     std::fs::write(&old, b"corrupt-non-dir-backup").unwrap();
 
     let opened = NodeServiceImpl::open(
@@ -183,11 +182,10 @@ fn generation_swap_cleanup_and_rollback_io_errors_refuse_shard_open() {
     std::fs::remove_file(&tmp).unwrap();
 
     if !is_effective_root() {
-        // Make parent directory read-only (`0o555`) while `.snap` is absent and
-        // `.snap-old` holds the shard's generation so `rename(&old, &snap)`
-        // fails with `EACCES`. Previously `recover_generation` swallowed the
-        // failed rename and `open(..., allow_missing_bm25 = true)` opened an
-        // empty shard with its installed generation stranded in `.snap-old`.
+        // Make the parent directory read-only (`0o555`) while `.snap` is absent and
+        // `.snap-old` holds the shard's generation so `rename(&old, &snap)` fails
+        // with `EACCES`; `open` must refuse rather than opening an empty shard with
+        // its installed generation stranded in `.snap-old`.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let rollback_opened = NodeServiceImpl::open(
             NodeConfig {

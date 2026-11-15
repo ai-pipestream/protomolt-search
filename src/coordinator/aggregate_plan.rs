@@ -72,7 +72,6 @@ pub(crate) fn compile_projections(
 
 /// The compiled aggregate request: everything the fan-out sends and
 /// the merge needs.
-
 #[derive(Clone)]
 pub(crate) struct CompiledAggregate {
     pub(crate) aggregations: Vec<crate::pb::CompiledAggregation>,
