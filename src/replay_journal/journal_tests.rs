@@ -1,19 +1,56 @@
-use pipestream_search::test_support::ForkGuarded;
-use pipestream_search::{
-    pb,
-    replay_journal::{binding_digest, seal_frame, ReplayJournal},
-};
-use prost::Message;
-use std::{
-    path::PathBuf,
-    sync::{Arc, Barrier},
-};
+//! The journal's chain, retry, paging and recovery contract, with every
+//! frame admitted through a live authority session.
+
+use super::*;
+use crate::pb;
+use std::path::PathBuf;
+use std::sync::{Arc, Barrier};
 use tonic::Code;
 
-struct Directory(PathBuf);
+pub(super) const PEER: [u8; 32] = [10; 32];
+
+/// A decision admitting `PEER` under `binding`, published through a live
+/// session. Admission lasts while the session is held.
+pub(super) fn live<'a>(
+    journal: &'a ReplayJournal,
+    binding: &pb::ReplayStreamBinding,
+) -> ReplayAuthoritySession<'a> {
+    let policy = ReplayAdmissionPolicy {
+        contract_version: 1,
+        authority_id: vec![9; 16],
+        revision: 1,
+        binding_sha256: binding_digest(binding).unwrap(),
+        source_certificate_sha256: vec![PEER.to_vec()],
+        source_history_id: binding.source_history_id.clone(),
+        target_history_id: binding.target_history_id.clone(),
+        source_write_epoch: binding.source_write_epoch,
+        target_write_epoch: binding.target_write_epoch,
+        source_residency: 1,
+        target_residency: 1,
+        enabled: true,
+    };
+    let session = journal.authority_session().unwrap();
+    session
+        .begin_refresh(MAX_AUTHORITY_VALIDITY)
+        .unwrap()
+        .publish(&policy)
+        .unwrap();
+    session
+}
+
+/// Admit one frame from `PEER` under a session opened for the call.
+pub(super) fn accept(
+    journal: &ReplayJournal,
+    frame: &pb::ReplayJournalFrame,
+) -> Result<ReplayJournalReceipt, Status> {
+    let _session = live(journal, &journal.binding);
+    journal.accept_inner(frame, &PEER)
+}
+
+pub(super) struct Directory(PathBuf);
 impl Directory {
-    fn new(tag: &str) -> Self {
-        let p = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+    pub(super) fn new(tag: &str) -> Self {
+        let p = std::env::temp_dir().join(format!(
             "replay-journal-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -24,7 +61,7 @@ impl Directory {
         std::fs::create_dir_all(&p).unwrap();
         Self(p)
     }
-    fn path(&self) -> PathBuf {
+    pub(super) fn path(&self) -> PathBuf {
         self.0.join("receiver.redb")
     }
 }
@@ -33,7 +70,7 @@ impl Drop for Directory {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
-fn binding() -> pb::ReplayStreamBinding {
+pub(super) fn binding() -> pb::ReplayStreamBinding {
     pb::ReplayStreamBinding {
         contract_version: 1,
         workspace: "work".into(),
@@ -52,7 +89,7 @@ fn binding() -> pb::ReplayStreamBinding {
         index_contract_sha256: vec![5; 32],
     }
 }
-fn record(clock: u64, text: &str) -> Vec<u8> {
+pub(super) fn record(clock: u64, text: &str) -> Vec<u8> {
     pb::wal::WalRecord {
         seq: 1,
         clock,
@@ -86,7 +123,7 @@ fn record(clock: u64, text: &str) -> Vec<u8> {
     }
     .encode_to_vec()
 }
-fn first(text: &str) -> pb::ReplayJournalFrame {
+pub(super) fn first(text: &str) -> pb::ReplayJournalFrame {
     seal_frame(
         &binding(),
         1,
@@ -95,7 +132,7 @@ fn first(text: &str) -> pb::ReplayJournalFrame {
     )
     .unwrap()
 }
-fn page(after: u64) -> pb::ReadReplayJournalRequest {
+pub(super) fn page(after: u64) -> pb::ReadReplayJournalRequest {
     pb::ReadReplayJournalRequest {
         after_sequence: after,
         through_sequence: None,
@@ -110,10 +147,10 @@ fn exact_retries_survive_reopen_and_do_not_claim_search_visibility() {
     let journal = ReplayJournal::create(&dir.path(), binding()).unwrap();
     let a = first("first");
     let b = seal_frame(&binding(), 2, a.sha256.clone(), record(14, "second")).unwrap();
-    let receipt = journal.accept(&a).unwrap();
+    let receipt = accept(&journal, &a).unwrap();
     assert!(receipt.accepted && receipt.durable && !receipt.searchable && !receipt.replayed);
-    journal.accept(&b).unwrap();
-    let duplicate = journal.accept(&a).unwrap();
+    accept(&journal, &b).unwrap();
+    let duplicate = accept(&journal, &a).unwrap();
     assert_eq!(
         duplicate,
         pb::ReplayJournalReceipt {
@@ -122,13 +159,13 @@ fn exact_retries_survive_reopen_and_do_not_claim_search_visibility() {
         }
     );
     assert_eq!(
-        journal.accept(&first("changed")).unwrap_err().code(),
+        accept(&journal, &first("changed")).unwrap_err().code(),
         Code::AlreadyExists
     );
     assert_eq!(journal.head().unwrap().accepted_sequence, 2);
     drop(journal);
     let journal = ReplayJournal::open(&dir.path(), binding()).unwrap();
-    assert_eq!(journal.accept(&a).unwrap(), duplicate);
+    assert_eq!(accept(&journal, &a).unwrap(), duplicate);
     let read = journal.read(&page(0)).unwrap();
     assert_eq!(read.frames, vec![a, b]);
     assert!(read.complete);
@@ -141,7 +178,7 @@ fn gaps_divergence_repeated_clocks_and_forged_digests_fail_before_acceptance() {
     let dir = Directory::new("order");
     let journal = ReplayJournal::create(&dir.path(), binding()).unwrap();
     let a = first("first");
-    journal.accept(&a).unwrap();
+    accept(&journal, &a).unwrap();
     let cases = [
         seal_frame(&binding(), 3, a.sha256.clone(), record(12, "gap")).unwrap(),
         seal_frame(&binding(), 2, vec![99; 32], record(12, "fork")).unwrap(),
@@ -150,14 +187,14 @@ fn gaps_divergence_repeated_clocks_and_forged_digests_fail_before_acceptance() {
     ];
     for bad in cases {
         assert_eq!(
-            journal.accept(&bad).unwrap_err().code(),
+            accept(&journal, &bad).unwrap_err().code(),
             Code::FailedPrecondition
         );
     }
     let mut forged = a.clone();
     forged.record = record(11, "tampered");
     assert_eq!(
-        journal.accept(&forged).unwrap_err().code(),
+        accept(&journal, &forged).unwrap_err().code(),
         Code::InvalidArgument
     );
     assert_eq!(journal.head().unwrap().accepted_sequence, 1);
@@ -180,7 +217,7 @@ fn every_assignment_component_is_bound_and_reassignment_cannot_reuse_the_file() 
     let dir = Directory::new("binding");
     let base = binding();
     let journal = ReplayJournal::create(&dir.path(), base.clone()).unwrap();
-    journal.accept(&first("doc")).unwrap();
+    accept(&journal, &first("doc")).unwrap();
     assert!(
         ReplayJournal::open(&dir.path(), base.clone()).is_err(),
         "exclusive lifetime lock"
@@ -251,14 +288,14 @@ fn pages_are_byte_bounded_and_pin_their_prefix_across_later_appends() {
     .unwrap();
     let c = seal_frame(&binding(), 3, b.sha256.clone(), record(13, "c")).unwrap();
     for frame in [&a, &b] {
-        journal.accept(frame).unwrap();
+        accept(&journal, frame).unwrap();
     }
     let mut request = page(0);
     request.max_bytes = a.encoded_len() as u64;
     let initial = journal.read(&request).unwrap();
     assert_eq!(initial.frames, std::slice::from_ref(&a));
     assert!(!initial.complete);
-    journal.accept(&c).unwrap();
+    accept(&journal, &c).unwrap();
     request.after_sequence = initial.next_sequence;
     request.through_sequence = Some(initial.through_sequence);
     assert_eq!(
@@ -288,6 +325,7 @@ fn pages_are_byte_bounded_and_pin_their_prefix_across_later_appends() {
 fn concurrent_duplicate_deliveries_share_one_durable_decision() {
     let dir = Directory::new("concurrent");
     let journal = Arc::new(ReplayJournal::create(&dir.path(), binding()).unwrap());
+    let _session = live(&journal, &binding());
     let barrier = Arc::new(Barrier::new(8));
     let threads: Vec<_> = (0..8)
         .map(|_| {
@@ -295,7 +333,7 @@ fn concurrent_duplicate_deliveries_share_one_durable_decision() {
             let barrier = barrier.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                journal.accept(&first("same")).unwrap()
+                journal.accept_inner(&first("same"), &PEER).unwrap()
             })
         })
         .collect();
@@ -303,141 +341,4 @@ fn concurrent_duplicate_deliveries_share_one_durable_decision() {
     assert_eq!(receipts.iter().filter(|r| !r.replayed).count(), 1);
     assert!(receipts.iter().all(|r| r.durable && !r.searchable));
     assert_eq!(journal.head().unwrap().accepted_sequence, 1);
-}
-
-#[test]
-fn accepted_receipt_survives_process_exit_without_drop() {
-    const ENV: &str = "PROTOMOLT_REPLAY_JOURNAL_EXIT_TEST";
-    if let Some(path) = std::env::var_os(ENV) {
-        let journal = ReplayJournal::create(std::path::Path::new(&path), binding()).unwrap();
-        let receipt = journal.accept(&first("exit")).unwrap();
-        assert!(receipt.accepted && receipt.durable && !receipt.searchable);
-        std::process::exit(0); // No journal/database destructor runs.
-    }
-    let dir = Directory::new("exit");
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "accepted_receipt_survives_process_exit_without_drop",
-            "--nocapture",
-        ])
-        .env(ENV, dir.path())
-        .status_guarded()
-        .unwrap();
-    assert!(status.success());
-    let journal = ReplayJournal::open(&dir.path(), binding()).unwrap();
-    assert!(journal.accept(&first("exit")).unwrap().replayed);
-    assert_eq!(journal.read(&page(0)).unwrap().frames, [first("exit")]);
-}
-
-#[test]
-fn missing_or_corrupted_history_is_never_adopted_as_an_empty_journal() {
-    use redb::ReadableTable;
-    for case in 0..3 {
-        let dir = Directory::new("corrupt");
-        let journal = ReplayJournal::create(&dir.path(), binding()).unwrap();
-        journal.accept(&first("doc")).unwrap();
-        drop(journal);
-        let db = redb::Database::open(dir.path()).unwrap();
-        let tx = db.begin_write().unwrap();
-        {
-            let mut frames = tx
-                .open_table(redb::TableDefinition::<u64, &[u8]>::new("frames"))
-                .unwrap();
-            match case {
-                0 => {
-                    frames.remove(1).unwrap();
-                }
-                1 => {
-                    let mut frame: pb::ReplayJournalFrame =
-                        pb::ReplayJournalFrame::decode(frames.get(1).unwrap().unwrap().value())
-                            .unwrap();
-                    frame.record = record(11, "different");
-                    frames.insert(1, frame.encode_to_vec().as_slice()).unwrap();
-                }
-                _ => {
-                    let mut meta = tx
-                        .open_table(redb::TableDefinition::<&str, &[u8]>::new("metadata"))
-                        .unwrap();
-                    meta.remove("header").unwrap();
-                }
-            }
-        }
-        tx.commit().unwrap();
-        drop(db);
-        assert!(ReplayJournal::open(&dir.path(), binding()).is_err());
-    }
-    let dir = Directory::new("empty");
-    std::fs::write(dir.path(), []).unwrap();
-    assert_eq!(
-        ReplayJournal::open(&dir.path(), binding())
-            .err()
-            .unwrap()
-            .code(),
-        Code::DataLoss
-    );
-    assert_eq!(std::fs::metadata(dir.path()).unwrap().len(), 0);
-}
-
-#[test]
-fn legal_wal_encodings_and_unknown_fields_are_preserved_without_normalizing() {
-    let encodings = [
-        vec![0x08, 0x01, 0x30, 0x0b, 0x22, 0x00],
-        vec![0x22, 0x00, 0x30, 0x0b, 0x08, 0x01],
-        vec![0x08, 0x81, 0x00, 0x22, 0x00, 0x30, 0x0b],
-        vec![
-            0x08, 0x01, 0x22, 0x00, 0x30, 0x0b, 0xfa, 0x07, 0x02, 0x00, 0xff,
-        ],
-    ];
-    let semantic = pb::wal::WalRecord::decode(encodings[0].as_slice()).unwrap();
-    let mut digests = std::collections::HashSet::new();
-    for bytes in encodings {
-        assert_eq!(
-            pb::wal::WalRecord::decode(bytes.as_slice()).unwrap(),
-            semantic
-        );
-        let dir = Directory::new("wire");
-        let journal = ReplayJournal::create(&dir.path(), binding()).unwrap();
-        let frame = seal_frame(
-            &binding(),
-            1,
-            binding_digest(&binding()).unwrap(),
-            bytes.clone(),
-        )
-        .unwrap();
-        assert!(
-            digests.insert(frame.sha256.clone()),
-            "original byte identity is distinct"
-        );
-        journal.accept(&frame).unwrap();
-        drop(journal);
-        let journal = ReplayJournal::open(&dir.path(), binding()).unwrap();
-        assert_eq!(journal.read(&page(0)).unwrap().frames[0].record, bytes);
-        assert!(journal.accept(&frame).unwrap().replayed);
-    }
-}
-
-#[test]
-fn digest_matches_independently_encoded_contract_fixture() {
-    // Fixture uses ascending tags, shortest varints, omitted default scalars,
-    // and Python hashlib SHA-256, independently of Prost and the Rust hasher.
-    let expected_binding = vec![
-        250, 87, 157, 11, 13, 136, 3, 250, 148, 255, 191, 174, 104, 197, 61, 217, 77, 2, 46, 59,
-        40, 46, 214, 141, 228, 240, 72, 89, 41, 8, 27, 193,
-    ];
-    assert_eq!(binding_digest(&binding()).unwrap(), expected_binding);
-    let frame = seal_frame(
-        &binding(),
-        1,
-        expected_binding,
-        vec![0x22, 0, 0x30, 0x0b, 8, 1],
-    )
-    .unwrap();
-    assert_eq!(
-        frame.sha256,
-        vec![
-            50, 252, 35, 84, 2, 103, 13, 228, 166, 209, 35, 163, 118, 225, 104, 222, 94, 0, 27,
-            167, 37, 181, 67, 57, 102, 11, 203, 162, 238, 31, 43, 252
-        ]
-    );
 }
