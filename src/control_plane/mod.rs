@@ -42,7 +42,7 @@ use tonic::{Request, Status};
 use crate::coordinator::TopologyRoute;
 
 use self::state::{StoredRoute, StoredState, StoredTopology};
-use self::state_write::{write_state, UNCERTAIN_CONTROL_STATE};
+use self::state_write::{StateWriter, UNCERTAIN_CONTROL_STATE};
 
 #[derive(Debug, Clone)]
 pub struct ControlPolicy {
@@ -78,8 +78,7 @@ pub struct DurableControlPlane {
     // Shared by every clone. Set while holding `state`; checked only after
     // acquiring that same lock, so a queued operation cannot miss the failure.
     persistence_uncertain: Arc<AtomicBool>,
-    #[cfg(test)]
-    write_fault: Arc<Mutex<Option<StateWriteFault>>>,
+    writer: StateWriter,
     // Every clone retains the same open lock file through its lifetime.
     _ownership_lock: Option<Arc<std::fs::File>>,
 }
@@ -130,8 +129,7 @@ impl DurableControlPlane {
             path: Some(path),
             policy,
             persistence_uncertain: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
-            write_fault: Arc::new(Mutex::new(None)),
+            writer: StateWriter::default(),
             _ownership_lock: Some(ownership_lock),
         };
         this.persist()?;
@@ -144,8 +142,7 @@ impl DurableControlPlane {
             path: None,
             policy,
             persistence_uncertain: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
-            write_fault: Arc::new(Mutex::new(None)),
+            writer: StateWriter::default(),
             _ownership_lock: None,
         }
     }
@@ -251,13 +248,7 @@ impl DurableControlPlane {
             return Err(UNCERTAIN_CONTROL_STATE.to_string());
         }
         match &self.path {
-            Some(path) => write_state(
-                path,
-                state,
-                #[cfg(test)]
-                &self.write_fault,
-            )
-            .map_err(|error| {
+            Some(path) => self.writer.write(path, state).map_err(|error| {
                 if error.may_have_published {
                     self.persistence_uncertain.store(true, Ordering::Release);
                     format!("{UNCERTAIN_CONTROL_STATE}: {}", error.message)
