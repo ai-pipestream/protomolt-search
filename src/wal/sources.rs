@@ -1,7 +1,7 @@
 //! Generation-local source interning. Row records carry addresses, while WAL
 //! readers restore self-contained documents for replay and replication.
 
-use super::{read_frame, read_frame_limited, write_frame, FrameRead};
+use super::frames::{read_frame, read_frame_limited, write_frame, FrameRead};
 use crate::pb::storage::{SourceBlob, SourceRecord};
 use crate::pb::wal::{source_wal_blob, LoggedAddDocuments, SourceReference, SourceWalBlob};
 use crate::pb::ProtobufSource;
