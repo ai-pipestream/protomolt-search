@@ -1,29 +1,10 @@
 use super::*;
 use crate::pb::storage::{SourceBackupLimits, SourceBackupManifest};
 use crate::segments::OpenedSegmentSet;
-use std::io::{Read, Seek, SeekFrom, Write};
 use tonic::Code;
 
-fn limits() -> SourceBackupLimits {
-    SourceBackupLimits {
-        metadata_bytes: 4 << 20,
-        max_files: 256,
-        max_bytes: 64 << 20,
-        source_batch_bytes: 64 << 10,
-    }
-}
-async fn publish(f: &Fixture, key: &[u8], version: u64, rows: Option<usize>) {
-    let (_, candidate) = f.stage(key, version, rows).await;
-    let node = f.node.clone();
-    let source = f.source.clone();
-    tokio::task::spawn_blocking(move || {
-        node.publish_document_projection_blocking(&source, INDEX, &candidate)
-    })
-    .await
-    .unwrap()
-    .unwrap();
-}
-async fn compact(f: &Fixture) {
+/// Compact the node's index through source-owned maintenance.
+pub(super) async fn compact(f: &Fixture) {
     let node = f.node.clone();
     let source = f.source.clone();
     tokio::task::spawn_blocking(move || {
@@ -42,7 +23,9 @@ async fn compact(f: &Fixture) {
     .unwrap()
     .unwrap();
 }
-fn check_files(path: &std::path::Path, manifest: &SourceBackupManifest) {
+/// A written bundle holds exactly its manifest: the completion file, the
+/// manifest digest, and every artifact's length and checksum.
+pub(super) fn check_files(path: &std::path::Path, manifest: &SourceBackupManifest) {
     assert!(!path.join(".source-audit.redb").exists());
     assert_eq!(
         SourceBackupManifest::decode(
@@ -66,10 +49,10 @@ fn check_files(path: &std::path::Path, manifest: &SourceBackupManifest) {
 #[tokio::test]
 async fn captured_backup_survives_source_compaction_and_keeps_unpublished_backlog() {
     let f = Fixture::new();
-    publish(&f, KEY, 1, Some(3)).await;
-    publish(&f, b"other", 1, Some(3)).await;
+    f.publish_through_node(KEY, 1, Some(3)).await;
+    f.publish_through_node(b"other", 1, Some(3)).await;
     compact(&f).await;
-    publish(&f, KEY, 2, Some(2)).await;
+    f.publish_through_node(KEY, 2, Some(2)).await;
     let _ = f.stage(KEY, 3, Some(0)).await;
     let catalog = f.node.document_backup_catalog(&f.source, INDEX).unwrap();
     let before = catalog.snapshot();
@@ -77,7 +60,7 @@ async fn captured_backup_survives_source_compaction_and_keeps_unpublished_backlo
     assert_eq!(before.metadata(0).live_rows, 3);
     let captured = f
         .source
-        .capture_backup(&[(INDEX, &catalog)], &limits())
+        .capture_backup(&[(INDEX, &catalog)], &backup_limits())
         .unwrap();
     compact(&f).await;
     for segment in &before.manifest().segments {
@@ -136,7 +119,7 @@ async fn captured_backup_survives_source_compaction_and_keeps_unpublished_backlo
 #[tokio::test]
 async fn backup_refuses_missing_duplicate_and_foreign_indexes_and_preserves_destinations() {
     let f = Fixture::new();
-    publish(&f, KEY, 1, Some(2)).await;
+    f.publish_through_node(KEY, 1, Some(2)).await;
     let catalog = f.node.document_backup_catalog(&f.source, INDEX).unwrap();
     for supplied in [
         vec![],
@@ -145,7 +128,7 @@ async fn backup_refuses_missing_duplicate_and_foreign_indexes_and_preserves_dest
     ] {
         assert_eq!(
             f.source
-                .capture_backup(&supplied, &limits())
+                .capture_backup(&supplied, &backup_limits())
                 .err()
                 .unwrap()
                 .code(),
@@ -153,14 +136,14 @@ async fn backup_refuses_missing_duplicate_and_foreign_indexes_and_preserves_dest
         );
     }
     let foreign = Fixture::new();
-    publish(&foreign, KEY, 1, Some(2)).await;
+    foreign.publish_through_node(KEY, 1, Some(2)).await;
     let wrong = foreign
         .node
         .document_backup_catalog(&foreign.source, INDEX)
         .unwrap();
     assert_eq!(
         f.source
-            .capture_backup(&[(INDEX, &wrong)], &limits())
+            .capture_backup(&[(INDEX, &wrong)], &backup_limits())
             .err()
             .unwrap()
             .code(),
@@ -169,15 +152,15 @@ async fn backup_refuses_missing_duplicate_and_foreign_indexes_and_preserves_dest
     for config in [
         SourceBackupLimits {
             max_files: 1,
-            ..limits()
+            ..backup_limits()
         },
         SourceBackupLimits {
             metadata_bytes: 1,
-            ..limits()
+            ..backup_limits()
         },
         SourceBackupLimits {
             max_bytes: 1,
-            ..limits()
+            ..backup_limits()
         },
     ] {
         assert_eq!(
@@ -194,7 +177,7 @@ async fn backup_refuses_missing_duplicate_and_foreign_indexes_and_preserves_dest
     std::fs::write(output.join("keep"), b"existing").unwrap();
     let captured = f
         .source
-        .capture_backup(&[(INDEX, &catalog)], &limits())
+        .capture_backup(&[(INDEX, &catalog)], &backup_limits())
         .unwrap();
     assert_eq!(
         captured.write_to(&output).unwrap_err().code(),
@@ -206,27 +189,17 @@ async fn backup_refuses_missing_duplicate_and_foreign_indexes_and_preserves_dest
 #[tokio::test]
 async fn backup_copy_rejects_changed_pinned_bytes_and_cleans_only_its_private_output() {
     let f = Fixture::new();
-    publish(&f, KEY, 1, Some(2)).await;
+    f.publish_through_node(KEY, 1, Some(2)).await;
     let catalog = f.node.document_backup_catalog(&f.source, INDEX).unwrap();
     let captured = f
         .source
-        .capture_backup(&[(INDEX, &catalog)], &limits())
+        .capture_backup(&[(INDEX, &catalog)], &backup_limits())
         .unwrap();
     let set = catalog.snapshot();
     let segment = set.metadata(0);
     let path =
         SegmentCatalog::segment_dir(set.root(), &segment.segment_id).join(&segment.bm25.file);
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .unwrap();
-    let mut byte = [0];
-    file.read_exact(&mut byte).unwrap();
-    byte[0] ^= 1;
-    file.seek(SeekFrom::Start(0)).unwrap();
-    file.write_all(&byte).unwrap();
-    file.sync_all().unwrap();
+    flip_first_byte(&path);
     let output = f.root.join("bad-backup");
     assert_eq!(
         captured.write_to(&output).unwrap_err().code(),
@@ -239,8 +212,8 @@ async fn backup_copy_rejects_changed_pinned_bytes_and_cleans_only_its_private_ou
 #[tokio::test]
 async fn backup_retains_an_empty_declared_index_and_later_source_acceptance() {
     let f = Fixture::new();
-    publish(&f, KEY, 1, Some(2)).await;
-    publish(&f, KEY, 2, None).await;
+    f.publish_through_node(KEY, 1, Some(2)).await;
+    f.publish_through_node(KEY, 2, None).await;
     compact(&f).await;
     let catalog = f.node.document_backup_catalog(&f.source, INDEX).unwrap();
     assert!(catalog.snapshot().is_empty());
@@ -250,7 +223,7 @@ async fn backup_retains_an_empty_declared_index_and_later_source_acceptance() {
     let source = f.source.clone();
     let target = output.clone();
     let manifest = tokio::task::spawn_blocking(move || {
-        node.backup_documents_blocking(&source, INDEX, &target, &limits())
+        node.backup_documents_blocking(&source, INDEX, &target, &backup_limits())
     })
     .await
     .unwrap()
@@ -326,7 +299,7 @@ async fn backup_captures_two_owned_indexes_in_key_order() {
         .source
         .capture_backup(
             &[(b"second-index", &second_catalog), (INDEX, &first_catalog)],
-            &limits(),
+            &backup_limits(),
         )
         .unwrap();
     let output = f.root.join("two-indexes");
@@ -359,11 +332,11 @@ async fn backup_captures_two_owned_indexes_in_key_order() {
 #[tokio::test]
 async fn backup_database_budget_failure_removes_partial_output() {
     let f = Fixture::new();
-    publish(&f, KEY, 1, Some(2)).await;
+    f.publish_through_node(KEY, 1, Some(2)).await;
     let catalog = f.node.document_backup_catalog(&f.source, INDEX).unwrap();
     let reference = f
         .source
-        .capture_backup(&[(INDEX, &catalog)], &limits())
+        .capture_backup(&[(INDEX, &catalog)], &backup_limits())
         .unwrap()
         .write_to(&f.root.join("reference"))
         .unwrap();
@@ -375,7 +348,7 @@ async fn backup_database_budget_failure_removes_partial_output() {
         .sum();
     let tight = SourceBackupLimits {
         max_bytes: artifact_bytes + 1,
-        ..limits()
+        ..backup_limits()
     };
     let captured = f
         .source
@@ -401,7 +374,7 @@ async fn backup_without_any_index_retains_all_accepted_source() {
             &[],
             &SourceBackupLimits {
                 max_files: 1,
-                ..limits()
+                ..backup_limits()
             },
         )
         .unwrap()
@@ -420,312 +393,16 @@ async fn backup_without_any_index_retains_all_accepted_source() {
 #[tokio::test]
 async fn backup_rejects_destinations_inside_a_live_catalog() {
     let f = Fixture::new();
-    publish(&f, KEY, 1, Some(2)).await;
+    f.publish_through_node(KEY, 1, Some(2)).await;
     let catalog = f.node.document_backup_catalog(&f.source, INDEX).unwrap();
     let output = catalog.snapshot().root().join("nested-backup");
     let captured = f
         .source
-        .capture_backup(&[(INDEX, &catalog)], &limits())
+        .capture_backup(&[(INDEX, &catalog)], &backup_limits())
         .unwrap();
     assert_eq!(
         captured.write_to(&output).unwrap_err().code(),
         Code::FailedPrecondition
     );
     assert!(!output.exists());
-}
-
-#[tokio::test]
-async fn backup_rejects_a_hole_in_older_accepted_history() {
-    let f = Fixture::new();
-    let _ = f.stage(KEY, 1, Some(0)).await;
-    let _ = f.stage(KEY, 2, Some(0)).await;
-    let key = DocumentVersionKey {
-        document_key: KEY.to_vec(),
-        version: 1,
-    }
-    .encode_to_vec();
-    let tx = f.source.database.begin_write().unwrap();
-    tx.open_table(VERSIONS)
-        .unwrap()
-        .remove(key.as_slice())
-        .unwrap();
-    tx.commit().unwrap();
-    // The latest head still exists and there are no index tips to expose the hole.
-    assert!(f.source.get(KEY, None).unwrap().is_some());
-    let output = f.root.join("incomplete-history");
-    let result = f
-        .source
-        .capture_backup(&[], &limits())
-        .unwrap()
-        .write_to(&output);
-    assert_eq!(result.unwrap_err().code(), Code::DataLoss);
-    assert!(!output.exists());
-}
-
-#[tokio::test]
-async fn backup_rejects_missing_older_publication_decisions() {
-    let f = Fixture::new();
-    for version in 1..=3 {
-        publish(&f, KEY, version, Some(2)).await;
-    }
-    let key = decision_key(INDEX, 1);
-    let tx = f.source.database.begin_write().unwrap();
-    tx.open_table(DECISIONS)
-        .unwrap()
-        .remove(key.as_slice())
-        .unwrap();
-    tx.commit().unwrap();
-    let catalog = f.node.document_backup_catalog(&f.source, INDEX).unwrap();
-    let output = f.root.join("missing-decision");
-    let captured = f
-        .source
-        .capture_backup(&[(INDEX, &catalog)], &limits())
-        .unwrap();
-    assert_eq!(
-        captured.write_to(&output).unwrap_err().code(),
-        Code::DataLoss
-    );
-    assert!(!output.exists());
-}
-
-#[tokio::test]
-async fn backup_checks_historical_source_links_even_with_new_record_hashes() {
-    for damage in ["before", "after", "source", "orphan"] {
-        let f = Fixture::new();
-        for version in 1..=3 {
-            publish(&f, KEY, version, Some(2)).await;
-        }
-        let tx = f.source.database.begin_write().unwrap();
-        {
-            let mut table = tx.open_table(DECISIONS).unwrap();
-            let key = decision_key(INDEX, 2);
-            let mut intent: ProjectionIntent =
-                decode(table.get(key.as_slice()).unwrap().unwrap().value()).unwrap();
-            match damage {
-                "before" => intent.before_manifest_sha256 = vec![44; 32],
-                "after" => intent.after_manifest_sha256 = vec![45; 32],
-                "source" => intent.source = Some(f.source.get(KEY, Some(1)).unwrap().unwrap().0),
-                "orphan" => intent.index_key = b"unregistered-index".to_vec(),
-                _ => unreachable!(),
-            }
-            intent.intent_id = intent_hash(&intent);
-            let key = decision_key(&intent.index_key, 2);
-            table
-                .insert(key.as_slice(), intent.encode_to_vec().as_slice())
-                .unwrap();
-        }
-        tx.commit().unwrap();
-        let catalog = f.node.document_backup_catalog(&f.source, INDEX).unwrap();
-        let captured = f
-            .source
-            .capture_backup(&[(INDEX, &catalog)], &limits())
-            .unwrap();
-        let output = f.root.join("broken-source-chain");
-        let error = captured.write_to(&output).unwrap_err();
-        assert_eq!(error.code(), Code::DataLoss, "{damage}: {error}");
-        assert!(
-            error.message().contains("journal audit"),
-            "{damage}: {error}"
-        );
-        assert!(!output.exists());
-    }
-}
-
-#[tokio::test]
-async fn backup_walks_maintenance_older_than_the_current_tip_and_its_predecessor() {
-    use crate::pb::storage::{MaintenanceCursor, MaintenanceIntent};
-    for damage in [
-        "missing", "previous", "anchor", "hash", "encoding", "orphan",
-    ] {
-        let f = Fixture::new();
-        publish(&f, KEY, 1, Some(2)).await;
-        compact(&f).await;
-        publish(&f, KEY, 2, Some(3)).await;
-        for _ in 0..3 {
-            compact(&f).await;
-        }
-        publish(&f, KEY, 3, Some(1)).await;
-        let _ = f.stage(KEY, 4, Some(0)).await;
-        // A coherent interleaved chain and unpublished backlog must pass first.
-        let catalog = f.node.document_backup_catalog(&f.source, INDEX).unwrap();
-        let clean = f
-            .source
-            .capture_backup(&[(INDEX, &catalog)], &limits())
-            .unwrap()
-            .write_to(&f.root.join("clean-chain"))
-            .unwrap();
-        assert_eq!(
-            clean
-                .source
-                .as_ref()
-                .unwrap()
-                .header
-                .as_ref()
-                .unwrap()
-                .accepted_sequence,
-            4
-        );
-        assert_eq!(
-            clean.source.as_ref().unwrap().indexes[0].committed_sequence,
-            3
-        );
-        let tx = f.source.database.begin_write().unwrap();
-        {
-            let mut table = tx.open_table(MAINTENANCE).unwrap();
-            assert_eq!(table.len().unwrap(), 4);
-            let first: MaintenanceIntent = table
-                .iter()
-                .unwrap()
-                .map(|entry| decode::<MaintenanceIntent>(entry.unwrap().1.value()).unwrap())
-                .min_by_key(|intent| intent.after_epoch)
-                .unwrap();
-            let key = maintenance_key(INDEX, first.after_epoch);
-            if damage == "missing" {
-                table.remove(key.as_slice()).unwrap();
-            } else if damage == "encoding" {
-                let mut bytes = first.encode_to_vec();
-                bytes.extend_from_slice(&[0xa0, 6, 1]);
-                table.insert(key.as_slice(), bytes.as_slice()).unwrap();
-            } else {
-                let mut intent = first;
-                match damage {
-                    "previous" => {
-                        intent.previous = Some(MaintenanceCursor {
-                            after_epoch: intent.before_epoch,
-                            intent_id: vec![46; 32],
-                        })
-                    }
-                    "anchor" => intent.source_intent_id = vec![47; 32],
-                    "hash" => intent.before_manifest_sha256 = vec![48; 32],
-                    "orphan" => {
-                        intent.owner.as_mut().unwrap().index_key = b"unregistered-index".to_vec();
-                        intent.preservation.as_mut().unwrap().owner = intent.owner.clone();
-                    }
-                    _ => unreachable!(),
-                }
-                intent.intent_id.clear();
-                intent.intent_id = sha256::digest(&intent.encode_to_vec()).to_vec();
-                let key = maintenance_key(
-                    &intent.owner.as_ref().unwrap().index_key,
-                    intent.after_epoch,
-                );
-                table
-                    .insert(key.as_slice(), intent.encode_to_vec().as_slice())
-                    .unwrap();
-            }
-        }
-        tx.commit().unwrap();
-        // The tip validator sees only the most recent maintenance pair; the
-        // damaged first decision sits before both and before later source writes.
-        let captured = f
-            .source
-            .capture_backup(&[(INDEX, &catalog)], &limits())
-            .unwrap();
-        let output = f.root.join("broken-maintenance-chain");
-        let error = captured.write_to(&output).unwrap_err();
-        assert_eq!(error.code(), Code::DataLoss, "{damage}: {error}");
-        assert!(!output.exists());
-    }
-}
-
-#[tokio::test]
-async fn retained_vector_artifacts_survive_source_backup_and_verified_restore() {
-    let mut f = Fixture::new();
-    // Keep the schema's full 8D vector as the active image, and require a
-    // separate 4D tier so this exercises actual retained materialization.
-    f.node.config.matryoshka_prefix_dims = vec![4, 8];
-    publish(&f, KEY, 1, Some(3)).await;
-    publish(&f, KEY, 2, Some(2)).await;
-    let catalog = f.node.document_backup_catalog(&f.source, INDEX).unwrap();
-    let before = catalog.snapshot();
-    let mut expected = Vec::new();
-    for segment in 0..before.len() {
-        assert!(before.metadata(segment).multi_res.is_some());
-        for row in 0..before.metadata(segment).rows as u32 {
-            let retained = before.retained_segment(segment).retained(row).unwrap();
-            assert!(retained.output.tier(4).is_some());
-            assert!(retained.output.tier(8).is_some());
-            expected.push((segment, row, crate::multi_res::encode(retained).unwrap()));
-        }
-    }
-    assert_eq!(
-        expected.len(),
-        5,
-        "retain historical tombstoned rows until compaction"
-    );
-    let bundle = f.root.join("retained-backup");
-    let manifest = f
-        .source
-        .capture_backup(&[(INDEX, &catalog)], &limits())
-        .unwrap()
-        .write_to(&bundle)
-        .unwrap();
-    check_files(&bundle, &manifest);
-    let retained_files: Vec<_> = manifest
-        .artifacts
-        .iter()
-        .filter(|artifact| artifact.file.ends_with("/vectors.multi"))
-        .collect();
-    assert_eq!(
-        retained_files.len(),
-        before.len(),
-        "backup must inventory each retained artifact"
-    );
-    // Retention must also survive source-owned maintenance, whose staged
-    // manifest is assembled separately from ordinary shard compaction.
-    compact(&f).await;
-    let compacted = f
-        .node
-        .document_backup_catalog(&f.source, INDEX)
-        .unwrap()
-        .snapshot();
-    assert_eq!(
-        compacted
-            .manifest()
-            .segments
-            .iter()
-            .map(|s| s.rows)
-            .sum::<u64>(),
-        2
-    );
-    assert!(compacted
-        .manifest()
-        .segments
-        .iter()
-        .all(|s| s.multi_res.is_some()));
-    before
-        .verify_source_rewrite(&compacted, &f.root.join("retained-maintenance-proof"), 2)
-        .unwrap();
-
-    let destination = f.root.join("retained-restore");
-    let header = manifest.source.as_ref().unwrap().header.as_ref().unwrap();
-    let request = crate::pb::storage::SourceRestoreRequest {
-        expected_manifest_sha256: manifest.manifest_sha256.clone(),
-        collection: header.collection.clone(),
-        history_id: header.history_id.clone(),
-        limits: Some(limits()),
-    };
-    let verified = DocumentCatalog::stage_backup_restore(&bundle, &destination, &request).unwrap();
-    let restored =
-        OpenedSegmentSet::open(destination.join(&manifest.indexes[0].directory)).unwrap();
-    assert_eq!(restored.manifest(), before.manifest());
-    for (segment, row, bytes) in expected {
-        assert_eq!(
-            crate::multi_res::encode(restored.retained_segment(segment).retained(row).unwrap())
-                .unwrap(),
-            bytes,
-            "full/prefix/norm/code/sentence bits changed at segment {segment}, row {row}"
-        );
-    }
-    before
-        .verify_source_rewrite(&restored, &f.root.join("retained-restore-proof"), 2)
-        .unwrap();
-    drop(restored);
-    drop(verified);
-    assert!(!destination.exists());
-    // A missing retained artifact is corruption even though every original
-    // provider, FP32, BM25 and live-doc file is still present and checksummed.
-    std::fs::remove_file(bundle.join(&retained_files[0].file)).unwrap();
-    assert!(DocumentCatalog::stage_backup_restore(&bundle, &destination, &request).is_err());
-    assert!(!destination.exists());
 }

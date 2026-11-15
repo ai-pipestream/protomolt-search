@@ -4,12 +4,14 @@ use crate::pb::{
     storage::{SourceBackupIndex, SourceBackupLimits, SourceBackupManifest},
     SnapshotArtifact,
 };
-use crate::segments::{SegmentArtifact, SegmentCatalog};
+use crate::segments::{OpenedSegmentSet, SegmentArtifact, SegmentCatalog};
 use std::{
     collections::BTreeSet,
     io::{Read, Seek, SeekFrom, Write},
     path::{Component, PathBuf},
 };
+
+mod write;
 
 pub(super) const SOURCE: &str = "sources.redb";
 pub(super) const COMPLETION: &str = "source-backup.pb";
@@ -142,54 +144,7 @@ impl DocumentCatalog {
                 .expect("captured header")
                 .clone();
             catalog.with_durable_snapshot(|set| {
-                let directory = format!("indexes/{ordinal:08}/index.segments");
-                let encoded = capture.json(set.manifest())?;
-                if sha256::digest(&encoded).as_slice() != state.committed_manifest_sha256 {
-                    return Err(fail(
-                        "backup index manifest differs from its captured journal state",
-                    ));
-                }
-                let expected_owner = crate::pb::storage::SourceIndexOwner {
-                    format_version: 1,
-                    history_id: header.history_id.clone(),
-                    index_key: key.to_vec(),
-                    collection: header.collection.clone(),
-                };
-                match &set.manifest().source_owner {
-                    Some(owner) if owner.decode().map_err(Status::data_loss)? == expected_owner => {
-                    }
-                    None if state.committed_sequence == 0 && set.is_empty() => {}
-                    _ => return Err(fail("backup index belongs to another source owner")),
-                }
-                capture.indexes.push(SourceBackupIndex {
-                    index_key: key.to_vec(),
-                    directory: directory.clone(),
-                    catalog_epoch: set.epoch(),
-                });
-                capture.bytes_file(format!("{directory}/segments.json"), encoded)?;
-                for segment in &set.manifest().segments {
-                    file_name(&segment.segment_id)?;
-                    let prefix = format!("{directory}/segments/{}", segment.segment_id);
-                    let bytes = capture.json(segment)?;
-                    capture.bytes_file(format!("{prefix}/segment.json"), bytes)?;
-                    let original = SegmentCatalog::segment_dir(set.root(), &segment.segment_id);
-                    for artifact in [
-                        Some(&segment.vector),
-                        Some(&segment.exact_vectors),
-                        Some(&segment.bm25),
-                        Some(&segment.live_docs),
-                        segment.multi_res.as_ref(),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    {
-                        if artifact.file.is_empty() {
-                            continue;
-                        }
-                        capture.pin_file(&original, &prefix, artifact)?;
-                    }
-                }
-                Ok(())
+                capture.pin_index(ordinal, key, set, &state, &header)
             })?;
         }
         // Include the final protobuf inventory in metadata accounting before any
@@ -206,6 +161,65 @@ impl DocumentCatalog {
 }
 
 impl CapturedBackup<'_> {
+    /// Pin one journaled index: its manifest must be the captured journal
+    /// state's and owned by this source; every segment file it names is
+    /// held open under the bundle path it will be copied to.
+    fn pin_index(
+        &mut self,
+        ordinal: usize,
+        key: &[u8],
+        set: &OpenedSegmentSet,
+        state: &crate::pb::storage::ProjectionJournalState,
+        header: &DocumentCatalogHeader,
+    ) -> Result<(), Status> {
+        let directory = format!("indexes/{ordinal:08}/index.segments");
+        let encoded = self.json(set.manifest())?;
+        if sha256::digest(&encoded).as_slice() != state.committed_manifest_sha256 {
+            return Err(fail(
+                "backup index manifest differs from its captured journal state",
+            ));
+        }
+        let expected_owner = crate::pb::storage::SourceIndexOwner {
+            format_version: 1,
+            history_id: header.history_id.clone(),
+            index_key: key.to_vec(),
+            collection: header.collection.clone(),
+        };
+        match &set.manifest().source_owner {
+            Some(owner) if owner.decode().map_err(Status::data_loss)? == expected_owner => {}
+            None if state.committed_sequence == 0 && set.is_empty() => {}
+            _ => return Err(fail("backup index belongs to another source owner")),
+        }
+        self.indexes.push(SourceBackupIndex {
+            index_key: key.to_vec(),
+            directory: directory.clone(),
+            catalog_epoch: set.epoch(),
+        });
+        self.bytes_file(format!("{directory}/segments.json"), encoded)?;
+        for segment in &set.manifest().segments {
+            file_name(&segment.segment_id)?;
+            let prefix = format!("{directory}/segments/{}", segment.segment_id);
+            let bytes = self.json(segment)?;
+            self.bytes_file(format!("{prefix}/segment.json"), bytes)?;
+            let original = SegmentCatalog::segment_dir(set.root(), &segment.segment_id);
+            for artifact in [
+                Some(&segment.vector),
+                Some(&segment.exact_vectors),
+                Some(&segment.bm25),
+                Some(&segment.live_docs),
+                segment.multi_res.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if artifact.file.is_empty() {
+                    continue;
+                }
+                self.pin_file(&original, &prefix, artifact)?;
+            }
+        }
+        Ok(())
+    }
     fn metadata_charge(&mut self, bytes: usize) -> Result<(), Status> {
         self.metadata_bytes = self
             .metadata_bytes
@@ -319,137 +333,60 @@ impl CapturedBackup<'_> {
             manifest_sha256: Vec::new(),
         }
     }
+}
 
-    /// Write one complete local bundle in an exclusively created directory.
-    /// The source checkpoint is copied from the captured transaction; artifacts
-    /// are copied from held files, never reopened by their retired source paths.
-    /// Failed writes remove only their own directory. A process crash may leave
-    /// a partial directory; without a verified completion manifest it is invalid.
-    pub fn write_to(mut self, destination: &Path) -> Result<SourceBackupManifest, Status> {
-        let name = destination
-            .file_name()
-            .ok_or_else(|| fail("backup destination needs a directory name"))?;
-        let resolved = std::fs::canonicalize(parent_directory(destination))
-            .map_err(storage)?
-            .join(name);
-        if self
-            .source_roots
-            .iter()
-            .any(|root| resolved.starts_with(root))
-        {
-            return Err(fail(
-                "backup destination must be outside every live catalog",
-            ));
+/// Create `path` as a new directory private to this process's user. The
+/// returned guard removes it again unless the caller keeps it.
+pub(super) fn create_private_directory(
+    path: &Path,
+    occupied: &'static str,
+) -> Result<OwnedDirectory, Status> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            Status::already_exists(occupied)
+        } else {
+            storage(error)
         }
-        let parent = File::open(parent_directory(destination)).map_err(storage)?;
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder.create(destination).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                Status::already_exists("backup destination already exists")
-            } else {
-                storage(error)
-            }
-        })?;
-        let mut owned = OwnedDirectory {
-            path: destination.to_path_buf(),
-            keep: false,
-        };
-        self.source.verify_source_history(
-            &destination.join(".source-audit.redb"),
-            self.limits.source_batch_bytes as usize,
-            self.limits.max_bytes,
-        )?;
-        let remaining = self
-            .limits
-            .max_bytes
-            .checked_sub(self.bytes)
-            .filter(|n| *n > 0)
-            .ok_or_else(exhausted)?;
-        let source = self.source.write_to(
-            &destination.join(SOURCE),
-            &crate::pb::storage::DocumentCatalogCheckpointLimits {
-                batch_bytes: self.limits.source_batch_bytes,
-                max_file_bytes: remaining,
-            },
-        )?;
-        let mut total = self.bytes;
-        charge(&mut total, source.bytes, self.limits.max_bytes)?;
-        let mut manifest = self.manifest(source);
-        manifest.manifest_sha256 = sha256::digest(&manifest.encode_to_vec()).to_vec();
-        let completed = manifest.encode_to_vec();
-        charge(&mut total, completed.len() as u64, self.limits.max_bytes)?;
-        drop(self.source);
-        let mut directories = BTreeSet::new();
-        directories.insert(destination.to_path_buf());
-        let mut buffer = [0u8; 64 << 10];
-        for pinned in &mut self.files {
-            let output = destination.join(&pinned.metadata.file);
-            let directory = output.parent().expect("bundle artifact parent");
-            std::fs::create_dir_all(directory).map_err(storage)?;
-            let mut ancestor = directory;
-            while ancestor != destination {
-                directories.insert(ancestor.to_path_buf());
-                ancestor = ancestor.parent().expect("generated bundle path");
-            }
-            let mut file = new_file(&output)?;
-            let mut hash = sha256::Sha256::new();
-            let mut count = 0u64;
-            let mut copy = |input: &mut dyn Read| -> Result<(), Status> {
-                loop {
-                    let n = input.read(&mut buffer).map_err(storage)?;
-                    if n == 0 {
-                        break;
-                    }
-                    count = count.checked_add(n as u64).ok_or_else(exhausted)?;
-                    if count > pinned.metadata.bytes {
-                        return Err(Status::data_loss("backup artifact grew after capture"));
-                    }
-                    file.write_all(&buffer[..n]).map_err(storage)?;
-                    hash.update(&buffer[..n]);
-                }
-                Ok(())
-            };
-            match &mut pinned.data {
-                Data::Bytes(bytes) => copy(&mut bytes.as_slice())?,
-                Data::File(input) => {
-                    input.seek(SeekFrom::Start(0)).map_err(storage)?;
-                    copy(input)?;
-                }
-            }
-            if count != pinned.metadata.bytes
-                || sha256::to_hex(&hash.finalize()) != pinned.metadata.sha256
-            {
-                return Err(Status::data_loss(
-                    "backup artifact changed or failed its checksum",
-                ));
-            }
-            file.sync_all().map_err(storage)?;
-        }
-        for directory in directories.iter().rev() {
-            File::open(directory)
-                .and_then(|f| f.sync_all())
-                .map_err(storage)?;
-        }
-        // Commit marker is last. Its presence alone is not proof: readers must
-        // validate its digest and every referenced artifact before restoration.
-        {
-            let mut file = new_file(&destination.join(COMPLETION))?;
-            file.write_all(&completed).map_err(storage)?;
-            file.sync_all().map_err(storage)?;
-        }
-        File::open(destination)
+    })?;
+    Ok(OwnedDirectory {
+        path: path.to_path_buf(),
+        keep: false,
+    })
+}
+
+/// Make a fully written bundle durable: sync every directory created
+/// under it, then write the completion marker and sync the bundle and its
+/// parent.
+pub(super) fn commit_bundle(
+    destination: &Path,
+    directories: &BTreeSet<PathBuf>,
+    completion: &[u8],
+    parent: &File,
+) -> Result<(), Status> {
+    for directory in directories.iter().rev() {
+        File::open(directory)
             .and_then(|f| f.sync_all())
             .map_err(storage)?;
-        parent.sync_all().map_err(storage)?;
-        owned.keep = true;
-        Ok(manifest)
     }
+    // Commit marker is last. Its presence alone is not proof: readers must
+    // validate its digest and every referenced artifact before restoration.
+    {
+        let mut file = new_file(&destination.join(COMPLETION))?;
+        file.write_all(completion).map_err(storage)?;
+        file.sync_all().map_err(storage)?;
+    }
+    File::open(destination)
+        .and_then(|f| f.sync_all())
+        .map_err(storage)?;
+    parent.sync_all().map_err(storage)
 }
+
 pub(super) struct OwnedDirectory {
     pub(super) path: PathBuf,
     pub(super) keep: bool,
