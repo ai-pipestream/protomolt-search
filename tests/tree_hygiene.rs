@@ -29,7 +29,6 @@ const RATCHET_HEADROOM: usize = 150;
 /// when its file shrinks; remove it when the file is split or deleted.
 const RATCHET: &[(&str, usize)] = &[
     ("src/hnsw/tests.rs", 3_972 + RATCHET_HEADROOM),
-    ("src/query.rs", 3_285 + RATCHET_HEADROOM),
     ("src/segments.rs", 2_999 + RATCHET_HEADROOM),
     ("src/segmented.rs", 2_236 + RATCHET_HEADROOM),
     ("src/main.rs", 2_010 + RATCHET_HEADROOM),
