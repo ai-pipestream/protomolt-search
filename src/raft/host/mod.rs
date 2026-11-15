@@ -207,12 +207,6 @@ pub fn inspect_node(
     })
 }
 
-impl RaftHost {
-    // -----------------------------------------------------------------
-    // Membership: learner, promotion, removal
-    // -----------------------------------------------------------------
-}
-
 fn refusal_status(refusal: crate::pb::storage::RaftRefusal) -> Status {
     Status::new(tonic::Code::from_i32(refusal.code as i32), refusal.message)
 }

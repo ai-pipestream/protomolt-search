@@ -11,6 +11,7 @@ mod receive;
 mod staging;
 mod storage;
 
+#[cfg(any(test, feature = "fault-injection"))]
 pub(crate) use self::image::meta_to_proto;
 #[cfg(test)]
 pub(crate) use self::image::published_generation;
