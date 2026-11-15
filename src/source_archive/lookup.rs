@@ -55,7 +55,7 @@ impl SourceArchive {
 impl SourceArchiveReader {
     /// Same contract as `SourceArchive::visit_document_rows`. The lookup uses
     /// exact key comparisons and visits only this key's bound rows after a
-    /// binary search. Legacy identity archives build the lookup once on open.
+    /// binary search.
     pub fn visit_document_rows(
         &self,
         key: &[u8],
