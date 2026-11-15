@@ -54,7 +54,7 @@
             0.03%  ::dim  <-  ::dim
             0.02%  ::row  <-  ::row
   0.08%  enumerate body (consider/bar/survives)
-            0.05%  ::try_fold::<(), core::iter::adapters::copied::cop  <-  ::try_fold::<(), core::iter::adapters::copied::copy_try_fold<f32, (), 
+            0.05%  ::try_fold::<(), core::iter::adapters::copied::cop  <-  ::try_fold::<(), core::iter::adapters::copied::copy_try_fold<f32, (),
             0.01%  ::then_some::  <-  pipestream_search::vector::first_invalid_coordinate::{closure#0}
             0.00%  ::eq  <-  ::connect_back
             0.00%  ::try_fold::enumerate::::{closure#0}  <-  ::try_fold::enumerate::::{closure#0}

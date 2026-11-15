@@ -769,11 +769,11 @@ Use only when shards cannot share a calibration.
 
 ### Shared provider scoring identity and its caveats
 
-`SearchService.BroadcastVectorBackend` pushes one opaque provider
-configuration to every shard. Configure before ingest and verify matching
-`scoring_fingerprint` values with `GetVectorBackend`. Provider configuration
-is locked for a generation, so a scoring-identity change is a coordinated
-rebuild and cutover event.
+`SearchService.BroadcastVectorBackend` fans out one opaque provider
+configuration (`NodeService.ConfigureVectorBackend`) to every shard. Configure
+before ingest and verify matching `scoring_fingerprint` values with
+`NodeService.GetVectorBackend`; scoring-identity changes require a coordinated
+generation rebuild and cutover.
 
 Fork caveats (read from the turbovec source, pinned in
 `tests/score_layout.rs`): with a shared calibration, encoding is a pure

@@ -11,6 +11,8 @@
 //! each batch's slots. Nothing is approximated: every part is scanned
 //! exhaustively under the same options.
 
+mod search;
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -20,6 +22,7 @@ use crate::vector::{
     VectorSearchOptions, VectorSearchResults, VectorStreamBatch, VectorStreamControl,
     VectorStreamSummary,
 };
+use search::{collect_part_hits, segment_options, StreamState, UnaryAccum};
 
 /// One sealed part's rows, with its image when it has vectors.
 struct Part {
@@ -313,10 +316,7 @@ impl VectorProvider for SegmentedProvider {
         // same way, so the result shape is bounded by the shard.
         let k = k.min(self.len());
         let mut per_query: Vec<Vec<(f32, i64)>> = vec![Vec::new(); nq];
-        let mut regimes = crate::vector::FilterRegimeCounts::default();
-        let mut tail_enumerated_rows = 0u64;
-        let mut patience_stopped = 0u32;
-        let mut floor_pruned = 0u32;
+        let mut acc = UnaryAccum::default();
         let mut running_floor = options.minimum_score;
         let shard_eligible = if options.floor_prune.is_some() {
             options.allow.map_or_else(|| self.len(), |m| m.count())
@@ -331,69 +331,18 @@ impl VectorProvider for SegmentedProvider {
                 },
                 None => None,
             };
-            let mut part_options = VectorSearchOptions::new();
-            part_options.allow = allow.as_ref().map(|part| part.as_mask());
-            if let Some(floor) = running_floor {
-                part_options = part_options.with_minimum_score(floor);
-            }
-            if let Some(depth) = options.candidate_depth {
-                part_options = part_options.with_candidate_depth(depth);
-            }
-            part_options.filter_regime = options.filter_regime;
-            part_options.enumerate_max_rows = options.enumerate_max_rows;
-            part_options.patience = options.patience;
-            if let Some(fp) = options.floor_prune {
-                let seg_eligible = part_options.allow.map_or(rows, |m| m.count());
-                part_options.floor_prune = Some(fp.for_segment(seg_eligible, shard_eligible));
-            }
+            let part_options = segment_options(
+                &options,
+                allow.as_ref().map(|part| part.as_mask()),
+                running_floor,
+                rows,
+                shard_eligible,
+            );
             let results = image.try_search(queries, k.min(rows), part_options)?;
-            regimes.add(results.regimes);
-            tail_enumerated_rows =
-                tail_enumerated_rows.saturating_add(results.tail_enumerated_rows);
-            patience_stopped = patience_stopped.saturating_add(results.patience_stopped);
-            floor_pruned = floor_pruned.saturating_add(results.floor_pruned);
-            for (q, hits) in per_query.iter_mut().enumerate() {
-                for (&slot, &score) in results
-                    .slots_for_query(q)
-                    .iter()
-                    .zip(results.scores_for_query(q))
-                {
-                    if slot >= 0 && score.is_finite() {
-                        hits.push((score, slot + base as i64));
-                    }
-                }
-            }
-            if nq == 1 && k > 0 && per_query[0].len() >= k {
-                per_query[0].sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-                per_query[0].truncate(k);
-                let kth = per_query[0][k - 1].0;
-                running_floor = Some(running_floor.map_or(kth, |cur| cur.max(kth)));
-            }
+            acc.absorb(&results);
+            collect_part_hits(&results, base, k, &mut running_floor, &mut per_query);
         }
-        let mut scores = Vec::with_capacity(nq * k);
-        let mut slots = Vec::with_capacity(nq * k);
-        for hits in per_query.iter_mut() {
-            hits.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-            hits.truncate(k);
-            for &(score, slot) in hits.iter() {
-                scores.push(score);
-                slots.push(slot);
-            }
-            for _ in hits.len()..k {
-                scores.push(f32::NEG_INFINITY);
-                slots.push(-1);
-            }
-        }
-        Ok(VectorSearchResults {
-            scores,
-            slots,
-            query_count: nq,
-            result_count: k,
-            regimes,
-            tail_enumerated_rows,
-            patience_stopped,
-            floor_pruned,
-        })
+        Ok(acc.finish(per_query, k))
     }
 
     fn search_streaming_controlled(
@@ -407,29 +356,14 @@ impl VectorProvider for SegmentedProvider {
             .dimension()
             .ok_or_else(|| VectorError::new("segmented index has no dimension yet"))?;
         let nq = queries.len().checked_div(dim).unwrap_or(0);
-        let floor = std::cell::Cell::new(options.minimum_score);
-        let stopped = std::cell::Cell::new(false);
-        let finished = std::cell::Cell::new(false);
-        let end_reason = std::cell::Cell::new(crate::vector::VectorStreamEndReason::Unspecified);
-        let allow_early_finish = matches!(
-            self.descriptor().quality_contract,
-            crate::vector::QualityContract::ConfiguredAnn
-                | crate::vector::QualityContract::ProbabilisticBound
-        ) && options.filter_regime
-            != Some(crate::vector::FilterRegime::Enumerate);
-        let mut emitted = 0usize;
-        let mut units = 0usize;
-        let mut regimes = crate::vector::FilterRegimeCounts::default();
-        let mut tail_enumerated_rows = 0u64;
-        let mut patience_stopped = 0u32;
-        let mut floor_pruned = 0u32;
+        let mut state = StreamState::new(self.descriptor().quality_contract, &options);
         let shard_eligible = if options.floor_prune.is_some() {
             options.allow.map_or_else(|| self.len(), |m| m.count())
         } else {
             0
         };
         for (base, rows, image) in self.search_images() {
-            if stopped.get() || finished.get() {
+            if state.is_done() {
                 break;
             }
             let allow = match options.allow {
@@ -439,105 +373,16 @@ impl VectorProvider for SegmentedProvider {
                 },
                 None => None,
             };
-            let mut part_options = VectorSearchOptions::new();
-            part_options.allow = allow.as_ref().map(|part| part.as_mask());
-            if let Some(f) = floor.get() {
-                part_options = part_options.with_minimum_score(f);
-            }
-            if let Some(depth) = options.candidate_depth {
-                part_options = part_options.with_candidate_depth(depth);
-            }
-            part_options.filter_regime = options.filter_regime;
-            part_options.enumerate_max_rows = options.enumerate_max_rows;
-            part_options.patience = options.patience;
-            if let Some(fp) = options.floor_prune {
-                let seg_eligible = part_options.allow.map_or(rows, |m| m.count());
-                part_options.floor_prune = Some(fp.for_segment(seg_eligible, shard_eligible));
-            }
-            let note = |verdict: VectorStreamControl| match verdict {
-                VectorStreamControl::RaiseFloor(f) => {
-                    floor.set(Some(floor.get().map_or(f, |cur| cur.max(f))));
-                }
-                VectorStreamControl::Finish { deadline } if allow_early_finish => {
-                    finished.set(true);
-                    let reason = if deadline {
-                        crate::vector::VectorStreamEndReason::Deadline
-                    } else {
-                        crate::vector::VectorStreamEndReason::FinishRequested
-                    };
-                    end_reason.set(end_reason.get().merge(reason));
-                }
-                VectorStreamControl::Finish { .. } => {}
-                VectorStreamControl::Stop => {
-                    stopped.set(true);
-                    end_reason.set(crate::vector::VectorStreamEndReason::Abandoned);
-                }
-                VectorStreamControl::Continue => {}
-            };
-            let mut remapped: Vec<i64> = Vec::new();
-            let mut part_sink = |batch: &VectorStreamBatch<'_>| -> VectorStreamControl {
-                remapped.clear();
-                remapped.extend(
-                    batch
-                        .slots
-                        .iter()
-                        .map(|&s| if s < 0 { s } else { s + base as i64 }),
-                );
-                let outward = VectorStreamBatch {
-                    query_index: batch.query_index,
-                    block_base: batch.block_base,
-                    scores: batch.scores,
-                    slots: &remapped,
-                };
-                let verdict = sink(&outward);
-                note(verdict);
-                verdict
-            };
-            let mut part_control = || -> VectorStreamControl {
-                let verdict = control();
-                note(verdict);
-                verdict
-            };
-            let summary = image.try_search_streaming_controlled(
-                queries,
-                part_options,
-                &mut part_sink,
-                &mut part_control,
-            )?;
-            emitted += summary.emitted;
-            units += summary.units_scanned;
-            regimes.add(summary.regimes);
-            tail_enumerated_rows =
-                tail_enumerated_rows.saturating_add(summary.tail_enumerated_rows);
-            patience_stopped = patience_stopped.saturating_add(summary.patience_stopped);
-            floor_pruned = floor_pruned.saturating_add(summary.floor_pruned);
-            end_reason.set(end_reason.get().merge(summary.end_reason));
-            if summary.end_reason.is_early_finish() {
-                finished.set(true);
-            }
-            if !summary.completed {
-                stopped.set(true);
-                end_reason.set(crate::vector::VectorStreamEndReason::Abandoned);
-            }
+            let part_options = segment_options(
+                &options,
+                allow.as_ref().map(|part| part.as_mask()),
+                state.current_floor(),
+                rows,
+                shard_eligible,
+            );
+            state.run_part((base, image), queries, part_options, sink, control)?;
         }
-        let final_reason = if stopped.get() {
-            crate::vector::VectorStreamEndReason::Abandoned
-        } else if end_reason.get() == crate::vector::VectorStreamEndReason::Unspecified {
-            crate::vector::VectorStreamEndReason::Exhausted
-        } else {
-            end_reason.get()
-        };
-        Ok(VectorStreamSummary {
-            query_count: nq,
-            emitted,
-            units_scanned: units,
-            completed: !stopped.get(),
-            end_reason: final_reason,
-            regimes,
-            tail_enumerated_rows,
-            patience_stopped,
-            floor_pruned,
-        })
+        Ok(state.into_summary(nq))
     }
 
     fn as_segmented_mut(&mut self) -> Option<&mut SegmentedProvider> {

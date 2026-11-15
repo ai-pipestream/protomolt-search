@@ -35,7 +35,9 @@ pub mod graph;
 pub mod image;
 pub mod merge;
 pub mod reorder;
+mod repair;
 pub mod rows;
+mod stream_hook;
 #[cfg(test)]
 mod tests;
 
@@ -62,6 +64,7 @@ use distance::prefetch;
 use graph::{
     with_scratch, Filter, FloorHook, FloorPrune, Hook, Patience, Route, Scored, Store, Walk,
 };
+use stream_hook::{StreamHook, STREAM_BATCH_ROWS};
 
 /// Stable identifier of the backend, as `vector_backend` names it.
 pub const HNSW: &str = "hnsw";
@@ -82,14 +85,6 @@ pub const MIN_GRAPH_ROWS: usize = 256;
 /// A parallel-mode batch at least this large is inserted from every
 /// thread; smaller batches are not worth the fork.
 const PARALLEL_MIN_BATCH: usize = 256;
-/// Streaming emission batch: rows scored before the sink is called.
-const STREAM_BATCH_ROWS: usize = 64;
-/// Hops before `StreamHook` emits its early first-flush batch so the
-/// coordinator establishes a global floor without waiting for 64 rows.
-const STREAM_FIRST_FLUSH_HOPS: usize = 2;
-/// Minimum buffered rows required for the early first-flush after
-/// [`STREAM_FIRST_FLUSH_HOPS`] layer-0 hops.
-const STREAM_FIRST_FLUSH_ROWS: usize = 8;
 /// Rows the enumerate regime streams between polls of the control.
 const STREAM_POLL_ROWS: usize = 16;
 /// Enumerate wins while the allowed rows cost less to score in row order
@@ -803,14 +798,7 @@ impl HnswIndex {
     }
 
     fn slack_per_norm(&self, query: &[f32]) -> f64 {
-        let du = self.dim as f64 / (1u64 << 24) as f64;
-        let gamma = du / (1.0 - du);
-        let query_norm = query
-            .iter()
-            .map(|&v| f64::from(v) * f64::from(v))
-            .sum::<f64>()
-            .sqrt();
-        4.0 * gamma * query_norm
+        distance::kernel_dot_slack_per_norm(self.dim, query)
     }
 
     /// The enumerate regime: the exact top `k` of the allowed rows at or
@@ -839,12 +827,14 @@ impl HnswIndex {
         let slack_per_norm = self.slack_per_norm(query);
         let mut survivors = Vec::new();
         let scored = with_view!(self, |view| view.enumerate_skipping(
-            query,
-            allow,
-            k,
-            floor,
-            slack_per_norm,
-            already_scored,
+            graph::EnumerateQuery {
+                q: query,
+                allow,
+                k,
+                floor,
+                slack_per_norm,
+                already_scored,
+            },
             skip,
             &mut survivors
         ));
@@ -1017,6 +1007,59 @@ impl HnswIndex {
     /// floor is active yet, rows go directly to the scalar scorer to avoid
     /// double-scoring. The control is polled every `STREAM_POLL_ROWS` rows.
     /// Returns the rows scored and whether the pass finished.
+    fn stream_rows_chunk<L: graph::LinkCells + ?Sized>(
+        view: &graph::View<'_, L>,
+        slack_per_norm: f64,
+        chunk: &[u32],
+        ahead: &[u32],
+        hook: &mut StreamHook<'_>,
+        total: &mut usize,
+    ) -> bool {
+        let lines = view.kernel.prefetch_lines(view.dim);
+        let batch = view.kernel.batch_width();
+        for &node in &ahead[..ahead.len().min(batch)] {
+            prefetch(view.row(node), lines);
+        }
+        if (*hook.floor).is_finite() {
+            let mut simd_scores = [0.0f32; STREAM_POLL_ROWS];
+            view.kernel.score_nodes(
+                hook.query,
+                view.rows,
+                view.dim,
+                chunk,
+                lines,
+                &mut simd_scores[..chunk.len()],
+            );
+            for (&node, &simd_score) in chunk.iter().zip(&simd_scores[..chunk.len()]) {
+                if hook.stopped {
+                    return false;
+                }
+                *total += 1;
+                let inv = view.inv_norm[node as usize];
+                let keep = !(inv > 0.0 && inv.is_finite())
+                    || !(*hook.floor).is_finite()
+                    || f64::from(simd_score)
+                        + distance::kernel_row_slack(view.dim, slack_per_norm, inv)
+                        >= f64::from(*hook.floor);
+                if keep {
+                    hook.scored(node, simd_score, view.row(node));
+                }
+            }
+        } else {
+            for &node in chunk {
+                if hook.stopped {
+                    return false;
+                }
+                *total += 1;
+                hook.scored(node, 0.0, view.row(node));
+            }
+        }
+        if hook.stopped || hook.finish_reason.is_some() {
+            return false;
+        }
+        chunk.len() < STREAM_POLL_ROWS || hook.hop()
+    }
+
     fn stream_rows(
         &self,
         allow: Mask<'_>,
@@ -1025,64 +1068,11 @@ impl HnswIndex {
     ) -> (usize, bool) {
         let slack_per_norm = self.slack_per_norm(hook.query);
         with_view!(self, |view| {
-            let lines = view.kernel.prefetch_lines(view.dim);
-            let batch = view.kernel.batch_width();
             let mut cur = [0u32; STREAM_POLL_ROWS];
             let mut cur_len = 0usize;
             let mut next = [0u32; STREAM_POLL_ROWS];
             let mut next_len = 0usize;
-            let mut simd_scores = [0.0f32; STREAM_POLL_ROWS];
-            let mut total_scored = 0usize;
-
-            let mut run_chunk = |chunk: &[u32],
-                                 ahead: &[u32],
-                                 hook: &mut StreamHook<'_>,
-                                 total: &mut usize|
-             -> bool {
-                for &node in &ahead[..ahead.len().min(batch)] {
-                    prefetch(view.row(node), lines);
-                }
-                if (*hook.floor).is_finite() {
-                    view.kernel.score_nodes(
-                        hook.query,
-                        view.rows,
-                        view.dim,
-                        chunk,
-                        lines,
-                        &mut simd_scores[..chunk.len()],
-                    );
-                    for (&node, &simd_score) in chunk.iter().zip(&simd_scores[..chunk.len()]) {
-                        if hook.stopped {
-                            return false;
-                        }
-                        *total += 1;
-                        let inv = view.inv_norm[node as usize];
-                        let keep = !(inv > 0.0 && inv.is_finite())
-                            || !(*hook.floor).is_finite()
-                            || f64::from(simd_score) + slack_per_norm / f64::from(inv)
-                                >= f64::from(*hook.floor);
-                        if keep {
-                            hook.scored(node, simd_score, view.row(node));
-                        }
-                    }
-                } else {
-                    for &node in chunk {
-                        if hook.stopped {
-                            return false;
-                        }
-                        *total += 1;
-                        hook.scored(node, 0.0, view.row(node));
-                    }
-                }
-                if hook.stopped || hook.finish_reason.is_some() {
-                    return false;
-                }
-                if chunk.len() == STREAM_POLL_ROWS && !hook.hop() {
-                    return false;
-                }
-                true
-            };
-
+            let mut total = 0usize;
             let flow = allow.try_for_each(|row| {
                 let node = row as u32;
                 if skip(node) {
@@ -1095,9 +1085,15 @@ impl HnswIndex {
                     next[next_len] = node;
                     next_len += 1;
                     if next_len == STREAM_POLL_ROWS {
-                        if !run_chunk(&cur[..cur_len], &next[..next_len], hook, &mut total_scored) {
-                            cur_len = 0;
-                            next_len = 0;
+                        let ok = Self::stream_rows_chunk(
+                            &view,
+                            slack_per_norm,
+                            &cur[..cur_len],
+                            &next[..next_len],
+                            hook,
+                            &mut total,
+                        );
+                        if !ok {
                             return ControlFlow::Break(());
                         }
                         cur = next;
@@ -1107,18 +1103,28 @@ impl HnswIndex {
                 }
                 ControlFlow::Continue(())
             });
-            if flow.is_break() {
-                return (total_scored, !hook.stopped);
-            }
-            if cur_len > 0
-                && !run_chunk(&cur[..cur_len], &next[..next_len], hook, &mut total_scored)
+            if flow.is_continue()
+                && (cur_len == 0
+                    || Self::stream_rows_chunk(
+                        &view,
+                        slack_per_norm,
+                        &cur[..cur_len],
+                        &next[..next_len],
+                        hook,
+                        &mut total,
+                    ))
+                && next_len > 0
             {
-                return (total_scored, !hook.stopped);
+                let _ = Self::stream_rows_chunk(
+                    &view,
+                    slack_per_norm,
+                    &next[..next_len],
+                    &[],
+                    hook,
+                    &mut total,
+                );
             }
-            if next_len > 0 && !run_chunk(&next[..next_len], &[], hook, &mut total_scored) {
-                return (total_scored, !hook.stopped);
-            }
-            (total_scored, !hook.stopped)
+            (total, !hook.stopped)
         })
     }
 
@@ -1132,137 +1138,6 @@ impl HnswIndex {
             }
             Backing::Mapped(mapped) => out.extend_from_slice(mapped.row_bytes(row)),
         }
-    }
-}
-
-/// The streaming walk's hook: rescores every allowed row the walk scores
-/// with the scalar scorer, buffers those at or above the floor, hands
-/// batches to the sink ordered score descending then row ascending, polls
-/// the control after each expansion, and lets either raise the floor,
-/// finish gracefully at a hop boundary (`#100`), or abandon (`Stop`).
-struct StreamHook<'a> {
-    query_index: usize,
-    query: &'a [f32],
-    node_to_row: Option<&'a [u32]>,
-    floor: &'a mut f32,
-    allow_early_finish: bool,
-    hops: usize,
-    flushed_once: bool,
-    scores: Vec<f32>,
-    slots: Vec<i64>,
-    sink: &'a mut dyn FnMut(&VectorStreamBatch<'_>) -> VectorStreamControl,
-    control: &'a mut dyn FnMut() -> VectorStreamControl,
-    stopped: bool,
-    finish_reason: Option<VectorStreamEndReason>,
-    emitted: usize,
-}
-
-impl StreamHook<'_> {
-    fn apply(&mut self, decision: VectorStreamControl) {
-        match decision {
-            VectorStreamControl::Continue => {}
-            VectorStreamControl::RaiseFloor(raised) => {
-                if raised > *self.floor {
-                    *self.floor = raised;
-                }
-            }
-            VectorStreamControl::Finish { deadline } => {
-                if self.allow_early_finish && self.finish_reason.is_none() {
-                    self.finish_reason = Some(if deadline {
-                        VectorStreamEndReason::Deadline
-                    } else {
-                        VectorStreamEndReason::FinishRequested
-                    });
-                }
-            }
-            VectorStreamControl::Stop => self.stopped = true,
-        }
-    }
-
-    fn flush(&mut self) {
-        if self.scores.is_empty() || self.stopped {
-            self.scores.clear();
-            self.slots.clear();
-            return;
-        }
-        let floor = *self.floor;
-        // Rows that were above the floor when scored may have fallen below
-        // a floor raised since; the sink only sees rows at or above it now.
-        let mut kept = 0;
-        for i in 0..self.scores.len() {
-            if self.scores[i] >= floor {
-                self.scores[kept] = self.scores[i];
-                self.slots[kept] = self.slots[i];
-                kept += 1;
-            }
-        }
-        self.scores.truncate(kept);
-        self.slots.truncate(kept);
-        if kept == 0 {
-            return;
-        }
-        // Score descending, then row ascending, within the batch.
-        let mut order: Vec<usize> = (0..kept).collect();
-        order.sort_by(|&a, &b| {
-            self.scores[b]
-                .total_cmp(&self.scores[a])
-                .then(self.slots[a].cmp(&self.slots[b]))
-        });
-        let scores: Vec<f32> = order.iter().map(|&i| self.scores[i]).collect();
-        let slots: Vec<i64> = order.iter().map(|&i| self.slots[i]).collect();
-        self.scores = scores;
-        self.slots = slots;
-        self.flushed_once = true;
-        self.emitted += kept;
-        let decision = (self.sink)(&VectorStreamBatch {
-            query_index: self.query_index,
-            block_base: 0,
-            scores: &self.scores,
-            slots: &self.slots,
-        });
-        self.scores.clear();
-        self.slots.clear();
-        self.apply(decision);
-    }
-}
-
-impl Hook for StreamHook<'_> {
-    #[inline]
-    fn scored(&mut self, node: u32, _traversal_score: f32, row: &[f32]) {
-        if self.stopped {
-            return;
-        }
-        let score = crate::exact_vectors::dot(row, self.query);
-        if score >= *self.floor {
-            let ext_row = self.node_to_row.map_or(node, |m| m[node as usize]);
-            self.scores.push(score);
-            self.slots.push(i64::from(ext_row));
-            if self.scores.len() >= STREAM_BATCH_ROWS {
-                self.flush();
-            }
-        }
-    }
-
-    fn hop(&mut self) -> bool {
-        self.hops += 1;
-        if !self.stopped && self.finish_reason.is_none() {
-            let decision = (self.control)();
-            self.apply(decision);
-        }
-        if !self.stopped
-            && self.finish_reason.is_none()
-            && !self.flushed_once
-            && self.hops >= STREAM_FIRST_FLUSH_HOPS
-            && self.scores.len() >= STREAM_FIRST_FLUSH_ROWS
-        {
-            self.flush();
-        }
-        !self.stopped && self.finish_reason.is_none()
-    }
-
-    #[inline]
-    fn current_floor(&self) -> f32 {
-        *self.floor
     }
 }
 

@@ -216,40 +216,38 @@ impl Store {
     }
 
     pub fn view(&self) -> View<'_, [AtomicU32]> {
-        match &self.links {
-            Some(links) => {
-                let (entry, top) = links.entry_state();
-                View {
-                    dim: self.dim,
-                    m: self.m,
-                    m0: self.m0,
-                    rows: self.rows.values(),
-                    inv_norm: &self.inv_norm,
-                    level: &links.level,
-                    upper_slot: &links.upper_slot,
-                    upper_base: &links.upper_base,
-                    links0: links.links0.as_slice(),
-                    upper: links.upper.as_slice(),
-                    entry,
-                    top,
-                    kernel: self.kernel,
-                }
-            }
-            None => View {
-                dim: self.dim,
-                m: self.m,
-                m0: self.m0,
-                rows: self.rows.values(),
-                inv_norm: &self.inv_norm,
-                level: &[],
-                upper_slot: &[],
-                upper_base: &[],
-                links0: &EMPTY_CELLS,
-                upper: &EMPTY_CELLS,
-                entry: NO_NODE,
-                top: 0,
-                kernel: self.kernel,
-            },
+        let (level, upper_slot, upper_base, links0, upper, (entry, top)) = match &self.links {
+            Some(links) => (
+                links.level.as_slice(),
+                links.upper_slot.as_slice(),
+                links.upper_base.as_slice(),
+                links.links0.as_slice(),
+                links.upper.as_slice(),
+                links.entry_state(),
+            ),
+            None => (
+                &[][..],
+                &[][..],
+                &[][..],
+                &EMPTY_CELLS[..],
+                &EMPTY_CELLS[..],
+                (NO_NODE, 0),
+            ),
+        };
+        View {
+            dim: self.dim,
+            m: self.m,
+            m0: self.m0,
+            rows: self.rows.values(),
+            inv_norm: &self.inv_norm,
+            level,
+            upper_slot,
+            upper_base,
+            links0,
+            upper,
+            entry,
+            top,
+            kernel: self.kernel,
         }
     }
 
@@ -326,27 +324,15 @@ impl Store {
                 upper_cells += cells;
             }
         }
-        let links0: Vec<AtomicU32> = std::iter::repeat_with(|| AtomicU32::new(0))
-            .take(n * stride0)
-            .collect();
-        let upper: Vec<AtomicU32> = std::iter::repeat_with(|| AtomicU32::new(0))
-            .take(upper_cells)
-            .collect();
+        let links0: Vec<AtomicU32> = (0..n * stride0).map(|_| AtomicU32::new(0)).collect();
+        let upper: Vec<AtomicU32> = (0..upper_cells).map(|_| AtomicU32::new(0)).collect();
         let links =
             GraphLinks::from_parts(level, upper_slot, upper_base, links0, upper, NO_NODE, 0);
-        let builder = LinkBuilder {
-            dim: self.dim,
-            m: self.m,
-            m0: self.m0,
-            ef_construction: self.ef_construction,
-            kernel: self.kernel,
-            rows: self.rows.values(),
-            inv_norm: &self.inv_norm,
-            links: &links,
-        };
+        let builder = LinkBuilder::new(self, &links);
         let range = 0..n as u32;
         if parallel {
             builder.insert_parallel(range);
+            super::super::repair::repair_connectivity(&builder);
         } else {
             builder.insert_sequential(range);
         }
@@ -403,11 +389,8 @@ impl<'a> LinkBuilder<'a> {
         }
     }
 
-    /// Seed an initial navigable skeleton sequentially when `self.links` is
-    /// empty (`entry == NO_NODE`), returning the prefix count to insert on one
-    /// thread before forking across Rayon workers. Without a connected entry
-    /// neighborhood and upper-layer skeleton, dozens of worker threads racing
-    /// at cold start search a near-empty graph and contend on `entry_lock`.
+    /// Prefix length to insert sequentially on cold start (`entry == NO_NODE`)
+    /// before forking across Rayon workers.
     pub(super) fn bootstrap_prefix_len(&self, total: usize) -> usize {
         if self.links.entry_state().0 != NO_NODE {
             return 0;
@@ -423,24 +406,54 @@ impl<'a> LinkBuilder<'a> {
         });
     }
 
-    fn insert_parallel(&self, range: std::ops::Range<u32>) {
-        use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
-        let boot = self.bootstrap_prefix_len(range.len()) as u32;
+    /// Insert `all` in doubling waves: each wave links layer-0 nodes in parallel
+    /// over immutable upper layers, then links `level > 0` hubs sequentially so
+    /// upper layers and `(entry, top)` stay deterministic with full layer-0 reach.
+    fn insert_waves(&self, all: &[u32]) {
+        use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+        let boot = self.bootstrap_prefix_len(all.len());
         if boot > 0 {
-            self.insert_sequential(range.start..range.start + boot);
+            with_scratch(|s| all[..boot].iter().for_each(|&n| self.insert(n, None, s)));
         }
-        let rest = range.start + boot..range.end;
-        if rest.is_empty() {
-            return;
-        }
-        if rest.len() < PARALLEL_MIN_TASK_LEN {
-            self.insert_sequential(rest);
+        if boot >= all.len() {
             return;
         }
         let locks = Locks::default();
-        rest.into_par_iter()
-            .with_min_len(PARALLEL_MIN_TASK_LEN)
-            .for_each(|node| with_scratch(|scratch| self.insert(node, Some(&locks), scratch)));
+        let mut wave = if boot > 0 {
+            boot
+        } else {
+            super::super::repair::linked_node_count(self).max(1)
+        };
+        let (mut at, mut zero, mut upper) = (boot, Vec::new(), Vec::new());
+        while at < all.len() {
+            let end = all.len().min(at + wave);
+            zero.clear();
+            upper.clear();
+            for &n in &all[at..end] {
+                if self.links.level[n as usize] > 0 {
+                    upper.push(n);
+                } else {
+                    zero.push(n);
+                }
+            }
+            if zero.len() < PARALLEL_MIN_TASK_LEN {
+                with_scratch(|s| zero.iter().for_each(|&n| self.insert(n, None, s)));
+            } else {
+                zero.par_iter()
+                    .with_min_len(PARALLEL_MIN_TASK_LEN)
+                    .for_each(|&n| with_scratch(|s| self.insert(n, Some(&locks), s)));
+            }
+            if !upper.is_empty() {
+                with_scratch(|s| upper.iter().for_each(|&n| self.insert(n, None, s)));
+            }
+            at = end;
+            wave = wave.saturating_mul(2);
+        }
+    }
+
+    fn insert_parallel(&self, range: std::ops::Range<u32>) {
+        let nodes: Vec<u32> = range.collect();
+        self.insert_waves(&nodes);
     }
 
     pub(in crate::hnsw) fn insert_slice(&self, nodes: &[u32], parallel: bool) {
@@ -448,38 +461,11 @@ impl<'a> LinkBuilder<'a> {
             return;
         }
         if !parallel {
-            with_scratch(|scratch| {
-                for &node in nodes {
-                    self.insert(node, None, scratch);
-                }
-            });
+            with_scratch(|s| nodes.iter().for_each(|&n| self.insert(n, None, s)));
             return;
         }
-        let boot = self.bootstrap_prefix_len(nodes.len());
-        if boot > 0 {
-            with_scratch(|scratch| {
-                for &node in &nodes[..boot] {
-                    self.insert(node, None, scratch);
-                }
-            });
-        }
-        let rest = &nodes[boot..];
-        if rest.is_empty() {
-            return;
-        }
-        if rest.len() < PARALLEL_MIN_TASK_LEN {
-            with_scratch(|scratch| {
-                for &node in rest {
-                    self.insert(node, None, scratch);
-                }
-            });
-            return;
-        }
-        use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
-        let locks = Locks::default();
-        rest.par_iter()
-            .with_min_len(PARALLEL_MIN_TASK_LEN)
-            .for_each(|&node| with_scratch(|scratch| self.insert(node, Some(&locks), scratch)));
+        self.insert_waves(nodes);
+        super::super::repair::repair_slice_connectivity(self, nodes);
     }
 
     pub(in crate::hnsw) fn write_links(
