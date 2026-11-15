@@ -1,10 +1,9 @@
 //! Wire snippet construction and the served order of reranked hits.
 
-use super::RerankedHit;
 use crate::pb::{OffsetSpan, Snippet, SnippetCut};
 
 #[cfg(any(feature = "net", feature = "local-core"))]
-pub(super) fn sort_reranked_hits(hits: &mut [RerankedHit]) {
+pub(super) fn sort_reranked_hits(hits: &mut [super::RerankedHit]) {
     hits.sort_by(|a, b| {
         b.calibrated_probability
             .total_cmp(&a.calibrated_probability)

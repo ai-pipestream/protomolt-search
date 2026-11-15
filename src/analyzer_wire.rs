@@ -14,7 +14,7 @@ mod graph;
 #[path = "analyzer_wire/session.rs"]
 mod session;
 
-#[cfg(any(feature = "net", test))]
+#[cfg(feature = "net")]
 use tonic::Status;
 
 #[cfg(any(feature = "net", test))]

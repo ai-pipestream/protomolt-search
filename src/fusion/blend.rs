@@ -47,6 +47,9 @@ pub enum Combination {
 /// Provenance mirrors [`rrf_fuse`]: competition leg ranks and RAW leg
 /// scores. The fused order breaks ties by leg presence (more legs
 /// first), then ascending doc id.
+///
+/// [`merge_legs_by_score`]: super::merge_legs_by_score
+/// [`rrf_fuse`]: super::rrf_fuse
 pub fn blend_fuse(
     legs: &[Leg],
     leg_k: usize,

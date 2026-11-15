@@ -78,7 +78,6 @@ pub struct PartRange<'a, T> {
 /// One part of a shard answering a range: set in `out` the slots of
 /// `domain` within `span` where `range` evaluates to `want`.
 ///
-///
 /// The run costs the rows it names wherever they are; the read costs the
 /// rows of `domain`. Whichever is fewer is used, so a range under an AND
 /// with a selective facet still reads only the facet's rows.

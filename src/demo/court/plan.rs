@@ -37,6 +37,8 @@ pub struct ChunkPlan {
 ///
 /// Block indices in the plan refer to `sentences` order, for pairing
 /// with the sidecar's per-block embeddings.
+///
+/// [`assemble_chunks`]: super::assemble_chunks
 pub fn plan_chunks(
     text: &str,
     sentences: &[Span],

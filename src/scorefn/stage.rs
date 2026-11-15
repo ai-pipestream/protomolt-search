@@ -10,6 +10,8 @@ impl Stage {
     /// as a missing signal. The float expressions match
     /// [`ScoreChain::eval`] term for term, so a contribution composed
     /// back onto a score reproduces the chain's arithmetic.
+    ///
+    /// [`ScoreChain::eval`]: super::ScoreChain::eval
     pub fn contribution(&self, doc_id: u32, columns: &dyn NumericRead) -> Option<f64> {
         if let StageOp::MultGeoDecay {
             metric,

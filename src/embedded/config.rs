@@ -26,6 +26,8 @@ pub struct EmbeddedShardConfig {
 impl EmbeddedShardConfig {
     /// A purely in-memory shard. [`EmbeddedSearch::flush_all`] reports it as
     /// unwritten, matching `NodeService.Flush`.
+    ///
+    /// [`EmbeddedSearch::flush_all`]: super::EmbeddedSearch::flush_all
     pub fn in_memory(slot_offset: u64) -> Self {
         let node = NodeConfig {
             slot_offset,
