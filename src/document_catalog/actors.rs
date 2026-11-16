@@ -263,18 +263,8 @@ impl DocumentCatalog {
         &self,
         request: &SourceActorAssignment,
     ) -> Result<(), Status> {
-        if request.format_version != 1
-            || !valid_history_id(&request.history_id)
-            || request.request_sha256.len() != 32
-        {
-            return Err(Status::invalid_argument("actor assignment requires format 1, a history identity and a 32-byte request digest"));
-        }
+        let sha = assignment_digest(request)?;
         let key = OperationKey::new(Some(&request.principal), &request.operation_id)?;
-        let sha: [u8; 32] = request
-            .request_sha256
-            .as_slice()
-            .try_into()
-            .expect("validated digest");
         let mut tx = self.database.begin_write().map_err(storage)?;
         tx.set_durability(Durability::Immediate).map_err(storage)?;
         let mut header = seal::header_from(self, &tx)?;
@@ -336,21 +326,46 @@ impl DocumentCatalog {
             .map_err(storage)?
             .remove(request.operation_id.as_slice())
             .map_err(storage)?;
-        let migration = header
-            .actor_namespace
-            .as_mut()
-            .expect("validated namespace");
-        migration.assigned_operations = migration
-            .assigned_operations
-            .checked_add(1)
-            .ok_or_else(|| Status::data_loss("actor attribution count overflow"))?;
-        validate_write_counts(&tx, &header)?;
-        tx.open_table(META)
-            .map_err(storage)?
-            .insert("header", header.encode_to_vec().as_slice())
-            .map_err(storage)?;
-        tx.commit().map_err(storage)
+        commit_assignment(tx, header)
     }
+}
+
+/// The request digest of a well-formed assignment.
+fn assignment_digest(request: &SourceActorAssignment) -> Result<[u8; 32], Status> {
+    if request.format_version != 1
+        || !valid_history_id(&request.history_id)
+        || request.request_sha256.len() != 32
+    {
+        return Err(Status::invalid_argument(
+            "actor assignment requires format 1, a history identity and a 32-byte request digest",
+        ));
+    }
+    Ok(request
+        .request_sha256
+        .as_slice()
+        .try_into()
+        .expect("validated digest"))
+}
+
+/// Count one more attributed operation in the header and commit.
+fn commit_assignment(
+    tx: redb::WriteTransaction,
+    mut header: DocumentCatalogHeader,
+) -> Result<(), Status> {
+    let migration = header
+        .actor_namespace
+        .as_mut()
+        .expect("validated namespace");
+    migration.assigned_operations = migration
+        .assigned_operations
+        .checked_add(1)
+        .ok_or_else(|| Status::data_loss("actor attribution count overflow"))?;
+    validate_write_counts(&tx, &header)?;
+    tx.open_table(META)
+        .map_err(storage)?
+        .insert("header", header.encode_to_vec().as_slice())
+        .map_err(storage)?;
+    tx.commit().map_err(storage)
 }
 
 #[cfg(test)]

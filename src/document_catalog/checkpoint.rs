@@ -231,22 +231,27 @@ impl CatalogCheckpoint<'_> {
             ));
         }
         result.records = records;
-        let mut input = &file;
-        input.seek(SeekFrom::Start(0)).map_err(storage)?;
-        let mut hash = sha256::Sha256::new();
-        let mut buffer = [0u8; 64 << 10];
-        loop {
-            let n = input.read(&mut buffer).map_err(storage)?;
-            if n == 0 {
-                break;
-            }
-            hash.update(&buffer[..n]);
-        }
-        result.sha256 = hash.finalize().to_vec();
+        result.sha256 = file_sha256(&file)?;
         directory.sync_all().map_err(storage)?;
         owned.keep = true;
         Ok(result)
     }
+}
+
+/// The SHA-256 of the whole file, read from its start.
+fn file_sha256(file: &File) -> Result<Vec<u8>, Status> {
+    let mut input = file;
+    input.seek(SeekFrom::Start(0)).map_err(storage)?;
+    let mut hash = sha256::Sha256::new();
+    let mut buffer = [0u8; 64 << 10];
+    loop {
+        let n = input.read(&mut buffer).map_err(storage)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buffer[..n]);
+    }
+    Ok(hash.finalize().to_vec())
 }
 
 struct OwnedFile<'a> {

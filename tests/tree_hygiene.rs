@@ -20,16 +20,7 @@ use std::path::{Path, PathBuf};
 const DEFAULT_CEILING: usize = 1_500;
 /// The ceiling for a `*tests.rs` file.
 const TESTS_CEILING: usize = 2_200;
-/// The growth each ratcheted file was allowed over its size on the day
-/// the table was written.
-const RATCHET_HEADROOM: usize = 150;
-
-/// Files above the default ceiling on the stabilization baseline, with
-/// their ceilings (baseline size plus `RATCHET_HEADROOM`). Lower an entry
-/// when its file shrinks; remove it when the file is split or deleted.
-const RATCHET: &[(&str, usize)] = &[
-    ("src/main.rs", 2_010 + RATCHET_HEADROOM),
-];
+const RATCHET: &[(&str, usize)] = &[];
 
 /// The directories walked, relative to the package root.
 const ROOTS: &[&str] = &["src", "crates"];

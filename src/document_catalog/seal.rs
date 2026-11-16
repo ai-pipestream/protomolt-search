@@ -156,7 +156,7 @@ impl DocumentCatalog {
     }
 
     /// Close new admission durably before draining existing index intents.
-    /// The writer atomically captures every previously accepted write. There is
+    /// The writer atomically captures every write accepted before it. There is
     /// no cancellation: reopen preserves closure, recovery may resolve pending
     /// work, and the same operation must finish through `seal_history`.
     /// This trusted local operation grants no replacement ownership.
