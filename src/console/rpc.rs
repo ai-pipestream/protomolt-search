@@ -90,7 +90,7 @@ pub(super) async fn stream_rpc(
 ) -> std::io::Result<()> {
     let method = match resolve_method(service, method) {
         Ok(m) => m,
-        Err(reply) => return write_reply(stream, reply).await,
+        Err(reply) => return write_reply(stream, reply, false).await,
     };
     if !method.is_server_streaming() {
         return write_reply(
@@ -104,25 +104,27 @@ pub(super) async fn stream_rpc(
                     method.name()
                 ),
             ),
+            false,
         )
         .await;
     }
     let addr = match ctx.target(param(&request.query, "target")) {
         Ok(addr) => addr,
-        Err(reply) => return write_reply(stream, reply).await,
+        Err(reply) => return write_reply(stream, reply, false).await,
     };
     let bytes = match encode_request(&method, &streaming_request_json(request)) {
         Ok(b) => b,
-        Err(reply) => return write_reply(stream, reply).await,
+        Err(reply) => return write_reply(stream, reply, false).await,
     };
     let mut grpc = match raw_grpc(ctx, &addr) {
         Ok(g) => g,
-        Err(reply) => return write_reply(stream, reply).await,
+        Err(reply) => return write_reply(stream, reply, false).await,
     };
     if let Err(e) = grpc.ready().await {
         return write_reply(
             stream,
             Reply::error(502, "UNAVAILABLE", format!("{addr}: {e}")),
+            false,
         )
         .await;
     }
@@ -132,7 +134,7 @@ pub(super) async fn stream_rpc(
     {
         Ok(r) => r.into_inner(),
         Err(status) => {
-            return write_reply(stream, call_status_reply(&status, &method, &addr)).await
+            return write_reply(stream, call_status_reply(&status, &method, &addr), false).await
         }
     };
     let head = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";

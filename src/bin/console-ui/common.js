@@ -118,7 +118,6 @@ export function el(tag, attrs = {}, children = []) {
     if (v == null || v === false) continue;
     if (k === 'class') node.className = v;
     else if (k === 'text') node.textContent = v;
-    else if (k === 'html') node.innerHTML = v;
     else if (k.startsWith('on')) node.addEventListener(k.slice(2), v);
     else if (k === 'value') node.value = v;
     else if (k === 'checked') node.checked = !!v;

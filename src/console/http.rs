@@ -1,5 +1,4 @@
-//! The hand-rolled HTTP/1.1 side: requests, replies, the router, and the
-//! static UI assets.
+//! The hand-rolled HTTP/1.1 side: requests, replies, and the router.
 
 use super::*;
 
@@ -46,6 +45,8 @@ pub(super) struct HttpRequest {
     pub(super) path: String,
     pub(super) query: Vec<(String, String)>,
     pub(super) body: Vec<u8>,
+    /// Whether the connection stays open after the reply.
+    pub(super) keep_alive: bool,
 }
 
 pub(super) fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -95,60 +96,6 @@ pub(super) fn param<'a>(query: &'a [(String, String)], key: &str) -> Option<&'a 
         .map(|(_, v)| v.as_str())
 }
 
-pub(super) async fn read_request(
-    stream: &mut TcpStream,
-) -> std::io::Result<Result<HttpRequest, Reply>> {
-    let mut buf: Vec<u8> = Vec::with_capacity(4096);
-    let header_end = loop {
-        let mut chunk = [0u8; 4096];
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            return Ok(Err(Reply::text(400, "text/plain", "empty request")));
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
-            break pos + 4;
-        }
-        if buf.len() > MAX_BODY_BYTES {
-            return Ok(Err(Reply::text(431, "text/plain", "headers too large")));
-        }
-    };
-    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
-    let mut lines = head.lines();
-    let request_line = lines.next().unwrap_or_default();
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or_default().to_string();
-    let target = parts.next().unwrap_or_default().to_string();
-    let (path, query) = match target.split_once('?') {
-        Some((p, q)) => (p.to_string(), parse_query(q)),
-        None => (target.clone(), Vec::new()),
-    };
-    let content_length = lines
-        .filter_map(|l| l.split_once(':'))
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, v)| v.trim().parse::<usize>().ok())
-        .unwrap_or(0);
-    if content_length > MAX_BODY_BYTES {
-        return Ok(Err(Reply::text(413, "text/plain", "body too large")));
-    }
-    let mut body = buf[header_end..].to_vec();
-    while body.len() < content_length {
-        let mut chunk = [0u8; 4096];
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            break;
-        }
-        body.extend_from_slice(&chunk[..n]);
-    }
-    body.truncate(content_length);
-    Ok(Ok(HttpRequest {
-        method,
-        path,
-        query,
-        body,
-    }))
-}
-
 pub(super) fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -157,67 +104,51 @@ pub(super) fn reason(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
         413 => "Payload Too Large",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
         501 => "Not Implemented",
         502 => "Bad Gateway",
+        505 => "HTTP Version Not Supported",
         _ => "Error",
     }
 }
 
-pub(super) async fn write_reply(stream: &mut TcpStream, reply: Reply) -> std::io::Result<()> {
-    let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+/// One reply, head and body in a single write under the stream write
+/// deadline. `keep_alive` says whether the connection stays open after it.
+pub(super) async fn write_reply(
+    stream: &mut TcpStream,
+    reply: Reply,
+    keep_alive: bool,
+) -> std::io::Result<()> {
+    let connection = if keep_alive {
+        format!(
+            "keep-alive\r\nKeep-Alive: timeout={}",
+            LIMITS.idle.as_secs()
+        )
+    } else {
+        "close".to_string()
+    };
+    let mut bytes = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: {connection}\r\n\r\n",
         reply.status,
         reason(reply.status),
         reply.content_type,
         reply.body.len()
-    );
-    stream.write_all(head.as_bytes()).await?;
-    stream.write_all(&reply.body).await?;
-    stream.flush().await
+    )
+    .into_bytes();
+    bytes.extend_from_slice(&reply.body);
+    write_frame(stream, &[&bytes]).await
 }
 
-pub(super) async fn handle_conn(mut stream: TcpStream, ctx: Arc<Ctx>) -> std::io::Result<()> {
-    let request = match read_request(&mut stream).await? {
-        Ok(request) => request,
-        Err(reply) => return write_reply(&mut stream, reply).await,
-    };
-    let segments: Vec<&str> = request.path.split('/').filter(|s| !s.is_empty()).collect();
-    match (request.method.as_str(), segments.as_slice()) {
-        ("GET", ["api", "stream", service, method])
-        | ("POST", ["api", "stream", service, method]) => {
-            stream_rpc(&mut stream, &ctx, service, method, &request).await
-        }
-        _ => {
-            let reply = route(&ctx, &request, &segments).await;
-            write_reply(&mut stream, reply).await
-        }
-    }
-}
-
-pub(super) fn asset(path: &str) -> Option<(&'static str, &'static str)> {
-    Some(match path {
-        "/" | "/index.html" => ("text/html; charset=utf-8", INDEX_HTML),
-        "/dashboard" | "/dashboard.html" => ("text/html; charset=utf-8", DASHBOARD_HTML),
-        "/explorer" | "/explorer.html" => ("text/html; charset=utf-8", EXPLORER_HTML),
-        "/explorer.js" => ("text/javascript; charset=utf-8", EXPLORER_JS),
-        "/app.css" => ("text/css; charset=utf-8", APP_CSS),
-        "/common.js" => ("text/javascript; charset=utf-8", COMMON_JS),
-        "/search.js" => ("text/javascript; charset=utf-8", SEARCH_JS),
-        "/dashboard.js" => ("text/javascript; charset=utf-8", DASHBOARD_JS),
-        "/query-state.js" => ("text/javascript; charset=utf-8", QUERY_STATE_JS),
-        "/sparkline.js" => ("text/javascript; charset=utf-8", SPARKLINE_JS),
-        _ => return None,
-    })
-}
-
-pub(super) async fn route(ctx: &Ctx, request: &HttpRequest, segments: &[&str]) -> Reply {
+pub(super) async fn route(ctx: &Arc<Ctx>, request: &HttpRequest, segments: &[&str]) -> Reply {
     match (request.method.as_str(), segments) {
-        ("GET", []) | ("GET", [_]) if asset(&request.path).is_some() => {
-            let (content_type, body) = asset(&request.path).expect("checked");
-            Reply::text(200, content_type, body)
+        ("GET", []) | ("GET", [_]) if asset_name(&request.path).is_some() => {
+            asset_reply(ctx.ui_dir.as_deref(), &request.path).unwrap_or_else(|| {
+                Reply::error(404, "NOT_FOUND", format!("no route for {}", request.path))
+            })
         }
         ("GET", ["api", "health"]) => match health(ctx).await {
             Ok(v) => Reply::json(200, v),

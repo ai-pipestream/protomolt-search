@@ -9,41 +9,41 @@ This document reads top down. It starts with the system as a whole, then
 walks each layer: the search engine library, the server and its roles, the
 coordinator, the search nodes, the NLP engine, the index, and the repo
 service. Protocol details appear only where a line between two boxes needs a
-name. Wire formats, field tables, and vocabularies belong in the appendix,
-which is deliberately still placeholders.
+name. Wire formats, field tables, and vocabularies live in the protos and
+the code; the appendix points to them.
 
 ## 1. Overall architecture
 
 The system is a distributed search cluster built from four kinds of parts.
 At the center is turbovec, an embedded vector search library, not a server.
 Around it we built pipestream-search: a single binary that can serve as a
-search node, as a coordinator, or as both at once. Product lexical analysis
-can run inside that process; extended OpenNLP analysis and embeddings live in
-a separate sidecar. Document storage is headed toward a repo service that
+search node, as a coordinator, or as both at once. Lexical and NLP analysis
+run inside that process (the `native` and `turbo` providers) or offload to a
+pooled `turbo-kserve` gRPC endpoint, which also serves embeddings. Document
+storage is headed toward a repo service that
 holds source material and derived data the index itself should not carry.
 Clients talk to a coordinator over gRPC; cluster traffic is also gRPC, with
 one deliberate exception described later (a UDP fast lane for typed stream
 signals).
 
 ```mermaid
-C4Context
-    title System context
-    Person(client, "Search client", "Any gRPC caller: console, pipelines, apps")
-    System(cluster, "pipestream-search cluster", "Coordinator, search nodes, and native lexical analysis")
-    System_Ext(nlp, "OpenNLP analysis sidecar", "gRPC: extended analysis and embeddings")
-    System_Ext(repo, "Repo service", "Claim-check document store: Postgres ledger + S3 object storage")
-    Rel(client, cluster, "Search / ingest", "gRPC")
-    Rel(cluster, nlp, "Extended analysis and embeddings", "gRPC stream")
-    Rel(cluster, repo, "Fetch source documents and parsed parts", "gRPC (planned)")
+flowchart TD
+    client["Search client<br/>any gRPC caller: console, pipelines, apps"]
+    cluster["pipestream-search cluster<br/>coordinator, search nodes, in-process analysis"]
+    kserve["turbo-kserve endpoint (optional)<br/>offloaded analysis and embeddings"]
+    repo["Repo service (planned)<br/>claim-check store: Postgres ledger + S3 objects"]
+    client -->|"search / ingest (gRPC)"| cluster
+    cluster -.->|"analysis and embeddings (gRPC stream)"| kserve
+    cluster -.->|"source documents and parsed parts (planned gRPC)"| repo
 ```
 
 The responsibilities split cleanly. The engine library scores vectors and
 nothing else. The server owns everything distributed: sharding, fan-out,
 merging, floors, fusion, and the lexical (BM25) index, which is ours rather
 than the library's. The product owns the persisted term-identity contract.
-Its native Rust provider implements the production lexical subset in-process;
-the OpenNLP sidecar implements the wider language, model, and embedding
-surface. The repo service owns bytes at rest that are not needed to rank:
+Its in-process `native` provider implements the zero-model lexical specs;
+`turbo-client` (in process) or `turbo-kserve` (over gRPC) implements full
+linguistic normalization, NLP projections, and embeddings. The repo service owns bytes at rest that are not needed to rank:
 source documents, parser output, and annotation payloads. The index stays lean
 because anything recoverable from the repo service does not have to live on
 the search path.
@@ -65,8 +65,8 @@ flowchart TB
     coord -->|"gRPC: NodeService<br/>+ UDP signal lane"| n3
     n1 -->|"in process"| native["Rust analyzer"]
     coord -->|"in process<br/>(query analysis)"| native
-    n1 -.->|"optional gRPC:<br/>extended analysis"| nlp["OpenNLP sidecar"]
-    coord -.->|"optional gRPC:<br/>embeddings/models"| nlp
+    n1 -.->|"optional gRPC:<br/>offloaded analysis"| kserve["turbo-kserve"]
+    coord -.->|"optional gRPC:<br/>embeddings/models"| kserve
     coord -.->|"planned"| repo["Repo service"]
 ```
 
@@ -206,7 +206,7 @@ lexical queries it runs flat or fused multi-field block-max BM25, emits compact
 candidates, adopts inclusive live-floor raises, and finishes with a completion
 certificate plus scoring fingerprint. Phrase-aware lexical scoring currently
 uses the unary exact route. Ingestion also lands here: documents arrive over a stream, each
-field's text goes to the configured native or OpenNLP analyzer, and the
+field's text goes to the configured analysis backend, and the
 returned terms are written into the lexical index while embeddings land in
 the vector index. A write-ahead log makes ingestion restartable.
 
@@ -218,9 +218,12 @@ derived artifact are kept so that a rebuild is always possible.
 
 ## 6. The NLP engine
 
-All text analysis happens in a separate process: a JVM sidecar exposing
-Apache OpenNLP through gRPC. The server never tokenizes text itself.
-Whatever the sidecar says a field's terms are, at ingest and at query time,
+Text analysis runs through one of three backends, chosen by configuration
+(`AnalysisBackend` in `src/analyzer/mod.rs`): `native`, the in-process
+`protomolt-analyzer` provider for the zero-model lexical specs; `turbo`, the
+in-process pure-Rust `turbo-client` lattice and one-pass NLP provider; or an
+address naming a pooled remote `turbo-kserve` gRPC endpoint. No JVM is
+involved. Whatever the configured analyzer says a field's terms are, at ingest and at query time,
 is the truth, and the two must match for search to mean anything. That
 contract is enforced rather than assumed: each analyzer configuration
 hashes to a fingerprint, the fingerprint is stored per field in the index,
@@ -231,20 +234,24 @@ refuse to ship.
 An analyzer is described in industry terms: optional character filters
 (Unicode normalization, accent folding, case folding), a tokenizer, and
 token filters such as stemming. The wire protocol is a bidirectional
-stream, one per analyzer configuration, so a document with several fields
+stream to the remote endpoint, one per analyzer configuration, so a document with several fields
 rides a handful of persistent streams instead of paying one RPC per field.
-The sidecar is allowed to hold a response until more work arrives, and the
+The endpoint is allowed to hold a response until more work arrives, and the
 client side is written for that.
 
-The sidecar is also where richer NLP will come from: sentence boundaries,
-named entities, and part-of-speech tags are available from the same models.
-TODO: whether entity and annotation output becomes index columns, repo
-service payloads, or both is an open design question (see section 7).
+The `turbo` and `turbo-kserve` backends also supply richer NLP from the same
+pass. Sentence spans, `(pos, pos_len)` token lattices, and quantized SPLADE
+postings are index columns (section 7), and NER mentions can be materialized
+into the optional entity map column (`entity_map_field` with `phrase_ner`).
+Analysis persists original-text UTF-8 byte offsets (`ViewId::SOURCE`), and a
+response in UTF-16 units is refused rather than stored.
 
 ## 7. The index
 
-A shard's lexical index is our own format, currently v6, and this section
-stays at the shape level because the details are still settling. The file
+A shard's lexical index is our own format. Writers emit a v6 (multi-field)
+or v7 (per-document columns) payload inside the v8 per-section CRC integrity
+envelope (`TVBM2508`, `src/postings/format.rs`); readers still open v6 and v7
+files. This section stays at the shape level. The file
 carries an explicit section table: per-field postings with per-field
 analysis fingerprints, document lengths, the stored chunk texts with an
 index over them, and lineage records tying each chunk back to its source
@@ -252,13 +259,11 @@ document and position. Multiple fields score independently with their own
 weights, which is what makes A/B comparisons of term identity affordable:
 two analyzer treatments of the same text are just two columns in one file.
 
-What the index will eventually hold beyond that is deliberately open:
-
-- TODO: sparse annotation columns (entities, sentence structure) priced at
-  roughly the cost of a small extra field
-- TODO: alternate term-identity columns as first-class A/B arms
-- TODO: positional or bigram data for phrase scoring
-- TODO: fast fields for filtering and faceting (court, date, category)
+The v7 column table carries typed per-document columns: string facets, f64,
+i64, u64, and geo-point columns, string, f64, i64, and u64 map columns, token
+positions for phrase and proximity scoring, sentence spans, `(pos, pos_len)`
+lattices, SPLADE postings, and derived columns. An unknown column kind is
+refused at open by number.
 
 The vector side of a shard is turbovec's own format and moves with the
 upstream library; the pending change there is the per-block v7 format,
@@ -281,14 +286,14 @@ ranking needs, the repo service keeps everything else, and results carry
 enough lineage to fetch the rest on demand. That gives two document
 shapes on purpose. A search hit is lean: identity, score, the chunk
 text, and lineage. The full record, with every annotation layer the
-sidecar produced, is fetched from the repo service by that lineage. The
+analysis service produced, is fetched from the repo service by that lineage. The
 lean shape is what ranking and paging need; the full shape is what
 someone analyzing the corpus needs, and making them the same object
 would put analysis payloads on the query path.
 
 ### 8.1 Capturing NLP output
 
-The sidecar produces sixteen annotation layers and the index consumes
+The analysis service produces sixteen annotation layers and the index consumes
 two of them: term vectors and embeddings. The rest (sentences, POS,
 entities, lemmas, coreference, dependencies, relations, geography,
 noise, artifacts, PII, glossary matches) are computed only if asked for
@@ -299,7 +304,7 @@ The cost question is when to ask. Analysis is by far the most expensive
 part of a corpus build, so capturing annotations during the rebuild that
 is already happening is much cheaper than a second pass over the corpus
 later. But the layers are not equally priced. Measured against the live
-sidecar on real chunks, relative to a term-vectors-only pass:
+analysis service on real chunks, relative to a term-vectors-only pass:
 
 - near free, within measurement noise: sentence detection, noise,
   artifacts, and lemmatization
@@ -338,8 +343,8 @@ registration, leases, shard reports, and placement actions such as replica
 bootstrap and the online split (`docs/cluster-control.md`). Coordinator to node is the
 NodeService: vector and lexical candidate streams with their floor relays,
 rescoring,
-document ingestion, and snapshot install. Node and coordinator to sidecar
-is the analysis stream. The UDP signal lane shares the node's listen address
+document ingestion, and snapshot install. Node and coordinator to a
+`turbo-kserve` endpoint is the analysis stream. The UDP signal lane shares the node's listen address
 and carries typed monotonic floor hints or advisory cancellation. The same
 signal also travels over gRPC, and correctness never depends on a datagram
 arriving. This section intentionally stops here; message-level detail belongs
@@ -347,24 +352,11 @@ to the proto files and the appendix.
 
 ## Appendix
 
-Placeholders until the shapes stop moving. Filling these in early would
-create drift against sections 7 and 8, so they wait.
+Reference material lives with the code it describes:
 
-### A. Data dictionary
-
-TODO: per-field definitions for the index sections, lineage records, and
-repo service parts.
-
-### B. Schemas
-
-TODO: the settled proto surface, the index section table layout, and the
-repo service ledger schema.
-
-### C. Vocabularies
-
-TODO: analyzer configuration names, field names, fusion mode names, and
-the terminology mapping between our proto and Lucene/OpenNLP usage.
-
-### D. Operational notes
-
-TODO: deployment topology, rebuild runbook, monitoring.
+- Wire schemas: the vendored protos under `proto/`, checked by
+  `scripts/check-vendored-protos.sh`.
+- Lexical index layout and column kinds: `src/postings/format.rs`.
+- Analyzer specs and fingerprints: `src/analyzer/spec.rs`.
+- Security and cluster control: [`docs/security.md`](security.md) and
+  [`docs/cluster-control.md`](cluster-control.md).

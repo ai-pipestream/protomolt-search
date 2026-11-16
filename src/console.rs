@@ -14,17 +14,27 @@
 //! exposed service needs no change here.
 //!
 //! A few convenience routes exist for the UI: `/api/health`,
-//! `/api/config`, `/api/embed` (the analysis sidecar's embedding, when
-//! one is configured), and `/api/documents` (stored text from the owning
-//! nodes, routed by the cluster's slot ranges).
+//! `/api/config`, `/api/embed` (the analysis endpoint's embedding, when
+//! one is configured, dialed with the console's TLS material and bearer
+//! token), and `/api/documents` (stored text from the owning nodes,
+//! routed by the cluster's slot ranges and read from them concurrently).
 //!
-//! The HTTP side is hand-rolled HTTP/1.1 with `Connection: close`: this
-//! is an operator's tool bound to loopback by default, not a product
-//! server. Binding elsewhere needs `--allow-remote`, because whoever
-//! reaches the facade acts as its principal.
+//! The HTTP side is hand-rolled HTTP/1.1: persistent connections with
+//! pipelined requests answered in order, `Content-Length` and chunked
+//! request bodies, deadlines on reading a request's head and body and on
+//! an idle connection, and a cap on open connections. This is an
+//! operator's tool bound to loopback by default, not a product server.
+//! Binding elsewhere needs `--allow-remote`, because whoever reaches the
+//! facade acts as its principal.
+//!
+//! The UI is compiled in. [`Console::with_ui_dir`] serves the files of a
+//! directory instead, read on every request, so UI work needs a reload
+//! rather than a rebuild; a file missing there falls back to the
+//! compiled-in copy.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -35,14 +45,16 @@ use prost_reflect::{
     SerializeOptions,
 };
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::codegen::http::uri::PathAndQuery;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 use tonic::{Code, Request, Status};
 
+use crate::analyzer::RemoteCallOptions;
 use crate::pb::node_service_client::NodeServiceClient;
 use crate::pb::search_service_client::SearchServiceClient;
 use crate::pb::{ClusterHealthRequest, GetDocumentsRequest};
@@ -93,16 +105,11 @@ const HEALTH_TTL: Duration = Duration::from_secs(5);
 /// How long a stream's client may take to accept one frame.
 const STREAM_WRITE_DEADLINE: Duration = Duration::from_secs(10);
 
-const INDEX_HTML: &str = include_str!("bin/console-ui/index.html");
-const DASHBOARD_HTML: &str = include_str!("bin/console-ui/dashboard.html");
-const EXPLORER_HTML: &str = include_str!("bin/console-ui/explorer.html");
-const EXPLORER_JS: &str = include_str!("bin/console-ui/explorer.js");
-const APP_CSS: &str = include_str!("bin/console-ui/app.css");
-const COMMON_JS: &str = include_str!("bin/console-ui/common.js");
-const SEARCH_JS: &str = include_str!("bin/console-ui/search.js");
-const QUERY_STATE_JS: &str = include_str!("bin/console-ui/query-state.js");
-const DASHBOARD_JS: &str = include_str!("bin/console-ui/dashboard.js");
-const SPARKLINE_JS: &str = include_str!("bin/console-ui/sparkline.js");
+/// Connections served at once; further clients wait in the listen
+/// backlog until one closes.
+const MAX_CONNECTIONS: usize = 256;
+/// How long one embedding call to the analysis endpoint may take.
+const EMBED_DEADLINE: Duration = Duration::from_secs(30);
 
 /// What the facade needs to run, parsed from the tool flags.
 pub struct ConsoleConfig {
@@ -129,6 +136,36 @@ fn grpc_addr(addr: &str) -> String {
     }
 }
 
+/// The `--ui-dir` flag, as `--ui-dir=<path>` or `--ui-dir <path>`.
+pub fn ui_dir_arg(args: &[String]) -> Option<PathBuf> {
+    flag(args, "ui-dir").map(PathBuf::from).or_else(|| {
+        let at = args.iter().position(|a| a == "--ui-dir")?;
+        args.get(at + 1).map(PathBuf::from)
+    })
+}
+
+/// The options every embedding call carries: the interactive lane, a
+/// deadline, the tool's bearer token, and, when the tool dials TLS, its
+/// client TLS material. `ToolClient` hands that material over through the
+/// process-wide install, which this performs when nothing is installed
+/// yet; an earlier install in the same process wins.
+fn embed_options(security: &ToolClient) -> RemoteCallOptions {
+    if security.is_tls() && crate::security::process_client_tls().is_none() {
+        security.install();
+    }
+    RemoteCallOptions {
+        bearer_token: security.raw_bearer_token().map(str::to_string),
+        interactive: true,
+        timeout: Some(EMBED_DEADLINE),
+        tls: if security.is_tls() {
+            crate::security::process_client_tls().cloned()
+        } else {
+            None
+        },
+        ..Default::default()
+    }
+}
+
 impl ConsoleConfig {
     /// Flags, all `--key=value`: `--listen` (default `127.0.0.1:8600`),
     /// `--coordinator` (default `http://127.0.0.1:50050`), `--nodes`
@@ -152,8 +189,8 @@ impl ConsoleConfig {
             listen: flag(args, "listen").unwrap_or_else(|| "127.0.0.1:8600".to_string()),
             coordinator,
             nodes,
-            // The sidecar has no TLS; its address
-            // keeps its own scheme.
+            // A bare address gets `http://`; with `--tls-ca` the embedding
+            // call dials it as `https://` (see `embed_options`).
             analysis: flag(args, "analysis").map(|a| grpc_addr(&a)),
             security,
             allow_remote: args.iter().any(|a| a == "--allow-remote"),
@@ -166,6 +203,10 @@ struct Ctx {
     nodes: Vec<String>,
     analysis: Option<String>,
     security: ToolClient,
+    /// What every `/api/embed` call carries to the analysis endpoint.
+    embed: RemoteCallOptions,
+    /// The canonical `--ui-dir`, when the UI is served from disk.
+    ui_dir: Option<PathBuf>,
     /// One channel per address, connected lazily and reused across
     /// requests (a handshake per request would dominate a TLS fleet).
     channels: Mutex<HashMap<String, Channel>>,
@@ -242,6 +283,7 @@ impl Ctx {
 pub struct Console {
     listener: TcpListener,
     ctx: Arc<Ctx>,
+    max_connections: usize,
 }
 
 impl Console {
@@ -267,11 +309,37 @@ impl Console {
                 coordinator: config.coordinator,
                 nodes: config.nodes,
                 analysis: config.analysis,
+                embed: embed_options(&config.security),
                 security: config.security,
+                ui_dir: None,
                 channels: Mutex::new(HashMap::new()),
                 health: Mutex::new(None),
             }),
+            max_connections: MAX_CONNECTIONS,
         })
+    }
+
+    /// Serves the UI files found in `dir`, read on every request, ahead
+    /// of the compiled-in copies. Only single-segment `.html`, `.js` and
+    /// `.css` names are looked up there, and a file that resolves outside
+    /// `dir` is refused.
+    pub fn with_ui_dir(mut self, dir: &Path) -> Result<Self, String> {
+        let dir = dir
+            .canonicalize()
+            .map_err(|e| format!("--ui-dir {}: {e}", dir.display()))?;
+        if !dir.is_dir() {
+            return Err(format!("--ui-dir {} is not a directory", dir.display()));
+        }
+        Arc::get_mut(&mut self.ctx)
+            .expect("the context is shared only once serving starts")
+            .ui_dir = Some(dir);
+        Ok(self)
+    }
+
+    /// Caps the connections served at once (at least one).
+    pub fn with_max_connections(mut self, max: usize) -> Self {
+        self.max_connections = max.max(1);
+        self
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -283,7 +351,7 @@ impl Console {
     /// A one-line description for the startup log.
     pub fn describe(&self) -> String {
         format!(
-            "console on http://{} -> coordinator {} ({} node(s), analysis {}, tls {}, bearer {})",
+            "console on http://{} -> coordinator {} ({} node(s), analysis {}, tls {}, bearer {}, ui {})",
             self.local_addr(),
             self.ctx.coordinator,
             self.ctx.nodes.len(),
@@ -293,31 +361,50 @@ impl Console {
                 .unwrap_or("none: embedding disabled"),
             self.ctx.security.is_tls(),
             self.ctx.security.has_bearer(),
+            self.ctx
+                .ui_dir
+                .as_deref()
+                .map_or_else(|| "compiled in".to_string(), |d| d.display().to_string()),
         )
     }
 
-    /// Accepts connections until the listener fails.
+    /// Accepts connections until the listener fails, at most
+    /// `max_connections` of them open at once.
     pub async fn serve(self) -> std::io::Result<()> {
+        let slots = Arc::new(Semaphore::new(self.max_connections));
         loop {
+            let slot = Arc::clone(&slots)
+                .acquire_owned()
+                .await
+                .expect("the connection semaphore is never closed");
             let (stream, _) = self.listener.accept().await?;
             let ctx = Arc::clone(&self.ctx);
             tokio::spawn(async move {
                 let _ = handle_conn(stream, ctx).await;
+                drop(slot);
             });
         }
     }
 }
 
+mod assets;
 mod codec;
+mod conn;
 mod http;
+#[cfg(test)]
+mod http_tests;
 mod routes;
 mod rpc;
 mod schema;
 #[cfg(test)]
+mod serve_tests;
+#[cfg(test)]
 mod tests;
 
+use self::assets::*;
 use self::codec::*;
 pub use self::codec::{json_to_message_bytes, message_bytes_to_json};
+use self::conn::*;
 use self::http::*;
 use self::routes::*;
 use self::rpc::*;
