@@ -53,17 +53,11 @@ impl MultiResVectorOutput {
             let vec: Vec<f32> = slice.iter().map(|v| v * p_inv).collect();
             prefixes.push((take as u32, vec));
         }
-        let mut le_bytes = Vec::with_capacity(full.len() * 4);
-        for &v in &full {
-            le_bytes.extend_from_slice(&v.to_le_bytes());
+        let mut digest = crate::sha256::Sha256::new();
+        for &value in &full {
+            digest.update(&value.to_le_bytes());
         }
-        let digest_hex = crate::sha256::hex_digest(&le_bytes);
-        let mut sha256 = [0u8; 32];
-        for (i, slot) in sha256.iter_mut().enumerate() {
-            if let Ok(b) = u8::from_str_radix(&digest_hex[i * 2..i * 2 + 2], 16) {
-                *slot = b;
-            }
-        }
+        let sha256 = digest.finalize();
         Self {
             prefixes,
             full,

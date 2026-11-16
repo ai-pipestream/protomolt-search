@@ -1,0 +1,426 @@
+//! Regression coverage for cached analysis and typed query binding.
+
+use pipestream_search::turbo_bridge::query_plan::bind_one_pass_query;
+use pipestream_search::turbo_bridge::{MultiResVectorOutput, NlpColumnSpec};
+use turbo_client::{OnePassQueryBuilder, QueryComparisonOp as Op, StructuredFilterPayload as P};
+
+fn columns() -> NlpColumnSpec {
+    NlpColumnSpec {
+        money_column: "money".into(),
+        quantity_column: "qty".into(),
+        date_column: "doc_date".into(),
+        geo_spine_column: "geo_spine".into(),
+        affirmed_entity_column: "entities".into(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn typed_filters_match_cel_for_all_comparisons_and_escaped_keys() {
+    let analyzer = OnePassQueryBuilder::new().build().unwrap();
+    let original = analyzer
+        .analyze("batteries $5000 25 kg in 2024 Berlin ops@acme.example")
+        .unwrap();
+    assert!(original
+        .filters
+        .iter()
+        .any(|f| matches!(f.payload, P::Money { .. })));
+    assert!(original
+        .filters
+        .iter()
+        .any(|f| matches!(f.payload, P::Quantity { .. })));
+    assert!(original
+        .filters
+        .iter()
+        .any(|f| matches!(f.payload, P::Temporal(_))));
+    assert!(original
+        .filters
+        .iter()
+        .any(|f| matches!(f.payload, P::Place { .. })));
+    for op in [Op::Eq, Op::Gt, Op::Gte, Op::Lt, Op::Lte, Op::Range] {
+        let mut plan = original.clone();
+        for f in &mut plan.filters {
+            f.comparison = op;
+            if let P::Quantity { si_base_unit, .. } = &mut f.payload {
+                *si_base_unit = "a\"b\\c\n\r\t".into();
+            }
+        }
+        for caller in [None, Some("tier == 1 || tier == 2")] {
+            let bound = bind_one_pass_query(&plan, &columns(), caller).unwrap();
+            let text = match caller {
+                Some(caller) => format!("({caller}) && ({})", bound.synthesized_cel),
+                None => bound.synthesized_cel.clone(),
+            };
+            assert_eq!(
+                bound.filter_expr,
+                pipestream_search::cel::compile_filter(&text).unwrap()
+            );
+            assert_eq!(bound.residual_terms.len(), plan.residual_terms.len());
+        }
+    }
+}
+
+#[test]
+fn numeric_comparisons_have_the_requested_operators() {
+    let analyzer = OnePassQueryBuilder::new().build().unwrap();
+    let mut plan = analyzer.analyze("batteries $5000").unwrap();
+    let money = plan
+        .filters
+        .iter()
+        .find(|f| matches!(f.payload, P::Money { .. }))
+        .unwrap()
+        .clone();
+    for (op, symbol) in [
+        (Op::Eq, "=="),
+        (Op::Gt, ">"),
+        (Op::Gte, ">="),
+        (Op::Lt, "<"),
+        (Op::Lte, "<="),
+        (Op::Range, "=="),
+    ] {
+        plan.filters = vec![money.clone()];
+        plan.filters[0].comparison = op;
+        let expected = format!("money[\"USD\"] {symbol} 5000.0");
+        let bound = bind_one_pass_query(&plan, &columns(), None).unwrap();
+        assert_eq!(bound.synthesized_cel, expected);
+        assert_eq!(
+            bound.filter_expr,
+            pipestream_search::cel::compile_filter(&expected).unwrap()
+        );
+    }
+}
+
+#[test]
+fn temporal_endpoints_preserve_half_open_ranges_and_saturation() {
+    let analyzer = OnePassQueryBuilder::new().build().unwrap();
+    let mut plan = analyzer.analyze("batteries in 2024").unwrap();
+    let template = plan
+        .filters
+        .iter()
+        .find(|f| matches!(f.payload, P::Temporal(_)))
+        .unwrap()
+        .clone();
+    for (start, end) in [
+        (Some(1), Some(2)),
+        (Some(i64::MIN), Some(i64::MAX)),
+        (Some(4), None),
+        (None, Some(4)),
+        (None, None),
+        (Some(2), Some(1)),
+    ] {
+        for op in [Op::Eq, Op::Gt, Op::Gte, Op::Lt, Op::Lte, Op::Range] {
+            let mut filter = template.clone();
+            filter.comparison = op;
+            let P::Temporal(t) = &mut filter.payload else {
+                unreachable!()
+            };
+            t.start_epoch_seconds = start;
+            t.end_epoch_seconds = end;
+            plan.filters = vec![filter];
+            let bound = bind_one_pass_query(&plan, &columns(), None).unwrap();
+            assert_eq!(
+                bound.filter_expr,
+                pipestream_search::cel::compile_filter(&bound.synthesized_cel).unwrap()
+            );
+            assert_eq!(bound.estimated_selectivity, 0.20);
+        }
+    }
+}
+
+#[test]
+fn structured_filters_validate_identifiers_and_combined_limits() {
+    let analyzer = OnePassQueryBuilder::new().build().unwrap();
+    let mut plan = analyzer.analyze("batteries $5000").unwrap();
+    for invalid in ["x || true", "true", "x.y", "9money"] {
+        let mut cols = columns();
+        cols.money_column = invalid.into();
+        assert_eq!(
+            bind_one_pass_query(&plan, &cols, None).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+    let money = plan
+        .filters
+        .iter()
+        .find(|f| matches!(f.payload, P::Money { .. }))
+        .unwrap()
+        .clone();
+    plan.filters = vec![money; 256];
+    assert!(bind_one_pass_query(&plan, &columns(), None).is_ok());
+    assert_eq!(
+        bind_one_pass_query(&plan, &columns(), Some("tier == 1"))
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+}
+
+#[test]
+fn vector_digest_matches_canonical_bytes_including_signed_zero() {
+    for raw in [vec![3.0, 4.0], vec![-0.0, 0.0], vec![], vec![f32::NAN, 1.0]] {
+        let out = MultiResVectorOutput::from_full_and_sentences(&raw, &[1], None, vec![]);
+        let bytes: Vec<_> = out.full.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(out.sha256, pipestream_search::sha256::digest(&bytes));
+    }
+}
+
+#[cfg(feature = "net")]
+mod remote {
+    use pipestream_search::analyzer::{embed_text_with_options, RemoteCallOptions};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+    use tonic::{Request, Response, Status};
+    use turbo_client::proto::{
+        self as wire,
+        grpc_inference_service_server::{GrpcInferenceService, GrpcInferenceServiceServer},
+    };
+
+    static RPC_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[derive(Default)]
+    struct Mock {
+        metadata: AtomicUsize,
+        inference: AtomicUsize,
+        revision: AtomicUsize,
+        fail_infer: AtomicBool,
+        stall_metadata: AtomicBool,
+        saw_timeout: AtomicBool,
+    }
+
+    #[derive(Clone)]
+    struct MockService(Arc<Mock>);
+
+    #[tonic::async_trait]
+    impl GrpcInferenceService for MockService {
+        async fn server_live(
+            &self,
+            _: Request<wire::ServerLiveRequest>,
+        ) -> Result<Response<wire::ServerLiveResponse>, Status> {
+            Err(Status::unimplemented("unused"))
+        }
+        async fn server_ready(
+            &self,
+            _: Request<wire::ServerReadyRequest>,
+        ) -> Result<Response<wire::ServerReadyResponse>, Status> {
+            Err(Status::unimplemented("unused"))
+        }
+        async fn model_ready(
+            &self,
+            _: Request<wire::ModelReadyRequest>,
+        ) -> Result<Response<wire::ModelReadyResponse>, Status> {
+            Err(Status::unimplemented("unused"))
+        }
+        async fn server_metadata(
+            &self,
+            _: Request<wire::ServerMetadataRequest>,
+        ) -> Result<Response<wire::ServerMetadataResponse>, Status> {
+            Err(Status::unimplemented("unused"))
+        }
+        async fn model_metadata(
+            &self,
+            request: Request<wire::ModelMetadataRequest>,
+        ) -> Result<Response<wire::ModelMetadataResponse>, Status> {
+            self.0.metadata.fetch_add(1, Ordering::SeqCst);
+            self.0.saw_timeout.store(
+                request.metadata().contains_key("grpc-timeout"),
+                Ordering::SeqCst,
+            );
+            if self.0.stall_metadata.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            let properties = [
+                ("model_info.model_id", request.get_ref().name.clone()),
+                (
+                    "model_info.revision",
+                    self.0.revision.load(Ordering::SeqCst).to_string(),
+                ),
+                ("model_info.manifest_sha256", "a".repeat(64)),
+                ("model_info.task", "embed".into()),
+                ("model_info.dim", "2".into()),
+                ("model_info.pooling", "mean".into()),
+                ("model_info.normalize", "l2".into()),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value))
+            .collect();
+            Ok(Response::new(wire::ModelMetadataResponse {
+                properties,
+                ..Default::default()
+            }))
+        }
+        async fn model_infer(
+            &self,
+            _: Request<wire::ModelInferRequest>,
+        ) -> Result<Response<wire::ModelInferResponse>, Status> {
+            self.0.inference.fetch_add(1, Ordering::SeqCst);
+            if self.0.fail_infer.swap(false, Ordering::SeqCst) {
+                return Err(Status::unavailable("reconnect"));
+            }
+            Ok(Response::new(wire::ModelInferResponse {
+                outputs: vec![wire::model_infer_response::InferOutputTensor {
+                    name: "embeddings".into(),
+                    datatype: "FP32".into(),
+                    shape: vec![1, 2],
+                    contents: Some(wire::InferTensorContents {
+                        fp32_contents: vec![3.0, 4.0],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }))
+        }
+    }
+
+    async fn server(mock: Arc<Mock>) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}?model=fast-seam", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(GrpcInferenceServiceServer::new(MockService(mock)))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        (addr, task)
+    }
+
+    #[tokio::test]
+    async fn tofu_is_single_flight_and_rechecks_identity_after_transport_failure() {
+        let _guard = RPC_TEST.lock().await;
+        let mock = Arc::new(Mock::default());
+        let (addr, task) = server(Arc::clone(&mock)).await;
+        let options = RemoteCallOptions {
+            timeout: Some(Duration::from_secs(2)),
+            ..Default::default()
+        };
+        let mut calls = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let addr = addr.clone();
+            let options = options.clone();
+            calls.spawn(async move { embed_text_with_options(&addr, "query", &options).await });
+        }
+        while let Some(result) = calls.join_next().await {
+            assert_eq!(result.unwrap().unwrap(), vec![0.6, 0.8]);
+        }
+        for _ in 0..3 {
+            embed_text_with_options(&addr, "query", &options)
+                .await
+                .unwrap();
+        }
+        assert_eq!(mock.metadata.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.inference.load(Ordering::SeqCst), 11);
+        assert!(mock.saw_timeout.load(Ordering::SeqCst));
+        mock.fail_infer.store(true, Ordering::SeqCst);
+        assert_eq!(
+            embed_text_with_options(&addr, "query", &options)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+        mock.revision.store(1, Ordering::SeqCst);
+        assert_eq!(
+            embed_text_with_options(&addr, "query", &options)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(mock.metadata.load(Ordering::SeqCst), 2);
+        assert_eq!(mock.inference.load(Ordering::SeqCst), 12);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn new_runtime_reprobes_but_call_budget_changes_reuse_verification() {
+        let _guard = RPC_TEST.lock().await;
+        let mock = Arc::new(Mock::default());
+        let (addr, task) = server(Arc::clone(&mock)).await;
+        let mut options = RemoteCallOptions::default();
+        embed_text_with_options(&addr, "query", &options)
+            .await
+            .unwrap();
+        options.timeout = Some(Duration::from_secs(2));
+        options.interactive = !options.interactive;
+        embed_text_with_options(&addr, "query", &options)
+            .await
+            .unwrap();
+        assert_eq!(mock.metadata.load(Ordering::SeqCst), 1);
+        mock.revision.store(1, Ordering::SeqCst);
+        let error = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(embed_text_with_options(&addr, "query", &options))
+                .unwrap_err()
+        })
+        .await
+        .unwrap();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(mock.metadata.load(Ordering::SeqCst), 2);
+        assert_eq!(mock.inference.load(Ordering::SeqCst), 2);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn explicit_probes_invalidate_cached_tofu_without_replacing_its_pin() {
+        let _guard = RPC_TEST.lock().await;
+        for revision in [0, 1] {
+            let mock = Arc::new(Mock::default());
+            let (addr, task) = server(Arc::clone(&mock)).await;
+            let options = RemoteCallOptions::default();
+            embed_text_with_options(&addr, "query", &options)
+                .await
+                .unwrap();
+            mock.revision.store(1, Ordering::SeqCst);
+            let explicit = format!(
+                "{addr}&sha256={}&dim=2&revision={revision}&pooling=mean&normalize=l2",
+                "a".repeat(64)
+            );
+            let result = embed_text_with_options(&explicit, "query", &options).await;
+            assert_eq!(result.is_ok(), revision == 1);
+            assert_eq!(
+                embed_text_with_options(&addr, "query", &options)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+            assert_eq!(mock.metadata.load(Ordering::SeqCst), 3);
+            assert_eq!(mock.inference.load(Ordering::SeqCst), 1 + revision);
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_handshake_obeys_timeout_without_inference_or_pin() {
+        let _guard = RPC_TEST.lock().await;
+        let mock = Arc::new(Mock::default());
+        mock.stall_metadata.store(true, Ordering::SeqCst);
+        let (addr, task) = server(Arc::clone(&mock)).await;
+        let options = RemoteCallOptions {
+            timeout: Some(Duration::from_millis(100)),
+            ..Default::default()
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            embed_text_with_options(&addr, "query", &options),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err().code(), tonic::Code::DeadlineExceeded);
+        assert_eq!(mock.inference.load(Ordering::SeqCst), 0);
+        mock.stall_metadata.store(false, Ordering::SeqCst);
+        embed_text_with_options(&addr, "query", &options)
+            .await
+            .unwrap();
+        assert_eq!(mock.metadata.load(Ordering::SeqCst), 2);
+        assert_eq!(mock.inference.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
+}

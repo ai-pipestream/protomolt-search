@@ -1,28 +1,26 @@
-//! One-pass `AnalyzeQuery` filter binding (`Money`, `Quantity`, `Temporal`,
-//! `Place`, `Entity` -> native CEL / `FilterExpr`), filter-selectivity
-//! HNSW budget selection, `MappedSurfaceLexicon` stem-to-surface completion,
-//! and `QuerySpellchecker` contextual multi-word spellcheck.
+//! Typed query binding, filtered ANN budgets, surface completion, and spellcheck.
 
 use std::collections::BTreeMap;
 
 use tonic::Status;
 
 use super::{NlpColumnSpec, MICROS_PER_SECOND};
-use crate::pb::{FilterExpr, Suggestion, SynonymExpansion, TermCandidate, TermSuggestion};
+use crate::pb::{
+    self, filter_bound::Value as V, filter_expr::Expr as E, FilterBound, FilterExpr, Suggestion,
+    SynonymExpansion, TermCandidate, TermSuggestion,
+};
+use turbo_client::{QueryComparisonOp as Op, StructuredFilterPayload as P, StructuredFilterPlan};
 
 /// HNSW filtered search execution strategy.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FilteredAnnStrategy {
-    /// Graph traversal with escalated `ef_search` proportional to `1 / selectivity`.
+    /// Graph traversal with a selectivity-adjusted budget.
     Graph { ef_search: u32 },
-    /// Exact prefiltered distance scan when survivor cardinality is small enough
-    /// that brute-force scoring over admitted slots beats sparse graph hops.
+    /// Exact distance scan over a small filtered survivor set.
     PrefilteredExact,
 }
 
-/// Selects the filtered HNSW visit budget (`ef_search` vs prefiltered exact scan)
-/// from `base_ef`, `k`, `shard_docs`, and `estimated_selectivity` in `(0.0, 1.0]`
-///.
+/// Select graph or prefiltered scan budgets from estimated filter selectivity.
 pub fn select_filtered_ann_strategy(
     base_ef: u32,
     k: u32,
@@ -41,8 +39,6 @@ pub fn select_filtered_ann_strategy(
         };
     }
     let expected_survivors = (shard_docs as f64 * sel).ceil() as u64;
-    // Below ~256 expected survivors or < 1% selectivity on medium shards,
-    // exact prefiltered evaluation guarantees 100% recall in fewer dot products.
     if expected_survivors <= u64::from(k.saturating_mul(8).max(128)) || sel <= 0.005 {
         return FilteredAnnStrategy::PrefilteredExact;
     }
@@ -61,7 +57,7 @@ pub struct BoundOnePassQuery {
     pub synonym_expansions: Vec<SynonymExpansion>,
     /// Synthesized CEL predicate string for extracted structured filters (`""` when none).
     pub synthesized_cel: String,
-    /// Conjoined native [`FilterExpr`] combining `caller_cel` and `synthesized_cel`.
+    /// Validated caller and structured predicates.
     pub filter_expr: Option<FilterExpr>,
     /// Heuristic selectivity estimate in `(0.0, 1.0]` for HNSW budget escalation.
     pub estimated_selectivity: f64,
@@ -85,217 +81,236 @@ fn escape_cel_string(raw: &str) -> String {
 }
 
 fn format_f64_cel(val: f64) -> String {
-    let s = format!("{val}");
-    if s.contains('.') || s.contains('e') || s.contains('E') {
-        s
-    } else {
-        format!("{s}.0")
+    let mut s = val.to_string();
+    if !s.contains(['.', 'e', 'E']) {
+        s.push_str(".0");
+    }
+    s
+}
+
+fn conjunction(mut exprs: Vec<FilterExpr>) -> Option<FilterExpr> {
+    match exprs.len() {
+        0 => None,
+        1 => exprs.pop(),
+        _ => Some(FilterExpr {
+            expr: Some(E::And(pb::FilterList { exprs })),
+        }),
     }
 }
 
-fn comparison_cel(lhs: &str, op: turbo_client::QueryComparisonOp, rhs: &str) -> String {
-    use turbo_client::QueryComparisonOp as Op;
-    let sym = match op {
-        Op::Eq | Op::Range => "==",
-        Op::Gt => ">",
-        Op::Gte => ">=",
-        Op::Lt => "<",
-        Op::Lte => "<=",
+fn number(column: &str, key: Option<&str>, op: Op, value: V) -> FilterExpr {
+    let value = Some(value);
+    let bound = |exclusive| Some(pb::FilterBound { value, exclusive });
+    let (min, max) = match op {
+        Op::Eq | Op::Range => (bound(false), bound(false)),
+        Op::Gt => (bound(true), None),
+        Op::Gte => (bound(false), None),
+        Op::Lt => (None, bound(true)),
+        Op::Lte => (None, bound(false)),
     };
-    format!("{lhs} {sym} {rhs}")
+    let expr = match key {
+        Some(key) => E::TypedMapNumber(pb::MapNumberPredicate {
+            column: column.to_owned(),
+            key: key.to_owned(),
+            min,
+            max,
+        }),
+        None => E::Number(pb::NumberPredicate {
+            column: column.to_owned(),
+            min,
+            max,
+        }),
+    };
+    FilterExpr { expr: Some(expr) }
 }
 
-/// Translates a [`turbo_client::OnePassQueryPlan`] and [`NlpColumnSpec`] into a
-/// native [`BoundOnePassQuery`] whose structured filters compile through
-/// [`crate::cel::compile_filter`] onto the shard predicate IR (`#104`, `#2339`).
+fn temporal(column: &str, op: Op, start: Option<i64>, end: Option<i64>) -> Option<FilterExpr> {
+    let leaf = |op, seconds: i64| {
+        let value = V::Int(seconds.saturating_mul(MICROS_PER_SECOND));
+        number(column, None, op, value)
+    };
+    match (op, start, end) {
+        (Op::Gt, Some(_), Some(e)) => Some(leaf(Op::Gte, e)),
+        (Op::Gte, Some(s), _) => Some(leaf(Op::Gte, s)),
+        (Op::Lt, Some(s), _) => Some(leaf(Op::Lt, s)),
+        (Op::Lte, _, Some(e)) => Some(leaf(Op::Lt, e)),
+        (_, Some(s), Some(e)) if s < e => conjunction(vec![leaf(Op::Gte, s), leaf(Op::Lt, e)]),
+        (_, Some(s), None) => Some(leaf(Op::Eq, s)),
+        _ => None,
+    }
+}
+
+fn numeric_filter(f: &StructuredFilterPlan, c: &NlpColumnSpec) -> Option<FilterExpr> {
+    let (column, key, value) = match &f.payload {
+        P::Money {
+            raw,
+            amount_f64,
+            ecb_converted,
+        } => {
+            let (key, value) = match ecb_converted {
+                Some(conv) if conv.amount_f64.is_finite() => {
+                    (conv.currency.as_str(), conv.amount_f64)
+                }
+                _ => (raw.currency.as_str(), *amount_f64),
+            };
+            (&c.money_column, key, value)
+        }
+        P::Quantity {
+            si_base_unit,
+            si_value_f64,
+            ..
+        } => (&c.quantity_column, si_base_unit.as_str(), *si_value_f64),
+        _ => return None,
+    };
+    (!column.is_empty() && !key.is_empty() && value.is_finite())
+        .then(|| number(column, Some(key), f.comparison, V::Num(value)))
+}
+
+fn key_filter(f: &StructuredFilterPlan, c: &NlpColumnSpec) -> (Option<FilterExpr>, f64) {
+    let (column, key, selectivity) = match &f.payload {
+        P::Place {
+            raw, spine_path, ..
+        } => {
+            let key = if spine_path.is_empty() {
+                &raw.canonical_name
+            } else {
+                spine_path
+            };
+            (&c.geo_spine_column, key.clone(), 0.15)
+        }
+        P::Entity {
+            kb_id,
+            canonical_name,
+            ..
+        } => {
+            let canonical = kb_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .or_else(|| canonical_name.as_deref().filter(|s| !s.is_empty()))
+                .unwrap_or(&f.surface);
+            if canonical.is_empty() {
+                return (None, 1.0);
+            }
+            (&c.affirmed_entity_column, format!("id:{canonical}"), 0.10)
+        }
+        _ => return (None, 1.0),
+    };
+    if column.is_empty() || key.is_empty() {
+        return (None, 1.0);
+    }
+    let expr = E::TypedMapHasKey(pb::MapKeyPredicate {
+        column: column.clone(),
+        key,
+    });
+    (Some(FilterExpr { expr: Some(expr) }), selectivity)
+}
+
+fn compile_structured_filters(
+    plan: &turbo_client::OnePassQueryPlan,
+    columns: &NlpColumnSpec,
+) -> (Vec<FilterExpr>, f64) {
+    let mut exprs = Vec::new();
+    let mut selectivity = 1.0;
+    for filter in &plan.filters {
+        let (expr, factor) = match &filter.payload {
+            P::Place { .. } | P::Entity { .. } => key_filter(filter, columns),
+            P::Temporal(t) if !columns.date_column.is_empty() => {
+                let expr = temporal(
+                    &columns.date_column,
+                    filter.comparison,
+                    t.start_epoch_seconds,
+                    t.end_epoch_seconds,
+                );
+                (expr, 0.20)
+            }
+            _ => {
+                let expr = numeric_filter(filter, columns);
+                let factor = if expr.is_some() { 0.25 } else { 1.0 };
+                (expr, factor)
+            }
+        };
+        selectivity *= factor;
+        exprs.extend(expr);
+    }
+    (exprs, selectivity)
+}
+
+fn diagnostic_number(lhs: &str, min: &Option<FilterBound>, max: &Option<FilterBound>) -> String {
+    let value = |b: &FilterBound| match b.value.expect("constructed bound") {
+        V::Num(v) => format_f64_cel(v),
+        V::Int(v) => v.to_string(),
+        V::Uint(v) => v.to_string(),
+    };
+    let (op, bound) = match (min, max) {
+        (Some(lo), Some(hi)) if lo == hi => ("==", lo),
+        (Some(lo), None) => (if lo.exclusive { ">" } else { ">=" }, lo),
+        (None, Some(hi)) => (if hi.exclusive { "<" } else { "<=" }, hi),
+        _ => unreachable!("constructed numeric predicate"),
+    };
+    format!("{lhs} {op} {}", value(bound))
+}
+
+fn diagnostic_cel(expr: &FilterExpr) -> String {
+    match expr.expr.as_ref().expect("constructed filter") {
+        E::And(list) => {
+            let children: Vec<_> = list.exprs.iter().map(diagnostic_cel).collect();
+            format!("({})", children.join(" && "))
+        }
+        E::Number(n) => diagnostic_number(&n.column, &n.min, &n.max),
+        E::TypedMapNumber(n) => diagnostic_number(
+            &format!("{}[{}]", n.column, escape_cel_string(&n.key)),
+            &n.min,
+            &n.max,
+        ),
+        E::TypedMapHasKey(k) => format!("{} in {}", escape_cel_string(&k.key), k.column),
+        _ => unreachable!("constructed structured filter"),
+    }
+}
+
+/// Bind structured predicates directly; parse only the caller's CEL filter.
 pub fn bind_one_pass_query(
     plan: &turbo_client::OnePassQueryPlan,
     columns: &NlpColumnSpec,
     caller_cel: Option<&str>,
 ) -> Result<BoundOnePassQuery, Status> {
-    use turbo_client::{QueryComparisonOp as Op, StructuredFilterPayload as P};
-
     columns.validate()?;
-    let mut clauses: Vec<String> = Vec::new();
-    let mut selectivity = 1.0_f64;
-
-    for f in &plan.filters {
-        match &f.payload {
-            P::Money {
-                raw,
-                amount_f64,
-                ecb_converted,
-            } => {
-                if !columns.money_column.is_empty() {
-                    let (ccy, val) = match ecb_converted {
-                        Some(conv) if conv.amount_f64.is_finite() => {
-                            (conv.currency.as_str().to_string(), conv.amount_f64)
-                        }
-                        _ => (raw.currency.as_str().to_string(), *amount_f64),
-                    };
-                    if val.is_finite() && !ccy.is_empty() {
-                        let lhs = format!("{}[{}]", columns.money_column, escape_cel_string(&ccy));
-                        clauses.push(comparison_cel(&lhs, f.comparison, &format_f64_cel(val)));
-                        selectivity *= 0.25;
-                    }
-                }
-            }
-            P::Quantity {
-                si_base_unit,
-                si_value_f64,
-                ..
-            } => {
-                if !columns.quantity_column.is_empty()
-                    && si_value_f64.is_finite()
-                    && !si_base_unit.is_empty()
-                {
-                    let lhs = format!(
-                        "{}[{}]",
-                        columns.quantity_column,
-                        escape_cel_string(si_base_unit)
-                    );
-                    clauses.push(comparison_cel(
-                        &lhs,
-                        f.comparison,
-                        &format_f64_cel(*si_value_f64),
-                    ));
-                    selectivity *= 0.25;
-                }
-            }
-            P::Temporal(t) => {
-                if !columns.date_column.is_empty() {
-                    let col = &columns.date_column;
-                    match (f.comparison, t.start_epoch_seconds, t.end_epoch_seconds) {
-                        (Op::Gt, Some(s), Some(e)) => {
-                            clauses
-                                .push(format!("{col} >= {}", e.saturating_mul(MICROS_PER_SECOND)));
-                            let _ = s;
-                        }
-                        (Op::Gte, Some(s), _) => {
-                            clauses
-                                .push(format!("{col} >= {}", s.saturating_mul(MICROS_PER_SECOND)));
-                        }
-                        (Op::Lt, Some(s), _) => {
-                            clauses
-                                .push(format!("{col} < {}", s.saturating_mul(MICROS_PER_SECOND)));
-                        }
-                        (Op::Lte, _, Some(e)) => {
-                            clauses
-                                .push(format!("{col} < {}", e.saturating_mul(MICROS_PER_SECOND)));
-                        }
-                        (_, Some(s), Some(e)) if s < e => {
-                            clauses.push(format!(
-                                "({col} >= {} && {col} < {})",
-                                s.saturating_mul(MICROS_PER_SECOND),
-                                e.saturating_mul(MICROS_PER_SECOND)
-                            ));
-                        }
-                        (_, Some(s), None) => {
-                            clauses
-                                .push(format!("{col} == {}", s.saturating_mul(MICROS_PER_SECOND)));
-                        }
-                        _ => {}
-                    }
-                    selectivity *= 0.20;
-                }
-            }
-            P::Place {
-                raw, spine_path, ..
-            } => {
-                if !columns.geo_spine_column.is_empty() {
-                    let target = if !spine_path.is_empty() {
-                        spine_path.as_str()
-                    } else if !raw.canonical_name.is_empty() {
-                        raw.canonical_name.as_str()
-                    } else {
-                        ""
-                    };
-                    if !target.is_empty() {
-                        clauses.push(format!(
-                            "{} in {}",
-                            escape_cel_string(target),
-                            columns.geo_spine_column
-                        ));
-                        selectivity *= 0.15;
-                    }
-                }
-            }
-            P::Entity {
-                raw,
-                kb_id,
-                canonical_name,
-                ..
-            } => {
-                if !columns.affirmed_entity_column.is_empty() {
-                    let canonical = kb_id
-                        .as_deref()
-                        .filter(|s| !s.is_empty())
-                        .or_else(|| canonical_name.as_deref().filter(|s| !s.is_empty()))
-                        .unwrap_or(f.surface.as_str());
-                    if !canonical.is_empty() {
-                        let key = format!("id:{canonical}");
-                        clauses.push(format!(
-                            "{} in {}",
-                            escape_cel_string(&key),
-                            columns.affirmed_entity_column
-                        ));
-                        let _ = raw;
-                        selectivity *= 0.10;
-                    }
-                }
-            }
-            P::Glossary(_) => {}
-        }
-    }
-
+    let (exprs, estimated_selectivity) = compile_structured_filters(plan, columns);
+    let clauses: Vec<_> = exprs.iter().map(diagnostic_cel).collect();
     let synthesized_cel = clauses.join(" && ");
-    let combined_cel = match (
-        caller_cel.map(str::trim).filter(|s| !s.is_empty()),
-        synthesized_cel.as_str(),
-    ) {
-        (Some(caller), "") => caller.to_string(),
-        (None, synth) => synth.to_string(),
-        (Some(caller), synth) => format!("({caller}) && ({synth})"),
-    };
-    let filter_expr = crate::cel::compile_filter(&combined_cel)?;
-
+    let caller = crate::cel::compile_filter(caller_cel.unwrap_or_default())?;
+    let filter_expr = conjunction(caller.into_iter().chain(conjunction(exprs)).collect());
+    if let Some(expr) = &filter_expr {
+        crate::filter::validate_filter(expr)?;
+    }
     let mut synonym_expansions = Vec::new();
     for fp in &plan.fields {
-        for syn in &fp.synonyms {
-            if !syn.terms.is_empty() {
-                synonym_expansions.push(SynonymExpansion {
-                    field: fp.field.clone(),
-                    term: syn.surface.clone(),
-                    terms: syn.terms.clone(),
-                });
-            }
+        for syn in fp.synonyms.iter().filter(|syn| !syn.terms.is_empty()) {
+            synonym_expansions.push(SynonymExpansion {
+                field: fp.field.clone(),
+                term: syn.surface.clone(),
+                terms: syn.terms.clone(),
+            });
         }
     }
-
-    let residual_terms: Vec<(String, u32)> = plan
-        .residual_terms
-        .iter()
-        .map(|t| (t.term.clone(), t.ordinal))
-        .collect();
-    let residual_text = if !plan.free_text.trim().is_empty() {
-        plan.free_text.clone()
-    } else {
-        plan.query.clone()
-    };
-
     Ok(BoundOnePassQuery {
-        residual_text,
-        residual_terms,
+        residual_text: if plan.free_text.trim().is_empty() {
+            plan.query.clone()
+        } else {
+            plan.free_text.clone()
+        },
+        residual_terms: plan
+            .residual_terms
+            .iter()
+            .map(|t| (t.term.clone(), t.ordinal))
+            .collect(),
         synonym_expansions,
         synthesized_cel,
         filter_expr,
-        estimated_selectivity: selectivity,
+        estimated_selectivity,
     })
 }
 
-/// Owned or OS-memory-mapped `TSUGLEX1` surface lexicon with
-/// guaranteed 8-byte alignment so [`turbo_client::MappedSurfaceLexicon`] can
-/// borrow its `u32` FST/posting tables with zero heap allocation on lookup.
+/// Aligned `TSUGLEX1` storage for zero-copy [`turbo_client::MappedSurfaceLexicon`] views.
 #[derive(Debug)]
 pub enum SharedSurfaceLexicon {
     /// Zero-copy OS file mapping (`memmap2::Mmap` is page-aligned).
@@ -307,18 +322,13 @@ pub enum SharedSurfaceLexicon {
 impl SharedSurfaceLexicon {
     /// Memory-maps a `TSUGLEX1` file from disk and validates its header/bounds.
     pub fn open_mmap(path: impl AsRef<std::path::Path>) -> Result<Self, Status> {
-        let file = std::fs::File::open(path.as_ref()).map_err(|e| {
-            Status::invalid_argument(format!(
-                "open surface lexicon {}: {e}",
-                path.as_ref().display()
-            ))
+        let path = path.as_ref();
+        let file = std::fs::File::open(path).map_err(|e| {
+            Status::invalid_argument(format!("open surface lexicon {}: {e}", path.display()))
         })?;
         // SAFETY: read-only mapping of an immutable `TSUGLEX1` lexicon artifact.
         let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| {
-            Status::invalid_argument(format!(
-                "mmap surface lexicon {}: {e}",
-                path.as_ref().display()
-            ))
+            Status::invalid_argument(format!("mmap surface lexicon {}: {e}", path.display()))
         })?;
         turbo_client::MappedSurfaceLexicon::from_bytes(&mmap).map_err(|e| {
             Status::invalid_argument(format!("invalid TSUGLEX1 surface lexicon: {e}"))
@@ -361,13 +371,7 @@ impl SharedSurfaceLexicon {
     }
 }
 
-/// Rewrites stemmed dictionary prefix matches into genuine surface completions
-/// using [`turbo_client::MappedSurfaceLexicon`].
-///
-/// Preserves shard presence metadata when a surface's stem also matched on shards,
-/// and surfaces lexicon prefix completions whose stems were truncated shorter
-/// than the user's typed prefix (for example typing `"internationa"` when the
-/// Porter stem in `.bm25` is `"intern"`).
+/// Resolve stemmed matches and lexicon prefixes into surface completions, preserving shard metadata.
 pub fn resolve_stemmed_suggestions(
     lexicon: &turbo_client::MappedSurfaceLexicon,
     normalized_prefix: &str,
@@ -376,7 +380,6 @@ pub fn resolve_stemmed_suggestions(
 ) -> Vec<Suggestion> {
     let mut merged: BTreeMap<String, (u64, u32)> = BTreeMap::new();
 
-    // 1. Direct zero-copy prefix completions from the mapped surface FST.
     for comp in lexicon.suggest_prefix(normalized_prefix, limit.saturating_mul(4).max(32)) {
         let shards = shard_union.get(comp.stem).map_or(1, |&(_, s)| s.max(1));
         let df = shard_union
@@ -385,7 +388,6 @@ pub fn resolve_stemmed_suggestions(
         merged.insert(comp.surface.to_string(), (df, shards));
     }
 
-    // 2. Map any shard stem hits through `stem_surfaces` when the surface starts with `normalized_prefix`.
     for (stem, &(df, shards)) in shard_union {
         let surfaces = lexicon.stem_surfaces(stem, 16);
         let mut matched_surface = false;
@@ -415,8 +417,7 @@ pub fn resolve_stemmed_suggestions(
         .collect()
 }
 
-/// Evaluates contextual multi-word bigram spellcheck, returning
-/// [`TermSuggestion`] entries for corrected tokens in query order.
+/// Return contextual bigram corrections as [`TermSuggestion`] entries in query order.
 pub fn spellcheck_query_terms(
     checker: &turbo_client::QuerySpellchecker,
     query_text: &str,

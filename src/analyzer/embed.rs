@@ -4,12 +4,15 @@
 #[cfg(feature = "net")]
 use std::collections::HashMap;
 #[cfg(feature = "net")]
-use std::sync::{Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex, OnceLock,
+};
 
 use tonic::Status;
 
 #[cfg(feature = "net")]
-use super::pool::remote_client_for;
+use super::pool::{remote_client_for, turbo_pool_generation};
 #[cfg(not(feature = "net"))]
 use super::status::sidecar_needs_net;
 #[cfg(feature = "net")]
@@ -58,124 +61,206 @@ pub async fn embed_text_with_options(
     }
     #[cfg(feature = "net")]
     {
-        let (clean_addr, model_name, uri_handshake) = parse_embed_endpoint(addr);
-        let remote = remote_client_for(&clean_addr, options)?;
-        if let Some(hs) = options
-            .expected_handshake
-            .as_ref()
-            .or(uri_handshake.as_ref())
-        {
-            if hs.bundle.is_some() {
-                remote
-                    .verify_model_handshake(&model_name, "", hs)
-                    .await
-                    .map_err(|e| inspect_remote_client_err(&clean_addr, e))?;
-            }
-        } else {
-            enforce_tofu_remote_model_handshake(&clean_addr, &model_name, &remote).await?;
-        }
-        let prio = if options.interactive {
-            turbo_client::RemotePriority::Interactive
-        } else {
-            turbo_client::RemotePriority::Bulk
-        };
-        let (mut vec, dim) = remote
-            .embed_texts(
-                &model_name,
-                &[text],
-                Some("query"),
-                Some(prio),
-                options.timeout,
-            )
-            .await
-            .map_err(|e| inspect_remote_client_err(&clean_addr, e))?;
-        if vec.is_empty() || dim == 0 {
-            return Err(Status::failed_precondition(
-                "turbo-kserve returned no embeddings",
-            ));
-        }
-        vec.truncate(dim);
-        let norm = vec
-            .iter()
-            .map(|&v| f64::from(v) * f64::from(v))
-            .sum::<f64>()
-            .sqrt();
-        if norm == 0.0 || !norm.is_finite() {
-            return Err(Status::failed_precondition("embedding pooled to zero"));
-        }
-        for v in &mut vec {
-            *v = (f64::from(*v) / norm) as f32;
-        }
-        Ok(vec)
+        embed_remote(addr, text, options).await
     }
 }
 
 #[cfg(feature = "net")]
-static PINNED_REMOTE_MODEL_HANDSHAKES: OnceLock<
-    Mutex<HashMap<(String, String), turbo_client::IndexGenerationHandshake>>,
-> = OnceLock::new();
+async fn embed_remote(
+    addr: &str,
+    text: &str,
+    options: &RemoteCallOptions,
+) -> Result<Vec<f32>, Status> {
+    let (clean_addr, model_name, uri_handshake) = parse_embed_endpoint(addr);
+    let (remote, generation) = remote_for_generation(&clean_addr, options)?;
+    if let Some(hs) = options
+        .expected_handshake
+        .as_ref()
+        .or(uri_handshake.as_ref())
+    {
+        if hs.bundle.is_some() {
+            let result = remote.verify_model_handshake(&model_name, "", hs).await;
+            invalidate_cached_model(&clean_addr, &model_name);
+            result.map_err(|e| inspect_remote_client_err(&clean_addr, e))?;
+        }
+    } else {
+        enforce_tofu_remote_model_handshake(
+            &clean_addr,
+            &model_name,
+            &remote,
+            generation,
+            options.timeout,
+        )
+        .await?;
+    }
+    let prio = if options.interactive {
+        turbo_client::RemotePriority::Interactive
+    } else {
+        turbo_client::RemotePriority::Bulk
+    };
+    let (mut vec, dim) = remote
+        .embed_texts(
+            &model_name,
+            &[text],
+            Some("query"),
+            Some(prio),
+            options.timeout,
+        )
+        .await
+        .map_err(|e| inspect_remote_client_err(&clean_addr, e))?;
+    if vec.is_empty() || dim == 0 {
+        return Err(Status::failed_precondition(
+            "turbo-kserve returned no embeddings",
+        ));
+    }
+    vec.truncate(dim);
+    let norm = vec
+        .iter()
+        .map(|&v| f64::from(v) * f64::from(v))
+        .sum::<f64>()
+        .sqrt();
+    if norm == 0.0 || !norm.is_finite() {
+        return Err(Status::failed_precondition("embedding pooled to zero"));
+    }
+    for v in &mut vec {
+        *v = (f64::from(*v) / norm) as f32;
+    }
+    Ok(vec)
+}
+
+#[cfg(feature = "net")]
+fn remote_for_generation(
+    addr: &str,
+    options: &RemoteCallOptions,
+) -> Result<(turbo_client::RemoteClient, u64), Status> {
+    loop {
+        let generation = turbo_pool_generation();
+        let remote = remote_client_for(addr, options)?;
+        if generation == turbo_pool_generation() {
+            return Ok((remote, generation));
+        }
+    }
+}
+
+#[cfg(feature = "net")]
+#[derive(Default)]
+struct VerifiedModel {
+    fingerprint: Option<turbo_client::BundleScoringFingerprint>,
+    verified: Option<(u64, tokio::runtime::Id, u64)>,
+    endpoint: Option<turbo_client::RemoteEndpointConfig>,
+}
+
+#[cfg(feature = "net")]
+#[derive(Default)]
+struct ModelEntry {
+    state: tokio::sync::Mutex<VerifiedModel>,
+    recheck: AtomicU64,
+}
+
+#[cfg(feature = "net")]
+type ModelCache = Mutex<HashMap<(String, String), Arc<ModelEntry>>>;
+
+#[cfg(feature = "net")]
+static PINNED_REMOTE_MODELS: OnceLock<ModelCache> = OnceLock::new();
+
+#[cfg(feature = "net")]
+fn invalidate_cached_model(addr: &str, model: &str) {
+    if let Some(cache) = PINNED_REMOTE_MODELS.get() {
+        if let Some(entry) = cache
+            .lock()
+            .expect("pinned remote models poisoned")
+            .get(&(addr.to_owned(), model.to_owned()))
+        {
+            entry.recheck.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
 
 #[cfg(feature = "net")]
 async fn enforce_tofu_remote_model_handshake(
     clean_addr: &str,
     model_name: &str,
     remote: &turbo_client::RemoteClient,
+    generation: u64,
+    timeout: Option<std::time::Duration>,
 ) -> Result<(), Status> {
-    let key = (clean_addr.to_string(), model_name.to_string());
-    let pinned = PINNED_REMOTE_MODEL_HANDSHAKES
+    let entry = PINNED_REMOTE_MODELS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .expect("pinned remote model handshakes poisoned")
-        .get(&key)
-        .cloned();
-    match pinned {
-        Some(expected) => {
-            remote
-                .verify_model_handshake(model_name, "", &expected)
-                .await
-                .map_err(|e| inspect_remote_client_err(clean_addr, e))?;
+        .expect("pinned remote models poisoned")
+        .entry((clean_addr.to_owned(), model_name.to_owned()))
+        .or_default()
+        .clone();
+    let verify = verify_cached_model(&entry, model_name, remote, generation);
+    let result = match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, verify)
+            .await
+            .unwrap_or_else(|_| Err(Status::deadline_exceeded("model handshake timed out"))),
+        None => verify.await,
+    };
+    result.map_err(|status| inspect_remote_status(clean_addr, status))
+}
+
+#[cfg(feature = "net")]
+async fn verify_cached_model(
+    entry: &ModelEntry,
+    model_name: &str,
+    remote: &turbo_client::RemoteClient,
+    generation: u64,
+) -> Result<(), Status> {
+    let runtime = tokio::runtime::Handle::try_current()
+        .map_err(|_| Status::failed_precondition("remote embedding requires a Tokio runtime"))?
+        .id();
+    let mut cached = entry.state.lock().await;
+    let recheck = entry.recheck.load(Ordering::Acquire);
+    if cached.verified == Some((generation, runtime, recheck))
+        && cached
+            .endpoint
+            .as_ref()
+            .is_some_and(|cfg| same_endpoint_identity(cfg, remote.config()))
+    {
+        return Ok(());
+    }
+    let expected = turbo_client::IndexGenerationHandshake {
+        analysis: None,
+        bundle: cached.fingerprint,
+    };
+    match remote
+        .verify_model_handshake(model_name, "", &expected)
+        .await
+    {
+        Ok((_, fingerprint)) => {
+            if fingerprint.sha256 != [0; 32] {
+                cached.fingerprint = Some(fingerprint);
+                cached.verified = Some((generation, runtime, recheck));
+                cached.endpoint = Some(remote.config().clone());
+            }
             Ok(())
         }
-        None => {
-            let probe = turbo_client::IndexGenerationHandshake {
-                analysis: None,
-                bundle: None,
-            };
-            match remote.verify_model_handshake(model_name, "", &probe).await {
-                Ok((_, fp)) => {
-                    if fp.sha256 != [0u8; 32] {
-                        let mut map = PINNED_REMOTE_MODEL_HANDSHAKES
-                            .get_or_init(|| Mutex::new(HashMap::new()))
-                            .lock()
-                            .expect("pinned remote model handshakes poisoned");
-                        match map.get(&key) {
-                            Some(existing) => {
-                                existing.verify_bundle(&fp).map_err(client_err_to_status)?;
-                            }
-                            None => {
-                                map.insert(
-                                    key,
-                                    turbo_client::IndexGenerationHandshake {
-                                        analysis: None,
-                                        bundle: Some(fp),
-                                    },
-                                );
-                            }
-                        }
-                    }
-                    Ok(())
-                }
-                Err(e) => {
-                    let status = client_err_to_status(e);
-                    if status.code() == tonic::Code::Unimplemented {
-                        Ok(())
-                    } else {
-                        Err(inspect_remote_status(clean_addr, status))
-                    }
-                }
+        Err(error) => {
+            let status = client_err_to_status(error);
+            if status.code() == tonic::Code::Unimplemented && cached.fingerprint.is_none() {
+                Ok(())
+            } else {
+                Err(status)
             }
         }
     }
+}
+
+#[cfg(feature = "net")]
+fn same_endpoint_identity(
+    a: &turbo_client::RemoteEndpointConfig,
+    b: &turbo_client::RemoteEndpointConfig,
+) -> bool {
+    if a.endpoint != b.endpoint || a.bearer_token != b.bearer_token {
+        return false;
+    }
+    #[cfg(feature = "tls")]
+    if a.tls != b.tls {
+        return false;
+    }
+    true
 }
 
 #[cfg(feature = "net")]
