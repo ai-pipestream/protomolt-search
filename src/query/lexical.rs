@@ -2,18 +2,18 @@
 
 use tonic::{Request, Status};
 
-use super::pool::{answer_pool, Answer};
+use super::pool::{answer_pool, Answer, Routed};
 use super::rerank::{turbo_rerank, RerankSources};
 use super::response::{leaf_signal, matched, ms, scored_hit};
 use super::run::Run;
 use crate::pb::search_service_server::SearchService;
-use crate::pb::{Bm25SearchRequest, Bm25SearchResponse, LexicalQuery, QueryHit, QueryResponse};
+use crate::pb::{Bm25SearchRequest, Bm25SearchResponse, LexicalQuery, QueryHit};
 
 pub(super) async fn execute_lexical(
     mut run: Run<'_>,
     id: &str,
     query: &LexicalQuery,
-) -> Result<QueryResponse, Status> {
+) -> Result<Routed, Status> {
     let base = run.base;
     let t_sel = std::time::Instant::now();
     let request = bm25_request(&mut run, query);
@@ -40,12 +40,12 @@ pub(super) async fn execute_lexical(
     };
     let request_id = base.req.request_id.clone();
     let mut answer = match answer_pool(&mut run, hits, route, request_id).await? {
-        Answer::Deepened(response) => return Ok(response),
-        Answer::Paged(response) => response,
+        Answer::Deepen(depth) => return Ok(Routed::Deepen(depth)),
+        Answer::Paged(response) => *response,
     };
     answer.field_details_redacted = response.field_details_redacted;
     answer.synonym_expansions = synonym_expansions;
-    Ok(answer)
+    Ok(Routed::Done(Box::new(answer)))
 }
 
 /// The route request. The lexical route carries projections and
