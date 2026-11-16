@@ -14,6 +14,12 @@ fn packed_view_exposes_rows_without_copying() {
     assert_eq!(owned.data(), &data);
     assert!(owned.empty_rows().is_empty());
     assert_eq!(owned.view().row(1), view.row(1));
+
+    let raw = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let ptr = raw.as_ptr();
+    let moved = OwnedMatrix::from_flat(raw, 3).unwrap();
+    assert_eq!(moved.data().as_ptr(), ptr);
+    assert_eq!((moved.rows(), moved.dim()), (2, 3));
 }
 
 #[test]
@@ -36,6 +42,21 @@ fn invalid_dimensions_and_ragged_flats_are_rejected() {
         Err(TensorError::ZeroDim)
     );
     assert!(MatrixView::strided(&[1.0], 2, 2, usize::MAX).is_err());
+    let zst = &[(); usize::MAX][..];
+    assert_eq!(
+        MatrixView::strided(zst, 2, 2, usize::MAX),
+        Err(TensorError::RaggedFlat {
+            len: usize::MAX,
+            dim: usize::MAX,
+        })
+    );
+    assert_eq!(
+        MatrixView::strided(zst, usize::MAX, 1, 2),
+        Err(TensorError::RaggedFlat {
+            len: usize::MAX,
+            dim: usize::MAX,
+        })
+    );
     let integers = OwnedMatrix::from_flat(vec![1_u16, 2, 3, 4], 2).unwrap();
     assert_eq!(integers.view().row(1), Some(&[3, 4][..]));
 }

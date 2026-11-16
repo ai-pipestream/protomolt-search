@@ -24,8 +24,6 @@
 
 #![deny(clippy::result_large_err)]
 
-use std::sync::{Mutex, OnceLock};
-
 mod boundary;
 mod cut;
 #[cfg(test)]
@@ -48,106 +46,36 @@ pub const MAX_CHARS: u32 = 4096;
 /// A compact domain error, converted to transport status only at the edge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HighlightError {
-    InvalidArgument(CompactMessage),
-    Internal(CompactMessage),
-    FailedPrecondition(CompactMessage),
-}
-
-#[derive(Debug)]
-pub struct CompactMessage(u16);
-
-#[derive(Default)]
-struct MessageRegistry {
-    next_id: u16,
-    messages: std::collections::HashMap<u16, Box<str>>,
-}
-
-impl MessageRegistry {
-    fn shared() -> &'static Mutex<Self> {
-        static REGISTRY: OnceLock<Mutex<MessageRegistry>> = OnceLock::new();
-        REGISTRY.get_or_init(|| {
-            Mutex::new(MessageRegistry {
-                next_id: 1,
-                messages: std::collections::HashMap::new(),
-            })
-        })
-    }
-}
-
-impl CompactMessage {
-    fn new(text: String) -> Self {
-        let mut registry = MessageRegistry::shared()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let id = (0..=u16::MAX)
-            .map(|offset| registry.next_id.wrapping_add(offset))
-            .find(|id| !registry.messages.contains_key(id))
-            .expect("too many live highlight errors");
-        registry.next_id = id.wrapping_add(1);
-        registry.messages.insert(id, text.into_boxed_str());
-        Self(id)
-    }
-
-    fn message(&self) -> String {
-        MessageRegistry::shared()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .messages
-            .get(&self.0)
-            .expect("highlight message is registered")
-            .to_string()
-    }
-}
-
-impl Clone for CompactMessage {
-    fn clone(&self) -> Self {
-        Self::new(self.message())
-    }
-}
-
-impl PartialEq for CompactMessage {
-    fn eq(&self, other: &Self) -> bool {
-        self.message() == other.message()
-    }
-}
-
-impl Eq for CompactMessage {}
-
-impl Drop for CompactMessage {
-    fn drop(&mut self) {
-        MessageRegistry::shared()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .messages
-            .remove(&self.0);
-    }
+    InvalidArgument(Box<str>),
+    Internal(Box<str>),
+    FailedPrecondition(Box<str>),
 }
 
 impl HighlightError {
-    pub(crate) fn invalid_argument(message: impl Into<String>) -> Self {
-        Self::InvalidArgument(CompactMessage::new(message.into()))
+    pub(crate) fn invalid_argument(message: impl Into<Box<str>>) -> Self {
+        Self::InvalidArgument(message.into())
     }
 
-    pub(crate) fn internal(message: impl Into<String>) -> Self {
-        Self::Internal(CompactMessage::new(message.into()))
+    pub(crate) fn internal(message: impl Into<Box<str>>) -> Self {
+        Self::Internal(message.into())
     }
 
-    pub(crate) fn failed_precondition(message: impl Into<String>) -> Self {
-        Self::FailedPrecondition(CompactMessage::new(message.into()))
+    pub(crate) fn failed_precondition(message: impl Into<Box<str>>) -> Self {
+        Self::FailedPrecondition(message.into())
     }
 
-    pub fn message(&self) -> String {
+    pub fn message(&self) -> &str {
         match self {
             Self::InvalidArgument(message)
             | Self::Internal(message)
-            | Self::FailedPrecondition(message) => message.message(),
+            | Self::FailedPrecondition(message) => message,
         }
     }
 }
 
 impl std::fmt::Display for HighlightError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message())
+        f.write_str(self.message())
     }
 }
 
@@ -155,11 +83,14 @@ impl std::error::Error for HighlightError {}
 
 impl From<HighlightError> for tonic::Status {
     fn from(error: HighlightError) -> Self {
-        let message = error.message();
         match error {
-            HighlightError::InvalidArgument(_) => Self::invalid_argument(message),
-            HighlightError::Internal(_) => Self::internal(message),
-            HighlightError::FailedPrecondition(_) => Self::failed_precondition(message),
+            HighlightError::InvalidArgument(message) => {
+                Self::invalid_argument(String::from(message))
+            }
+            HighlightError::Internal(message) => Self::internal(String::from(message)),
+            HighlightError::FailedPrecondition(message) => {
+                Self::failed_precondition(String::from(message))
+            }
         }
     }
 }

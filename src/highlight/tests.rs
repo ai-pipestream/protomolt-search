@@ -187,19 +187,15 @@ fn assert_status(error: HighlightError, code: tonic::Code, message: &str) {
 }
 
 #[test]
-fn domain_error_is_smaller_than_transport_status() {
-    assert!(size_of::<HighlightError>() < size_of::<tonic::Status>());
-}
-
-#[test]
-fn compact_message_ids_never_replace_a_live_message() {
-    let original = HighlightError::internal("original message");
+fn domain_error_is_compact_and_formats_readably() {
+    assert!(size_of::<HighlightError>() <= 32);
+    assert!(size_of::<Result<(), HighlightError>>() <= 32);
+    let original = HighlightError::internal("original highlight error");
     let cloned = original.clone();
-    for _ in 0..=u16::MAX {
-        drop(HighlightError::internal("temporary message"));
-    }
-    assert_eq!(original.message(), "original message");
-    assert_eq!(cloned.message(), "original message");
+    assert_eq!(original, cloned);
+    assert_eq!(original.message(), "original highlight error");
+    assert_eq!(original.to_string(), "original highlight error");
+    assert!(format!("{original:?}").contains("original highlight error"));
 }
 
 #[test]

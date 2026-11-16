@@ -47,9 +47,10 @@ fn main() {
     matcher.find("cat", &every_boundary("cat"), &mut matches);
     println!("TIE {}", matches[0].entry.0);
 
-    let matcher = TextMatcher::new(&tied, Case::Insensitive).unwrap();
+    let ordered = entries(&[("zeta", "dog"), ("alpha", "cat")]);
+    let matcher = TextMatcher::new(&ordered, Case::Insensitive).unwrap();
     println!("FINGERPRINT {}", fingerprint(&matcher));
-    let reversed = entries(&[("alpha", "cat"), ("zeta", "cat")]);
+    let reversed = entries(&[("alpha", "cat"), ("zeta", "dog")]);
     let matcher = TextMatcher::new(&reversed, Case::Insensitive).unwrap();
     println!("REVERSED {}", fingerprint(&matcher));
 }

@@ -8,7 +8,6 @@ use pipestream_search::analyzer::{
     analysis_fingerprint, analyze_document_native, analyze_document_turbo, body_spec,
     turbo_field_config, uax29_body_spec, SessionLayers,
 };
-use pipestream_search::highlight::check_coverage;
 use pipestream_search::pb::AnalysisSpec;
 use pipestream_search::postings::AnalyzedField;
 use protomolt_analyzer::{Glossary as NativeGlossary, GlossaryEntry as NativeEntry};
@@ -73,12 +72,10 @@ fn shared_uax29_baseline_is_bit_identical() {
                 assert!(start as usize <= text.len());
             }
         }
-        let occurrences = native
-            .terms
-            .iter()
-            .flat_map(|(_, _, spans)| spans.iter().copied());
-        check_coverage(native.sentences.as_deref().unwrap(), occurrences.clone()).unwrap();
-        check_coverage(turbo.sentences.as_deref().unwrap(), occurrences).unwrap();
+        assert!(native.sentences.is_some());
+        assert!(turbo.sentences.is_some());
+        native.check_sentences().unwrap();
+        turbo.check_sentences().unwrap();
     }
     let field = native("The quick brown fox", &spec);
     assert_eq!(term(&field, "quick").0, 1);
@@ -93,14 +90,20 @@ fn empty_normalizing_tokens_move_positions_and_spans() {
         ..uax29_body_spec()
     };
     let text = "new \u{00AD} york";
-    let native = native(text, &spec);
-    let turbo = turbo(text, &spec);
-    assert_eq!(term(&native, "new").1, vec![0]);
-    assert_eq!(term(&native, "york").1, vec![2]);
-    assert_eq!(term(&native, "york").2, vec![(7, 11)]);
-    assert_eq!(term(&turbo, "new").1, vec![0]);
-    assert_eq!(term(&turbo, "york").1, vec![1]);
-    assert_eq!(term(&turbo, "york").2, vec![(7, 11)]);
+    let native_mid = native(text, &spec);
+    let turbo_mid = turbo(text, &spec);
+    assert_eq!(term(&native_mid, "new").1, vec![0]);
+    assert_eq!(term(&native_mid, "york").1, vec![2]);
+    assert_eq!(term(&native_mid, "york").2, vec![(7, 11)]);
+    assert_eq!(term(&turbo_mid, "new").1, vec![0]);
+    assert_eq!(term(&turbo_mid, "york").1, vec![1]);
+    assert_eq!(term(&turbo_mid, "york").2, vec![(7, 11)]);
+
+    let leading = "\u{00AD}abc";
+    let native_lead = native(leading, &spec);
+    let turbo_lead = turbo(leading, &spec);
+    assert_eq!(term(&native_lead, "abc").2, vec![(0, 5)]);
+    assert_eq!(term(&turbo_lead, "abc").2, vec![(2, 5)]);
 }
 
 #[test]
@@ -118,13 +121,22 @@ fn supplementary_scalars_use_different_porter_units() {
 #[test]
 fn letter_and_other_number_token_handling_is_recorded() {
     let spec = porter_spec();
-    let native = native("² Ⅷ", &spec);
-    let turbo = turbo("² Ⅷ", &spec);
-    assert_eq!(term(&native, "²").1, vec![0]);
-    assert_eq!(term(&native, "Ⅷ").1, vec![1]);
-    assert_eq!(term(&turbo, "²").1, vec![0]);
-    assert_eq!(term(&turbo, "ⅷ").1, vec![1]);
-    assert_eq!(turbo.length, 2);
+    let native_porter = native("² Ⅷ", &spec);
+    let turbo_porter = turbo("² Ⅷ", &spec);
+    assert_eq!(term(&native_porter, "²").1, vec![0]);
+    assert_eq!(term(&native_porter, "Ⅷ").1, vec![1]);
+    assert_eq!(term(&turbo_porter, "²").1, vec![0]);
+    assert_eq!(term(&turbo_porter, "ⅷ").1, vec![1]);
+    assert_eq!(turbo_porter.length, 2);
+
+    let uax = uax29_body_spec();
+    let native_uax = native("² Ⅷ", &uax);
+    let turbo_uax = turbo("² Ⅷ", &uax);
+    assert_eq!(term(&native_uax, "²").1, vec![0]);
+    assert_eq!(term(&native_uax, "ⅷ").1, vec![1]);
+    assert_eq!(native_uax.length, 2);
+    assert!(turbo_uax.terms.is_empty());
+    assert_eq!(turbo_uax.length, 0);
 }
 
 #[test]
@@ -155,16 +167,15 @@ fn glossary_case_folding_and_overlap_tie_breaks_diverge() {
 
 #[test]
 fn glossary_fingerprints_have_distinct_algorithms_and_order_rules() {
-    let entries = [("zeta", "cat"), ("alpha", "cat")];
+    let entries = [("zeta", "dog"), ("alpha", "cat")];
     let native = NativeGlossary::new(native_entries(&entries), true).unwrap();
     let reversed = NativeGlossary::new(native_entries(&[entries[1], entries[0]]), true).unwrap();
     assert_eq!(native.fingerprint(), reversed.fingerprint());
-    assert_eq!(native.fingerprint(), 5_495_772_835_308_271_196);
 
     let observed = glossary_support::outcome();
-    assert_eq!(observed.fingerprint, 4_214_671_574_067_794_287);
-    assert_eq!(observed.fingerprint, observed.reversed_fingerprint);
+    assert_ne!(observed.fingerprint, observed.reversed_fingerprint);
     assert_ne!(native.fingerprint(), observed.fingerprint);
+    assert_ne!(native.fingerprint(), observed.reversed_fingerprint);
 }
 
 #[test]

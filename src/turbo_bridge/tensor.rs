@@ -45,19 +45,20 @@ impl<'a, T: Copy> MatrixView<'a, T> {
         if stride < dim {
             return Err(TensorError::StrideTooSmall { dim, stride });
         }
-        let required = if rows == 0 {
-            0
-        } else {
-            (rows - 1)
+        if rows > 0 {
+            let required = (rows - 1)
                 .checked_mul(stride)
                 .and_then(|offset| offset.checked_add(dim))
-                .unwrap_or(usize::MAX)
-        };
-        if data.len() < required {
-            return Err(TensorError::RaggedFlat {
-                len: data.len(),
-                dim: required,
-            });
+                .ok_or(TensorError::RaggedFlat {
+                    len: data.len(),
+                    dim: usize::MAX,
+                })?;
+            if data.len() < required {
+                return Err(TensorError::RaggedFlat {
+                    len: data.len(),
+                    dim: required,
+                });
+            }
         }
         Ok(Self {
             data,
@@ -112,7 +113,7 @@ impl<'a, T: Copy> MatrixView<'a, T> {
 
     /// Pack the visible rows into owned storage, copying only here.
     pub fn to_owned(&self) -> OwnedMatrix<T> {
-        let mut data = Vec::with_capacity(self.rows * self.dim);
+        let mut data = Vec::with_capacity(self.rows.saturating_mul(self.dim));
         for row in self.iter_rows() {
             data.extend_from_slice(row);
         }
@@ -134,8 +135,12 @@ pub struct OwnedMatrix<T: Copy = f32> {
 
 impl<T: Copy> OwnedMatrix<T> {
     pub fn from_flat(data: Vec<T>, dim: usize) -> Result<Self, TensorError> {
-        let view = MatrixView::packed(&data, dim)?;
-        Ok(view.to_owned())
+        MatrixView::packed(&data, dim)?;
+        Ok(Self {
+            data,
+            dim,
+            empty_rows: Vec::new(),
+        })
     }
 
     pub fn rows(&self) -> usize {

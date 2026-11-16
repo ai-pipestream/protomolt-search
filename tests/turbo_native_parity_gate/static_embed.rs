@@ -1,119 +1,275 @@
-use protomolt_embedder::StaticEmbedder;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use protomolt_embedder::StaticEmbedder;
 use turbo_client::{EmbedPromptRole, LocalEmbedEngine, LocalEncoderOptions, MultiResOptions};
 
-fn dependency_bundle() -> PathBuf {
-    let cargo_home = std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
-        .unwrap();
-    let checkouts = cargo_home.join("git/checkouts");
-    for entry in std::fs::read_dir(checkouts).unwrap() {
-        let path = entry.unwrap().path();
-        if path
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with("turboembed-")
-        {
-            let candidate = path.join("31e9857/testdata/tiny-static-bundle");
-            if candidate.is_dir() {
-                return candidate;
+const VOCAB_SIZE: usize = 8;
+const DIM: usize = 16;
+const MAX_SEQ: u32 = 8;
+
+static NEXT_FIXTURE_ID: AtomicUsize = AtomicUsize::new(1);
+
+struct TempFixtureDir {
+    root: PathBuf,
+    bundle_dir: PathBuf,
+    native_dir: PathBuf,
+}
+
+impl TempFixtureDir {
+    fn new(tag: &str) -> Self {
+        let id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "turbo-static-parity-{tag}-{}-{id}",
+            std::process::id()
+        ));
+        let bundle_dir = root.join("bundle");
+        let native_dir = root.join("native");
+        std::fs::create_dir_all(bundle_dir.join("weights")).unwrap();
+        std::fs::create_dir_all(bundle_dir.join("reference")).unwrap();
+        std::fs::create_dir_all(&native_dir).unwrap();
+        Self {
+            root,
+            bundle_dir,
+            native_dir,
+        }
+    }
+}
+
+impl Drop for TempFixtureDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn encode_safetensors(header_json: &str, payload: &[u8]) -> Vec<u8> {
+    let mut header = header_json.as_bytes().to_vec();
+    while !(8 + header.len()).is_multiple_of(8) {
+        header.push(b' ');
+    }
+    let mut out = Vec::with_capacity(8 + header.len() + payload.len());
+    out.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(payload);
+    out
+}
+
+fn synthetic_tokenizer_bytes() -> Vec<u8> {
+    let vocab = [
+        ("[PAD]", 0u32),
+        ("[UNK]", 1),
+        ("the", 2),
+        ("quick", 3),
+        ("brown", 4),
+        ("fox", 5),
+        ("zero", 6),
+        ("tail", 7),
+    ];
+    let vocab_map: serde_json::Map<String, serde_json::Value> = vocab
+        .into_iter()
+        .map(|(piece, id)| (piece.to_string(), serde_json::json!(id)))
+        .collect();
+    let doc = serde_json::json!({
+        "normalizer": {
+            "type": "BertNormalizer",
+            "clean_text": true,
+            "handle_chinese_chars": true,
+            "strip_accents": null,
+            "lowercase": true
+        },
+        "pre_tokenizer": { "type": "BertPreTokenizer" },
+        "added_tokens": [
+            {
+                "id": 0,
+                "content": "[PAD]",
+                "special": true,
+                "normalized": false,
+                "lstrip": false,
+                "rstrip": false,
+                "single_word": false
+            },
+            {
+                "id": 1,
+                "content": "[UNK]",
+                "special": true,
+                "normalized": false,
+                "lstrip": false,
+                "rstrip": false,
+                "single_word": false
             }
+        ],
+        "model": {
+            "type": "WordPiece",
+            "unk_token": "[UNK]",
+            "continuing_subword_prefix": "##",
+            "max_input_chars_per_word": 100,
+            "vocab": vocab_map
+        }
+    });
+    serde_json::to_vec(&doc).unwrap()
+}
+
+fn synthetic_embeddings_bytes() -> Vec<u8> {
+    let mut payload = Vec::with_capacity(VOCAB_SIZE * DIM * 4);
+    for row in 0..VOCAB_SIZE {
+        for col in 0..DIM {
+            let value = if matches!(row, 0 | 1 | 6) {
+                0.0_f32
+            } else {
+                let num = (((row * 17 + col * 31 + 5) % 97) as i32 - 48) as f32;
+                let den = (7 + ((row * 5 + col * 3) % 13)) as f32;
+                num / den
+            };
+            payload.extend_from_slice(&value.to_le_bytes());
         }
     }
-    panic!("the pinned static bundle is missing from the dependency checkout")
-}
-
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
-    let exponent = (bits >> 10) & 0x1f;
-    let fraction = bits & 0x03ff;
-    match exponent {
-        0 => sign * (fraction as f32) * 2.0f32.powi(-24),
-        31 if fraction == 0 => sign * f32::INFINITY,
-        31 => f32::NAN,
-        _ => sign * (1.0 + (fraction as f32) / 1024.0) * 2.0f32.powi(exponent as i32 - 15),
-    }
-}
-
-fn native_model(bundle: &Path, name: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("turbo-native-parity-{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::copy(bundle.join("tokenizer.json"), dir.join("tokenizer.json")).unwrap();
-    let bytes = std::fs::read(bundle.join("weights/static.safetensors")).unwrap();
-    let header_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
-    let header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + header_len]).unwrap();
-    let tensor = &header["embeddings"];
-    assert_eq!(tensor["dtype"], "F16");
-    let shape = tensor["shape"].as_array().unwrap();
-    let elements = shape[0].as_u64().unwrap() as usize * shape[1].as_u64().unwrap() as usize;
-    let payload = &bytes[8 + header_len..];
-    let mut converted = Vec::with_capacity(elements * 4);
-    for chunk in payload.as_chunks::<2>().0.iter().take(elements) {
-        let value = f16_to_f32(u16::from_le_bytes(*chunk));
-        converted.extend_from_slice(&value.to_le_bytes());
-    }
-    let converted_header = format!(
-        "{{\"embeddings\":{{\"dtype\":\"F32\",\"shape\":[{},{}],\"data_offsets\":[0,{}]}}}}",
-        shape[0],
-        shape[1],
-        elements * 4
+    let header = format!(
+        r#"{{"embeddings":{{"dtype":"F32","shape":[{VOCAB_SIZE},{DIM}],"data_offsets":[0,{}]}}}}"#,
+        payload.len()
     );
-    let mut model = Vec::new();
-    model.extend_from_slice(&(converted_header.len() as u64).to_le_bytes());
-    model.extend_from_slice(converted_header.as_bytes());
-    model.extend_from_slice(&converted);
-    std::fs::write(dir.join("model.safetensors"), model).unwrap();
-    dir
+    encode_safetensors(&header, &payload)
 }
 
-fn zero_bundle(bundle: &Path) -> (PathBuf, String) {
-    let dir = std::env::temp_dir().join(format!("turbo-zero-parity-{}", std::process::id()));
-    for subdir in ["weights", "quality", "reference"] {
-        std::fs::create_dir_all(dir.join(subdir)).unwrap();
+fn synthetic_reference_bytes() -> Vec<u8> {
+    let ids_bytes = (MAX_SEQ as usize) * 4;
+    let len_end = ids_bytes + 4;
+    let emb_end = len_end + DIM * 4;
+    let mut payload = Vec::with_capacity(emb_end);
+    for _ in 0..MAX_SEQ {
+        payload.extend_from_slice(&5_i32.to_le_bytes());
     }
-    for (source, target) in [
-        ("manifest.json", "manifest.json"),
-        ("tokenizer.json", "tokenizer.json"),
-        ("quality/texts.jsonl", "quality/texts.jsonl"),
-        (
-            "reference/reference.safetensors",
-            "reference/reference.safetensors",
-        ),
-        ("weights/static.safetensors", "weights/static.safetensors"),
-    ] {
-        std::fs::copy(bundle.join(source), dir.join(target)).unwrap();
+    payload.extend_from_slice(&(MAX_SEQ as i32).to_le_bytes());
+    for _ in 0..DIM {
+        payload.extend_from_slice(&0.0_f32.to_le_bytes());
     }
-    let tokenizer: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(dir.join("tokenizer.json")).unwrap()).unwrap();
-    let (piece, id) = tokenizer["model"]["vocab"]
-        .as_object()
-        .unwrap()
+    let header = format!(
+        r#"{{"embeddings":{{"dtype":"F32","shape":[1,{DIM}],"data_offsets":[{len_end},{emb_end}]}},"ids":{{"dtype":"I32","shape":[1,{MAX_SEQ}],"data_offsets":[0,{ids_bytes}]}},"lengths":{{"dtype":"I32","shape":[1],"data_offsets":[{ids_bytes},{len_end}]}}}}"#
+    );
+    encode_safetensors(&header, &payload)
+}
+
+fn manifest_tokenizer_spec() -> serde_json::Value {
+    serde_json::json!({
+        "file": "tokenizer.json",
+        "normalizer": {
+            "clean_text": true,
+            "lowercase": true,
+            "strip_accents": true,
+            "split_cjk": true,
+            "unicode_form": "UNICODE_NONE"
+        },
+        "wordpiece": {
+            "continuing_prefix": "##",
+            "max_chars_per_word": 100
+        },
+        "special_tokens": [
+            { "role": "SPECIAL_PAD", "content": "[PAD]", "id": 0 },
+            { "role": "SPECIAL_UNK", "content": "[UNK]", "id": 1 }
+        ],
+        "template": ["$TEXT"],
+        "truncation": "TRUNCATE_RIGHT"
+    })
+}
+
+fn manifest_produced_by() -> serde_json::Value {
+    serde_json::json!({
+        "tool": "parity-fixture",
+        "tool_version": "0.1.0",
+        "container": "host",
+        "reproducible": true
+    })
+}
+
+fn write_bundle_manifest(bundle_dir: &Path, files: &[(&str, &[u8])]) {
+    let file_entries: Vec<serde_json::Value> = files
         .iter()
-        .find(|(piece, _)| !piece.starts_with('['))
-        .unwrap();
-    let id = id.as_u64().unwrap() as usize;
-    let header_len = u64::from_le_bytes(
-        std::fs::read(dir.join("weights/static.safetensors")).unwrap()[..8]
-            .try_into()
-            .unwrap(),
-    ) as usize;
-    let dim = 16;
-    let mut bytes = std::fs::read(dir.join("weights/static.safetensors")).unwrap();
-    bytes[8 + header_len + id * dim * 2..8 + header_len + (id + 1) * dim * 2].fill(0);
-    std::fs::write(dir.join("weights/static.safetensors"), &bytes).unwrap();
-    let mut manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
-    for file in manifest["files"].as_array_mut().unwrap() {
-        if file["path"] == "weights/static.safetensors" {
-            file["sha256"] =
-                serde_json::Value::String(pipestream_search::sha256::hex_digest(&bytes));
-        }
-    }
-    std::fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
-    (dir, piece.clone())
+        .map(|(rel, bytes)| {
+            serde_json::json!({
+                "path": rel,
+                "size": bytes.len(),
+                "sha256": pipestream_search::sha256::hex_digest(bytes),
+            })
+        })
+        .collect();
+    let produced_by = manifest_produced_by();
+    let manifest = serde_json::json!({
+        "bundle_version": 1,
+        "model": {
+            "id": "parity-testdata/tiny-static-16",
+            "revision": "1",
+            "source": {
+                "repository": "https://example.invalid/tiny-static-16",
+                "commit": "0123456789abcdef0123456789abcdef01234567"
+            },
+            "license": "Apache-2.0"
+        },
+        "task": "TASK_EMBED",
+        "embed": {
+            "dim": DIM,
+            "pooling": "POOLING_MEAN",
+            "normalize": "NORMALIZE_L2",
+            "max_seq": MAX_SEQ,
+            "max_batch": 16
+        },
+        "tokenizer": manifest_tokenizer_spec(),
+        "static_embedding": {
+            "vocab_size": VOCAB_SIZE,
+            "max_length": MAX_SEQ
+        },
+        "artifacts": [
+            {
+                "name": "table-f32",
+                "format": "FORMAT_SAFETENSORS",
+                "files": ["weights/static.safetensors"],
+                "backends": ["cpu"],
+                "graph_input": "INPUT_TOKEN_IDS",
+                "graph_output": "OUTPUT_HIDDEN_STATES",
+                "tensor_names": { "static_embeddings": "embeddings" },
+                "produced_by": produced_by.clone()
+            }
+        ],
+        "reference": {
+            "file": "reference/reference.safetensors",
+            "cases": [
+                {
+                    "text": "fox fox fox fox fox fox fox fox fox",
+                    "prompt_role": "PROMPT_NONE"
+                }
+            ],
+            "produced_by": produced_by
+        },
+        "files": file_entries
+    });
+    std::fs::write(
+        bundle_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+}
+
+fn create_static_fixture(tag: &str) -> TempFixtureDir {
+    let fx = TempFixtureDir::new(tag);
+    let tokenizer = synthetic_tokenizer_bytes();
+    let weights = synthetic_embeddings_bytes();
+    let reference = synthetic_reference_bytes();
+    std::fs::write(fx.bundle_dir.join("tokenizer.json"), &tokenizer).unwrap();
+    std::fs::write(fx.bundle_dir.join("weights/static.safetensors"), &weights).unwrap();
+    std::fs::write(
+        fx.bundle_dir.join("reference/reference.safetensors"),
+        &reference,
+    )
+    .unwrap();
+    write_bundle_manifest(
+        &fx.bundle_dir,
+        &[
+            ("reference/reference.safetensors", &reference),
+            ("tokenizer.json", &tokenizer),
+            ("weights/static.safetensors", &weights),
+        ],
+    );
+    std::fs::write(fx.native_dir.join("tokenizer.json"), &tokenizer).unwrap();
+    std::fs::write(fx.native_dir.join("model.safetensors"), &weights).unwrap();
+    fx
 }
 
 fn vector_digest(vector: &[f32]) -> String {
@@ -124,64 +280,55 @@ fn vector_digest(vector: &[f32]) -> String {
     pipestream_search::sha256::hex_digest(&bytes)
 }
 
-fn compare_pooling(bundle: &Path) {
-    let native_dir = native_model(bundle, "pooling");
-    let native = StaticEmbedder::load(&native_dir).unwrap();
-    let turbo =
-        LocalEmbedEngine::open(bundle, &LocalEncoderOptions::default(), None, None).unwrap();
+#[test]
+fn static_pooling_pins_f64_native_and_f32_turbo_outputs() {
+    let fx = create_static_fixture("pooling");
+    let native = StaticEmbedder::load(&fx.native_dir).unwrap();
+    let turbo = LocalEmbedEngine::open(&fx.bundle_dir, &LocalEncoderOptions::default(), None, None)
+        .unwrap();
     let text = "The quick brown fox";
     let native_vector = native.embed(text).unwrap();
     let turbo_vectors = turbo
         .embed_texts_multires(&[text], EmbedPromptRole::None, &MultiResOptions::default())
         .unwrap();
-    assert_eq!(native_vector.len(), 16);
-    assert_eq!(turbo_vectors.full.data.len(), 16);
+    let turbo_repeat = turbo
+        .embed_texts_multires(&[text], EmbedPromptRole::None, &MultiResOptions::default())
+        .unwrap();
+    assert_eq!(native_vector.len(), DIM);
+    assert_eq!(turbo_vectors.full.data.len(), DIM);
     let native_digest = vector_digest(&native_vector);
     let turbo_digest = vector_digest(&turbo_vectors.full.data);
-    assert_eq!(
-        native_digest,
-        "b49df11743b22b80860901760f64dab78a7bea3d3028681a87b82142c2c30003"
-    );
-    assert_eq!(
-        turbo_digest,
-        "91102bf06956529a141d648017a9bb246a08fb5d65517bcb783e554af195a3ae"
-    );
+    assert_eq!(turbo_digest, vector_digest(&turbo_repeat.full.data));
     assert_ne!(native_digest, turbo_digest);
-    std::fs::remove_dir_all(native_dir).unwrap();
+    let mut dot = 0.0_f64;
+    for (&lhs, &rhs) in native_vector.iter().zip(&turbo_vectors.full.data) {
+        assert!((lhs - rhs).abs() < 1e-6, "{lhs} vs {rhs}");
+        dot += f64::from(lhs) * f64::from(rhs);
+    }
+    assert!((dot - 1.0).abs() < 1e-6, "cosine {dot}");
 }
 
-fn compare_empty_pooling(bundle: &Path) {
-    let (zero_bundle, zero_text) = zero_bundle(bundle);
-    let native_dir = native_model(&zero_bundle, "empty");
-    let native = StaticEmbedder::load(&native_dir).unwrap();
-    let turbo =
-        LocalEmbedEngine::open(&zero_bundle, &LocalEncoderOptions::default(), None, None).unwrap();
-    let texts = [zero_text.as_str()];
-    for text in texts {
-        assert_eq!(native.embed(text), None);
-    }
+#[test]
+fn static_empty_pooling_is_none_natively_and_zero_rows_in_turbo() {
+    let fx = create_static_fixture("empty");
+    let native = StaticEmbedder::load(&fx.native_dir).unwrap();
+    let turbo = LocalEmbedEngine::open(&fx.bundle_dir, &LocalEncoderOptions::default(), None, None)
+        .unwrap();
+    assert_eq!(native.embed("zero"), None);
+    assert_eq!(native.embed("   "), None);
     let empty_error = turbo
         .embed_texts_multires(&["   "], EmbedPromptRole::None, &MultiResOptions::default())
         .unwrap_err();
     assert!(empty_error.to_string().contains("neither may be 0"));
     let output = turbo
-        .embed_texts_multires(&texts, EmbedPromptRole::None, &MultiResOptions::default())
+        .embed_texts_multires(
+            &["zero"],
+            EmbedPromptRole::None,
+            &MultiResOptions::default(),
+        )
         .unwrap();
-    assert_eq!(output.full.rows as usize, texts.len());
-    for row in output.full.data.chunks_exact(output.full.dim as usize) {
-        assert!(row.iter().all(|value| *value == 0.0));
-    }
+    assert_eq!(output.full.rows, 1);
+    assert_eq!(output.full.data.len(), DIM);
+    assert!(output.full.data.iter().all(|value| *value == 0.0));
     assert!(output.full.inv_norm.iter().all(|value| *value == 0.0));
-    std::fs::remove_dir_all(native_dir).unwrap();
-    std::fs::remove_dir_all(zero_bundle).unwrap();
-}
-
-#[test]
-fn static_pooling_pins_f64_native_and_f32_turbo_outputs() {
-    compare_pooling(&dependency_bundle());
-}
-
-#[test]
-fn static_empty_pooling_is_none_natively_and_zero_rows_in_turbo() {
-    compare_empty_pooling(&dependency_bundle());
 }

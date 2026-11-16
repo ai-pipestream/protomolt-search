@@ -12,34 +12,59 @@ pub struct TurboOutcome {
     pub reversed_fingerprint: u64,
 }
 
-fn dependency_dir() -> PathBuf {
-    std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("target"))
-        .join("debug/deps")
+struct ProbeDir(PathBuf);
+
+impl ProbeDir {
+    fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo-glossary-probe-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
 }
 
-fn glossary_rlib(deps: &Path) -> PathBuf {
+impl Drop for ProbeDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn find_glossary_rlib(deps: &Path) -> Option<PathBuf> {
     let mut candidates: Vec<_> = std::fs::read_dir(deps)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
         .filter(|path| {
-            let name = path.file_name().unwrap().to_string_lossy();
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
             name.starts_with("libturbo_glossary-") && name.ends_with(".rlib")
         })
         .collect();
     candidates.sort_by_key(|path| path.metadata().unwrap().modified().unwrap());
-    candidates.pop().expect("turbo_glossary rlib is built")
+    candidates.pop()
+}
+
+fn dependency_dir() -> PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    let parent = exe.parent().unwrap();
+    if find_glossary_rlib(parent).is_some() {
+        parent.to_path_buf()
+    } else {
+        parent.join("deps")
+    }
 }
 
 fn compile_probe(source: &Path, deps: &Path, binary: &Path) {
-    let output = Command::new("rustc")
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let rlib = find_glossary_rlib(deps).expect("turbo_glossary rlib is built");
+    let output = Command::new(rustc)
         .arg("--edition=2021")
         .arg(source)
         .arg("-L")
         .arg(format!("dependency={}", deps.display()))
         .arg("--extern")
-        .arg(format!("turbo_glossary={}", glossary_rlib(deps).display()))
+        .arg(format!("turbo_glossary={}", rlib.display()))
         .arg("-o")
         .arg(binary)
         .output()
@@ -52,7 +77,8 @@ fn compile_probe(source: &Path, deps: &Path, binary: &Path) {
 }
 
 fn run_probe(source: &Path) -> BTreeMap<String, String> {
-    let binary = std::env::temp_dir().join(format!("turbo-glossary-probe-{}", std::process::id()));
+    let probe_dir = ProbeDir::new();
+    let binary = probe_dir.0.join("turbo_glossary_probe");
     compile_probe(source, &dependency_dir(), &binary);
     let output = Command::new(&binary).output().unwrap();
     assert!(
