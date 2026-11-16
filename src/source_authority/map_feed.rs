@@ -1,6 +1,6 @@
-//! The committed map feed (docs/map-feed.md): one `PublishedMap` per applied
-//! control revision, produced from committed rows in one read, and the
-//! consumer rules that make a stale or forged frame a named refusal.
+//! The committed map feed: one `PublishedMap` per applied control revision,
+//! produced from committed rows in one read, and the consumer rules that
+//! make a stale or forged frame a named refusal.
 use super::capacity::load_committed;
 use super::control::{hash, prefix_end, read_headers, CONTROL, NODES, REPLICAS, TOPOLOGIES};
 use super::*;
@@ -54,62 +54,12 @@ impl SourceAuthorityStore {
                 Some(Placement::NoPlacement(true)) => None,
                 _ => return Err(corrupt("committed placement configuration is not explicit")),
             };
-            let mut nodes = Vec::with_capacity(committed.nodes.len());
-            for (node_id, row) in &committed.nodes {
-                let node = row.node.as_ref().ok_or_else(|| missing("node"))?;
-                nodes.push(PublishedNode {
-                    node_id: node_id.clone(),
-                    addr: node.addr.clone(),
-                    state: node.state,
-                    residency: row.residency,
-                    failure_domain: node
-                        .capacity
-                        .as_ref()
-                        .map(|c| c.failure_domain.clone())
-                        .unwrap_or_default(),
-                });
-            }
+            let nodes = published_nodes(&committed)?;
             let mut replicas = Vec::with_capacity(committed.replicas.len());
             for row in &committed.replicas {
                 replicas.push(row.replica.clone().ok_or_else(|| missing("replica"))?);
             }
-            // Owners of this resource: every LogicalSourceOwner key with the
-            // resource's workspace and collection.
-            let owners_table = tx.open_table(OWNERS).map_err(storage)?;
-            let prefix = LogicalSourceOwner {
-                workspace: key.workspace.clone(),
-                collection: key.collection.clone(),
-                owner_id: Vec::new(),
-            }
-            .encode_to_vec();
-            let end = prefix_end(&prefix).ok_or_else(|| corrupt("resource prefix overflow"))?;
-            let mut owners = Vec::new();
-            for entry in owners_table
-                .range(prefix.as_slice()..end.as_slice())
-                .map_err(storage)?
-            {
-                let (k, v) = entry.map_err(storage)?;
-                let owner_key: LogicalSourceOwner = contract::decode(k.value())?;
-                if owner_key.workspace != key.workspace || owner_key.collection != key.collection {
-                    continue;
-                }
-                let owner: PreparedSourceOwner = contract::decode(v.value())?;
-                contract::owner(&owner).map_err(corrupt)?;
-                let target = owner
-                    .target
-                    .as_ref()
-                    .ok_or_else(|| missing("owner target"))?;
-                owners.push(PublishedOwner {
-                    owner_id: owner_key.owner_id,
-                    node_id: target.node_id.clone(),
-                    storage_incarnation: target.storage_incarnation.clone(),
-                    history_id: target.history_id.clone(),
-                    residency: target.residency,
-                    ownership_generation: owner.ownership_generation,
-                    phase: owner.phase,
-                    write_epoch: owner.activation.as_ref().map_or(0, |a| a.write_epoch),
-                });
-            }
+            let owners = published_owners(&tx, key)?;
             let mut map = PublishedMap {
                 format_version: 1,
                 authority: Some(self.inner.identity.clone()),
@@ -130,6 +80,69 @@ impl SourceAuthorityStore {
             Ok(map)
         })
     }
+}
+
+fn published_nodes(committed: &capacity::Committed) -> Result<Vec<PublishedNode>, Status> {
+    let mut nodes = Vec::with_capacity(committed.nodes.len());
+    for (node_id, row) in &committed.nodes {
+        let node = row.node.as_ref().ok_or_else(|| missing("node"))?;
+        nodes.push(PublishedNode {
+            node_id: node_id.clone(),
+            addr: node.addr.clone(),
+            state: node.state,
+            residency: row.residency,
+            failure_domain: node
+                .capacity
+                .as_ref()
+                .map(|c| c.failure_domain.clone())
+                .unwrap_or_default(),
+        });
+    }
+    Ok(nodes)
+}
+
+/// Owners of this resource: every `LogicalSourceOwner` key with the
+/// resource's workspace and collection.
+fn published_owners(
+    tx: &redb::ReadTransaction,
+    key: &LogicalSourceOwner,
+) -> Result<Vec<PublishedOwner>, Status> {
+    let owners_table = tx.open_table(OWNERS).map_err(storage)?;
+    let prefix = LogicalSourceOwner {
+        workspace: key.workspace.clone(),
+        collection: key.collection.clone(),
+        owner_id: Vec::new(),
+    }
+    .encode_to_vec();
+    let end = prefix_end(&prefix).ok_or_else(|| corrupt("resource prefix overflow"))?;
+    let mut owners = Vec::new();
+    for entry in owners_table
+        .range(prefix.as_slice()..end.as_slice())
+        .map_err(storage)?
+    {
+        let (k, v) = entry.map_err(storage)?;
+        let owner_key: LogicalSourceOwner = contract::decode(k.value())?;
+        if owner_key.workspace != key.workspace || owner_key.collection != key.collection {
+            continue;
+        }
+        let owner: PreparedSourceOwner = contract::decode(v.value())?;
+        contract::owner(&owner).map_err(corrupt)?;
+        let target = owner
+            .target
+            .as_ref()
+            .ok_or_else(|| missing("owner target"))?;
+        owners.push(PublishedOwner {
+            owner_id: owner_key.owner_id,
+            node_id: target.node_id.clone(),
+            storage_incarnation: target.storage_incarnation.clone(),
+            history_id: target.history_id.clone(),
+            residency: target.residency,
+            ownership_generation: owner.ownership_generation,
+            phase: owner.phase,
+            write_epoch: owner.activation.as_ref().map_or(0, |a| a.write_epoch),
+        });
+    }
+    Ok(owners)
 }
 
 /// The consumer side of the feed: validates identity, format and digest,

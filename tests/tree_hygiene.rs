@@ -29,8 +29,6 @@ const RATCHET_HEADROOM: usize = 150;
 /// when its file shrinks; remove it when the file is split or deleted.
 const RATCHET: &[(&str, usize)] = &[
     ("src/main.rs", 2_010 + RATCHET_HEADROOM),
-    ("src/source_authority.rs", 1_635 + RATCHET_HEADROOM),
-    ("src/source_authority/capacity.rs", 1_527 + RATCHET_HEADROOM),
 ];
 
 /// The directories walked, relative to the package root.

@@ -11,6 +11,9 @@ use crate::test_support::ForkGuarded;
 use std::path::PathBuf;
 use tonic::Code;
 
+mod configure;
+mod transitions;
+
 const COHORT_MS: u64 = 60_000;
 
 /// A store holding the installed `state_with_tree`.
@@ -181,426 +184,6 @@ fn planner_view(store: &SourceAuthorityStore, instant: u64) -> (String, [u8; 32]
 }
 
 #[test]
-fn configure_is_a_retained_control_command_over_applied_state() {
-    let dir = Directory::new("configure-unapplied");
-    let limits = limits(64 << 10, 64);
-    let authority = identity(7);
-    let store = store(&dir, 7, &limits);
-    // Without applied control state there is nothing to plan over.
-    let refused = store
-        .configure_capacity(
-            "alice",
-            &configure(&authority, "c1", 1, configuration("hot")),
-        )
-        .unwrap();
-    assert_eq!(
-        refused.code,
-        Code::FailedPrecondition as u32,
-        "{}",
-        refused.message
-    );
-    assert!(
-        refused.message.contains("no applied control state"),
-        "{}",
-        refused.message
-    );
-    drop(store);
-
-    let fixture = installed("configure");
-    let store = &fixture.store;
-    let authority = &fixture.authority;
-    let revision = fixture.revision;
-    // Invalid configurations are envelope refusals, never decisions.
-    let mut device = configuration("hot");
-    device.policy.as_mut().unwrap().tiers[0].residency = CapacityResidency::Device as i32;
-    assert_eq!(
-        store
-            .configure_capacity("alice", &configure(authority, "bad-tier", revision, device))
-            .err()
-            .unwrap()
-            .code(),
-        Code::InvalidArgument
-    );
-    let mut wide = configuration("hot");
-    wide.max_total_records = MAX_CAPACITY_RECORDS + 1;
-    assert_eq!(
-        store
-            .configure_capacity("alice", &configure(authority, "bad-bound", revision, wide))
-            .err()
-            .unwrap()
-            .code(),
-        Code::InvalidArgument
-    );
-    assert_eq!(
-        store
-            .configure_capacity(
-                "bob",
-                &configure(authority, "bob", revision, configuration("hot"))
-            )
-            .unwrap()
-            .code,
-        0
-    );
-    // bob's configuration landed; alice's exact retry of her own id is hers.
-    let stale = store
-        .configure_capacity(
-            "alice",
-            &configure(authority, "c1", revision, configuration("hot")),
-        )
-        .unwrap();
-    assert_eq!(stale.code, Code::FailedPrecondition as u32);
-    let accepted = store
-        .configure_capacity(
-            "alice",
-            &configure(authority, "c2", revision + 1, configuration("warm")),
-        )
-        .unwrap();
-    assert_eq!(accepted.code, 0, "{}", accepted.message);
-    assert_eq!(accepted.control_revision, revision + 2);
-    assert_eq!(
-        store
-            .configure_capacity(
-                "alice",
-                &configure(authority, "c2", revision + 1, configuration("warm"))
-            )
-            .unwrap(),
-        accepted
-    );
-    assert_eq!(
-        store
-            .configure_capacity(
-                "alice",
-                &configure(authority, "c2", revision + 1, configuration("cold"))
-            )
-            .err()
-            .unwrap()
-            .code(),
-        Code::FailedPrecondition
-    );
-    // The shared command_id namespace: an install id cannot be reused here
-    // and vice versa.
-    assert_eq!(
-        store
-            .configure_capacity(
-                "alice",
-                &configure(authority, "install", revision + 2, configuration("x"))
-            )
-            .err()
-            .unwrap()
-            .code(),
-        Code::FailedPrecondition
-    );
-    assert_eq!(
-        store
-            .install_control(
-                "alice",
-                &install_command(authority, "c2", revision + 2, state(2)),
-            )
-            .err()
-            .unwrap()
-            .code(),
-        Code::FailedPrecondition
-    );
-    let state = store.capacity_state("alice", &key("books")).unwrap();
-    assert_eq!(state.configured_control_revision, revision + 2);
-    assert_eq!(
-        state.configuration.unwrap().policy.unwrap().tiers[0].name,
-        "warm"
-    );
-    assert_eq!(
-        store
-            .capacity_configure_decision("alice", &key("books"), b"c2")
-            .unwrap(),
-        accepted
-    );
-    drop(fixture);
-}
-
-#[test]
-fn transitions_register_report_expire_and_recover_identically() {
-    let fixture = installed("transitions");
-    let store = &fixture.store;
-    let authority = &fixture.authority;
-    let revision = fixture.revision;
-    assert_eq!(
-        store
-            .capacity_transition("alice", &register(authority, "node/α", 1))
-            .err()
-            .unwrap()
-            .code(),
-        Code::FailedPrecondition,
-        "no configuration yet"
-    );
-    assert_eq!(
-        store
-            .configure_capacity(
-                "alice",
-                &configure(authority, "cfg", revision, configuration("hot"))
-            )
-            .unwrap()
-            .code,
-        0
-    );
-    // A report before registration refuses with Kimi's refusal text.
-    let error = store
-        .capacity_transition("alice", &report(authority, observation(1, 5, 10)))
-        .err()
-        .unwrap();
-    assert_eq!(error.code(), Code::FailedPrecondition);
-    assert!(error.message().contains("has not registered"), "{error}");
-    let registered = store
-        .capacity_transition("alice", &register(authority, "node/α", 1))
-        .unwrap();
-    assert_eq!(registered.observation_epoch, 0);
-    assert_eq!(
-        store
-            .capacity_transition("alice", &register(authority, "node/α", 1))
-            .unwrap(),
-        registered
-    );
-    // Land, exact retry, conflict, supersession, newer window.
-    let landed = store
-        .capacity_transition("alice", &report(authority, observation(1, 5, 10)))
-        .unwrap();
-    assert_eq!(landed.outcome, CapacityTransitionOutcome::Landed as i32);
-    assert_eq!(landed.observation_epoch, 1);
-    assert_eq!(landed.control_revision, revision + 1);
-    let again = store
-        .capacity_transition("alice", &report(authority, observation(1, 5, 10)))
-        .unwrap();
-    assert_eq!(again.outcome, CapacityTransitionOutcome::Unchanged as i32);
-    assert_eq!(again.observation_epoch, 1);
-    let conflict = store
-        .capacity_transition("alice", &report(authority, observation(1, 5, 11)))
-        .err()
-        .unwrap();
-    assert_eq!(conflict.code(), Code::FailedPrecondition);
-    assert!(conflict.message().contains("conflicts"), "{conflict}");
-    let older = store
-        .capacity_transition("alice", &report(authority, observation(1, 4, 3)))
-        .unwrap();
-    assert_eq!(older.outcome, CapacityTransitionOutcome::Superseded as i32);
-    assert_eq!(older.observation_epoch, 1);
-    let newer = store
-        .capacity_transition("alice", &report(authority, observation(1, 6, 12)))
-        .unwrap();
-    assert_eq!(newer.outcome, CapacityTransitionOutcome::Landed as i32);
-    assert_eq!(newer.observation_epoch, 2);
-    let state = store.capacity_state("alice", &key("books")).unwrap();
-    assert_eq!((state.reporter_count, state.observation_count), (1, 1));
-    // Reports against uncommitted identity are refused by name.
-    let mut wrong_leaf = observation(1, 6, 12);
-    wrong_leaf.leaf = "rest".into();
-    let error = store
-        .capacity_transition("alice", &report(authority, wrong_leaf))
-        .err()
-        .unwrap();
-    assert!(
-        error.message().contains("covers no rows in leaf rest"),
-        "{error}"
-    );
-    let mut wrong_generation = observation(1, 6, 12);
-    wrong_generation.shard.as_mut().unwrap().source_generation = 8;
-    let error = store
-        .capacity_transition("alice", &report(authority, wrong_generation))
-        .err()
-        .unwrap();
-    assert!(
-        error
-            .message()
-            .contains("source generation 8 is not the committed 7"),
-        "{error}"
-    );
-    let mut misaligned = observation(1, 6, 12);
-    misaligned.window_start_unix_ms += 1;
-    assert_eq!(
-        store
-            .capacity_transition("alice", &report(authority, misaligned))
-            .err()
-            .unwrap()
-            .code(),
-        Code::FailedPrecondition
-    );
-    // Planner input is served from the committed rows; the planning instant
-    // sits just after the observed window closes.
-    let (rendered, digest, plan) = planner_view(store, 7 * COHORT_MS);
-    assert!(rendered.contains("observation_epoch: 2"), "{rendered}");
-
-    // A restart of node/α: the new incarnation supersedes the old one and
-    // its observations are dropped in the same committed transition.
-    let restarted = store
-        .capacity_transition("alice", &register(authority, "node/α", 2))
-        .unwrap();
-    assert_eq!(restarted.dropped, 1);
-    assert_eq!(restarted.observation_epoch, 3);
-    let error = store
-        .capacity_transition("alice", &report(authority, observation(1, 7, 1)))
-        .err()
-        .unwrap();
-    assert!(error.message().contains("is superseded by"), "{error}");
-    assert_eq!(
-        store
-            .capacity_transition("alice", &report(authority, observation(2, 7, 1)))
-            .unwrap()
-            .observation_epoch,
-        4
-    );
-    // The cohort cannot change with observations retained; expiry first.
-    let mut shifted = configuration("hot");
-    shifted.cohort_phase_unix_ms = 5;
-    let refused = store
-        .configure_capacity(
-            "alice",
-            &configure(authority, "shift", revision + 1, shifted),
-        )
-        .unwrap();
-    assert_eq!(
-        refused.code,
-        Code::FailedPrecondition as u32,
-        "{}",
-        refused.message
-    );
-    let nothing = store
-        .capacity_transition("alice", &expire(authority, 8 * COHORT_MS, 10 * COHORT_MS))
-        .unwrap();
-    assert_eq!((nothing.dropped, nothing.observation_epoch), (0, 4));
-    let expired = store
-        .capacity_transition("alice", &expire(authority, 20 * COHORT_MS, COHORT_MS))
-        .unwrap();
-    assert_eq!((expired.dropped, expired.observation_epoch), (1, 5));
-    let state = store.capacity_state("alice", &key("books")).unwrap();
-    assert_eq!(
-        (
-            state.reporter_count,
-            state.observation_count,
-            state.observation_epoch
-        ),
-        (1, 0, 5)
-    );
-    assert_eq!(
-        store
-            .capacity_transition("alice", &report(authority, observation(2, 9, 2)))
-            .unwrap()
-            .observation_epoch,
-        6
-    );
-    let before = planner_view(store, 10 * COHORT_MS);
-    assert_ne!(before.1, digest);
-    assert_ne!(before.2, plan);
-
-    // Reopen recomputes every count and re-lands every row; the planner
-    // sees identical inputs and produces identical outputs.
-    drop(fixture.store.clone());
-    let Installed { dir, store, .. } = fixture;
-    drop(store);
-    let reopened = SourceAuthorityStore::open(&dir.authority(), authority).unwrap();
-    let after = planner_view(&reopened, 10 * COHORT_MS);
-    assert_eq!(after, before);
-    let state = reopened.capacity_state("alice", &key("books")).unwrap();
-    assert_eq!(
-        (
-            state.reporter_count,
-            state.observation_count,
-            state.observation_epoch
-        ),
-        (1, 1, 6)
-    );
-    assert_eq!(
-        reopened
-            .capacity_transition("alice", &report(authority, observation(2, 9, 2)))
-            .unwrap()
-            .outcome,
-        CapacityTransitionOutcome::Unchanged as i32
-    );
-}
-
-#[test]
-fn policy_and_configuration_changes_are_bound_into_the_plan_digest() {
-    let fixture = installed("policy-changes");
-    let store = &fixture.store;
-    let authority = &fixture.authority;
-    let revision = fixture.revision;
-    assert_eq!(
-        store
-            .configure_capacity(
-                "alice",
-                &configure(authority, "cfg", revision, configuration("hot"))
-            )
-            .unwrap()
-            .code,
-        0
-    );
-    store
-        .capacity_transition("alice", &register(authority, "node/α", 1))
-        .unwrap();
-    store
-        .capacity_transition("alice", &report(authority, observation(1, 5, 10)))
-        .unwrap();
-    let base = planner_view(store, 6 * COHORT_MS);
-    // An access-policy change advances the policy revision the plan binds.
-    let grants = SourceAuthorityCommand {
-        format_version: 1,
-        authority: Some(authority.clone()),
-        key: Some(key("books")),
-        command_id: b"grants".to_vec(),
-        expected_control_revision: revision + 1,
-        expected_policy_revision: 1,
-        expected_ownership_generation: 0,
-        action: Some(Action::ReplaceGrants(ReplaceSourceCollectionGrants {
-            grants: vec![
-                CollectionGrant {
-                    principal: "alice".into(),
-                    workspace: "workspace-a".into(),
-                    collection: "books".into(),
-                    actions: vec![AccessAction::Admin as i32, AccessAction::Search as i32],
-                    ..Default::default()
-                },
-                CollectionGrant {
-                    principal: "bob".into(),
-                    workspace: "workspace-a".into(),
-                    collection: "books".into(),
-                    actions: vec![AccessAction::Admin as i32],
-                    ..Default::default()
-                },
-            ],
-        })),
-    };
-    assert_eq!(store.execute("alice", &grants).unwrap().code, 0);
-    let after_grants = planner_view(store, 6 * COHORT_MS);
-    assert_ne!(after_grants.1, base.1);
-    assert!(
-        after_grants.0.contains("policy_revision: 2"),
-        "{}",
-        after_grants.0
-    );
-    // A tier-policy change is a control command and changes the digest too.
-    let mut cfg = configure(authority, "cfg2", revision + 2, configuration("warm"));
-    cfg.expected_policy_revision = 2;
-    assert_eq!(store.configure_capacity("alice", &cfg).unwrap().code, 0);
-    let after_policy = planner_view(store, 6 * COHORT_MS);
-    assert_ne!(after_policy.1, after_grants.1);
-    // Observations survive both; a revoked actor cannot read the input.
-    assert!(
-        after_policy.0.contains("observation_epoch: 1"),
-        "{}",
-        after_policy.0
-    );
-    assert_eq!(
-        store
-            .planner_input("carol", &key("books"), &context(6 * COHORT_MS))
-            .err()
-            .unwrap()
-            .code(),
-        Code::PermissionDenied
-    );
-    // Reopen reproduces the final view exactly.
-    let Installed { dir, store, .. } = fixture;
-    drop(store);
-    let reopened = SourceAuthorityStore::open(&dir.authority(), authority).unwrap();
-    assert_eq!(planner_view(&reopened, 6 * COHORT_MS), after_policy);
-}
-
-#[test]
 fn capacity_exit_worker() {
     let Some(mode) = std::env::var_os("PSEARCH_CAPACITY_EXIT_FAULT") else {
         return;
@@ -663,60 +246,7 @@ fn abrupt_exit_around_capacity_commits_recovers_and_replays() {
                 .control_snapshot("alice", &key("books"))
                 .unwrap()
                 .control_revision;
-            let configured = store.capacity_state("alice", &key("books"));
-            match (phase, fault) {
-                ("configure", "before") => {
-                    assert_eq!(configured.err().unwrap().code(), Code::NotFound);
-                    assert_eq!(
-                        store
-                            .configure_capacity(
-                                "alice",
-                                &configure(&authority, "cfg", revision, configuration("hot"))
-                            )
-                            .unwrap()
-                            .code,
-                        0
-                    );
-                }
-                ("configure", "after") => {
-                    assert_eq!(configured.unwrap().configured_control_revision, revision);
-                    let retry = store
-                        .configure_capacity(
-                            "alice",
-                            &configure(&authority, "cfg", revision - 1, configuration("hot")),
-                        )
-                        .unwrap();
-                    assert_eq!(retry.code, 0);
-                    assert_eq!(retry.control_revision, revision);
-                }
-                ("report", "before") => {
-                    assert_eq!(configured.unwrap().observation_count, 0);
-                    assert_eq!(
-                        store
-                            .capacity_transition(
-                                "alice",
-                                &report(&authority, observation(1, 5, 10))
-                            )
-                            .unwrap()
-                            .outcome,
-                        CapacityTransitionOutcome::Landed as i32
-                    );
-                }
-                _ => {
-                    let state = configured.unwrap();
-                    assert_eq!((state.observation_count, state.observation_epoch), (1, 1));
-                    assert_eq!(
-                        store
-                            .capacity_transition(
-                                "alice",
-                                &report(&authority, observation(1, 5, 10))
-                            )
-                            .unwrap()
-                            .outcome,
-                        CapacityTransitionOutcome::Unchanged as i32
-                    );
-                }
-            }
+            the_interrupted_step_recovers(&store, &authority, revision, (phase, fault));
             if phase == "configure" {
                 // Configure-phase workers exit before any report; land one so
                 // the planner view exists on both sides of the reopen.
@@ -731,6 +261,64 @@ fn abrupt_exit_around_capacity_commits_recovers_and_replays() {
             drop(store);
             let reopened = SourceAuthorityStore::open(&dir.authority(), &authority).unwrap();
             assert_eq!(planner_view(&reopened, 6 * COHORT_MS), view);
+        }
+    }
+}
+
+/// The step the worker exited around either never committed and applies
+/// now, or committed and answers its exact retry from the record.
+fn the_interrupted_step_recovers(
+    store: &SourceAuthorityStore,
+    authority: &SourceAuthorityIdentity,
+    revision: u64,
+    (phase, fault): (&str, &str),
+) {
+    let configured = store.capacity_state("alice", &key("books"));
+    match (phase, fault) {
+        ("configure", "before") => {
+            assert_eq!(configured.err().unwrap().code(), Code::NotFound);
+            assert_eq!(
+                store
+                    .configure_capacity(
+                        "alice",
+                        &configure(authority, "cfg", revision, configuration("hot"))
+                    )
+                    .unwrap()
+                    .code,
+                0
+            );
+        }
+        ("configure", "after") => {
+            assert_eq!(configured.unwrap().configured_control_revision, revision);
+            let retry = store
+                .configure_capacity(
+                    "alice",
+                    &configure(authority, "cfg", revision - 1, configuration("hot")),
+                )
+                .unwrap();
+            assert_eq!(retry.code, 0);
+            assert_eq!(retry.control_revision, revision);
+        }
+        ("report", "before") => {
+            assert_eq!(configured.unwrap().observation_count, 0);
+            assert_eq!(
+                store
+                    .capacity_transition("alice", &report(authority, observation(1, 5, 10)))
+                    .unwrap()
+                    .outcome,
+                CapacityTransitionOutcome::Landed as i32
+            );
+        }
+        _ => {
+            let state = configured.unwrap();
+            assert_eq!((state.observation_count, state.observation_epoch), (1, 1));
+            assert_eq!(
+                store
+                    .capacity_transition("alice", &report(authority, observation(1, 5, 10)))
+                    .unwrap()
+                    .outcome,
+                CapacityTransitionOutcome::Unchanged as i32
+            );
         }
     }
 }

@@ -1,5 +1,4 @@
-//! The committed map as a relay's map source (docs/map-feed.md,
-//! docs/relay-coordinators.md "Map interface"): a read-only consumer of
+//! The committed map as a relay's map source: a read-only consumer of
 //! `published_map` that wakes on the applied watch, validates every frame
 //! through `MapConsumer`, and hands the relay one frozen `MapSnapshot` per
 //! accepted revision. It grants no admission and carries no lease; a
