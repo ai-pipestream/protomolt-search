@@ -4,7 +4,7 @@
 //! a dense execution policy measured at one setting does not qualify another.
 //!
 //! The query beam is deliberately not here. It comes from the request's
-//! candidate depth (`docs/hnsw.md`, "The beam").
+//! candidate depth.
 
 use prost::Message;
 
@@ -75,8 +75,7 @@ impl BuildMode {
     }
 }
 
-/// Optional graph-locality row permutation applied at seal and compaction
-/// (`#98`, `docs/hnsw.md`).
+/// Optional graph-locality row permutation applied at seal and compaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LocalityOrder {
     /// Preserve ingest or caller-assigned row order (`0 B/row` overhead,

@@ -10,8 +10,8 @@ use crate::hnsw::{HnswIndex, EF_FLOOR};
 use crate::vector::{VectorProvider, VectorSearchOptions};
 
 use super::super::distance::Kernel;
-use super::build::{GraphLinks, LinkBuilder, Store};
-use super::{Probe, NO_NODE};
+use super::probe::Probe;
+use super::{GraphLinks, LinkBuilder, Store, NO_NODE};
 
 fn exact_top_k(corpus: &[f32], dim: usize, query: &[f32], k: usize) -> Vec<u32> {
     let mut ranked: Vec<(u32, f32)> = corpus
