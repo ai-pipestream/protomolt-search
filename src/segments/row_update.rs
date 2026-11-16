@@ -8,30 +8,6 @@ pub struct SegmentRowRetirement {
     pub rows: Vec<u64>,
 }
 
-/// Private copied images held until the owning publisher commits or abandons
-/// them. A durable intent retains them on ambiguous failure for reconciliation.
-pub(crate) struct StagedMaintenance {
-    before: Arc<OpenedSegmentSet>,
-    after: Arc<OpenedSegmentSet>,
-    outputs: Vec<SegmentMetadata>,
-    retain: std::cell::Cell<bool>,
-}
-impl StagedMaintenance {
-    pub(crate) fn snapshot(&self) -> &Arc<OpenedSegmentSet> {
-        &self.after
-    }
-    pub(crate) fn retain_for_recovery(&self) {
-        self.retain.set(true);
-    }
-}
-impl Drop for StagedMaintenance {
-    fn drop(&mut self) {
-        if !self.retain.get() {
-            cleanup_staged(self.after.root(), &self.outputs);
-        }
-    }
-}
-
 impl SegmentCatalog {
     /// Publish added segments and retire old rows in one manifest swap. Supports
     /// replacements with a different row count, including no new rows.
@@ -62,12 +38,14 @@ impl SegmentCatalog {
         prepare: impl FnOnce(&Arc<OpenedSegmentSet>) -> Result<T, String>,
     ) -> Result<(Arc<OpenedSegmentSet>, T), String> {
         self.commit_row_transaction(
-            expected_epoch,
-            retirements,
-            sources,
-            None,
-            None,
-            None,
+            RowTransaction {
+                expected_epoch,
+                retirements,
+                sources,
+                binding: None,
+                owner: None,
+                declaration: None,
+            },
             prepare,
         )
     }
@@ -86,116 +64,21 @@ impl SegmentCatalog {
         prepare: impl FnOnce(&Arc<OpenedSegmentSet>) -> Result<T, String>,
     ) -> Result<(Arc<OpenedSegmentSet>, T), String> {
         self.commit_row_transaction(
-            expected_epoch,
-            retirements,
-            sources,
-            binding,
-            Some(owner),
-            Some(declaration),
+            RowTransaction {
+                expected_epoch,
+                retirements,
+                sources,
+                binding,
+                owner: Some(owner),
+                declaration: Some(declaration),
+            },
             prepare,
         )
     }
 
-    /// Copy and validate immutable outputs without holding the catalog update
-    /// fence. The captured before view must still match at final publication.
-    pub(crate) fn stage_maintenance(
-        &self,
-        before: Arc<OpenedSegmentSet>,
-        sources: Vec<SegmentSource<'_>>,
-    ) -> Result<StagedMaintenance, String> {
-        if before.root() != self.root
-            || before.manifest().source_owner.is_none()
-            || before.generation_declaration().is_none()
-        {
-            return Err("maintenance requires this catalog's owned, declared generation".into());
-        }
-        let mut manifest = before.published_manifest();
-        manifest.epoch = before
-            .epoch()
-            .checked_add(1)
-            .ok_or("maintenance catalog epoch overflow")?;
-        let mut ids: BTreeSet<&str> = before
-            .manifest()
-            .segments
-            .iter()
-            .map(|s| s.segment_id.as_str())
-            .collect();
-        for source in &sources {
-            validate_segment_id(source.segment_id)?;
-            if !ids.insert(source.segment_id) {
-                return Err("maintenance requires fresh segment ids".into());
-            }
-        }
-        let mut outputs = Vec::with_capacity(sources.len());
-        let result = (|| {
-            for source in sources {
-                outputs.push(stage_segment(&self.root, source)?);
-            }
-            manifest.segments = outputs.clone();
-            manifest.segments.sort_by_key(|segment| segment.base_label);
-            manifest.update_retained_format();
-            let mut end = 0;
-            for segment in &manifest.segments {
-                if segment.base_label != end {
-                    return Err("maintenance requires contiguous rows beginning at zero".into());
-                }
-                end = segment.end_label_exclusive()?;
-            }
-            OpenedSegmentSet::open_manifest(self.root.clone(), manifest, self.load).map(Arc::new)
-        })();
-        match result {
-            Ok(after) => Ok(StagedMaintenance {
-                before,
-                after,
-                outputs,
-                retain: std::cell::Cell::new(false),
-            }),
-            Err(error) => {
-                cleanup_staged(&self.root, &outputs);
-                Err(error)
-            }
-        }
-    }
-
-    /// Commit only the exact immutable views previously staged by this owner.
-    /// The callback records intent and holds the final serving-state guard.
-    pub(crate) fn commit_maintenance_prepared<T>(
-        &self,
-        staged: &StagedMaintenance,
-        owner: &crate::pb::storage::SourceIndexOwner,
-        prepare: impl FnOnce(&Arc<OpenedSegmentSet>) -> Result<T, String>,
-    ) -> Result<(Arc<OpenedSegmentSet>, T), String> {
-        let _guard = self
-            .update
-            .lock()
-            .map_err(|_| "segment update lock poisoned")?;
-        if self
-            .pending_publication
-            .lock()
-            .map_err(|_| "segment publication lock poisoned")?
-            .is_some()
-        {
-            return Err("segment publication is uncertain; reopen before maintenance".into());
-        }
-        self.check_source_owner(Some(owner))?;
-        let current = self.snapshot();
-        if staged.before.root() != self.root || current.manifest() != staged.before.manifest() {
-            return Err("maintenance catalog changed during its private build".into());
-        }
-        let context = prepare(&staged.after)?;
-        let published = self.publish_owned(staged.after.clone(), Some(owner))?;
-        Ok((published, context))
-    }
-
-    #[allow(clippy::too_many_arguments)]
     fn commit_row_transaction<T>(
         &self,
-        expected_epoch: u64,
-        retirements: &[SegmentRowRetirement],
-        sources: Vec<SegmentSource<'_>>,
-        binding: Option<&StoredBinding>,
-        owner: Option<&crate::pb::storage::SourceIndexOwner>,
-        declaration: Option<&crate::pb::storage::IndexGenerationDeclaration>,
+        transaction: RowTransaction<'_, '_>,
         prepare: impl FnOnce(&Arc<OpenedSegmentSet>) -> Result<T, String>,
     ) -> Result<(Arc<OpenedSegmentSet>, T), String> {
         let _guard = self
@@ -214,105 +97,17 @@ impl SegmentCatalog {
             );
         }
         let current = self.snapshot();
-        self.check_source_owner(owner)?;
-        if current.epoch() != expected_epoch {
-            return Err(format!(
-                "row update expected epoch {expected_epoch}, current epoch is {}",
-                current.epoch()
-            ));
-        }
-        let epoch = expected_epoch
-            .checked_add(1)
-            .ok_or("segment catalog epoch overflow")?;
-        if owner.is_none() && retirements.is_empty() && sources.is_empty() {
-            return Err("row update requires retirements or new segments".into());
-        }
-        if binding.is_some_and(|binding| current.binding().is_some_and(|held| held != binding))
-            || (binding.is_some() && current.binding().is_none() && !current.is_empty())
-        {
-            return Err("projection cannot change or adopt a populated mapped binding".into());
-        }
-        let mut seen = BTreeSet::new();
-        let mut updates = Vec::new();
+        self.check_source_owner(transaction.owner)?;
+        let epoch = transaction.admit(&current)?;
         // Resolve and validate all old locations before creating artifacts.
-        for retirement in retirements {
-            if !seen.insert(&retirement.segment_id) || retirement.rows.is_empty() {
-                return Err("row update repeats a segment or has an empty retirement".into());
-            }
-            let index = current
-                .segments
-                .iter()
-                .position(|segment| segment.metadata.segment_id == retirement.segment_id)
-                .ok_or_else(|| {
-                    format!(
-                        "row update names unknown segment {:?}",
-                        retirement.segment_id
-                    )
-                })?;
-            let held = &current.segments[index];
-            let mut rows = BTreeSet::new();
-            for &row in &retirement.rows {
-                if row >= held.metadata.rows || usize::try_from(row).is_err() || !rows.insert(row) {
-                    return Err(format!(
-                        "row update has an invalid or duplicate row in {:?}",
-                        retirement.segment_id
-                    ));
-                }
-            }
-            updates.push((index, &retirement.rows));
-        }
-        let mut ids: BTreeSet<&str> = current
-            .manifest
-            .segments
-            .iter()
-            .map(|segment| segment.segment_id.as_str())
-            .collect();
-        let end = current
-            .manifest
-            .segments
-            .last()
-            .map(SegmentMetadata::end_label_exclusive)
-            .transpose()?
-            .unwrap_or(0);
-        for source in &sources {
-            validate_segment_id(source.segment_id)?;
-            if !ids.insert(source.segment_id) || source.base_label < end {
-                return Err(
-                    "row update requires fresh segment ids and ranges after the existing rows"
-                        .into(),
-                );
-            }
-        }
-        let mut manifest = current.published_manifest();
-        manifest.source_owner = owner.map(SegmentSourceOwner::encode).transpose()?;
-        if let Some(declaration) = declaration {
-            if let Some(previous) = current.generation_declaration() {
-                generation::check_upgrade(previous, declaration)?;
-            }
-            manifest.generation_declaration =
-                Some(SegmentGenerationDeclaration::encode(declaration)?);
-        }
-        manifest = manifest.with_binding(binding.or(current.binding()))?;
-        manifest.epoch = epoch;
+        let updates = resolve_retirements(&current, transaction.retirements)?;
+        check_fresh_sources(&current, &transaction.sources)?;
+        let mut manifest = transaction.manifest(&current, epoch)?;
+        let RowTransaction { sources, owner, .. } = transaction;
         let mut outputs = Vec::new();
         let mut overlays = Vec::new();
         let result = (|| {
-            for (index, rows) in updates {
-                let mut live = current.segments[index].live_docs.clone();
-                for &row in rows {
-                    live.delete(row as usize);
-                }
-                let metadata = &mut manifest.segments[index];
-                let (artifact, created) = write_overlay(&self.root, metadata, &live, epoch)?;
-                if created {
-                    overlays.push((metadata.segment_id.clone(), artifact.clone()));
-                }
-                metadata.live_docs = artifact;
-                metadata.live_rows = metadata
-                    .rows
-                    .checked_sub(live.deleted_count())
-                    .ok_or("retired row count exceeds segment")?;
-            }
+            self.retire_rows(&current, &mut manifest, updates, &mut overlays)?;
             for source in sources {
                 outputs.push(stage_segment(&self.root, source)?);
             }
@@ -335,6 +130,159 @@ impl SegmentCatalog {
         }
         result
     }
+
+    /// Write each retired segment's next bitmap and record it in `manifest`,
+    /// whose epoch names the overlays. `overlays` collects the files created.
+    fn retire_rows(
+        &self,
+        current: &OpenedSegmentSet,
+        manifest: &mut SegmentSetManifest,
+        updates: Vec<(usize, &Vec<u64>)>,
+        overlays: &mut Vec<(String, SegmentArtifact)>,
+    ) -> Result<(), String> {
+        let epoch = manifest.epoch;
+        for (index, rows) in updates {
+            let mut live = current.segments[index].live_docs.clone();
+            for &row in rows {
+                live.delete(row as usize);
+            }
+            let metadata = &mut manifest.segments[index];
+            let (artifact, created) = write_overlay(&self.root, metadata, &live, epoch)?;
+            if created {
+                overlays.push((metadata.segment_id.clone(), artifact.clone()));
+            }
+            metadata.live_docs = artifact;
+            metadata.live_rows = metadata
+                .rows
+                .checked_sub(live.deleted_count())
+                .ok_or("retired row count exceeds segment")?;
+        }
+        Ok(())
+    }
+}
+
+/// One row update: the epoch it expects, the rows it retires, the segments
+/// it adds and the generation metadata a source publication carries.
+struct RowTransaction<'a, 's> {
+    expected_epoch: u64,
+    retirements: &'a [SegmentRowRetirement],
+    sources: Vec<SegmentSource<'s>>,
+    binding: Option<&'a StoredBinding>,
+    owner: Option<&'a crate::pb::storage::SourceIndexOwner>,
+    declaration: Option<&'a crate::pb::storage::IndexGenerationDeclaration>,
+}
+
+impl RowTransaction<'_, '_> {
+    /// The epoch this update publishes, once `current` admits it.
+    fn admit(&self, current: &OpenedSegmentSet) -> Result<u64, String> {
+        if current.epoch() != self.expected_epoch {
+            return Err(format!(
+                "row update expected epoch {}, current epoch is {}",
+                self.expected_epoch,
+                current.epoch()
+            ));
+        }
+        let epoch = self
+            .expected_epoch
+            .checked_add(1)
+            .ok_or("segment catalog epoch overflow")?;
+        if self.owner.is_none() && self.retirements.is_empty() && self.sources.is_empty() {
+            return Err("row update requires retirements or new segments".into());
+        }
+        let binding = self.binding;
+        if binding.is_some_and(|binding| current.binding().is_some_and(|held| held != binding))
+            || (binding.is_some() && current.binding().is_none() && !current.is_empty())
+        {
+            return Err("projection cannot change or adopt a populated mapped binding".into());
+        }
+        Ok(epoch)
+    }
+
+    /// The manifest of `current` with this update's generation metadata.
+    fn manifest(
+        &self,
+        current: &OpenedSegmentSet,
+        epoch: u64,
+    ) -> Result<SegmentSetManifest, String> {
+        let mut manifest = current.published_manifest();
+        manifest.source_owner = self.owner.map(SegmentSourceOwner::encode).transpose()?;
+        if let Some(declaration) = self.declaration {
+            if let Some(previous) = current.generation_declaration() {
+                generation::check_upgrade(previous, declaration)?;
+            }
+            manifest.generation_declaration =
+                Some(SegmentGenerationDeclaration::encode(declaration)?);
+        }
+        manifest = manifest.with_binding(self.binding.or(current.binding()))?;
+        manifest.epoch = epoch;
+        Ok(manifest)
+    }
+}
+
+/// Each retirement as `(segment index, rows)`, refusing repeats, unknown
+/// segments and rows outside their segment.
+fn resolve_retirements<'r>(
+    current: &OpenedSegmentSet,
+    retirements: &'r [SegmentRowRetirement],
+) -> Result<Vec<(usize, &'r Vec<u64>)>, String> {
+    let mut seen = BTreeSet::new();
+    let mut updates = Vec::new();
+    for retirement in retirements {
+        if !seen.insert(&retirement.segment_id) || retirement.rows.is_empty() {
+            return Err("row update repeats a segment or has an empty retirement".into());
+        }
+        let index = current
+            .segments
+            .iter()
+            .position(|segment| segment.metadata.segment_id == retirement.segment_id)
+            .ok_or_else(|| {
+                format!(
+                    "row update names unknown segment {:?}",
+                    retirement.segment_id
+                )
+            })?;
+        let held = &current.segments[index];
+        let mut rows = BTreeSet::new();
+        for &row in &retirement.rows {
+            if row >= held.metadata.rows || usize::try_from(row).is_err() || !rows.insert(row) {
+                return Err(format!(
+                    "row update has an invalid or duplicate row in {:?}",
+                    retirement.segment_id
+                ));
+            }
+        }
+        updates.push((index, &retirement.rows));
+    }
+    Ok(updates)
+}
+
+/// New segments need ids the set does not hold and ranges after its rows.
+fn check_fresh_sources(
+    current: &OpenedSegmentSet,
+    sources: &[SegmentSource<'_>],
+) -> Result<(), String> {
+    let mut ids: BTreeSet<&str> = current
+        .manifest
+        .segments
+        .iter()
+        .map(|segment| segment.segment_id.as_str())
+        .collect();
+    let end = current
+        .manifest
+        .segments
+        .last()
+        .map(SegmentMetadata::end_label_exclusive)
+        .transpose()?
+        .unwrap_or(0);
+    for source in sources {
+        validate_segment_id(source.segment_id)?;
+        if !ids.insert(source.segment_id) || source.base_label < end {
+            return Err(
+                "row update requires fresh segment ids and ranges after the existing rows".into(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn write_overlay(
