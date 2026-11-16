@@ -109,6 +109,7 @@ impl FloorTracker {
     }
 
     /// The current aggregate floor (`-inf` before any observation).
+    #[cfg(test)]
     pub fn current(&self) -> f32 {
         self.current
     }
