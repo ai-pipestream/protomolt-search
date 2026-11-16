@@ -192,8 +192,6 @@ use topology::CoordinatorTopology;
 pub use topology::TopologyRoute;
 use variants::diff_against;
 use variants::variant_text;
-use vector_fanout::run_shard_with_hedge;
-use vector_fanout::ShardQueryCtx;
 
 /// Default distinct-value cap for `CARDINALITY` aggregations when unspecified.
 pub(crate) const DEFAULT_MAX_DISTINCT: u32 = 100_000;

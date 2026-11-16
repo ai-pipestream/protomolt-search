@@ -104,7 +104,7 @@ impl DecomposedRun<'_> {
                     max_response_bytes: 32 * 1024 * 1024,
                     timeout_ms: 60_000,
                 });
-        let mut fanout = coordinator.open_stream_fanout_with_identities(
+        let mut fanout = coordinator.open_stream_context(StreamOpen::new(
             input.request_id(),
             input.vector(),
             initial_floor,
@@ -112,7 +112,7 @@ impl DecomposedRun<'_> {
             false,
             input.filters(),
             limits,
-        )?;
+        )?)?;
         let mut remaining = self.summaries.len();
         for (shard, summary) in self.summaries.iter_mut().enumerate() {
             if self.mask.as_ref().is_some_and(|mask| mask.skipped[shard]) {

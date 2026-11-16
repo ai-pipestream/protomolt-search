@@ -1,5 +1,7 @@
 //! Vector shard dispatch, hedging, and top-k merging.
 
+mod dispatch;
+
 use super::*;
 
 /// Everything one shard-stream attempt needs, cheap to clone per attempt
@@ -45,6 +47,59 @@ pub(super) fn floor_message(floor: f32) -> SearchShardRequest {
     }
 }
 
+fn start_shard_search(shard: u32, ctx: &ShardQueryCtx) -> Result<SearchShardRequest, Status> {
+    Ok(SearchShardRequest {
+        payload: Some(search_shard_request::Payload::Start(StartShardSearch {
+            read_context: ctx
+                .admission
+                .as_ref()
+                .map(|barrier| barrier.context(shard as usize))
+                .transpose()?,
+            request_id: ctx.request_id.to_string(),
+            k: ctx.k,
+            vector: ctx.vector.as_ref().clone(),
+            tie_complete: ctx.tie_complete,
+            collapse_parents: ctx.collapse,
+            geo_filters: ctx.filters.geo.clone(),
+            filter: ctx.shard_filters.get(shard as usize).cloned().flatten(),
+            enumerate_max_rows: ctx.filters.enumerate_max_rows,
+            patience_saturation_ppm: ctx.filters.patience_saturation_ppm,
+            patience_hops: ctx.filters.patience_hops,
+            floor_prune: ctx.filters.floor_prune,
+            floor_k: ctx.filters.floor_k.or(Some(ctx.k)),
+            floor_share_ppm: ctx
+                .shard_floor_shares
+                .get(shard as usize)
+                .copied()
+                .flatten(),
+            floor_greediness_ppm: ctx.filters.floor_greediness_ppm,
+            floor_clamp_min: ctx.filters.floor_clamp_min,
+            include_rerank_candidate: ctx.filters.include_rerank_candidate,
+        })),
+    })
+}
+
+/// Merge one shard's published floor into the global one.
+fn observe_shard_floor(ctx: &ShardQueryCtx, floor: f32) {
+    let raised = ctx
+        .tracker
+        .lock()
+        .expect("floor tracker mutex poisoned")
+        .observe(floor);
+    if let Some(floor) = raised {
+        // send_if_modified with a strict raise: two racing
+        // pumps can never lower the broadcast value.
+        ctx.gfloor.send_if_modified(|cur| {
+            if floor > *cur {
+                *cur = floor;
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
 /// One `SearchShard` stream attempt against one node: Start, pump floors
 /// both ways, return the terminal Done.
 pub(super) async fn run_shard_stream(
@@ -54,35 +109,7 @@ pub(super) async fn run_shard_stream(
 ) -> Result<SearchShardDone, Status> {
     let (req_tx, req_rx) = mpsc::channel::<SearchShardRequest>(8);
     req_tx
-        .send(SearchShardRequest {
-            payload: Some(search_shard_request::Payload::Start(StartShardSearch {
-                read_context: ctx
-                    .admission
-                    .as_ref()
-                    .map(|barrier| barrier.context(shard as usize))
-                    .transpose()?,
-                request_id: ctx.request_id.to_string(),
-                k: ctx.k,
-                vector: ctx.vector.as_ref().clone(),
-                tie_complete: ctx.tie_complete,
-                collapse_parents: ctx.collapse,
-                geo_filters: ctx.filters.geo.clone(),
-                filter: ctx.shard_filters.get(shard as usize).cloned().flatten(),
-                enumerate_max_rows: ctx.filters.enumerate_max_rows,
-                patience_saturation_ppm: ctx.filters.patience_saturation_ppm,
-                patience_hops: ctx.filters.patience_hops,
-                floor_prune: ctx.filters.floor_prune,
-                floor_k: ctx.filters.floor_k.or(Some(ctx.k)),
-                floor_share_ppm: ctx
-                    .shard_floor_shares
-                    .get(shard as usize)
-                    .copied()
-                    .flatten(),
-                floor_greediness_ppm: ctx.filters.floor_greediness_ppm,
-                floor_clamp_min: ctx.filters.floor_clamp_min,
-                include_rerank_candidate: ctx.filters.include_rerank_candidate,
-            })),
-        })
+        .send(start_shard_search(shard, &ctx)?)
         .await
         .map_err(|_| Status::internal("node request channel closed before Start"))?;
     let mut responses = client
@@ -121,23 +148,7 @@ pub(super) async fn run_shard_stream(
             Ok(Some(SearchShardResponse {
                 payload: Some(search_shard_response::Payload::FloorUpdate(u)),
             })) => {
-                let raised = ctx
-                    .tracker
-                    .lock()
-                    .expect("floor tracker mutex poisoned")
-                    .observe(u.floor);
-                if let Some(floor) = raised {
-                    // send_if_modified with a strict raise: two racing
-                    // pumps can never lower the broadcast value.
-                    ctx.gfloor.send_if_modified(|cur| {
-                        if floor > *cur {
-                            *cur = floor;
-                            true
-                        } else {
-                            false
-                        }
-                    });
-                }
+                observe_shard_floor(&ctx, u.floor);
             }
             Ok(Some(SearchShardResponse {
                 payload: Some(search_shard_response::Payload::Done(done)),
@@ -297,125 +308,37 @@ impl CoordinatorServiceImpl {
             pinned.validate_read_versions(&reads).await?;
             return result;
         }
-        let n_nodes = self.node_addrs.len();
-        if n_nodes == 0 {
-            return Err(Status::failed_precondition("no shard nodes configured"));
-        }
-
-        let admission = self.vector_read_barrier()?;
-        self.ensure_shard_vector_rows().await;
-        let mut workers = tokio::task::JoinSet::new();
-        let mask = self.vector_scan_mask(filters.tree.as_ref());
-        let ctx = ShardQueryCtx {
-            admission: admission.clone(),
-            request_id: Arc::from(request_id),
-            vector: Arc::new(vector.to_vec()),
-            k,
-            tie_complete,
-            collapse: false,
-            filters: Arc::new(filters.clone()),
-            shard_filters: Arc::new(self.shard_filter_trees(filters, mask.as_ref())),
-            shard_floor_shares: Arc::new(self.shard_floor_share_ppms(filters, mask.as_ref())),
-            tracker: Arc::new(Mutex::new(FloorTracker::new())),
-            gfloor: Arc::new(watch::channel(f32::NEG_INFINITY).0),
-            hedges: Arc::new(AtomicU64::new(0)),
-            hedge_wins: Arc::new(AtomicU64::new(0)),
-        };
-        let (hedges, hedge_wins) = (Arc::clone(&ctx.hedges), Arc::clone(&ctx.hedge_wins));
-        let mut known = Self::filter_known(filters, mask.as_ref());
-        let active = (0..n_nodes)
-            .filter(|shard| !mask.as_ref().is_some_and(|m| m.skipped[*shard]))
-            .count();
-
-        let (done_tx, mut done_rx) =
-            mpsc::channel::<(u32, f32, Result<SearchShardDone, Status>)>(n_nodes);
-        for shard in 0..n_nodes {
-            if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
-                continue;
-            }
-            let primary = self.node_client(&self.node_addrs[shard])?;
-            let replica = match self.replica_addrs.get(shard).and_then(|r| r.as_deref()) {
-                Some(addr) => Some(self.node_client(addr)?),
-                None => None,
-            };
-            let ctx = ctx.clone();
-            let limits = self.limits();
-            let done_tx = done_tx.clone();
-            workers.spawn(async move {
-                let t0 = std::time::Instant::now();
-                let admission = ctx.admission.clone();
-                let result =
-                    run_shard_with_hedge(shard as u32, primary, replica, ctx, limits).await;
-                if let (Some(admission), Err(error)) = (admission, &result) {
-                    admission.fail(error.clone());
-                }
-                let wall_ms = t0.elapsed().as_secs_f32() * 1e3;
-                let _ = done_tx.send((shard as u32, wall_ms, result)).await;
-            });
-        }
-        drop(done_tx);
-
-        let mut shard_hits: Vec<(u32, Vec<(u64, f32)>)> = Vec::with_capacity(n_nodes);
+        let mut scan = self
+            .dispatch_vector_shards(request_id, vector, k, tie_complete, false, filters)
+            .await?;
         let mut identities = HashMap::new();
         let mut rerank_candidates: HashMap<u64, crate::pb::RerankCandidatePayload> = HashMap::new();
-        let mut shard_stats: Vec<Option<ShardScanStats>> = Vec::with_capacity(n_nodes);
-        let mut shard_wall_ms: Vec<(u32, f32)> = Vec::with_capacity(n_nodes);
-        // A skipped shard is a shard with no matching row: no hits, no
-        // stats, no wall time.
-        for shard in 0..n_nodes {
-            if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
-                shard_hits.push((shard as u32, Vec::new()));
-                shard_stats.push(None);
-                shard_wall_ms.push((shard as u32, 0.0));
-            }
-        }
-        for _ in 0..active {
-            match done_rx.recv().await {
-                Some((shard, wall_ms, Ok(done))) => {
-                    known.merge_shard(
-                        shard as usize,
-                        &done.geo_columns_known,
-                        &done.filter_columns_known,
-                    )?;
-                    for hit in &done.hits {
-                        if let Some(identity) = hit.identity.as_ref() {
-                            identities.insert((shard, hit.vector_id), identity.clone());
-                        }
-                        if let Some(cand) = hit.rerank_candidate.as_ref() {
-                            rerank_candidates
-                                .entry(hit.vector_id)
-                                .or_insert_with(|| cand.clone());
-                        }
-                    }
-                    shard_hits.push((
-                        shard,
-                        done.hits
-                            .into_iter()
-                            .map(|h| (h.vector_id, h.score))
-                            .collect(),
-                    ));
-                    shard_stats.push(done.stats);
-                    shard_wall_ms.push((shard, wall_ms));
+        for _ in 0..scan.active {
+            let (shard, wall_ms, done) = scan.next_done().await?;
+            for hit in &done.hits {
+                if let Some(identity) = hit.identity.as_ref() {
+                    identities.insert((shard, hit.vector_id), identity.clone());
                 }
-                Some((shard, _, Err(e))) => {
-                    return Err(Status::new(
-                        if admission.is_some() {
-                            e.code()
-                        } else {
-                            tonic::Code::Internal
-                        },
-                        format!("shard {shard} failed: {e}"),
-                    ));
-                }
-                None => {
-                    return Err(Status::internal("fan-out completed without all shards"));
+                if let Some(cand) = hit.rerank_candidate.as_ref() {
+                    rerank_candidates
+                        .entry(hit.vector_id)
+                        .or_insert_with(|| cand.clone());
                 }
             }
+            scan.shard_hits.push((
+                shard,
+                done.hits
+                    .into_iter()
+                    .map(|h| (h.vector_id, h.score))
+                    .collect(),
+            ));
+            scan.shard_stats.push(done.stats);
+            scan.shard_wall_ms.push((shard, wall_ms));
         }
 
-        known.refuse_unknown(filters)?;
+        scan.known.refuse_unknown(filters)?;
 
-        let hits = merge_topk(shard_hits.iter().cloned(), k as usize)
+        let hits = merge_topk(scan.shard_hits.iter().cloned(), k as usize)
             .into_iter()
             .map(|h| ScoredHit {
                 identity: identities.get(&(h.shard, h.vector_id)).cloned(),
@@ -427,11 +350,11 @@ impl CoordinatorServiceImpl {
             .collect();
         Ok(FanoutResult {
             hits,
-            shard_stats,
-            shard_hits,
-            shard_wall_ms,
-            hedges_fired: hedges.load(AtomicOrdering::Relaxed),
-            hedge_wins: hedge_wins.load(AtomicOrdering::Relaxed),
+            shard_stats: scan.shard_stats,
+            shard_hits: scan.shard_hits,
+            shard_wall_ms: scan.shard_wall_ms,
+            hedges_fired: scan.hedges.load(AtomicOrdering::Relaxed),
+            hedge_wins: scan.hedge_wins.load(AtomicOrdering::Relaxed),
             rerank_candidates,
         })
     }

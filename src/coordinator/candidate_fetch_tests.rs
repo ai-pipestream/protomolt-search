@@ -3,8 +3,9 @@
 use super::*;
 use crate::pb::*;
 
-#[tokio::test]
-async fn membership_planning_keeps_authority_separate_from_user_fields_and_versions() {
+/// Two shards, each holding a public red row with text "alpha" and a private
+/// blue row with text "secret".
+async fn two_audience_shards() -> Vec<Arc<crate::node::NodeServiceImpl>> {
     let mut nodes = Vec::new();
     for shard in 0..2 {
         let node = Arc::new(crate::node::NodeServiceImpl::new(
@@ -40,11 +41,12 @@ async fn membership_planning_keeps_authority_separate_from_user_fields_and_versi
             .unwrap();
         nodes.push(node);
     }
-    let owner = CoordinatorServiceImpl::with_local_nodes(nodes.clone()).with_bm25(
-        Some(crate::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
-        Default::default(),
-    );
-    let access = AccessDecision {
+    nodes
+}
+
+/// Public rows only, with `body` and `color` usable.
+fn public_color_access() -> AccessDecision {
+    AccessDecision {
         action: AccessAction::Search as i32,
         document_visibility: Some(DocumentVisibility {
             filter: crate::cel::compile_filter("audience == 'public'").unwrap(),
@@ -60,8 +62,10 @@ async fn membership_planning_keeps_authority_separate_from_user_fields_and_versi
             ..Default::default()
         }),
         ..Default::default()
-    };
-    let mut reader = owner.for_access(Some(&access), "bm25_search").unwrap();
+    }
+}
+
+async fn pin_fresh_read_versions(reader: &mut CoordinatorServiceImpl) {
     reader.query_read_versions = Some(Arc::new(
         reader
             .read_query_versions(false)
@@ -71,10 +75,9 @@ async fn membership_planning_keeps_authority_separate_from_user_fields_and_versi
             .map(|(_, claim)| claim)
             .collect(),
     ));
-    let all = RequestFilters::default();
-    let universe = reader.filter_membership(&all).await.unwrap();
-    assert_eq!(universe.ids, [0, 100].into_iter().collect());
-    assert_eq!(universe.epochs.len(), 2);
+}
+
+async fn assert_scoped_memberships(reader: &CoordinatorServiceImpl, universe: &MembershipSet) {
     let selected = reader
         .lexical_membership("alpha", Some(&crate::analyzer::body_spec()))
         .await
@@ -103,8 +106,14 @@ async fn membership_planning_keeps_authority_separate_from_user_fields_and_versi
         reader.vector_membership("").await.unwrap_err().code(),
         tonic::Code::PermissionDenied
     );
-    // Exercise the actual negative-only planner. Its starting universe must
-    // exclude private rows even when the negative clause matches no visible row.
+}
+
+/// Exercise the actual negative-only planner. Its starting universe must
+/// exclude private rows even when the negative clause matches no visible row.
+async fn assert_negative_only_plan_stays_in_universe(
+    reader: &CoordinatorServiceImpl,
+    universe: &MembershipSet,
+) {
     let query = QueryRequest {
         k: 4,
         selection: Some(SelectionQuery {
@@ -124,7 +133,7 @@ async fn membership_planning_keeps_authority_separate_from_user_fields_and_versi
         }),
         ..Default::default()
     };
-    let planned = crate::query::execute(&reader, query, 0).await.unwrap();
+    let planned = crate::query::execute(reader, query, 0).await.unwrap();
     assert_eq!(
         planned
             .hits
@@ -133,6 +142,40 @@ async fn membership_planning_keeps_authority_separate_from_user_fields_and_versi
             .collect::<BTreeSet<_>>(),
         universe.ids
     );
+}
+
+/// The refusal of one membership kind: filter, lexical, then vector.
+async fn membership_error(
+    reader: &CoordinatorServiceImpl,
+    all: &RequestFilters,
+    kind: usize,
+) -> Status {
+    match kind {
+        0 => reader.filter_membership(all).await.unwrap_err(),
+        1 => reader
+            .lexical_membership("alpha", Some(&crate::analyzer::body_spec()))
+            .await
+            .unwrap_err(),
+        _ => reader.vector_membership("").await.unwrap_err(),
+    }
+}
+
+#[tokio::test]
+async fn membership_planning_keeps_authority_separate_from_user_fields_and_versions() {
+    let nodes = two_audience_shards().await;
+    let owner = CoordinatorServiceImpl::with_local_nodes(nodes.clone()).with_bm25(
+        Some(crate::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
+        Default::default(),
+    );
+    let access = public_color_access();
+    let mut reader = owner.for_access(Some(&access), "bm25_search").unwrap();
+    pin_fresh_read_versions(&mut reader).await;
+    let all = RequestFilters::default();
+    let universe = reader.filter_membership(&all).await.unwrap();
+    assert_eq!(universe.ids, [0, 100].into_iter().collect());
+    assert_eq!(universe.epochs.len(), 2);
+    assert_scoped_memberships(&reader, &universe).await;
+    assert_negative_only_plan_stays_in_universe(&reader, &universe).await;
     let mut doc_only = access.clone();
     doc_only.field_permissions = None;
     let mut document_reader = owner.for_access(Some(&doc_only), "bm25_search").unwrap();
@@ -150,14 +193,7 @@ async fn membership_planning_keeps_authority_separate_from_user_fields_and_versi
         .await
         .unwrap();
     for kind in 0..3 {
-        let error = match kind {
-            0 => document_reader.filter_membership(&all).await.unwrap_err(),
-            1 => document_reader
-                .lexical_membership("alpha", Some(&crate::analyzer::body_spec()))
-                .await
-                .unwrap_err(),
-            _ => document_reader.vector_membership("").await.unwrap_err(),
-        };
+        let error = membership_error(&document_reader, &all, kind).await;
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert!(error
             .message()
@@ -169,14 +205,7 @@ async fn membership_planning_keeps_authority_separate_from_user_fields_and_versi
     });
     let unknown = owner.for_access(Some(&absent), "bm25_search").unwrap();
     for kind in 0..3 {
-        let error = match kind {
-            0 => unknown.filter_membership(&all).await.unwrap_err(),
-            1 => unknown
-                .lexical_membership("alpha", Some(&crate::analyzer::body_spec()))
-                .await
-                .unwrap_err(),
-            _ => unknown.vector_membership("").await.unwrap_err(),
-        };
+        let error = membership_error(&unknown, &all, kind).await;
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert!(!error.message().contains("private_column"));
     }
@@ -225,8 +254,8 @@ fn membership_view_validation_refuses_legacy_wrong_scope_and_incomplete_claims()
     assert_eq!(known, vec![true]);
 }
 
-#[tokio::test]
-async fn candidate_fetch_enforces_authority_fields_and_documents_before_disclosure() {
+/// One shard holding a public red row and a private row, both boosted.
+async fn audience_boost_node() -> Arc<crate::node::NodeServiceImpl> {
     let node = Arc::new(crate::node::NodeServiceImpl::new(
         None,
         crate::node::NodeConfig {
@@ -262,8 +291,12 @@ async fn candidate_fetch_enforces_authority_fields_and_documents_before_disclosu
         ))
         .await
         .unwrap();
-    let owner = CoordinatorServiceImpl::with_local_nodes(vec![node]);
-    let access = AccessDecision {
+    node
+}
+
+/// Public rows only; `color` usable and disclosable, `boost` usable.
+fn color_disclosure_access() -> AccessDecision {
+    AccessDecision {
         action: AccessAction::Search as i32,
         document_visibility: Some(DocumentVisibility {
             filter: crate::cel::compile_filter("audience == 'public'").unwrap(),
@@ -282,7 +315,14 @@ async fn candidate_fetch_enforces_authority_fields_and_documents_before_disclosu
             ..Default::default()
         }),
         ..Default::default()
-    };
+    }
+}
+
+#[tokio::test]
+async fn candidate_fetch_enforces_authority_fields_and_documents_before_disclosure() {
+    let node = audience_boost_node().await;
+    let owner = CoordinatorServiceImpl::with_local_nodes(vec![node]);
+    let access = color_disclosure_access();
     // The same authority-bound clone used by certified public routes.
     // Query remains refused until all of its phases consume this context.
     let reader = owner.for_access(Some(&access), "bm25_search").unwrap();

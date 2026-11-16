@@ -107,28 +107,6 @@ impl CoordinatorServiceImpl {
 
     /// Open a streaming fan-out with identity resolution; `candidate_depth`
     /// sets per-shard candidate walk depth (required by ANN providers).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn open_stream_fanout_with_identities(
-        &self,
-        request_id: &str,
-        vector: &[f32],
-        initial_floor: Option<f32>,
-        candidate_depth: Option<u32>,
-        collapse_parents: bool,
-        filters: &RequestFilters,
-        identity_limits: Option<crate::pb::StreamIdentityLimits>,
-    ) -> Result<StreamFanout, Status> {
-        self.open_stream_context(StreamOpen::new(
-            request_id,
-            vector,
-            initial_floor,
-            candidate_depth,
-            collapse_parents,
-            filters,
-            identity_limits,
-        )?)
-    }
-
     pub(crate) fn open_stream_context(
         &self,
         query: StreamOpen<'_>,

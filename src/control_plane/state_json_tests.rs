@@ -7,8 +7,7 @@ use super::state::{
 
 use super::*;
 
-/// A complete nondefault state.
-fn complete_state() -> StoredState {
+fn complete_nodes() -> (StoredNode, StoredNode) {
     let capacity = StoredCapacity {
         disk_bytes: (1u64 << 53) + 10_000,
         used_disk_bytes: (1u64 << 53) + 4_321,
@@ -40,6 +39,10 @@ fn complete_state() -> StoredState {
             ..capacity
         },
     };
+    (node_a, node_b)
+}
+
+fn complete_replicas(node_a: &StoredNode, node_b: &StoredNode) -> (StoredReplica, StoredReplica) {
     let replica_a = StoredReplica {
         shard_id: "shard-a".into(),
         node_id: node_a.node_id.clone(),
@@ -74,6 +77,30 @@ fn complete_state() -> StoredState {
         immutable_segments: 2,
         tombstones: (1u64 << 53) + 3,
     };
+    (replica_a, replica_b)
+}
+
+fn complete_action() -> StoredAction {
+    StoredAction {
+        action_id: u64::MAX - 1,
+        kind: PlacementActionKind::CopyReplica as i32,
+        shard_id: "shard-a".into(),
+        peer_shard_id: "peer-a".into(),
+        peer_source_generation: 6,
+        source_node_id: "node/α".into(),
+        target_node_id: "node z".into(),
+        source_generation: 7,
+        target_generation: 8,
+        hash_lo: 0,
+        hash_hi: 99,
+        reason: "rebalance exactly".into(),
+    }
+}
+
+/// A complete nondefault state.
+fn complete_state() -> StoredState {
+    let (node_a, node_b) = complete_nodes();
+    let (replica_a, replica_b) = complete_replicas(&node_a, &node_b);
     let route = |addr: &str, replica: Option<&str>, lo, hi| StoredRoute {
         addr: addr.into(),
         replica: replica.map(str::to_owned),
@@ -121,26 +148,12 @@ fn complete_state() -> StoredState {
         ]
         .into_iter()
         .collect(),
-        actions: vec![StoredAction {
-            action_id: u64::MAX - 1,
-            kind: PlacementActionKind::CopyReplica as i32,
-            shard_id: "shard-a".into(),
-            peer_shard_id: "peer-a".into(),
-            peer_source_generation: 6,
-            source_node_id: "node/α".into(),
-            target_node_id: "node z".into(),
-            source_generation: 7,
-            target_generation: 8,
-            hash_lo: 0,
-            hash_hi: 99,
-            reason: "rebalance exactly".into(),
-        }],
+        actions: vec![complete_action()],
         completed_actions: [3, 9].into_iter().collect(),
     }
 }
 
-#[test]
-fn json_defaults_round_trip_and_unknown_nested_fields_refuse_without_rewrite() {
+fn assert_absent_fields_default_and_round_trip() {
     let mut old_value = serde_json::to_value(complete_state()).unwrap();
     old_value.as_object_mut().unwrap().remove("collection");
     old_value
@@ -179,7 +192,9 @@ fn json_defaults_round_trip_and_unknown_nested_fields_refuse_without_rewrite() {
         serde_json::to_vec(&restored).unwrap(),
         serde_json::to_vec(&old).unwrap()
     );
+}
 
+fn assert_unknown_fields_are_refused_at_every_level() {
     for level in [
         "state", "topology", "route", "node", "capacity", "replica", "action",
     ] {
@@ -222,13 +237,9 @@ fn json_defaults_round_trip_and_unknown_nested_fields_refuse_without_rewrite() {
             "{level}: {error}"
         );
     }
-    let mut missing = serde_json::to_value(complete_state()).unwrap();
-    missing.as_object_mut().unwrap().remove("revision");
-    assert!(serde_json::from_value::<StoredState>(missing)
-        .unwrap_err()
-        .to_string()
-        .contains("missing field"));
+}
 
+fn assert_damaged_state_is_refused_without_rewrite() {
     let root = std::env::temp_dir().join(format!(
         "control-state-json-{}-{}",
         std::process::id(),
@@ -249,6 +260,19 @@ fn json_defaults_round_trip_and_unknown_nested_fields_refuse_without_rewrite() {
     assert!(error.contains("unknown field"), "{error}");
     assert_eq!(std::fs::read(&path).unwrap(), damaged);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn json_defaults_round_trip_and_unknown_nested_fields_refuse_without_rewrite() {
+    assert_absent_fields_default_and_round_trip();
+    assert_unknown_fields_are_refused_at_every_level();
+    let mut missing = serde_json::to_value(complete_state()).unwrap();
+    missing.as_object_mut().unwrap().remove("revision");
+    assert!(serde_json::from_value::<StoredState>(missing)
+        .unwrap_err()
+        .to_string()
+        .contains("missing field"));
+    assert_damaged_state_is_refused_without_rewrite();
 }
 
 #[test]

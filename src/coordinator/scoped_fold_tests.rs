@@ -3,8 +3,9 @@
 use super::*;
 use crate::pb::*;
 
-#[tokio::test]
-async fn browse_checks_fields_before_io_and_uses_the_authority_view() {
+/// One shard holding a public red row and a private blue row, with the link
+/// that wrote them.
+async fn audience_color_fixture() -> (crate::link::NodeLink, CoordinatorServiceImpl) {
     let node = Arc::new(crate::node::NodeServiceImpl::new(
         None,
         crate::node::NodeConfig {
@@ -34,7 +35,12 @@ async fn browse_checks_fields_before_io_and_uses_the_authority_view() {
         .unwrap();
     }
     let owner = CoordinatorServiceImpl::with_local_nodes(vec![node]);
-    let access = AccessDecision {
+    (link, owner)
+}
+
+/// Public rows only; `body` usable, `color` usable and disclosable.
+fn body_color_access() -> AccessDecision {
+    AccessDecision {
         action: AccessAction::Search as i32,
         document_visibility: Some(DocumentVisibility {
             filter: crate::cel::compile_filter("audience == 'public'").unwrap(),
@@ -53,53 +59,11 @@ async fn browse_checks_fields_before_io_and_uses_the_authority_view() {
             ..Default::default()
         }),
         ..Default::default()
-    };
-    let reader = owner.for_access(Some(&access), "aggregate").unwrap();
-    let sort = [BrowseSort {
-        map: None,
-        column: "color".into(),
-        descending: false,
-    }];
-    let rows = reader
-        .fanout_browse(10, None, &sort, &[], 0, &RequestFilters::default())
-        .await
-        .unwrap();
-    assert_eq!(rows.ids, vec![0]);
-    assert_eq!(
-        rows.values,
-        vec![vec![crate::sortkeys::Value::Text("red".into())]]
-    );
-    assert!(reader
-        .fanout_browse(
-            10,
-            None,
-            &sort,
-            &[],
-            0,
-            &RequestFilters::compile(&[], "color == 'blue'").unwrap()
-        )
-        .await
-        .unwrap()
-        .ids
-        .is_empty());
-    let (pinned, _) = reader.pin_read_versions().await.unwrap();
-    link.add_documents(tokio_stream::iter([AddDocumentsRequest {
-        text: "changed".into(),
-        analysis: Some(crate::analyzer::body_spec()),
-        ..Default::default()
-    }]))
-    .await
-    .unwrap();
-    assert_eq!(
-        pinned
-            .fanout_browse(10, None, &[], &[], 0, &RequestFilters::default())
-            .await
-            .err()
-            .unwrap()
-            .code(),
-        tonic::Code::FailedPrecondition
-    );
-    // Even a broken transport must not be touched for a forbidden input.
+    }
+}
+
+/// Even a broken transport must not be touched for a forbidden input.
+async fn assert_forbidden_inputs_skip_io(reader: CoordinatorServiceImpl) {
     let mut denied = reader;
     denied.node_addrs = vec!["http://must-not-resolve.invalid:50051".into()];
     for (sort, terms, filter) in [
@@ -158,6 +122,58 @@ async fn browse_checks_fields_before_io_and_uses_the_authority_view() {
             .code(),
         tonic::Code::PermissionDenied
     );
+}
+
+#[tokio::test]
+async fn browse_checks_fields_before_io_and_uses_the_authority_view() {
+    let (mut link, owner) = audience_color_fixture().await;
+    let access = body_color_access();
+    let reader = owner.for_access(Some(&access), "aggregate").unwrap();
+    let sort = [BrowseSort {
+        map: None,
+        column: "color".into(),
+        descending: false,
+    }];
+    let rows = reader
+        .fanout_browse(10, None, &sort, &[], 0, &RequestFilters::default())
+        .await
+        .unwrap();
+    assert_eq!(rows.ids, vec![0]);
+    assert_eq!(
+        rows.values,
+        vec![vec![crate::sortkeys::Value::Text("red".into())]]
+    );
+    assert!(reader
+        .fanout_browse(
+            10,
+            None,
+            &sort,
+            &[],
+            0,
+            &RequestFilters::compile(&[], "color == 'blue'").unwrap()
+        )
+        .await
+        .unwrap()
+        .ids
+        .is_empty());
+    let (pinned, _) = reader.pin_read_versions().await.unwrap();
+    link.add_documents(tokio_stream::iter([AddDocumentsRequest {
+        text: "changed".into(),
+        analysis: Some(crate::analyzer::body_spec()),
+        ..Default::default()
+    }]))
+    .await
+    .unwrap();
+    assert_eq!(
+        pinned
+            .fanout_browse(10, None, &[], &[], 0, &RequestFilters::default())
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_forbidden_inputs_skip_io(reader).await;
 }
 
 #[test]

@@ -1,5 +1,7 @@
 //! Global term statistics, prefix expansion, and synonym expansion.
 
+mod fused;
+
 use super::*;
 
 /// Analyze query text for one field, returning an empty analysis when text is
@@ -91,82 +93,12 @@ impl CoordinatorServiceImpl {
     ) -> Result<Vec<crate::pb::PrefixExpansion>, Status> {
         let mut out = Vec::with_capacity(prefixes.len());
         for prefix in prefixes {
-            let cap = match prefix.max_expansions {
-                0 => DEFAULT_PREFIX_EXPANSIONS,
-                n if n as usize > MAX_PREFIX_EXPANSIONS => {
-                    return Err(Status::invalid_argument(format!(
-                        "prefix {:?}: max_expansions {n} exceeds the maximum \
-                         {MAX_PREFIX_EXPANSIONS}",
-                        prefix.prefix
-                    )))
-                }
-                n => n as usize,
-            };
+            let cap = prefix_expansion_cap(prefix)?;
             let normalized = crate::analyzer::normalize_prefix(&prefix.prefix, spec)?;
-            let mut tasks = Vec::with_capacity(self.node_addrs.len());
-            for (i, node) in self.node_addrs.iter().enumerate() {
-                let mut client = self.node_client(node)?;
-                let request = crate::pb::ExpandTermPrefixRequest {
-                    visibility: self.document_visibility.clone(),
-                    field: field.to_string(),
-                    prefix: normalized.clone(),
-                    cap: cap as u32,
-                };
-                tasks.push((
-                    i,
-                    tokio::spawn(async move {
-                        client
-                            .expand_term_prefix(request)
-                            .await
-                            .map(|r| r.into_inner())
-                    }),
-                ));
-            }
-            let mut union = std::collections::BTreeSet::new();
-            let scope = crate::visibility::VisibilityScope::new(self.document_visibility.as_ref())?;
-            let mut visibility_known = vec![false; scope.column_count()];
-            let mut known = false;
-            for (shard, task) in tasks {
-                let resp = task.await.map_err(|e| {
-                    Status::internal(format!("prefix expansion task failed: {e}"))
-                })??;
-                scope
-                    .validate_echo(&resp.visibility_fingerprint, &resp.visibility_columns_known)?;
-                for (known, present) in visibility_known
-                    .iter_mut()
-                    .zip(&resp.visibility_columns_known)
-                {
-                    *known |= present;
-                }
-                if !resp.known {
-                    continue;
-                }
-                known = true;
-                if resp.count as usize > cap {
-                    return Err(Status::invalid_argument(format!(
-                        "prefix {normalized:?} on field {field:?} expands to {} terms on shard \
-                         {shard}; the cap is {cap} (raise max_expansions up to \
-                         {MAX_PREFIX_EXPANSIONS}, or lengthen the prefix)",
-                        resp.count
-                    )));
-                }
-                union.extend(resp.terms);
-            }
-            self.check_visibility_columns(&visibility_known)?;
-            if !known {
-                return Err(Status::invalid_argument(format!(
-                    "no shard indexes field {field:?}; prefix {normalized:?} has no dictionary \
-                     to expand in"
-                )));
-            }
-            if union.len() > cap {
-                return Err(Status::invalid_argument(format!(
-                    "prefix {normalized:?} on field {field:?} expands to {} terms across the \
-                     fleet; the cap is {cap} (raise max_expansions up to \
-                     {MAX_PREFIX_EXPANSIONS}, or lengthen the prefix)",
-                    union.len()
-                )));
-            }
+            let tasks = self.spawn_prefix_expansions(field, &normalized, cap)?;
+            let union = self
+                .union_prefix_terms(tasks, field, &normalized, cap)
+                .await?;
             let expanded: Vec<String> = union.into_iter().collect();
             for term in &expanded {
                 if !terms.contains(term) {
@@ -182,154 +114,89 @@ impl CoordinatorServiceImpl {
         Ok(out)
     }
 
-    /// Per-field global stats for a fused query, merged over per-node
-    /// shares served from the stats cache (`fresh` bypasses it; see
-    /// [`Self::body_stats`]). Shares merge elementwise per field, N
-    /// summed once (it is shared — a document is a document).
-    ///
-    /// A partially-known field is tolerated: that is a real
-    /// heterogeneous fleet, and the shards that have it still
-    /// contribute. A field NO shard has is a typo, not a query —
-    /// scoring it as "contributes nothing" would silently return the
-    /// ranking of the REMAINING fields, so a misspelled arm of an A/B
-    /// reads as "no difference". Refused instead.
-    pub(super) async fn fused_stats(
+    fn spawn_prefix_expansions(
         &self,
-        stats_fields: &[crate::pb::FieldTerms],
-        fresh: bool,
-    ) -> Result<FusedGlobals, Status> {
-        self.fused_stats_probing(stats_fields, fresh, stats_fields.len())
-            .await
-    }
-
-    /// [`Self::fused_stats`] where entries from `probe_from` onward are optional
-    /// probe fields (such as bigram columns) that are tolerated when absent
-    /// across all shards, while earlier caller-named fields still refuse on typos.
-    pub(super) async fn fused_stats_probing(
-        &self,
-        stats_fields: &[crate::pb::FieldTerms],
-        fresh: bool,
-        probe_from: usize,
-    ) -> Result<FusedGlobals, Status> {
-        let n = self.node_addrs.len();
-        let scope = crate::visibility::VisibilityScope::new(self.document_visibility.as_ref())?;
-        let mut visibility_known = vec![false; scope.column_count()];
-        let mut shares: Vec<Option<crate::stats_cache::FusedShare>> = vec![None; n];
-        if !fresh {
-            for (i, share) in shares.iter_mut().enumerate() {
-                *share = self
-                    .stats_cache
-                    .lookup_fused_scoped(i, stats_fields, &scope);
-            }
-        }
-        let mut fetch_tasks = Vec::new();
-        for (i, share) in shares.iter().enumerate() {
-            if share.is_some() {
-                continue;
-            }
-            let request = TermStatsRequest {
-                version_only: false,
+        field: &str,
+        normalized: &str,
+        cap: usize,
+    ) -> Result<Vec<(usize, PrefixTask)>, Status> {
+        let mut tasks = Vec::with_capacity(self.node_addrs.len());
+        for (i, node) in self.node_addrs.iter().enumerate() {
+            let mut client = self.node_client(node)?;
+            let request = crate::pb::ExpandTermPrefixRequest {
                 visibility: self.document_visibility.clone(),
-                terms: Vec::new(),
-                fields: stats_fields.to_vec(),
+                field: field.to_string(),
+                prefix: normalized.to_string(),
+                cap: cap as u32,
             };
-            let mut client = self.node_client(&self.node_addrs[i])?;
-            self.stats_cache.note_fetch();
-            fetch_tasks.push((
+            tasks.push((
                 i,
-                tokio::spawn(
-                    async move { client.term_stats(request).await.map(|r| r.into_inner()) },
-                ),
+                tokio::spawn(async move {
+                    client
+                        .expand_term_prefix(request)
+                        .await
+                        .map(|r| r.into_inner())
+                }),
             ));
         }
-        for (i, task) in fetch_tasks {
+        Ok(tasks)
+    }
+
+    /// The union of every shard's dictionary matches, refusing a prefix that
+    /// exceeds `cap` on one shard or across the fleet, or that no shard
+    /// indexes.
+    async fn union_prefix_terms(
+        &self,
+        tasks: Vec<(usize, PrefixTask)>,
+        field: &str,
+        normalized: &str,
+        cap: usize,
+    ) -> Result<std::collections::BTreeSet<String>, Status> {
+        let mut union = std::collections::BTreeSet::new();
+        let scope = crate::visibility::VisibilityScope::new(self.document_visibility.as_ref())?;
+        let mut visibility_known = vec![false; scope.column_count()];
+        let mut known = false;
+        for (shard, task) in tasks {
             let resp = task
                 .await
-                .map_err(|e| Status::internal(format!("term stats task failed: {e}")))??;
-            if resp.field_stats.len() != stats_fields.len() {
-                return Err(Status::internal(format!(
-                    "shard returned {} field stats for {} fields",
-                    resp.field_stats.len(),
-                    stats_fields.len()
-                )));
-            }
-            for (ft, fs) in stats_fields.iter().zip(&resp.field_stats) {
-                if fs.doc_frequencies.len() != ft.terms.len() {
-                    return Err(Status::internal("shard field stats df length mismatch"));
-                }
-            }
-            self.stats_cache
-                .store_scoped(i, &[], stats_fields, &scope, &resp)?;
-            shares[i] = Some(crate::stats_cache::FusedShare {
-                visibility_columns_known: resp.visibility_columns_known.clone(),
-                epoch: StatsClaim::required(resp.stats_epoch, &resp.stats_incarnation)?,
-                doc_count: resp.doc_count,
-                fields: resp
-                    .field_stats
-                    .iter()
-                    .map(|fs| crate::stats_cache::FusedFieldShare {
-                        total_doc_length: fs.total_doc_length,
-                        known: fs.known,
-                        positions: fs.positions,
-                        dfs: fs.doc_frequencies.clone(),
-                    })
-                    .collect(),
-            });
-        }
-        let mut doc_count = 0u64;
-        let mut totals = vec![0u64; stats_fields.len()];
-        let mut dfs: Vec<Vec<u32>> = stats_fields
-            .iter()
-            .map(|ft| vec![0u32; ft.terms.len()])
-            .collect();
-        let mut known_somewhere = vec![false; stats_fields.len()];
-        let mut known_shards = vec![0usize; stats_fields.len()];
-        let mut positions_shards = vec![0usize; stats_fields.len()];
-        let mut epochs = Vec::with_capacity(n);
-        for share in shares {
-            let s = share.expect("looked up or fetched above");
-            for (known, present) in visibility_known.iter_mut().zip(&s.visibility_columns_known) {
+                .map_err(|e| Status::internal(format!("prefix expansion task failed: {e}")))??;
+            scope.validate_echo(&resp.visibility_fingerprint, &resp.visibility_columns_known)?;
+            for (known, present) in visibility_known
+                .iter_mut()
+                .zip(&resp.visibility_columns_known)
+            {
                 *known |= present;
             }
-            doc_count += s.doc_count;
-            for (fi, fs) in s.fields.iter().enumerate() {
-                totals[fi] += fs.total_doc_length;
-                known_somewhere[fi] |= fs.known;
-                known_shards[fi] += usize::from(fs.known);
-                positions_shards[fi] += usize::from(fs.positions);
-                for (acc, df) in dfs[fi].iter_mut().zip(&fs.dfs) {
-                    *acc += df;
-                }
+            if !resp.known {
+                continue;
             }
-            epochs.push(s.epoch);
+            known = true;
+            if resp.count as usize > cap {
+                return Err(Status::invalid_argument(format!(
+                    "prefix {normalized:?} on field {field:?} expands to {} terms on shard \
+                     {shard}; the cap is {cap} (raise max_expansions up to \
+                     {MAX_PREFIX_EXPANSIONS}, or lengthen the prefix)",
+                    resp.count
+                )));
+            }
+            union.extend(resp.terms);
         }
         self.check_visibility_columns(&visibility_known)?;
-        let unknown: Vec<&str> = stats_fields
-            .iter()
-            .zip(&known_somewhere)
-            .take(probe_from)
-            .filter(|(_, known)| !**known)
-            .map(|(f, _)| f.field.as_str())
-            .collect();
-        if !unknown.is_empty() {
+        if !known {
             return Err(Status::invalid_argument(format!(
-                "no shard indexes {}: scoring an unknown field would silently return the \
-                 remaining fields' ranking. Check the spelling, or the nodes' --bm25-fields.",
-                unknown
-                    .iter()
-                    .map(|f| format!("{f:?}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "no shard indexes field {field:?}; prefix {normalized:?} has no dictionary \
+                 to expand in"
             )));
         }
-        Ok(FusedGlobals {
-            doc_count,
-            totals,
-            dfs,
-            epochs,
-            known_shards,
-            positions_shards,
-        })
+        if union.len() > cap {
+            return Err(Status::invalid_argument(format!(
+                "prefix {normalized:?} on field {field:?} expands to {} terms across the \
+                 fleet; the cap is {cap} (raise max_expansions up to \
+                 {MAX_PREFIX_EXPANSIONS}, or lengthen the prefix)",
+                union.len()
+            )));
+        }
+        Ok(union)
     }
 
     /// GLOBAL BM25 corpus stats for `terms`, summed over per-node shares
@@ -450,4 +317,21 @@ impl CoordinatorServiceImpl {
         }
         Ok(terms)
     }
+}
+
+type PrefixTask = tokio::task::JoinHandle<Result<crate::pb::ExpandTermPrefixResponse, Status>>;
+
+fn prefix_expansion_cap(prefix: &crate::pb::TermPrefix) -> Result<usize, Status> {
+    let cap = match prefix.max_expansions {
+        0 => DEFAULT_PREFIX_EXPANSIONS,
+        n if n as usize > MAX_PREFIX_EXPANSIONS => {
+            return Err(Status::invalid_argument(format!(
+                "prefix {:?}: max_expansions {n} exceeds the maximum \
+                 {MAX_PREFIX_EXPANSIONS}",
+                prefix.prefix
+            )))
+        }
+        n => n as usize,
+    };
+    Ok(cap)
 }
