@@ -13,22 +13,34 @@ impl DocumentCatalog {
         &self,
         request: &PrepareDocumentProjectionRequest,
     ) -> Result<PreparedDocumentProjection, Status> {
-        if !valid_history_id(&request.history_id)
-            || request.document_key.is_empty()
-            || request.document_key.len() > 16 * 1024
-            || request.version == 0
-        {
-            return Err(Status::invalid_argument(
-                "projection requires history_id, document_key and a positive exact version",
+        validate_request(request)?;
+        let mut result = self.accepted_version(request)?;
+        if result.deleted {
+            if !request.expected_plan_fingerprint.is_empty()
+                || !request.body_path.is_empty()
+                || request.index_definition.is_some()
+            {
+                return Err(Status::invalid_argument(
+                    "a deletion projection cannot declare a mapping",
+                ));
+            }
+        } else {
+            project_rows(request, &mut result)?;
+        }
+        if result.encoded_len() as u64 > request.max_bytes {
+            return Err(Status::resource_exhausted(
+                "document projection exceeds max_bytes",
             ));
         }
-        if !(1..=65536).contains(&request.max_rows)
-            || !(1..=64 * 1024 * 1024).contains(&request.max_bytes)
-        {
-            return Err(Status::invalid_argument(
-                "projection requires max_rows 1 to 65536 and max_bytes 1 to 64 MiB",
-            ));
-        }
+        Ok(result)
+    }
+
+    /// The exact accepted version the request names, checked against the
+    /// catalog header and the accepted history, with no rows yet.
+    fn accepted_version(
+        &self,
+        request: &PrepareDocumentProjectionRequest,
+    ) -> Result<PreparedDocumentProjection, Status> {
         let transaction = self.database.begin_read().map_err(storage)?;
         let meta = transaction.open_table(META).map_err(storage)?;
         let header: DocumentCatalogHeader = decode_header(
@@ -80,7 +92,7 @@ impl DocumentCatalog {
                 "projection version does not match accepted history",
             ));
         }
-        let mut result = PreparedDocumentProjection {
+        Ok(PreparedDocumentProjection {
             history_id: header.history_id,
             document_key: version.document_key,
             version: version.version,
@@ -88,74 +100,86 @@ impl DocumentCatalog {
             source,
             deleted: version.deleted,
             ..Default::default()
-        };
-        if result.deleted {
-            if !request.expected_plan_fingerprint.is_empty()
-                || !request.body_path.is_empty()
-                || request.index_definition.is_some()
-            {
-                return Err(Status::invalid_argument(
-                    "a deletion projection cannot declare a mapping",
-                ));
-            }
-        } else {
-            if request.expected_plan_fingerprint.is_empty() {
-                return Err(Status::invalid_argument(
-                    "projection requires the reviewed plan fingerprint",
-                ));
-            }
-            let source = result.source.as_ref().expect("verified source version");
-            let extractor = Extractor::with_definition(
-                &source.descriptor_set,
-                &source.message_type,
-                &request.body_path,
-                request.index_definition.as_ref(),
-            )?;
-            if extractor.plan().fingerprint != request.expected_plan_fingerprint {
-                return Err(Status::failed_precondition(
-                    "projection plan fingerprint differs from the reviewed plan",
-                ));
-            }
-            result.plan_fingerprint = extractor.plan().fingerprint.clone();
-            result.body_path = extractor.body_path().to_string();
-            let mut used = result.encoded_len() as u64;
-            if used > request.max_bytes {
-                return Err(Status::resource_exhausted(
-                    "projection metadata exceeds max_bytes",
-                ));
-            }
-            extractor.visit_rows(
-                &source.payload,
-                request.max_rows as usize,
-                |ordinal, mut row| {
-                    row.request.identity = Some(DocumentIdentity {
-                        document_key: result.document_key.clone(),
-                        version: result.version,
-                        chunk_ordinal: ordinal,
-                    });
-                    row.request.source_chunk_ordinal = ordinal;
-                    let row = DocumentProjectionRow {
-                        document: Some(row.request),
-                        vector: row.vector,
-                    };
-                    let size = row.encoded_len() as u64;
-                    let framed = 1 + prost::encoding::encoded_len_varint(size) as u64 + size;
-                    if framed > request.max_bytes - used {
-                        return Err(Status::resource_exhausted(
-                            "document projection exceeds max_bytes",
-                        ));
-                    }
-                    used += framed;
-                    result.rows.push(row);
-                    Ok(())
-                },
-            )?;
-        }
-        if result.encoded_len() as u64 > request.max_bytes {
-            return Err(Status::resource_exhausted(
-                "document projection exceeds max_bytes",
-            ));
-        }
-        Ok(result)
+        })
     }
+}
+
+fn validate_request(request: &PrepareDocumentProjectionRequest) -> Result<(), Status> {
+    if !valid_history_id(&request.history_id)
+        || request.document_key.is_empty()
+        || request.document_key.len() > 16 * 1024
+        || request.version == 0
+    {
+        return Err(Status::invalid_argument(
+            "projection requires history_id, document_key and a positive exact version",
+        ));
+    }
+    if !(1..=65536).contains(&request.max_rows)
+        || !(1..=64 * 1024 * 1024).contains(&request.max_bytes)
+    {
+        return Err(Status::invalid_argument(
+            "projection requires max_rows 1 to 65536 and max_bytes 1 to 64 MiB",
+        ));
+    }
+    Ok(())
+}
+
+/// Extract the version's rows under the reviewed plan, within the
+/// request's row and byte bounds.
+fn project_rows(
+    request: &PrepareDocumentProjectionRequest,
+    result: &mut PreparedDocumentProjection,
+) -> Result<(), Status> {
+    if request.expected_plan_fingerprint.is_empty() {
+        return Err(Status::invalid_argument(
+            "projection requires the reviewed plan fingerprint",
+        ));
+    }
+    let source = result.source.as_ref().expect("verified source version");
+    let extractor = Extractor::with_definition(
+        &source.descriptor_set,
+        &source.message_type,
+        &request.body_path,
+        request.index_definition.as_ref(),
+    )?;
+    if extractor.plan().fingerprint != request.expected_plan_fingerprint {
+        return Err(Status::failed_precondition(
+            "projection plan fingerprint differs from the reviewed plan",
+        ));
+    }
+    result.plan_fingerprint = extractor.plan().fingerprint.clone();
+    result.body_path = extractor.body_path().to_string();
+    let mut used = result.encoded_len() as u64;
+    if used > request.max_bytes {
+        return Err(Status::resource_exhausted(
+            "projection metadata exceeds max_bytes",
+        ));
+    }
+    extractor.visit_rows(
+        &source.payload,
+        request.max_rows as usize,
+        |ordinal, mut row| {
+            row.request.identity = Some(DocumentIdentity {
+                document_key: result.document_key.clone(),
+                version: result.version,
+                chunk_ordinal: ordinal,
+            });
+            row.request.source_chunk_ordinal = ordinal;
+            let row = DocumentProjectionRow {
+                document: Some(row.request),
+                vector: row.vector,
+            };
+            let size = row.encoded_len() as u64;
+            let framed = 1 + prost::encoding::encoded_len_varint(size) as u64 + size;
+            if framed > request.max_bytes - used {
+                return Err(Status::resource_exhausted(
+                    "document projection exceeds max_bytes",
+                ));
+            }
+            used += framed;
+            result.rows.push(row);
+            Ok(())
+        },
+    )?;
+    Ok(())
 }

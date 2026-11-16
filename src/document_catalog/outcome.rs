@@ -1,14 +1,14 @@
-//! Write outcomes (docs/document-writes.md, "Write outcomes"): the record
-//! of what a durable write became once its lease was judged. A write whose
-//! lease is still open when its commit returns is ACCEPTED in the same
-//! transaction. One whose lease lapsed before its commit returned is
-//! marked UNCONFIRMED in a transaction of its own, then settled under a
-//! fresh lease: ACCEPTED when the actor's right is still current, FENCED
-//! with the control revision at which the right was found gone. The marks
-//! live on the operation record (so a retry replays the settled decision)
-//! and on the version (so a history reader can tell a fenced version by
-//! name). A version's bytes are never rewritten: only the outcome fields
-//! move, and only forward, ACCEPTED to UNCONFIRMED to one of the two.
+//! Write outcomes: the record of what a durable write became once its
+//! lease was judged. A write whose lease is still open when its commit
+//! returns is ACCEPTED in the same transaction. One whose lease lapsed
+//! before its commit returned is marked UNCONFIRMED in a transaction of
+//! its own, then settled under a fresh lease: ACCEPTED when the actor's
+//! right is still current, FENCED with the control revision at which the
+//! right was found gone. The marks live on the operation record (so a
+//! retry replays the settled decision) and on the version (so a history
+//! reader can tell a fenced version by name). A version's bytes are never
+//! rewritten: only the outcome fields move, and only forward, ACCEPTED to
+//! UNCONFIRMED to one of the two.
 use super::*;
 
 /// The settled decision of an unconfirmed write.
@@ -121,19 +121,7 @@ impl DocumentCatalog {
             version: receipt.version,
         }
         .encode_to_vec();
-        let mut version: DocumentVersion = {
-            let versions = transaction.open_table(VERSIONS).map_err(storage)?;
-            let bytes = versions
-                .get(version_key.as_slice())
-                .map_err(storage)?
-                .ok_or_else(|| {
-                    crate::raft::reasons::reason(
-                        Status::data_loss("operation names a version the catalog does not hold"),
-                        crate::raft::reasons::OUTCOME_VERSION_UNKNOWN,
-                    )
-                })?;
-            decode(bytes.value())?
-        };
+        let mut version = operation_version(&transaction, &version_key)?;
         if version.accepted_sequence != receipt.accepted_sequence
             || outcome_of(version.outcome)? != current
         {
@@ -151,20 +139,7 @@ impl DocumentCatalog {
             .map_err(storage)?
             .insert(version_key.as_slice(), version_bytes.as_slice())
             .map_err(storage)?;
-        {
-            let mut heads = transaction.open_table(HEADS).map_err(storage)?;
-            let is_head = heads
-                .get(receipt.document_key.as_slice())
-                .map_err(storage)?
-                .map(|bytes| decode::<DocumentVersion>(bytes.value()))
-                .transpose()?
-                .is_some_and(|head| head.version == receipt.version);
-            if is_head {
-                heads
-                    .insert(receipt.document_key.as_slice(), version_bytes.as_slice())
-                    .map_err(storage)?;
-            }
-        }
+        refresh_head(&transaction, receipt, &version_bytes)?;
         transaction
             .open_table(operation_key.table())
             .map_err(storage)?
@@ -176,6 +151,44 @@ impl DocumentCatalog {
         transaction.commit().map_err(storage)?;
         Ok(outcome)
     }
+}
+
+/// The version an operation's receipt names.
+#[cfg(feature = "net")]
+fn operation_version(
+    transaction: &redb::WriteTransaction,
+    version_key: &[u8],
+) -> Result<DocumentVersion, Status> {
+    let versions = transaction.open_table(VERSIONS).map_err(storage)?;
+    let bytes = versions.get(version_key).map_err(storage)?.ok_or_else(|| {
+        crate::raft::reasons::reason(
+            Status::data_loss("operation names a version the catalog does not hold"),
+            crate::raft::reasons::OUTCOME_VERSION_UNKNOWN,
+        )
+    })?;
+    decode(bytes.value())
+}
+
+/// Rewrite the document's head when the receipt's version is the head.
+#[cfg(feature = "net")]
+fn refresh_head(
+    transaction: &redb::WriteTransaction,
+    receipt: &DocumentWriteReceipt,
+    version_bytes: &[u8],
+) -> Result<(), Status> {
+    let mut heads = transaction.open_table(HEADS).map_err(storage)?;
+    let is_head = heads
+        .get(receipt.document_key.as_slice())
+        .map_err(storage)?
+        .map(|bytes| decode::<DocumentVersion>(bytes.value()))
+        .transpose()?
+        .is_some_and(|head| head.version == receipt.version);
+    if is_head {
+        heads
+            .insert(receipt.document_key.as_slice(), version_bytes)
+            .map_err(storage)?;
+    }
+    Ok(())
 }
 
 pub(super) fn outcome_of(value: i32) -> Result<WriteOutcome, Status> {

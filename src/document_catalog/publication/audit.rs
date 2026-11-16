@@ -88,6 +88,128 @@ impl Chain {
     }
 }
 
+type Records = redb::ReadOnlyTable<&'static [u8], &'static [u8]>;
+
+/// The pinned tables one walk of the physical history reads.
+struct Audit<'a> {
+    header: &'a DocumentCatalogHeader,
+    decisions: Records,
+    maintenance: Option<Records>,
+    versions: Records,
+    changes: redb::ReadOnlyTable<u64, &'static [u8]>,
+    record_limit: usize,
+}
+
+impl Audit<'_> {
+    /// Walk one index's complete history to its committed tip; returns the
+    /// maintenance decisions the walk consumed.
+    fn index_history(&self, state: &ProjectionJournalState) -> Result<u64, Status> {
+        validate_state(state, &state.index_key, &self.header.history_id)?;
+        if state.pending.is_some()
+            || state.pending_maintenance.is_some()
+            || state.committed_sequence > self.header.accepted_sequence
+        {
+            return Err(damaged(
+                "index state is pending or ahead of accepted history",
+            ));
+        }
+        if state.committed_sequence == 0 {
+            if state.maintenance_tip.is_some() {
+                return Err(damaged("unpublished index has maintenance"));
+            }
+            return Ok(0);
+        }
+        let first: ProjectionIntent = required(
+            &self.decisions,
+            &decision_key(&state.index_key, 1),
+            self.record_limit,
+        )?;
+        validate_intent(&first, &state.index_key, &state.history_id)?;
+        let mut chain = Chain {
+            epoch: first.before_epoch,
+            hash: first.before_manifest_sha256,
+            source_sequence: 0,
+            source_id: Vec::new(),
+            maintenance: None,
+            maintenance_count: 0,
+        };
+        for sequence in 1..=state.committed_sequence {
+            self.source_decision(state, sequence, &mut chain)?;
+        }
+        let last_epoch = state
+            .maintenance_tip
+            .as_ref()
+            .map_or(chain.epoch, |tip| tip.after_epoch.max(chain.epoch));
+        chain.advance(
+            last_epoch,
+            self.maintenance.as_ref(),
+            state,
+            &self.header.collection,
+            self.record_limit,
+        )?;
+        if chain.hash != state.committed_manifest_sha256
+            || chain.maintenance != state.maintenance_tip
+        {
+            return Err(damaged(
+                "committed index tip differs from its complete physical history",
+            ));
+        }
+        Ok(chain.maintenance_count)
+    }
+
+    /// Check one source decision against accepted history and compose it
+    /// onto the chain.
+    fn source_decision(
+        &self,
+        state: &ProjectionJournalState,
+        sequence: u64,
+        chain: &mut Chain,
+    ) -> Result<(), Status> {
+        let intent: ProjectionIntent = required(
+            &self.decisions,
+            &decision_key(&state.index_key, sequence),
+            self.record_limit,
+        )?;
+        validate_intent(&intent, &state.index_key, &state.history_id)?;
+        let source = intent.source.as_ref().expect("validated source intent");
+        let source_key = DocumentVersionKey {
+            document_key: source.document_key.clone(),
+            version: source.version,
+        }
+        .encode_to_vec();
+        let version: DocumentVersion = required(&self.versions, &source_key, self.record_limit)?;
+        if source.accepted_sequence != sequence
+            || *source != version
+            || self
+                .changes
+                .get(sequence)
+                .map_err(storage)?
+                .is_none_or(|key| key.value() != source_key)
+        {
+            return Err(damaged(
+                "historical source decision differs from accepted history",
+            ));
+        }
+        chain.advance(
+            intent.before_epoch,
+            self.maintenance.as_ref(),
+            state,
+            &self.header.collection,
+            self.record_limit,
+        )?;
+        if chain.hash != intent.before_manifest_sha256 {
+            return Err(damaged(
+                "source decision does not follow the preceding physical manifest",
+            ));
+        }
+        chain.epoch = intent.after_epoch;
+        chain.hash = intent.after_manifest_sha256;
+        chain.source_sequence = sequence;
+        chain.source_id = intent.intent_id;
+        Ok(())
+    }
+}
+
 /// Verify all source and maintenance records, not only the latest pair. The
 /// caller supplies states from this same pinned read transaction. No repair,
 /// serving activation, historical artifact reopen or source rewrite occurs.
@@ -105,112 +227,31 @@ pub(in crate::document_catalog) fn verify_checkpoint_chain(
             Err(damaged("index states have no journal header"))
         };
     }
-    let decisions = tx.open_table(DECISIONS).map_err(storage)?;
-    let maintenance = maintenance_table!(tx);
-    let versions = tx.open_table(VERSIONS).map_err(storage)?;
-    let changes = tx.open_table(CHANGES).map_err(storage)?;
+    let audit = Audit {
+        header,
+        decisions: tx.open_table(DECISIONS).map_err(storage)?,
+        maintenance: maintenance_table!(tx),
+        versions: tx.open_table(VERSIONS).map_err(storage)?,
+        changes: tx.open_table(CHANGES).map_err(storage)?,
+        record_limit,
+    };
     let expected = states.iter().try_fold(0u64, |sum, state| {
         sum.checked_add(state.committed_sequence)
             .ok_or_else(|| damaged("source decision count overflow"))
     })?;
-    if decisions.len().map_err(storage)? != expected {
+    if audit.decisions.len().map_err(storage)? != expected {
         return Err(damaged(
             "source decision count differs from committed index sequences",
         ));
     }
     let mut maintenance_count = 0u64;
     for state in states {
-        validate_state(state, &state.index_key, &header.history_id)?;
-        if state.pending.is_some()
-            || state.pending_maintenance.is_some()
-            || state.committed_sequence > header.accepted_sequence
-        {
-            return Err(damaged(
-                "index state is pending or ahead of accepted history",
-            ));
-        }
-        if state.committed_sequence == 0 {
-            if state.maintenance_tip.is_some() {
-                return Err(damaged("unpublished index has maintenance"));
-            }
-            continue;
-        }
-        let first: ProjectionIntent =
-            required(&decisions, &decision_key(&state.index_key, 1), record_limit)?;
-        validate_intent(&first, &state.index_key, &state.history_id)?;
-        let mut chain = Chain {
-            epoch: first.before_epoch,
-            hash: first.before_manifest_sha256,
-            source_sequence: 0,
-            source_id: Vec::new(),
-            maintenance: None,
-            maintenance_count: 0,
-        };
-        for sequence in 1..=state.committed_sequence {
-            let intent: ProjectionIntent = required(
-                &decisions,
-                &decision_key(&state.index_key, sequence),
-                record_limit,
-            )?;
-            validate_intent(&intent, &state.index_key, &state.history_id)?;
-            let source = intent.source.as_ref().expect("validated source intent");
-            let source_key = DocumentVersionKey {
-                document_key: source.document_key.clone(),
-                version: source.version,
-            }
-            .encode_to_vec();
-            let version: DocumentVersion = required(&versions, &source_key, record_limit)?;
-            if source.accepted_sequence != sequence
-                || *source != version
-                || changes
-                    .get(sequence)
-                    .map_err(storage)?
-                    .is_none_or(|key| key.value() != source_key)
-            {
-                return Err(damaged(
-                    "historical source decision differs from accepted history",
-                ));
-            }
-            chain.advance(
-                intent.before_epoch,
-                maintenance.as_ref(),
-                state,
-                &header.collection,
-                record_limit,
-            )?;
-            if chain.hash != intent.before_manifest_sha256 {
-                return Err(damaged(
-                    "source decision does not follow the preceding physical manifest",
-                ));
-            }
-            chain.epoch = intent.after_epoch;
-            chain.hash = intent.after_manifest_sha256;
-            chain.source_sequence = sequence;
-            chain.source_id = intent.intent_id;
-        }
-        let last_epoch = state
-            .maintenance_tip
-            .as_ref()
-            .map_or(chain.epoch, |tip| tip.after_epoch.max(chain.epoch));
-        chain.advance(
-            last_epoch,
-            maintenance.as_ref(),
-            state,
-            &header.collection,
-            record_limit,
-        )?;
-        if chain.hash != state.committed_manifest_sha256
-            || chain.maintenance != state.maintenance_tip
-        {
-            return Err(damaged(
-                "committed index tip differs from its complete physical history",
-            ));
-        }
         maintenance_count = maintenance_count
-            .checked_add(chain.maintenance_count)
+            .checked_add(audit.index_history(state)?)
             .ok_or_else(|| damaged("maintenance decision count overflow"))?;
     }
-    if maintenance
+    if audit
+        .maintenance
         .as_ref()
         .map(|t| t.len())
         .transpose()
