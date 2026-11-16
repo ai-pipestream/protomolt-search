@@ -82,7 +82,6 @@ pub mod scorefn;
 pub mod security;
 pub mod segmented;
 pub mod segments;
-pub mod sha256;
 #[cfg(feature = "net")]
 pub mod snapshot;
 pub mod snapshot_repository;

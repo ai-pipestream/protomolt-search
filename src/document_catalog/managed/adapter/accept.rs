@@ -78,7 +78,7 @@ impl ActiveManagedCatalog {
         else {
             return Ok(None);
         };
-        let request_sha = crate::sha256::digest(&request.encode_to_vec());
+        let request_sha = turbo_sha256::sha256(&request.encode_to_vec()).0;
         if operation.request_sha256.as_slice() != request_sha {
             return Err(crate::raft::reasons::reason(
                 Status::already_exists("operation_id was used for a different document write"),

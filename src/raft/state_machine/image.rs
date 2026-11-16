@@ -35,7 +35,7 @@ pub(super) fn publish(lock: &Mutex<()>, snapshots: &Path, generation: u64) -> Re
 /// Streams the file through a bounded buffer; refuses past `max_bytes`.
 pub(super) fn image_signature(path: &Path, max_bytes: u64) -> Result<ImageSignature, Status> {
     let mut file = std::fs::File::open(path).map_err(io)?;
-    let mut hasher = crate::sha256::Sha256::new();
+    let mut hasher = turbo_sha256::Sha256::new();
     let mut buffer = vec![0u8; STREAM_BUFFER];
     let mut length = 0u64;
     loop {
@@ -53,7 +53,7 @@ pub(super) fn image_signature(path: &Path, max_bytes: u64) -> Result<ImageSignat
     }
     Ok(ImageSignature {
         length,
-        sha256: hasher.finalize(),
+        sha256: hasher.finish().0,
     })
 }
 
@@ -89,7 +89,7 @@ pub fn format_snapshot_id(
         "{}-{}-{}",
         last_log_id.map_or(0, |id| id.index),
         signature.length,
-        crate::sha256::to_hex(&signature.sha256)
+        turbo_sha256::to_hex(signature.sha256)
     )
 }
 

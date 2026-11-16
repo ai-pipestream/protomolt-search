@@ -187,7 +187,7 @@ fn rewrite_archive(bytes: &[u8], mutate: impl FnOnce(&mut SourceArchiveIndex)) -
     let mut output = Vec::new();
     output.extend_from_slice(MAGIC);
     output.extend_from_slice(&(index.len() as u64).to_le_bytes());
-    output.extend_from_slice(&sha256::digest(&index));
+    output.extend_from_slice(&turbo_sha256::sha256(&index).0);
     output.extend_from_slice(&index);
     output.extend_from_slice(&bytes[48 + old_len..]);
     output

@@ -18,7 +18,7 @@ fn explicit_binding_roundtrips_in_both_writers_and_refuses_corruption() {
                 }],
             }
             .encode_to_vec();
-            let mut hasher = pipestream_search::sha256::Sha256::new();
+            let mut hasher = turbo_sha256::Sha256::new();
             hasher.update(b"protomolt.search.mapped-analysis.v1\0");
             hasher.update(&contract);
             let binding = StoredBinding {
@@ -26,7 +26,7 @@ fn explicit_binding_roundtrips_in_both_writers_and_refuses_corruption() {
                 body_path: "body".into(),
                 materialize_sha: String::new(),
                 analysis_sha: if explicit {
-                    pipestream_search::sha256::to_hex(&hasher.finalize())
+                    hasher.finish().to_hex()
                 } else {
                     String::new()
                 },

@@ -16,7 +16,6 @@ use super::type_index::{MsgEntry, TypeIndex};
 use super::walk::PlanWalk;
 use super::{index_definition, refuse, refuse_at, schema_report};
 use crate::pb::{self, hints};
-use crate::sha256;
 
 /// Derive the plan for `message_type` inside `descriptor_set`. Every
 /// ambiguity and every unsupported hint is an error here, before any
@@ -88,7 +87,7 @@ pub fn derive_plan_with_definition(
         dim,
         chunks_path: roles.chunks_path.unwrap_or_default(),
         chunk_id_path: roles.chunk_id_path.unwrap_or_default(),
-        descriptor_sha256: sha256::hex_digest(descriptor_set),
+        descriptor_sha256: turbo_sha256::sha256(descriptor_set).to_hex(),
         schema_report: None,
         vector_binding: None,
         index_definition: canonical_definition,
@@ -274,7 +273,7 @@ pub fn describe_schema(
     }
     Ok(pb::DescribeSchemaResponse {
         report: Some(schema_report::describe(&pool, message_type)?),
-        descriptor_sha256: sha256::hex_digest(descriptor_set),
+        descriptor_sha256: turbo_sha256::sha256(descriptor_set).to_hex(),
     })
 }
 

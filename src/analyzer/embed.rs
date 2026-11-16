@@ -20,6 +20,10 @@ use super::status::{client_err_to_status, inspect_remote_client_err, inspect_rem
 #[cfg(feature = "net")]
 use super::DEFAULT_EMBED_MODEL;
 use super::{AnalysisBackend, RemoteCallOptions};
+use crate::turbo_bridge::embed::EmbedOptions;
+#[cfg(feature = "net")]
+use crate::turbo_bridge::embed::{unit_rows, EmbedRole};
+use crate::turbo_bridge::tensor::OwnedMatrix;
 
 /// Embed `text` through `turbo-kserve`'s Open Inference Protocol (`ModelInfer`)
 /// into one L2-normalized query vector.
@@ -43,16 +47,32 @@ pub async fn embed_text_with_options(
     text: &str,
     options: &RemoteCallOptions,
 ) -> Result<Vec<f32>, Status> {
-    match AnalysisBackend::parse(addr)? {
-        AnalysisBackend::Native | AnalysisBackend::Turbo => {
-            return Err(Status::failed_precondition(
-                "in-process lexical analysis does not provide neural embeddings without a configured model bundle; configure a turbo-kserve endpoint or local embedding provider",
-            ));
-        }
-        AnalysisBackend::Sidecar(_) => {}
-    }
     if text.is_empty() {
+        require_remote(addr)?;
         return Err(Status::invalid_argument("empty text"));
+    }
+    let options = EmbedOptions {
+        call: options.clone(),
+        ..Default::default()
+    };
+    let matrix = embed_texts_with_options(addr, &[text], &options).await?;
+    if !matrix.empty_rows().is_empty() {
+        return Err(Status::failed_precondition("embedding pooled to zero"));
+    }
+    Ok(matrix.data().to_vec())
+}
+
+/// Embed a batch of texts through `turbo-kserve` in one `ModelInfer` call:
+/// one unit-length row per text, in input order. A row that pools to zero
+/// comes back as a zero row listed in [`OwnedMatrix::empty_rows`].
+pub async fn embed_texts_with_options(
+    addr: &str,
+    texts: &[&str],
+    options: &EmbedOptions,
+) -> Result<OwnedMatrix, Status> {
+    require_remote(addr)?;
+    if texts.is_empty() {
+        return Err(Status::invalid_argument("embed batch is empty"));
     }
     #[cfg(not(feature = "net"))]
     {
@@ -61,16 +81,28 @@ pub async fn embed_text_with_options(
     }
     #[cfg(feature = "net")]
     {
-        embed_remote(addr, text, options).await
+        embed_remote(addr, texts, options.role, &options.call).await
+    }
+}
+
+/// Address-based embedding reaches only remote endpoints; an in-process
+/// bundle is opened explicitly as a `LocalBatchEmbedder`.
+fn require_remote(addr: &str) -> Result<(), Status> {
+    match AnalysisBackend::parse(addr)? {
+        AnalysisBackend::Native | AnalysisBackend::Turbo => Err(Status::failed_precondition(
+            "in-process lexical analysis does not provide neural embeddings without a configured model bundle; configure a turbo-kserve endpoint or local embedding provider",
+        )),
+        AnalysisBackend::Sidecar(_) => Ok(()),
     }
 }
 
 #[cfg(feature = "net")]
 async fn embed_remote(
     addr: &str,
-    text: &str,
+    texts: &[&str],
+    role: EmbedRole,
     options: &RemoteCallOptions,
-) -> Result<Vec<f32>, Status> {
+) -> Result<OwnedMatrix, Status> {
     let (clean_addr, model_name, uri_handshake) = parse_embed_endpoint(addr);
     let (remote, generation) = remote_for_generation(&clean_addr, options)?;
     if let Some(hs) = options
@@ -98,34 +130,17 @@ async fn embed_remote(
     } else {
         turbo_client::RemotePriority::Bulk
     };
-    let (mut vec, dim) = remote
+    let (flat, dim) = remote
         .embed_texts(
             &model_name,
-            &[text],
-            Some("query"),
+            texts,
+            role.wire_name(),
             Some(prio),
             options.timeout,
         )
         .await
         .map_err(|e| inspect_remote_client_err(&clean_addr, e))?;
-    if vec.is_empty() || dim == 0 {
-        return Err(Status::failed_precondition(
-            "turbo-kserve returned no embeddings",
-        ));
-    }
-    vec.truncate(dim);
-    let norm = vec
-        .iter()
-        .map(|&v| f64::from(v) * f64::from(v))
-        .sum::<f64>()
-        .sqrt();
-    if norm == 0.0 || !norm.is_finite() {
-        return Err(Status::failed_precondition("embedding pooled to zero"));
-    }
-    for v in &mut vec {
-        *v = (f64::from(*v) / norm) as f32;
-    }
-    Ok(vec)
+    unit_rows(flat, texts.len(), dim)
 }
 
 #[cfg(feature = "net")]

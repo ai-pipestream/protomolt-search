@@ -187,7 +187,7 @@ fn write_bundle_manifest(bundle_dir: &Path, files: &[(&str, &[u8])]) {
             serde_json::json!({
                 "path": rel,
                 "size": bytes.len(),
-                "sha256": pipestream_search::sha256::hex_digest(bytes),
+                "sha256": turbo_sha256::sha256(bytes).to_hex(),
             })
         })
         .collect();
@@ -277,7 +277,7 @@ fn vector_digest(vector: &[f32]) -> String {
     for value in vector {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
-    pipestream_search::sha256::hex_digest(&bytes)
+    turbo_sha256::sha256(&bytes).to_hex()
 }
 
 #[test]
@@ -331,4 +331,40 @@ fn static_empty_pooling_is_none_natively_and_zero_rows_in_turbo() {
     assert_eq!(output.full.data.len(), DIM);
     assert!(output.full.data.iter().all(|value| *value == 0.0));
     assert!(output.full.inv_norm.iter().all(|value| *value == 0.0));
+}
+
+#[tokio::test]
+async fn static_bundles_run_through_the_shared_batch_embedder() {
+    use pipestream_search::turbo_bridge::{
+        BatchEmbedder, EmbedOptions, EmbedRole, LocalBatchEmbedder,
+    };
+    let fx = create_static_fixture("batch");
+    let engine =
+        LocalEmbedEngine::open(&fx.bundle_dir, &LocalEncoderOptions::default(), None, None)
+            .unwrap();
+    let embedder = LocalBatchEmbedder::open(&fx.bundle_dir, None).unwrap();
+    assert_eq!(embedder.dim(), DIM);
+    let texts = ["The quick brown fox", "zero", "fox tail"];
+    let options = EmbedOptions {
+        role: EmbedRole::None,
+        ..Default::default()
+    };
+    let batch = embedder.embed_batch(&texts, &options).await.unwrap();
+    assert_eq!((batch.rows(), batch.dim()), (texts.len(), DIM));
+    assert_eq!(batch.empty_rows(), &[1]);
+    for (index, text) in texts.iter().enumerate() {
+        let single = engine
+            .embed_texts_multires(&[text], EmbedPromptRole::None, &MultiResOptions::default())
+            .unwrap();
+        assert_eq!(
+            vector_digest(batch.view().row(index).unwrap()),
+            vector_digest(&single.full.data),
+            "{text}"
+        );
+    }
+    let blocking = embedder.embed_blocking(&texts, EmbedRole::None).unwrap();
+    assert_eq!(blocking, batch);
+    let empty = embedder.embed_blocking(&[], EmbedRole::None).unwrap_err();
+    assert_eq!(empty.code(), tonic::Code::InvalidArgument);
+    assert_eq!(empty.message(), "embed batch is empty");
 }

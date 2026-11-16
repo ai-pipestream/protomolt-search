@@ -25,7 +25,7 @@ pub(super) fn maintenance_key(key: &[u8], epoch: u64) -> Vec<u8> {
 fn maintenance_hash(intent: &MaintenanceIntent) -> Vec<u8> {
     let mut value = intent.clone();
     value.intent_id.clear();
-    sha256::digest(&value.encode_to_vec()).to_vec()
+    turbo_sha256::sha256(&value.encode_to_vec()).0.to_vec()
 }
 pub(super) fn cursor(intent: &MaintenanceIntent) -> MaintenanceCursor {
     MaintenanceCursor {

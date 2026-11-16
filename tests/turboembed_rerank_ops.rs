@@ -498,7 +498,7 @@ impl TurboVocabularyService for LoopbackVocabServer {
         let idf = VocabularyCorpusIdf::from_entries(doc_count, entries)
             .map_err(Status::invalid_argument)?;
         let bytes = idf.to_bytes();
-        let sha256 = pipestream_search::sha256::hex_digest(&bytes);
+        let sha256 = turbo_sha256::sha256(&bytes).to_hex();
         self.recorded.lock().unwrap().compiled_idf_bytes = bytes.clone();
         Ok(Response::new(CorpusStatisticsArtifactDescriptor {
             artifact_id: format!("tcidf-{}", &sha256[..12]),
@@ -592,7 +592,7 @@ impl TurboVocabularyService for LoopbackVocabServer {
                 artifact.extend_from_slice(&v.to_le_bytes());
             }
         }
-        let sha256 = pipestream_search::sha256::hex_digest(&artifact);
+        let sha256 = turbo_sha256::sha256(&artifact).to_hex();
         Ok(Response::new(VoronoiCentroidArtifactDescriptor {
             artifact_id: format!("tcent-{}", &sha256[..12]),
             model_id: h.model_id,

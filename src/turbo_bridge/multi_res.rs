@@ -53,11 +53,11 @@ impl MultiResVectorOutput {
             let vec: Vec<f32> = slice.iter().map(|v| v * p_inv).collect();
             prefixes.push((take as u32, vec));
         }
-        let mut digest = crate::sha256::Sha256::new();
+        let mut digest = turbo_sha256::Sha256::new();
         for &value in &full {
             digest.update(&value.to_le_bytes());
         }
-        let sha256 = digest.finalize();
+        let sha256 = digest.finish().0;
         Self {
             prefixes,
             full,

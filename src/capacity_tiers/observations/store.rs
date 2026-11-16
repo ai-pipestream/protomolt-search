@@ -3,7 +3,6 @@
 use std::collections::BTreeMap;
 
 use crate::capacity_tiers::{put_u32, ENCODING_VERSION, MAX_COHORT_LENGTH_MS, OBSERVATIONS_DOMAIN};
-use crate::sha256;
 
 use super::committed::CommittedView;
 use super::identity::{ObsKey, PartitionObservation};
@@ -189,7 +188,7 @@ impl ObservationStore {
         for stored in self.records.values() {
             out.extend_from_slice(&stored.obs.canonical_bytes());
         }
-        sha256::digest(&out)
+        turbo_sha256::sha256(&out).0
     }
 }
 
@@ -207,5 +206,5 @@ pub fn observation_set_digest(observations: &[PartitionObservation]) -> [u8; 32]
     for (_, obs) in keyed {
         out.extend_from_slice(&obs.canonical_bytes());
     }
-    sha256::digest(&out)
+    turbo_sha256::sha256(&out).0
 }

@@ -98,7 +98,7 @@ pub async fn stage_from_peer(
         }
     };
     let encoded = manifest.encode();
-    let sha = crate::sha256::hex_digest(&encoded);
+    let sha = turbo_sha256::sha256(&encoded).to_hex();
     stage_manifest(tmp_dir, &encoded).await?;
     let mut frames = PeerFrames {
         stream,

@@ -18,7 +18,7 @@ fn readiness_is_confirmed_from_the_held_binding_and_survives_reopen() {
     assert_eq!(completion.bound_at_sequence, 1);
     assert_eq!(
         completion.binding_sha256,
-        crate::sha256::digest(&binding.encode_to_vec())
+        turbo_sha256::sha256(&binding.encode_to_vec()).0
     );
     assert_eq!(completion.history_id, fixture.receipt.history_id);
     // Caller bytes that differ from the held binding are not admitted.

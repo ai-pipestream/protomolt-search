@@ -49,13 +49,17 @@ pub enum ProjectionRecovery {
 fn manifest_hash(manifest: &SegmentSetManifest) -> Result<Vec<u8>, Status> {
     // Format 1 hashes the typed JSON encoding, independent of file whitespace.
     // The manifest contains the hashes of every artifact and the full binding.
-    Ok(sha256::digest(&serde_json::to_vec(manifest).map_err(storage)?).to_vec())
+    Ok(
+        turbo_sha256::sha256(&serde_json::to_vec(manifest).map_err(storage)?)
+            .0
+            .to_vec(),
+    )
 }
 
 fn intent_hash(intent: &ProjectionIntent) -> Vec<u8> {
     let mut value = intent.clone();
     value.intent_id.clear();
-    sha256::digest(&value.encode_to_vec()).to_vec()
+    turbo_sha256::sha256(&value.encode_to_vec()).0.to_vec()
 }
 
 fn index_key(key: &[u8]) -> Result<(), Status> {

@@ -14,7 +14,6 @@ use control_adversarial::kit;
 use pipestream_search::capacity_tiers::{plan_tiers, TierSnapshot};
 use pipestream_search::pb::storage::CapacityTransitionOutcome;
 use pipestream_search::pb::AccessAction;
-use pipestream_search::sha256;
 use tonic::Code;
 
 const T: u64 = kit::PLANNING_INSTANT_UNIX_MS;
@@ -60,7 +59,7 @@ fn adapter_input_and_plan_digest_stable_across_reopen() {
     assert_eq!(after, before, "reopen changed the adapter's plan view");
     eprintln!(
         "adapter reopen: plan digest {} stable",
-        sha256::to_hex(&after.1)
+        turbo_sha256::to_hex(after.1)
     );
 }
 

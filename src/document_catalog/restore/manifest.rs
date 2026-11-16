@@ -89,7 +89,7 @@ pub(super) fn manifest(
     let mut unsigned = manifest.clone();
     let digest = std::mem::take(&mut unsigned.manifest_sha256);
     if digest != request.expected_manifest_sha256
-        || sha256::digest(&unsigned.encode_to_vec()).as_slice() != digest
+        || turbo_sha256::sha256(&unsigned.encode_to_vec()).0.as_slice() != digest
     {
         return Err(damaged(
             "completion digest differs from the owner's expectation",

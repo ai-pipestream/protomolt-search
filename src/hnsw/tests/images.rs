@@ -136,7 +136,7 @@ fn recrc(b: &mut [u8]) {
 /// Recompute the trailer after a body edit.
 fn reseal(b: &mut [u8]) {
     let n = b.len() - 32;
-    let digest = crate::sha256::digest(&b[..n]);
+    let digest = turbo_sha256::sha256(&b[..n]).0;
     b[n..].copy_from_slice(&digest);
 }
 

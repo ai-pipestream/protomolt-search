@@ -129,7 +129,7 @@ fn a_version_1_file_loads_unchanged_and_carries_no_default() {
     assert_eq!(profile.points().len(), 2);
     assert_eq!(
         profile.fingerprint(),
-        crate::sha256::hex_digest(PROFILE.as_bytes())
+        turbo_sha256::sha256(PROFILE.as_bytes()).to_hex()
     );
     // The new fields are not smuggled into the old version.
     let with_default = PROFILE.replace(
@@ -303,7 +303,7 @@ fn the_document_round_trips_and_the_fingerprint_is_the_bytes() {
     assert_eq!(again.default_target_recall_ppm(), Some(990_000));
     assert_eq!(
         again.fingerprint(),
-        crate::sha256::hex_digest(text.as_bytes())
+        turbo_sha256::sha256(text.as_bytes()).to_hex()
     );
 
     let chosen = choose_points(parsed.measurements(), &[950_000, 990_000, 1_000_000]).unwrap();

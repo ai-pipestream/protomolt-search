@@ -1026,6 +1026,7 @@ dependencies = [
  "tonic-prost-build",
  "tower",
  "turbo-client",
+ "turbo-sha256",
  "turbovec 1.1.2",
  "turbovec-grpc",
  "webpki-roots",

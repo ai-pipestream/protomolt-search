@@ -91,7 +91,7 @@ fn hostile_unlinked_headers_are_refused(dir: &Path, path: &Path) {
         let crc = crate::wal::crc32(&b[..136]);
         b[136..140].copy_from_slice(&crc.to_le_bytes());
         let end = b.len() - 32;
-        let digest = crate::sha256::digest(&b[..end]);
+        let digest = turbo_sha256::sha256(&b[..end]).0;
         b[end..].copy_from_slice(&digest);
     };
     assert_eq!(header_len, 192);

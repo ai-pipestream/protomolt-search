@@ -168,10 +168,10 @@ fn missing(name: &str) -> Status {
 }
 
 fn digest(command: &SourceAuthorityCommand) -> Vec<u8> {
-    let mut hash = crate::sha256::Sha256::new();
+    let mut hash = turbo_sha256::Sha256::new();
     hash.update(b"protomolt.source-authority.command.v1\0");
     hash.update(&command.encode_to_vec());
-    hash.finalize().to_vec()
+    hash.finish().0.to_vec()
 }
 
 fn payload_change(total: u64, removed: usize, added: usize) -> Result<u64, Status> {

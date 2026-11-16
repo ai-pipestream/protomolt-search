@@ -145,10 +145,10 @@ pub(crate) fn valid_digest(digest: &str) -> bool {
 }
 
 fn contract_digest(bytes: &[u8]) -> String {
-    let mut hasher = crate::sha256::Sha256::new();
+    let mut hasher = turbo_sha256::Sha256::new();
     hasher.update(b"protomolt.search.mapped-analysis.v1\0");
     hasher.update(bytes);
-    crate::sha256::to_hex(&hasher.finalize())
+    hasher.finish().to_hex()
 }
 
 pub(crate) fn decode_contract(

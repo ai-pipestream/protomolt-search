@@ -176,7 +176,7 @@ fn read_json_lines<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>, 
 }
 
 fn file_digest(path: &Path) -> Result<String, Error> {
-    Ok(pipestream_search::sha256::hex_digest(&std::fs::read(path)?))
+    Ok(turbo_sha256::sha256(&std::fs::read(path)?).to_hex())
 }
 
 #[derive(Clone, Copy)]

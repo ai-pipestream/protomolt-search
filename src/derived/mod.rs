@@ -76,10 +76,10 @@ impl Eq for Declaration {}
 /// the TOML spelling, so a shard map and a node config that mean the
 /// same declaration agree.
 pub fn fingerprint_of(spec: &pb::DerivedColumns) -> String {
-    let mut hasher = crate::sha256::Sha256::new();
+    let mut hasher = turbo_sha256::Sha256::new();
     hasher.update(FINGERPRINT_DOMAIN);
     hasher.update(&spec.encode_to_vec());
-    crate::sha256::to_hex(&hasher.finalize())
+    hasher.finish().to_hex()
 }
 
 /// Decode a stored canonical declaration.

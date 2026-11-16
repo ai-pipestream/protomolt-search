@@ -8,7 +8,6 @@ use prost_types::{DescriptorProto, FileDescriptorSet};
 use super::type_index::{qualify, MsgEntry, TypeIndex};
 use super::FINGERPRINT_VERSION;
 use crate::pb;
-use crate::sha256;
 
 /// Canonical fingerprint over the derived plan: a fixed-layout byte
 /// encoding (never protobuf serialization, whose byte layout is not
@@ -20,7 +19,7 @@ pub(super) fn fingerprint(
     set: &FileDescriptorSet,
     pool: &DescriptorPool,
 ) -> String {
-    let mut hasher = sha256::Sha256::new();
+    let mut hasher = turbo_sha256::Sha256::new();
     if plan.index_definition.is_some() {
         write_str(&mut hasher, "protomolt.search.index-definition.v1");
     }
@@ -44,13 +43,13 @@ pub(super) fn fingerprint(
         write_str(&mut hasher, &field.search_analyzer);
         hasher.update(&field.family.to_le_bytes());
     }
-    sha256::to_hex(&hasher.finalize())
+    hasher.finish().to_hex()
 }
 
 /// Hash the reachable descriptor graph independently of file order and source comments.
 /// Projection policy is hashed separately above; this graph pins decoding meaning.
 fn hash_wire_schema(
-    hasher: &mut sha256::Sha256,
+    hasher: &mut turbo_sha256::Sha256,
     set: &FileDescriptorSet,
     pool: &DescriptorPool,
     root: &str,
@@ -109,7 +108,7 @@ fn reachable_type_names(
 
 /// Hashes one message's fields and extensions in field-number order.
 fn hash_message(
-    hasher: &mut sha256::Sha256,
+    hasher: &mut turbo_sha256::Sha256,
     entry: &MsgEntry<'_>,
     pool: &DescriptorPool,
     name: &str,
@@ -179,7 +178,7 @@ pub(super) fn reachable_messages(pool: &DescriptorPool, root: &str) -> Vec<Messa
     seen.into_values().collect()
 }
 
-fn write_str(hasher: &mut sha256::Sha256, text: &str) {
+fn write_str(hasher: &mut turbo_sha256::Sha256, text: &str) {
     hasher.update(&(text.len() as u32).to_le_bytes());
     hasher.update(text.as_bytes());
 }

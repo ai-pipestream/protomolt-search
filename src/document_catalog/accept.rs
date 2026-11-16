@@ -82,14 +82,14 @@ fn store_source(
 ) -> Result<Vec<u8>, Status> {
     let source_sha256 = match request.mutation.as_ref().expect("validated") {
         Mutation::Source(source) => {
-            let descriptor_sha = sha256::digest(&source.descriptor_set);
+            let descriptor_sha = turbo_sha256::sha256(&source.descriptor_set).0;
             let record = SourceRecord {
                 descriptor_sha256: descriptor_sha.to_vec(),
                 message_type: source.message_type.clone(),
                 payload: source.payload.clone(),
             }
             .encode_to_vec();
-            let source_sha = sha256::digest(&record);
+            let source_sha = turbo_sha256::sha256(&record).0;
             for (definition, hash, bytes) in [
                 (
                     DESCRIPTORS,
@@ -160,7 +160,7 @@ impl DocumentCatalog {
     ) -> Result<Written, Status> {
         let operation_key = actors::OperationKey::new(principal, &request.operation_id)?;
         validate_write_request(request)?;
-        let request_sha = sha256::digest(&request.encode_to_vec());
+        let request_sha = turbo_sha256::sha256(&request.encode_to_vec()).0;
         if let Some(receipt) = self.accepted_retry(request, &request_sha, &operation_key)? {
             return Ok(receipt);
         }

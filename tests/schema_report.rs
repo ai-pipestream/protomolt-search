@@ -53,7 +53,7 @@ fn source_description_covers_all_field_types_without_a_search_plan() {
     let described = describe_schema(bytes, "source_report.AllShapes").unwrap();
     assert_eq!(
         described.descriptor_sha256,
-        pipestream_search::sha256::hex_digest(bytes)
+        turbo_sha256::sha256(bytes).to_hex()
     );
     let report = described.report.unwrap();
     assert!(!report.requires_index_rows_for_preservation);

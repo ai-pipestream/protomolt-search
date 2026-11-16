@@ -116,7 +116,7 @@ pub(super) fn schema_hash(set: &OpenedSegmentSet, schema: Option<&Schema>) -> [u
             part(&mut hash, derived.fingerprint.as_bytes());
         }
     }
-    hash.finalize()
+    hash.finish().0
 }
 
 pub(super) fn backend(

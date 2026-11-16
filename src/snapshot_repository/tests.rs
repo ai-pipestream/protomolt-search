@@ -19,7 +19,7 @@ fn manifest() -> RepositoryManifest {
         artifacts: vec![Artifact {
             file: "vector.index".into(),
             bytes: 3,
-            sha256: crate::sha256::hex_digest(b"abc"),
+            sha256: turbo_sha256::sha256(b"abc").to_hex(),
         }],
     }
 }
@@ -31,7 +31,7 @@ fn encoding_is_deterministic_and_round_trips() {
     assert_eq!(bytes, m.encode());
     let parsed = RepositoryManifest::parse(&bytes).unwrap();
     assert_eq!(parsed, m);
-    assert_eq!(parsed.sha256(), crate::sha256::hex_digest(&bytes));
+    assert_eq!(parsed.sha256(), turbo_sha256::sha256(&bytes).to_hex());
     let pb = m.to_pb();
     assert_eq!(RepositoryManifest::from_pb(&pb).unwrap(), m);
 }
@@ -70,7 +70,7 @@ fn copy_hash_and_verify_agree_and_name_mismatches() {
     assert_eq!(artifact, manifest().artifacts[0]);
     assert_eq!(
         hash_file(&repo.join("vector.index")).unwrap(),
-        (3, crate::sha256::hex_digest(b"abc"))
+        (3, turbo_sha256::sha256(b"abc").to_hex())
     );
     let m = manifest();
     verify_artifacts(&repo, &m).unwrap();

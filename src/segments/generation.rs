@@ -15,7 +15,7 @@ impl SegmentGenerationDeclaration {
     pub fn encode(declaration: &IndexGenerationDeclaration) -> Result<Self, String> {
         let protobuf = declaration.encode_to_vec();
         let encoded = Self {
-            sha256: crate::sha256::hex_digest(&protobuf),
+            sha256: turbo_sha256::sha256(&protobuf).to_hex(),
             protobuf,
         };
         encoded.decode()?;
@@ -24,7 +24,7 @@ impl SegmentGenerationDeclaration {
     pub fn decode(&self) -> Result<IndexGenerationDeclaration, String> {
         let declaration = IndexGenerationDeclaration::decode(self.protobuf.as_slice())
             .map_err(|error| format!("generation declaration: {error}"))?;
-        if self.sha256 != crate::sha256::hex_digest(&self.protobuf)
+        if self.sha256 != turbo_sha256::sha256(&self.protobuf).to_hex()
             || declaration.encode_to_vec() != self.protobuf
         {
             return Err("generation declaration is noncanonical or its checksum differs".into());
@@ -311,7 +311,7 @@ mod tests {
         assert!(corrupt.decode().is_err());
         let mut unknown = encoded.clone();
         unknown.protobuf.extend_from_slice(&[0x78, 1]);
-        unknown.sha256 = crate::sha256::hex_digest(&unknown.protobuf);
+        unknown.sha256 = turbo_sha256::sha256(&unknown.protobuf).to_hex();
         assert!(unknown.decode().is_err());
         for change in 0..8 {
             let mut bad = value.clone();

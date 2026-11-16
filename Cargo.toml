@@ -14,6 +14,7 @@ resolver = "2"
 turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "main" }
 turbovec-grpc = { git = "https://github.com/ai-pipestream/turbovec-grpc.git", rev = "2cbab637a03d9ffeb5bcc3e40118c48c974a51d6", optional = true }
 turbo-client = { git = "https://github.com/ai-pipestream/turboembed.git", rev = "6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e", default-features = false }
+turbo-sha256 = { git = "https://github.com/ai-pipestream/turboembed.git", rev = "6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e" }
 # Control consensus (docs/raft-control-design.md). Pinned exactly: the
 # storage-v2 contracts are what the log store and state machine implement,
 # and the typed envelopes map to this version's types explicitly.

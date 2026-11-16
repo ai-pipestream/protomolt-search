@@ -122,7 +122,7 @@ impl SegmentBinding {
         }
         .encode_to_vec();
         let value = Self {
-            sha256: crate::sha256::hex_digest(&protobuf),
+            sha256: turbo_sha256::sha256(&protobuf).to_hex(),
             protobuf,
         };
         value.decode()?;
@@ -130,7 +130,7 @@ impl SegmentBinding {
     }
 
     pub fn decode(&self) -> Result<StoredBinding, String> {
-        if self.sha256 != crate::sha256::hex_digest(&self.protobuf) {
+        if self.sha256 != turbo_sha256::sha256(&self.protobuf).to_hex() {
             return Err("segment binding checksum mismatch".into());
         }
         let value = crate::pb::wal::LoggedBinding::decode(self.protobuf.as_slice())
@@ -177,7 +177,7 @@ impl SegmentSourceOwner {
     pub fn encode(owner: &crate::pb::storage::SourceIndexOwner) -> Result<Self, String> {
         let protobuf = owner.encode_to_vec();
         let value = Self {
-            sha256: crate::sha256::hex_digest(&protobuf),
+            sha256: turbo_sha256::sha256(&protobuf).to_hex(),
             protobuf,
         };
         value.decode()?;
@@ -187,7 +187,7 @@ impl SegmentSourceOwner {
     pub fn decode(&self) -> Result<crate::pb::storage::SourceIndexOwner, String> {
         let owner = crate::pb::storage::SourceIndexOwner::decode(self.protobuf.as_slice())
             .map_err(|e| format!("source index owner: {e}"))?;
-        if self.sha256 != crate::sha256::hex_digest(&self.protobuf)
+        if self.sha256 != turbo_sha256::sha256(&self.protobuf).to_hex()
             || owner.encode_to_vec() != self.protobuf
             || owner.format_version != 1
             || owner.history_id.len() != 16

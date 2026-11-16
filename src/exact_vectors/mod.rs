@@ -63,7 +63,7 @@ enum Storage {
         file: File,
         dim: Option<usize>,
         rows: usize,
-        digest: crate::sha256::Sha256,
+        digest: turbo_sha256::Sha256,
         finalized: AtomicBool,
     },
     /// The immutable mapped prefix plus only the new rows in a private spill.
@@ -150,7 +150,7 @@ impl ExactVectorStore {
                 file,
                 dim,
                 rows: 0,
-                digest: crate::sha256::Sha256::new(),
+                digest: turbo_sha256::Sha256::new(),
                 finalized: AtomicBool::new(false),
             },
         })

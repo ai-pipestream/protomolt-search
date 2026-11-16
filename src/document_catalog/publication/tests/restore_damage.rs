@@ -43,7 +43,7 @@ async fn restore_audits_every_file_and_the_complete_inventory() {
                 manifest.artifacts.push(crate::pb::SnapshotArtifact {
                     file: "unowned".into(),
                     bytes: 5,
-                    sha256: sha256::hex_digest(b"extra"),
+                    sha256: turbo_sha256::sha256(b"extra").to_hex(),
                 });
             }
             _ => unreachable!(),
@@ -115,7 +115,7 @@ async fn restore_runs_the_full_historical_source_audit_after_outer_integrity_pas
         tx.commit().unwrap();
     }
     let source_bytes = std::fs::read(bundle.join("sources.redb")).unwrap();
-    let source_sha = sha256::digest(&source_bytes);
+    let source_sha = turbo_sha256::sha256(&source_bytes).0;
     let mut manifest = read_manifest(&bundle);
     let checkpoint = manifest.source.as_mut().unwrap();
     checkpoint.bytes = source_bytes.len() as u64;
@@ -126,7 +126,7 @@ async fn restore_runs_the_full_historical_source_audit_after_outer_integrity_pas
         .find(|artifact| artifact.file == "sources.redb")
         .unwrap();
     source_artifact.bytes = source_bytes.len() as u64;
-    source_artifact.sha256 = sha256::hex_digest(&source_bytes);
+    source_artifact.sha256 = turbo_sha256::sha256(&source_bytes).to_hex();
     write_manifest(&bundle, &mut manifest);
 
     let destination = f.root.join("historical-audit-destination");

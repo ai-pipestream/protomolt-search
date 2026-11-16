@@ -150,11 +150,11 @@ fn source_owner_metadata_rejects_downgrade_corruption_and_noncanonical_protobuf(
     assert!(corrupted.decode().is_err());
     let mut noncanonical = valid.clone();
     noncanonical.protobuf.extend_from_slice(&[0x08, 0x01]);
-    noncanonical.sha256 = crate::sha256::hex_digest(&noncanonical.protobuf);
+    noncanonical.sha256 = turbo_sha256::sha256(&noncanonical.protobuf).to_hex();
     assert!(noncanonical.decode().is_err());
     let mut unknown = valid.clone();
     unknown.protobuf.extend_from_slice(&[0x78, 0x01]);
-    unknown.sha256 = crate::sha256::hex_digest(&unknown.protobuf);
+    unknown.sha256 = turbo_sha256::sha256(&unknown.protobuf).to_hex();
     assert!(unknown.decode().is_err());
     let root = std::env::temp_dir().join(format!("source-owner-format-{}", std::process::id()));
     let valid_manifest = SegmentSetManifest {

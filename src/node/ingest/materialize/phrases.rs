@@ -40,7 +40,7 @@ fn check_phrase_postings(
     doc: &AddDocumentsRequest,
 ) -> Result<(), Status> {
     for posting in &doc.phrases {
-        if posting.term != protomolt_analyzer::phrase_posting_term(&posting.concept_id)
+        if posting.term != crate::analyzer::native::phrase_posting_term(&posting.concept_id)
             || posting.field != index.phrase_field()
             || posting.concept_id.is_empty()
             || posting.token_count == 0

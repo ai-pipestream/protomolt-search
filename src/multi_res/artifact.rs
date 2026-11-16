@@ -15,7 +15,7 @@ use super::codec::{
     delimited, embedding, materialized, scan_embedding, skip, validate_retained, Row,
 };
 use super::{invalid, Limits, MultiResVectors, LIMITS, MAGIC, MAX_RECORD_BYTES, NEXT_TEMP};
-use crate::sha256::Sha256;
+use turbo_sha256::Sha256;
 
 const HEADER_LEN: usize = 24;
 
@@ -51,7 +51,7 @@ fn verify_artifact_digest(file: &mut File, expected_sha256: &str) -> io::Result<
         }
         hash.update(&buffer[..size]);
     }
-    if hex(&hash.finalize()) != expected_sha256 {
+    if hex(&hash.finish().0) != expected_sha256 {
         return Err(invalid("multi-resolution artifact digest mismatch"));
     }
     file.seek(SeekFrom::Start(0))?;
@@ -141,10 +141,10 @@ impl MultiResVectors {
         }
         let mut stored_digest = [0; 32];
         reader.read_exact(&mut stored_digest)?;
-        let expected_footer = digest.clone().finalize();
+        let expected_footer = digest.clone().finish().0;
         digest.update(&stored_digest);
         if expected_footer != stored_digest
-            || hex(&digest.finalize()) != expected_sha256
+            || hex(&digest.finish().0) != expected_sha256
             || reader.read(&mut [0])? != 0
         {
             return Err(invalid("multi-resolution vector file integrity failure"));
@@ -218,7 +218,7 @@ impl MultiResVectors {
             digest.update(&size);
             digest.update(&bytes);
         }
-        let footer = digest.clone().finalize();
+        let footer = digest.clone().finish().0;
         writer.write_all(&footer)?;
         digest.update(&footer);
         writer.flush()?;
@@ -233,6 +233,6 @@ impl MultiResVectors {
                 format!("multi-resolution publication uncertain after rename: {error}"),
             )
         })?;
-        Ok((bytes, hex(&digest.finalize())))
+        Ok((bytes, hex(&digest.finish().0)))
     }
 }

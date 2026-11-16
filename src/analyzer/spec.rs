@@ -164,7 +164,7 @@ pub fn normalize_prefix(prefix: &str, spec: Option<&AnalysisSpec>) -> Result<Str
         return Ok(prefix.to_string());
     }
     let normalized = match native_spec(Some(spec)) {
-        Ok(native) => protomolt_analyzer::normalize_term(prefix, &native.normalizers),
+        Ok(native) => super::native::normalize_term(prefix, &native.normalizers),
         Err(_) => {
             let cfg = turbo_field_config(Some(spec))?;
             turbo_client::LexicalAnalyzer::new(cfg).normalize_prefix(prefix)

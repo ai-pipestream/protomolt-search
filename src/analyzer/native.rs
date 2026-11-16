@@ -2,6 +2,15 @@
 
 use tonic::Status;
 
+/// Every `protomolt-analyzer` item the crate uses. Other modules reach the
+/// native stack only through these names, so retiring it in favor of
+/// `turbo-client` replaces this list and nothing else outside this module.
+pub(crate) use protomolt_analyzer::{
+    analyze, analyze_dual, normalize_term, phrase_posting_term, unicode_case_fold,
+    AnalysisSpec as NativeSpec, AnalyzedDocument, Glossary, GlossaryEntry, NormalizerStep, Stemmer,
+    TermVectorMode, TermVectorSource, Tokenizer,
+};
+
 use super::spec::validate_dual_cased_spec;
 use super::spec_convert::native_spec;
 use super::SessionLayers;
@@ -61,10 +70,10 @@ fn native_analysis(text: &str, spec: Option<&AnalysisSpec>) -> Result<NativeAnal
 
 pub(super) fn native_analysis_with_spec(
     text: &str,
-    spec: &protomolt_analyzer::AnalysisSpec,
+    spec: &NativeSpec,
 ) -> Result<NativeAnalysis, Status> {
-    let analyzed = protomolt_analyzer::analyze(text, spec)
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let analyzed =
+        analyze(text, spec).map_err(|error| Status::invalid_argument(error.to_string()))?;
     let tokens = analyzed.tokens.clone();
     Ok(NativeAnalysis {
         doc: AnalyzedDoc {
@@ -77,10 +86,10 @@ pub(super) fn native_analysis_with_spec(
 
 pub(super) fn native_dual_with_spec(
     text: &str,
-    spec: &protomolt_analyzer::AnalysisSpec,
+    spec: &NativeSpec,
 ) -> Result<NativeAnalysis, Status> {
-    let dual = protomolt_analyzer::analyze_dual(text, spec)
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let dual =
+        analyze_dual(text, spec).map_err(|error| Status::invalid_argument(error.to_string()))?;
     let tokens = dual.folded.tokens.clone();
     Ok(NativeAnalysis {
         doc: AnalyzedDoc {
@@ -92,7 +101,7 @@ pub(super) fn native_dual_with_spec(
     })
 }
 
-fn native_field(analyzed: protomolt_analyzer::AnalyzedDocument) -> crate::postings::AnalyzedField {
+fn native_field(analyzed: AnalyzedDocument) -> crate::postings::AnalyzedField {
     let mut terms = crate::postings::DocTerms::with_capacity(analyzed.term_vectors.len());
     let mut positions = crate::postings::DocPositions::with_capacity(analyzed.term_vectors.len());
     for vector in analyzed.term_vectors {

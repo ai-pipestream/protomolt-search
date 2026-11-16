@@ -234,13 +234,8 @@ pub fn renamed(meta: &RaftSnapshotMeta, index: u64, image: &[u8]) -> RaftSnapsho
             log_id.index = index;
         }
     }
-    let digest = pipestream_search::sha256::digest(image);
-    forged.snapshot_id = format!(
-        "{}-{}-{}",
-        index,
-        image.len(),
-        pipestream_search::sha256::to_hex(&digest)
-    );
+    let digest = turbo_sha256::sha256(image).0;
+    forged.snapshot_id = format!("{}-{}-{}", index, image.len(), turbo_sha256::to_hex(digest));
     forged.length = image.len() as u64;
     forged.sha256 = digest.to_vec();
     forged
@@ -255,7 +250,7 @@ pub fn meta_pb_for(
     image: &[u8],
     voters: &[u64],
 ) -> RaftSnapshotMeta {
-    let digest = pipestream_search::sha256::digest(image);
+    let digest = turbo_sha256::sha256(image).0;
     let log_id = RaftLogId {
         term: 1,
         node_id: NODE_ID,
@@ -280,12 +275,7 @@ pub fn meta_pb_for(
                     .collect(),
             }),
         }),
-        snapshot_id: format!(
-            "{}-{}-{}",
-            index,
-            image.len(),
-            pipestream_search::sha256::to_hex(&digest)
-        ),
+        snapshot_id: format!("{}-{}-{}", index, image.len(), turbo_sha256::to_hex(digest)),
         length: image.len() as u64,
         sha256: digest.to_vec(),
     }

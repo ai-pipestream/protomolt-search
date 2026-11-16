@@ -174,7 +174,7 @@ impl CapturedBackup<'_> {
     ) -> Result<(), Status> {
         let directory = format!("indexes/{ordinal:08}/index.segments");
         let encoded = self.json(set.manifest())?;
-        if sha256::digest(&encoded).as_slice() != state.committed_manifest_sha256 {
+        if turbo_sha256::sha256(&encoded).0.as_slice() != state.committed_manifest_sha256 {
             return Err(fail(
                 "backup index manifest differs from its captured journal state",
             ));
@@ -273,7 +273,7 @@ impl CapturedBackup<'_> {
             SnapshotArtifact {
                 file: name,
                 bytes: bytes.len() as u64,
-                sha256: sha256::hex_digest(&bytes),
+                sha256: turbo_sha256::sha256(&bytes).to_hex(),
             },
             Data::Bytes(bytes),
         )

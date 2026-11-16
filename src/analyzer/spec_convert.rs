@@ -100,10 +100,8 @@ pub(crate) fn validate_native_spec(spec: &AnalysisSpec) -> Result<(), Status> {
 
 pub(super) fn native_spec(
     spec: Option<&AnalysisSpec>,
-) -> Result<protomolt_analyzer::AnalysisSpec, Status> {
-    use protomolt_analyzer::{
-        AnalysisSpec as NativeSpec, Stemmer, TermVectorMode, TermVectorSource, Tokenizer,
-    };
+) -> Result<super::native::NativeSpec, Status> {
+    use super::native::{NativeSpec, Stemmer, TermVectorMode, TermVectorSource, Tokenizer};
 
     let spec = spec.ok_or_else(|| {
         Status::failed_precondition(
@@ -169,10 +167,8 @@ pub(super) fn native_spec(
     Ok(native)
 }
 
-fn native_normalizers(
-    char_filters: &[i32],
-) -> Result<Vec<protomolt_analyzer::NormalizerStep>, Status> {
-    use protomolt_analyzer::NormalizerStep;
+fn native_normalizers(char_filters: &[i32]) -> Result<Vec<super::native::NormalizerStep>, Status> {
+    use super::native::NormalizerStep;
 
     let mut normalizers = Vec::with_capacity(char_filters.len());
     for &value in char_filters {

@@ -250,7 +250,7 @@ impl VectorProvider for EmbeddedTurboVec {
             bits_per_dimension: Some(self.index.bit_width() as u32),
             metric: "inner_product".to_string(),
             score_direction: ScoreDirection::HigherIsBetter,
-            scoring_fingerprint: crate::sha256::hex_digest(
+            scoring_fingerprint: turbo_sha256::sha256(
                 [
                     EMBEDDED_TURBOVEC.as_bytes(),
                     BACKEND_VERSION.as_bytes(),
@@ -260,7 +260,8 @@ impl VectorProvider for EmbeddedTurboVec {
                 ]
                 .concat()
                 .as_slice(),
-            ),
+            )
+            .to_hex(),
             quality_contract: QualityContract::ExhaustiveQuantized,
             capabilities: vec![
                 VectorCapability::BatchQuery,

@@ -407,7 +407,7 @@ async fn maintenance_links_are_checked_even_when_record_checksums_are_recomputed
             _ => unreachable!(),
         }
         changed.intent_id.clear();
-        changed.intent_id = sha256::digest(&changed.encode_to_vec()).to_vec();
+        changed.intent_id = turbo_sha256::sha256(&changed.encode_to_vec()).0.to_vec();
         let tx = fixture.source.database.begin_write().unwrap();
         {
             let mut table = tx.open_table(MAINTENANCE).unwrap();

@@ -5,7 +5,6 @@ use super::frames::{read_frame, read_frame_limited, write_frame, FrameRead};
 use crate::pb::storage::{SourceBlob, SourceRecord};
 use crate::pb::wal::{source_wal_blob, LoggedAddDocuments, SourceReference, SourceWalBlob};
 use crate::pb::ProtobufSource;
-use crate::sha256;
 use prost::Message;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -91,7 +90,7 @@ impl Writer {
                 FrameRead::Frame(bytes) => {
                     let blob = SourceWalBlob::decode(bytes.as_slice()).map_err(io::Error::other)?;
                     validate(&blob)?;
-                    let hash = sha256::digest(&bytes);
+                    let hash = turbo_sha256::sha256(&bytes).0;
                     if addresses
                         .insert(
                             hash,
@@ -126,7 +125,7 @@ impl Writer {
         let blob = SourceWalBlob { value: Some(value) };
         validate(&blob)?;
         let bytes = blob.encode_to_vec();
-        let hash = sha256::digest(&bytes);
+        let hash = turbo_sha256::sha256(&bytes).0;
         if let Some(address) = self.addresses.get(&hash) {
             return Ok(address.clone());
         }
@@ -161,7 +160,7 @@ impl Writer {
                 references.push(SourceReference::default());
                 continue;
             };
-            let descriptor_hash = sha256::digest(&source.descriptor_set);
+            let descriptor_hash = turbo_sha256::sha256(&source.descriptor_set).0;
             let descriptor =
                 self.intern(source_wal_blob::Value::Descriptor(source.descriptor_set))?;
             let source = self.intern(source_wal_blob::Value::Source(SourceRecord {
@@ -218,7 +217,7 @@ impl Reader {
             return Err(invalid("truncated referenced WAL source"));
         };
         if offset != address.offset + address.length
-            || sha256::digest(&bytes).as_slice() != address.sha256
+            || turbo_sha256::sha256(&bytes).0.as_slice() != address.sha256
         {
             return Err(invalid("WAL source content address mismatch"));
         }
@@ -249,7 +248,9 @@ impl Reader {
                     else {
                         return Err(invalid("WAL source address names a descriptor"));
                     };
-                    if sha256::digest(&descriptor_set).as_slice() != source.descriptor_sha256 {
+                    if turbo_sha256::sha256(&descriptor_set).0.as_slice()
+                        != source.descriptor_sha256
+                    {
                         return Err(invalid("WAL source descriptor mismatch"));
                     }
                     document.original_source = Some(ProtobufSource {
