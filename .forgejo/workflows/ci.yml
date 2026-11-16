@@ -19,6 +19,15 @@ env:
   CARGO_TERM_COLOR: never
   CARGO_NET_RETRY: "5"
   RUSTUP_MAX_RETRIES: "5"
+  # Keep the target dir on /tmp. The self-hosted runner bind-mounts the
+  # host /tmp (multi-TB /work volume) into job containers; the container
+  # overlay and workspace volume live on the host root filesystem, which
+  # a full test build can fill (ENOSPC mid-suite).
+  # CARGO_TARGET_TMPDIR follows the target dir, so test scratch space
+  # lands on the same big volume. The dir persists across runs on the
+  # single-capacity runner: cargo fingerprints keep it correct, and it
+  # doubles as a build cache.
+  CARGO_TARGET_DIR: /tmp/forgejo-ci/protomolt-search-target
 
 jobs:
   test:
