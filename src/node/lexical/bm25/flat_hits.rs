@@ -99,7 +99,8 @@ impl FlatRun<'_> {
             .filter(filter)
             .live(live)
             .candidate(candidate)
-            .block_max(self.node.config.block_max);
+            .block_max(self.node.config.block_max)
+            .include_offsets(req.highlight.is_some() || req.explain);
         let docs = bm25::top_k(view.index, &req.terms, &self.stats, self.params, request);
         FlatHits {
             req,

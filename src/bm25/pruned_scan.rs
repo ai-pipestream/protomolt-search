@@ -31,7 +31,6 @@ pub(super) struct Scan<'a> {
     finished: (u64, u64),
     order: Vec<usize>,
     nonessential: Vec<bool>,
-    prefix: Vec<usize>,
     lengths: Vec<u32>,
     contributions: Vec<f64>,
     touched: Vec<usize>,
@@ -46,7 +45,6 @@ impl<'a> Scan<'a> {
             finished: (0, 0),
             order: Vec::new(),
             nonessential: Vec::new(),
-            prefix: Vec::new(),
             lengths: Vec::new(),
             contributions: vec![0.0; count],
             touched: Vec::new(),
@@ -115,21 +113,17 @@ impl<'a> Scan<'a> {
         });
         self.nonessential.clear();
         self.nonessential.resize(self.pairs.len(), false);
-        self.prefix.clear();
         for &next in &self.order {
             let mut bound = 0.0;
             for (position, pair) in self.pairs.iter().enumerate() {
-                if position == next || self.prefix.contains(&position) {
+                if position == next || self.nonessential[position] {
                     bound += pair.block_max;
                 }
             }
             if !cutoff.inert(bound) {
                 break;
             }
-            self.prefix.push(next);
-        }
-        for &position in &self.prefix {
-            self.nonessential[position] = true;
+            self.nonessential[next] = true;
         }
     }
 
@@ -179,15 +173,19 @@ impl<'a> Scan<'a> {
         bound
     }
 
-    pub fn score(&mut self, doc: u32, chain: ChainCtx<'_>, prune: &mut PruneStats) -> HeapEntry {
+    pub fn score(
+        &mut self,
+        doc: u32,
+        chain: ChainCtx<'_>,
+        include_offsets: bool,
+        prune: &mut PruneStats,
+    ) -> HeapEntry {
         self.touched.clear();
-        let mut mask = 0;
         for pair in &mut self.pairs {
             pair.cursor.advance_shallow(doc);
             if pair.cursor.doc_id() == doc {
                 self.contributions[pair.order] = pair.contribution(&self.lengths);
                 self.touched.push(pair.order);
-                mask |= 1u128 << pair.order;
             }
         }
         self.touched.sort_unstable();
@@ -198,10 +196,15 @@ impl<'a> Scan<'a> {
         let score = chain.map_or(score, |(chain, columns)| chain.eval(score, doc, columns));
         prune.candidates_evaluated += 1;
         prune.postings_scored += self.touched.len() as u64;
+        let matched = if include_offsets {
+            self.touched.clone().into_boxed_slice()
+        } else {
+            Box::default()
+        };
         HeapEntry {
             doc_id: doc,
             score,
-            mask,
+            matched,
         }
     }
 

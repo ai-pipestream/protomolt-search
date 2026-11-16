@@ -186,9 +186,11 @@ impl LexicalStream {
             state.floors_sent += 1;
         }
         let progress = state.progress.clone();
-        let snapshot = lexical_snapshot(&state);
+        let snapshot = progress.as_ref().map(|_| lexical_snapshot(&state));
         drop(state);
-        publish_lexical_progress(progress.as_deref(), snapshot, String::new());
+        if let Some(snapshot) = snapshot {
+            publish_lexical_progress(progress.as_deref(), snapshot, String::new());
+        }
         if let Some(floor) = raised {
             self.raise(floor);
         }

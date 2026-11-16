@@ -46,11 +46,9 @@ impl Pair<'_> {
 }
 
 pub(super) fn open<'a>(fields: &[FieldQuery<'a>], prune: &mut PruneStats) -> Option<Vec<Pair<'a>>> {
-    let count: usize = fields.iter().map(|field| field.terms.len()).sum();
-    if count > 128
-        || fields
-            .iter()
-            .any(|field| field.weight < 0.0 || field.weight.is_nan())
+    if fields
+        .iter()
+        .any(|field| field.weight < 0.0 || field.weight.is_nan())
     {
         return None;
     }

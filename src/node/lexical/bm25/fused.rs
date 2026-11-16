@@ -105,7 +105,8 @@ impl FusedExecution<'_> {
             .filter(filter)
             .live(live)
             .candidate(candidate)
-            .block_max(self.service.config.block_max);
+            .block_max(self.service.config.block_max)
+            .include_offsets(req.highlight.is_some() || req.explain);
         let docs = score_fused(&queries, request, phrase.as_ref());
         response.hits = fields.render_hits(
             self.store,

@@ -17,11 +17,11 @@ pub(super) fn sort_truncate<T>(docs: &mut Vec<(u32, f64, T)>, k: usize) {
     docs.truncate(k);
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(super) struct HeapEntry {
     pub score: f64,
     pub doc_id: u32,
-    pub mask: u128,
+    pub matched: Box<[usize]>,
 }
 
 impl PartialEq for HeapEntry {
