@@ -94,6 +94,18 @@ fn failure_before_rename_rolls_back_disk_and_memory_and_remains_usable() {
     assert_eq!(dir.stored().nodes.len(), 1);
 }
 
+/// An explicit reopen serves the registration the uncertain write published.
+fn assert_reopen_recovers_the_published_registration(dir: &Directory) {
+    let reopened =
+        DurableControlPlane::open_existing(dir.state(), ControlPolicy::default()).unwrap();
+    let recovered = reopened.plan().unwrap();
+    assert_eq!(recovered.control_revision, 2);
+    assert_eq!(recovered.nodes.len(), 1);
+    assert_eq!(recovered.nodes[0].node_id, "a");
+    let next = reopened.register(registration("b"), 100).unwrap();
+    assert_eq!(next.control_revision, 3);
+}
+
 #[test]
 fn failure_after_rename_latches_every_clone_until_an_explicit_reopen() {
     let dir = Directory::new("after-rename");
@@ -170,14 +182,7 @@ fn failure_after_rename_latches_every_clone_until_an_explicit_reopen() {
     assert_eq!(still_latched.code(), tonic::Code::FailedPrecondition);
     drop(service);
     drop(latched);
-    let reopened =
-        DurableControlPlane::open_existing(dir.state(), ControlPolicy::default()).unwrap();
-    let recovered = reopened.plan().unwrap();
-    assert_eq!(recovered.control_revision, 2);
-    assert_eq!(recovered.nodes.len(), 1);
-    assert_eq!(recovered.nodes[0].node_id, "a");
-    let next = reopened.register(registration("b"), 100).unwrap();
-    assert_eq!(next.control_revision, 3);
+    assert_reopen_recovers_the_published_registration(&dir);
 }
 
 #[test]
