@@ -1,7 +1,10 @@
 //! Accepted sources enter a private instance of the ordinary ingest pipeline.
 use super::*;
 use crate::document_catalog::DocumentCatalog;
-use crate::pb::{DocumentProjectionStage, StageDocumentProjectionRequest};
+use crate::pb::{
+    DocumentProjectionStage, PrepareDocumentProjectionRequest, PreparedDocumentProjection,
+    StageDocumentProjectionRequest,
+};
 use crate::segments::OpenedSegmentSet;
 use crate::stats_identity::StatsClaim;
 
@@ -86,6 +89,32 @@ impl PreparedSource {
     }
 }
 
+/// The target's read version, binding and provider shape captured for one stage.
+struct StageTarget {
+    expected: StatsClaim,
+    bound: Option<crate::postings::StoredBinding>,
+    backend: Option<(usize, crate::vector::VectorBackendConfig)>,
+    rows: u64,
+}
+
+fn stage_info(
+    batch: &PreparedDocumentProjection,
+    expected: &StatsClaim,
+) -> DocumentProjectionStage {
+    DocumentProjectionStage {
+        history_id: batch.history_id.clone(),
+        document_key: batch.document_key.clone(),
+        version: batch.version,
+        accepted_sequence: batch.accepted_sequence,
+        deleted: batch.deleted,
+        rows: batch.rows.len() as u64,
+        plan_fingerprint: batch.plan_fingerprint.clone(),
+        target_stats_epoch: expected.epoch,
+        target_stats_incarnation: expected.incarnation(),
+        ..Default::default()
+    }
+}
+
 impl NodeServiceImpl {
     /// Stage an exact accepted version using this node's schema, provider and
     /// configured analyzer. All analysis, derived values and artifact writes
@@ -104,57 +133,9 @@ impl NodeServiceImpl {
         let projection = request.projection.ok_or_else(|| {
             Status::invalid_argument("staging requires an exact accepted projection request")
         })?;
-        let collection = self.config.collection.clone();
-        let (mut batch, projection) = tokio::task::spawn_blocking(move || {
-            if catalog.collection()? != collection {
-                return Err(Status::failed_precondition(
-                    "projection catalog and target collection differ",
-                ));
-            }
-            catalog
-                .prepare_projection(&projection)
-                .map(|batch| (batch, projection))
-        })
-        .await
-        .map_err(|e| Status::internal(format!("prepare accepted projection task: {e}")))??;
-        let (expected, bound, backend, rows) = {
-            let guard = read_shard(&self.state);
-            guard.check_catalog_publication()?;
-            let expected =
-                StatsClaim::required(guard.stats_epoch, &guard.stats_incarnation.bytes()?)?;
-            let backend = guard
-                .index
-                .as_ref()
-                .map(|index| {
-                    Ok::<_, Status>((
-                        index.dim_opt().ok_or_else(|| {
-                            Status::failed_precondition("provider has no dimension")
-                        })?,
-                        index
-                            .backend_config()
-                            .map_err(|e| Status::failed_precondition(e.to_string()))?,
-                    ))
-                })
-                .transpose()?;
-            (
-                expected,
-                guard.mapped_binding.clone(),
-                backend,
-                physical_rows(&guard),
-            )
-        };
-        let mut info = DocumentProjectionStage {
-            history_id: batch.history_id.clone(),
-            document_key: batch.document_key.clone(),
-            version: batch.version,
-            accepted_sequence: batch.accepted_sequence,
-            deleted: batch.deleted,
-            rows: batch.rows.len() as u64,
-            plan_fingerprint: batch.plan_fingerprint.clone(),
-            target_stats_epoch: expected.epoch,
-            target_stats_incarnation: expected.incarnation(),
-            ..Default::default()
-        };
+        let (mut batch, projection) = self.prepare_accepted(catalog, projection).await?;
+        let target = self.stage_target()?;
+        let mut info = stage_info(&batch, &target.expected);
         if batch.deleted {
             if !request.field_analysis.is_empty() || request.materialize.is_some() {
                 return Err(Status::invalid_argument(
@@ -173,7 +154,7 @@ impl NodeServiceImpl {
                 "staging requires explicit analysis for every projected TEXT path",
             ));
         }
-        if bound.is_none() && rows != 0 {
+        if target.bound.is_none() && target.rows != 0 {
             return Err(Status::failed_precondition(
                 "cannot stage a mapping for a populated unbound shard",
             ));
@@ -193,6 +174,91 @@ impl NodeServiceImpl {
             materialize: request.materialize.clone(),
             ..Default::default()
         };
+        let (directory, shadow, analysis) = self.open_stage_shadow(bind, target).await?;
+        let input = PreparedSource {
+            rows: batch.rows.into_iter(),
+            original: source.clone(),
+            key: batch.document_key,
+            analysis,
+            materialize: request.materialize,
+        };
+        if shadow.ingest_prepared(input).await? != info.rows {
+            return Err(Status::data_loss(
+                "staged row count differs from the complete accepted projection",
+            ));
+        }
+        let (set, bytes) = seal_stage(shadow, &directory, request.max_staged_bytes).await?;
+        info.staged_bytes = bytes;
+        Ok(StagedDocumentCandidate {
+            info,
+            source: Some(source),
+            set: Some(set),
+            _directory: Some(directory),
+        })
+    }
+
+    /// The accepted version's prepared rows, read on a blocking worker.
+    async fn prepare_accepted(
+        &self,
+        catalog: Arc<DocumentCatalog>,
+        projection: PrepareDocumentProjectionRequest,
+    ) -> Result<(PreparedDocumentProjection, PrepareDocumentProjectionRequest), Status> {
+        let collection = self.config.collection.clone();
+        tokio::task::spawn_blocking(move || {
+            if catalog.collection()? != collection {
+                return Err(Status::failed_precondition(
+                    "projection catalog and target collection differ",
+                ));
+            }
+            catalog
+                .prepare_projection(&projection)
+                .map(|batch| (batch, projection))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("prepare accepted projection task: {e}")))?
+    }
+
+    fn stage_target(&self) -> Result<StageTarget, Status> {
+        let guard = read_shard(&self.state);
+        guard.check_catalog_publication()?;
+        let expected = StatsClaim::required(guard.stats_epoch, &guard.stats_incarnation.bytes()?)?;
+        let backend = guard
+            .index
+            .as_ref()
+            .map(|index| {
+                Ok::<_, Status>((
+                    index
+                        .dim_opt()
+                        .ok_or_else(|| Status::failed_precondition("provider has no dimension"))?,
+                    index
+                        .backend_config()
+                        .map_err(|e| Status::failed_precondition(e.to_string()))?,
+                ))
+            })
+            .transpose()?;
+        Ok(StageTarget {
+            expected,
+            bound: guard.mapped_binding.clone(),
+            backend,
+            rows: physical_rows(&guard),
+        })
+    }
+
+    /// A private segmented node in its own stage directory, bound to `bind`
+    /// and checked against the target's durable binding.
+    async fn open_stage_shadow(
+        &self,
+        bind: crate::pb::MappedBind,
+        target: StageTarget,
+    ) -> Result<
+        (
+            Arc<StageDirectory>,
+            Self,
+            crate::mapped_analysis::MappedAnalysis,
+        ),
+        Status,
+    > {
+        let StageTarget { bound, backend, .. } = target;
         let mut config = self.config.clone();
         if config.analysis_addr.is_none() {
             return Err(Status::failed_precondition(
@@ -210,7 +276,7 @@ impl NodeServiceImpl {
             .unwrap_or(Path::new("."))
             .to_path_buf();
         let phrases = self.phrase_index.clone();
-        let (directory, shadow, analysis) = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let directory = StageDirectory::create(&parent)?;
             config.index_path = Some(directory.0.join("index"));
             config.slot_offset = 0;
@@ -220,25 +286,31 @@ impl NodeServiceImpl {
             // One bounded source is private until the closing flush. Avoid
             // detached seal tasks outliving cancellation and stage ownership.
             config.seal_tail_docs = 0;
-            let index = backend.map(|(dim, config)| VectorIndex::from_backend_config(dim, &config).map_err(|e| Status::failed_precondition(e.to_string()))).transpose()?;
+            let index = backend
+                .map(|(dim, config)| {
+                    VectorIndex::from_backend_config(dim, &config)
+                        .map_err(|e| Status::failed_precondition(e.to_string()))
+                })
+                .transpose()?;
             let shadow = Self::new(index, config).with_phrase_index(phrases);
             let (_, analysis) = shadow.bind_mapped(&bind)?;
             if bound.is_some() && bound != read_shard(&shadow.state).mapped_binding {
                 return Err(Status::failed_precondition("projection differs from the target's durable mapping, analysis or materialization binding"));
             }
             Ok::<_, Status>((directory, shadow, analysis))
-        }).await.map_err(|e| Status::internal(format!("create projection stage task: {e}")))??;
-        let mut input = IngestSource::Prepared(Box::new(PreparedSource {
-            rows: batch.rows.into_iter(),
-            original: source.clone(),
-            key: batch.document_key,
-            analysis,
-            materialize: request.materialize,
-        }));
+        })
+        .await
+        .map_err(|e| Status::internal(format!("create projection stage task: {e}")))?
+    }
+
+    /// Run the prepared rows through this node's ordinary ingest pipeline.
+    /// Returns the rows added.
+    async fn ingest_prepared(&self, source: PreparedSource) -> Result<u64, Status> {
+        let mut input = IngestSource::Prepared(Box::new(source));
         let mut added = 0;
         let mut first_id = 0;
         if let Some(first) = input.next().await? {
-            let addr = shadow.config.analysis_addr.as_deref().ok_or_else(|| {
+            let addr = self.config.analysis_addr.as_deref().ok_or_else(|| {
                 Status::failed_precondition("projection target has no configured analyzer")
             })?;
             let session = crate::analyzer::AnalyzeStream::open_with_vocab(
@@ -247,48 +319,43 @@ impl NodeServiceImpl {
                 None,
                 session_layers(
                     &first.req,
-                    shadow.phrase_index.as_deref(),
-                    &shadow.config.sentence_fields,
+                    self.phrase_index.as_deref(),
+                    &self.config.sentence_fields,
                 ),
             )
             .await?;
-            shadow
-                .ingest_streamed(session, first, &mut input, addr, &mut added, &mut first_id)
+            self.ingest_streamed(session, first, &mut input, addr, &mut added, &mut first_id)
                 .await?;
         }
-        if added != info.rows {
-            return Err(Status::data_loss(
-                "staged row count differs from the complete accepted projection",
-            ));
-        }
-        // The blocking writer owns a lease even if its awaiting task is dropped.
-        let lease = Arc::clone(&directory);
-        let max_bytes = request.max_staged_bytes;
-        let (set, bytes) = tokio::task::spawn_blocking(move || {
-            let _lease = lease;
-            shadow.flush_index()?;
-            let set = {
-                let guard = read_shard(&shadow.state);
-                let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
-                    return Err(Status::internal(
-                        "projection stage lost its segmented layout",
-                    ));
-                };
-                shard.snapshot().clone()
-            };
-            let bytes = staged_bytes(&_lease.0, max_bytes)?;
-            Ok::<_, Status>((set, bytes))
-        })
-        .await
-        .map_err(|e| Status::internal(format!("seal projection stage task: {e}")))??;
-        info.staged_bytes = bytes;
-        Ok(StagedDocumentCandidate {
-            info,
-            source: Some(source),
-            set: Some(set),
-            _directory: Some(directory),
-        })
+        Ok(added)
     }
+}
+
+/// Flush the private node and measure its files against `max_bytes`.
+async fn seal_stage(
+    shadow: NodeServiceImpl,
+    directory: &Arc<StageDirectory>,
+    max_bytes: u64,
+) -> Result<(Arc<OpenedSegmentSet>, u64), Status> {
+    // The blocking writer owns a lease even if its awaiting task is dropped.
+    let lease = Arc::clone(directory);
+    tokio::task::spawn_blocking(move || {
+        let _lease = lease;
+        shadow.flush_index()?;
+        let set = {
+            let guard = read_shard(&shadow.state);
+            let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
+                return Err(Status::internal(
+                    "projection stage lost its segmented layout",
+                ));
+            };
+            shard.snapshot().clone()
+        };
+        let bytes = staged_bytes(&_lease.0, max_bytes)?;
+        Ok::<_, Status>((set, bytes))
+    })
+    .await
+    .map_err(|e| Status::internal(format!("seal projection stage task: {e}")))?
 }
 
 fn staged_bytes(root: &Path, limit: u64) -> Result<u64, Status> {

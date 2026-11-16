@@ -199,7 +199,7 @@ impl Bm25Shard {
 
     /// Range facets: one value read per matched document, then a
     /// binary search of the (validated) edge list. Buckets are
-    /// half-open [edges[i], edges[i+1]), so a value sitting exactly
+    /// half-open `[edges[i], edges[i+1])`, so a value sitting exactly
     /// on an interior edge lands in the upper bucket; a value below
     /// the first edge or at/above the last is counted in NO bucket.
     /// There are deliberately no implicit tail buckets — the caller
