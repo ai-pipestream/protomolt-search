@@ -17,7 +17,12 @@ pub(super) struct DenseProviderFacts {
     pub(super) dimensions: u32,
     /// 32 for providers that score original FP32 rows.
     pub(super) bits_per_dimension: u32,
+    /// Every shard can select by staged top-k over owned bit planes.
+    pub(super) staged: bool,
     pub(super) rows: u64,
+    pub(super) deleted_docs: u64,
+    pub(super) generation: u64,
+    pub(super) corpus_fingerprint: String,
 }
 
 impl DenseProviderFacts {
@@ -29,6 +34,12 @@ impl DenseProviderFacts {
         identity: crate::clustered_turbovec::ClusteredQualityIdentity,
         fp32_sidecar: bool,
     ) -> Self {
+        let mut corpus_hash = turbo_sha256::Sha256::new();
+        corpus_hash.update(b"dense-corpus-clustered-v1");
+        corpus_hash.update(&identity.rows.to_le_bytes());
+        corpus_hash.update(&identity.topology_generation.to_le_bytes());
+        corpus_hash.update(&(identity.scoring_fingerprint.len() as u64).to_le_bytes());
+        corpus_hash.update(identity.scoring_fingerprint.as_bytes());
         Self {
             provider: "clustered-turbovec".to_string(),
             scoring_fingerprint: identity.scoring_fingerprint,
@@ -42,7 +53,11 @@ impl DenseProviderFacts {
             supports_stream: true,
             dimensions: identity.dimensions,
             bits_per_dimension: 0,
+            staged: false,
             rows: identity.rows,
+            deleted_docs: 0,
+            generation: identity.topology_generation,
+            corpus_fingerprint: corpus_hash.finish().to_hex(),
         }
     }
 
@@ -73,13 +88,18 @@ struct ShardFactsFold {
     supports_stream: bool,
     dimensions: Option<u32>,
     bits_per_dimension: Option<u32>,
+    staged: bool,
     rows: u64,
+    deleted_docs: u64,
+    corpus_hash: turbo_sha256::Sha256,
 }
 
 impl ShardFactsFold {
     /// Every shard is one provider under one fingerprint, so
     /// one that lacks a regime means none can be relied on.
     fn new() -> Self {
+        let mut corpus_hash = turbo_sha256::Sha256::new();
+        corpus_hash.update(b"dense-corpus-state-v1");
         Self {
             provider: None,
             fingerprint: None,
@@ -91,8 +111,25 @@ impl ShardFactsFold {
             supports_stream: true,
             dimensions: None,
             bits_per_dimension: None,
+            staged: true,
             rows: 0,
+            deleted_docs: 0,
+            corpus_hash,
         }
+    }
+
+    fn absorb_state(&mut self, shard: usize, backend: &crate::pb::GetVectorBackendResponse) {
+        self.corpus_hash.update(&(shard as u64).to_le_bytes());
+        self.corpus_hash.update(&backend.num_vectors.to_le_bytes());
+        self.corpus_hash.update(&backend.deleted_docs.to_le_bytes());
+        self.corpus_hash
+            .update(&backend.wal_generation.to_le_bytes());
+        self.corpus_hash
+            .update(&backend.wal_high_watermark.to_le_bytes());
+        self.corpus_hash.update(&backend.stats_epoch.to_le_bytes());
+        self.corpus_hash
+            .update(&(backend.stats_incarnation.len() as u64).to_le_bytes());
+        self.corpus_hash.update(&backend.stats_incarnation);
     }
 
     fn absorb(
@@ -104,6 +141,7 @@ impl ShardFactsFold {
             == crate::pb::VectorQualityContract::ExhaustiveNativeScore
             && advertises(&descriptor, "exhaustive_completion");
         self.enumerates &= advertises(&descriptor, "mask_enumeration");
+        self.staged &= advertises(&descriptor, "staged_top_k");
         self.supports_patience &= advertises(&descriptor, "patience_early_stop");
         self.supports_floor_pruning &= advertises(&descriptor, "floor_pruning");
         self.supports_stream &= advertises(&descriptor, "candidate_stream");
@@ -140,7 +178,7 @@ impl ShardFactsFold {
         )
     }
 
-    fn finish(self) -> DenseProviderFacts {
+    fn finish(self, generation: u64) -> DenseProviderFacts {
         let configured = self.provider.is_some();
         let exhaustive = self.exhaustive.unwrap_or(false);
         let quality = self
@@ -160,7 +198,11 @@ impl ShardFactsFold {
             supports_stream: self.supports_stream && configured,
             dimensions: self.dimensions.unwrap_or_default(),
             bits_per_dimension: self.bits_per_dimension.unwrap_or_default(),
+            staged: self.staged && configured,
             rows: self.rows,
+            deleted_docs: self.deleted_docs,
+            generation,
+            corpus_fingerprint: self.corpus_hash.finish().to_hex(),
         }
     }
 }
@@ -239,7 +281,7 @@ impl CoordinatorServiceImpl {
         }
 
         let mut fold = ShardFactsFold::new();
-        for task in tasks {
+        for (shard_idx, task) in tasks.into_iter().enumerate() {
             let (addr, backend) = task.await.map_err(|error| {
                 Status::internal(format!("dense execution preflight failed: {error}"))
             })??;
@@ -247,6 +289,13 @@ impl CoordinatorServiceImpl {
                 .rows
                 .checked_add(backend.num_vectors)
                 .ok_or_else(|| Status::internal("dense execution preflight row count overflow"))?;
+            fold.deleted_docs = fold
+                .deleted_docs
+                .checked_add(backend.deleted_docs)
+                .ok_or_else(|| {
+                    Status::internal("dense execution preflight deleted_docs overflow")
+                })?;
+            fold.absorb_state(shard_idx, &backend);
             let descriptor = backend.descriptor.ok_or_else(|| {
                 Status::failed_precondition(
                     "dense execution preflight found an unconfigured vector shard",
@@ -259,6 +308,6 @@ impl CoordinatorServiceImpl {
             let shard_quality = shard_quality_contract(&descriptor)?;
             fold.absorb(descriptor, shard_quality)?;
         }
-        Ok(fold.finish())
+        Ok(fold.finish(self.topology_generation))
     }
 }

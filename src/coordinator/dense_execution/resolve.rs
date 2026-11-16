@@ -4,10 +4,12 @@ use super::dense_status;
 use super::provider::DenseProviderFacts;
 use super::*;
 use crate::dense_execution::{DenseRequest, ProviderCaps, RawDenseControls, ResolvedDensePlan};
+use crate::dense_policy::{DenseExecutionPolicy, Qualification, Qualified};
 
 impl DenseProviderFacts {
-    /// The executable capabilities the fleet proved.
-    pub(super) fn caps(&self) -> ProviderCaps {
+    /// The executable capabilities the fleet proved. Staged selection is a
+    /// unary technique, so a streaming coordinator does not offer it.
+    pub(super) fn caps(&self, streaming: bool) -> ProviderCaps {
         ProviderCaps {
             provider: self.provider.clone(),
             native: if self.bits_per_dimension == 32 {
@@ -20,10 +22,23 @@ impl DenseProviderFacts {
             fp32_sidecar: self.fp32_sidecar,
             walks: self.configured_ann(),
             enumerates: self.enumerates,
+            staged: self.staged && !streaming,
             patience: self.supports_patience,
             floor_pruning: self.supports_floor_pruning,
             candidate_stream: self.supports_stream,
             rows: self.rows,
+        }
+    }
+
+    fn live_identity(&self) -> crate::dense_policy::LiveIdentity {
+        crate::dense_policy::LiveIdentity {
+            provider_backend: self.provider.clone(),
+            scoring_fingerprint: self.scoring_fingerprint.clone(),
+            corpus_generation: self.generation,
+            corpus_rows: self.rows,
+            deleted_docs: self.deleted_docs,
+            dimensions: self.dimensions,
+            corpus_fingerprint: self.corpus_fingerprint.clone(),
         }
     }
 }
@@ -36,6 +51,13 @@ pub(crate) struct DensePlanned {
     pub(crate) rows: u64,
 }
 
+/// What a policy decided for an AUTO request.
+struct PolicyDecision {
+    plan: ResolvedDensePlan,
+    qualified: Option<Box<Qualified>>,
+    selectivity_ppm: u32,
+}
+
 impl CoordinatorServiceImpl {
     /// Prove the dense execution contract against every live shard before a
     /// dense route runs. Provider identity is generation-wide: mixed
@@ -45,6 +67,7 @@ impl CoordinatorServiceImpl {
         &self,
         request: DenseRequest,
         query_dim: usize,
+        key: DenseRequestKey<'_>,
     ) -> Result<DensePlanned, Status> {
         let facts = match self.clustered_quality_identity().await? {
             Some(identity) => {
@@ -63,13 +86,27 @@ impl CoordinatorServiceImpl {
                 facts.dimensions
             )));
         }
-        let plan = crate::dense_execution::resolve(request, &facts.caps()).map_err(dense_status)?;
-        let mut outcome = crate::dense_execution::planned_outcome(&plan);
+        let caps = facts.caps(self.stream_search);
+        let decision = match (&self.dense_execution_policy, request.mode) {
+            (Some(policy), crate::pb::DenseExecutionMode::Auto) => {
+                self.decide_auto(policy, request, &facts, &caps, key)
+                    .await?
+            }
+            _ => PolicyDecision {
+                plan: crate::dense_execution::resolve(request, &caps).map_err(dense_status)?,
+                qualified: None,
+                selectivity_ppm: 0,
+            },
+        };
+        let mut outcome = crate::dense_execution::planned_outcome(&decision.plan);
         outcome.provider_backend = facts.provider.clone();
         outcome.quality_contract = facts.quality as i32;
         outcome.scoring_fingerprint = facts.scoring_fingerprint.clone();
+        if let Some(hit) = decision.qualified {
+            stamp_provenance(&mut outcome, &hit, decision.selectivity_ppm);
+        }
         Ok(DensePlanned {
-            plan,
+            plan: decision.plan,
             outcome,
             rows: facts.rows,
         })
@@ -105,8 +142,96 @@ impl CoordinatorServiceImpl {
             Some(identity) => DenseProviderFacts::clustered(identity, false),
             None => self.shard_dense_facts().await?,
         };
-        crate::dense_execution::validate_raw_controls(raw, Some(&facts.caps()))
+        let streaming = self.stream_search
+            || raw.finish_settle_us.is_some()
+            || raw.finish_deadline_us.is_some();
+        crate::dense_execution::validate_raw_controls(raw, Some(&facts.caps(streaming)))
             .map_err(dense_status)?;
         Ok(facts.rows)
     }
+
+    /// Read the live corpus and provider identity a version-2 policy binds to.
+    pub async fn live_dense_identity(&self) -> Result<crate::dense_policy::LiveIdentity, Status> {
+        let facts = match self.clustered_quality_identity().await? {
+            Some(identity) => DenseProviderFacts::clustered(identity, false),
+            None => self.shard_dense_facts().await?,
+        };
+        Ok(facts.live_identity())
+    }
+
+    async fn decide_auto(
+        &self,
+        policy: &DenseExecutionPolicy,
+        request: DenseRequest,
+        facts: &DenseProviderFacts,
+        caps: &ProviderCaps,
+        key: DenseRequestKey<'_>,
+    ) -> Result<PolicyDecision, Status> {
+        if let Err(drift) = policy.verify_identity(&facts.live_identity()) {
+            crate::metrics::record_dense_policy_drift();
+            eprintln!("warning: {drift}; AUTO falling back to exhaustive execution");
+            let mut plan = crate::dense_execution::resolve(request, caps).map_err(|err| {
+                dense_status(
+                    crate::dense_execution::DenseExecutionError::FailedPrecondition(format!(
+                        "{drift}; {err}"
+                    )),
+                )
+            })?;
+            plan.fallback_reason = drift;
+            return Ok(PolicyDecision {
+                plan,
+                qualified: None,
+                selectivity_ppm: 0,
+            });
+        }
+        let selectivity_ppm = self
+            .dense_filter_selectivity(key.filters, facts.rows)
+            .await?;
+        let shape = if self.stream_search {
+            crate::pb::DenseExecutionShape::Streaming
+        } else {
+            crate::pb::DenseExecutionShape::Unary
+        };
+        let output_precision =
+            crate::dense_execution::output_precision(&request, caps).map_err(dense_status)?;
+        let qualification = policy.qualify(crate::dense_policy::RequestKey {
+            k: key.k,
+            candidate_depth: key.candidate_depth,
+            filter_selectivity_ppm: selectivity_ppm,
+            output_precision,
+            shape,
+        });
+        match qualification {
+            Qualification::Qualified(hit) => Ok(PolicyDecision {
+                plan: crate::dense_execution::qualified(request, caps, &hit.point)
+                    .map_err(dense_status)?,
+                qualified: Some(hit),
+                selectivity_ppm,
+            }),
+            Qualification::Unqualified(reason) => {
+                let mut plan =
+                    crate::dense_execution::resolve(request, caps).map_err(dense_status)?;
+                plan.fallback_reason = reason;
+                Ok(PolicyDecision {
+                    plan,
+                    qualified: None,
+                    selectivity_ppm,
+                })
+            }
+        }
+    }
+}
+
+/// The measured evidence behind a qualified AUTO plan.
+fn stamp_provenance(
+    outcome: &mut crate::pb::DenseExecutionOutcome,
+    hit: &Qualified,
+    selectivity_ppm: u32,
+) {
+    outcome.policy_id = hit.policy_id.clone();
+    outcome.policy_fingerprint = hit.policy_fingerprint.clone();
+    outcome.policy_point = Some(hit.point);
+    outcome.filter_selectivity_ppm = selectivity_ppm;
+    outcome.candidate_depth = hit.point.candidates;
+    outcome.evidence_scope = crate::pb::DenseEvidenceScope::SelectivityBandBenchmark as i32;
 }

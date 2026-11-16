@@ -1,6 +1,109 @@
-//! Dense filter selectivity under document views, field grants, and pinned reads.
+//! Dense execution policy qualification under document views.
 
 use super::*;
+
+fn doc_view_policy_point(band: u32, candidates: u32, recall: u32) -> crate::pb::DensePolicyPoint {
+    crate::pb::DensePolicyPoint {
+        k: 1,
+        filter_selectivity_ppm_min: band,
+        filter_selectivity_ppm_max: band,
+        candidates,
+        measured_recall_ppm: recall,
+        mode: DenseExecutionMode::Balanced as i32,
+        technique: crate::pb::DenseTechnique::HnswWalk as i32,
+        selection_precision: crate::pb::DenseScorePrecision::Quantized as i32,
+        output_precision: crate::pb::DenseScorePrecision::Quantized as i32,
+        filter_strategy: crate::pb::DenseFilterStrategy::Speed as i32,
+        shape: crate::pb::DenseExecutionShape::Unary as i32,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn auto_ann_qualifies_the_document_view_instead_of_the_unfiltered_point() {
+    let node = node(0, false);
+    let fingerprint = {
+        let mut guard = crate::node::write_shard(&node.state);
+        let index = guard.index.take().unwrap();
+        let fingerprint = crate::harness::fake_ann::fingerprint_of(&index);
+        guard.index = Some(crate::harness::fake_ann::fake_ann_index(index));
+        fingerprint
+    };
+    let probe = CoordinatorServiceImpl::with_local_nodes(vec![node]);
+    let live = probe.live_dense_identity().await.unwrap();
+    let policy = crate::dense_policy::DenseExecutionPolicy::from_document(
+        crate::pb::DenseExecutionPolicyDocument {
+            format_version: crate::dense_policy::FORMAT_VERSION,
+            policy_id: "document-view".into(),
+            embedding_model: "test".into(),
+            provider_backend: "fake-ann".into(),
+            scoring_fingerprint: fingerprint,
+            corpus_generation: live.corpus_generation,
+            corpus_rows: live.corpus_rows,
+            deleted_docs: live.deleted_docs,
+            corpus_fingerprint: live.corpus_fingerprint,
+            dimensions: 16,
+            measured_queries: 20,
+            target_recall_ppm: 950_000,
+            points: vec![
+                doc_view_policy_point(1_000_000, 1, 990_000),
+                doc_view_policy_point(500_000, 2, 980_000),
+            ],
+        },
+    )
+    .unwrap();
+    let owner = probe.with_dense_execution_policy(policy);
+    let key = DenseRequestKey {
+        k: 1,
+        candidate_depth: 0,
+        filters: None,
+    };
+    let unrestricted = owner
+        .resolve_dense_execution(auto(), 16, key)
+        .await
+        .unwrap()
+        .outcome;
+    assert_eq!(unrestricted.candidate_depth, 1);
+    assert!(unrestricted.policy_qualified);
+    let reader = owner
+        .for_access(Some(&access("semantic", FieldAction::Use)), "bm25_search")
+        .unwrap()
+        .for_vector_field("semantic")
+        .unwrap();
+    let restricted = reader
+        .resolve_dense_execution(auto(), 16, key)
+        .await
+        .unwrap()
+        .outcome;
+    assert_eq!(
+        restricted.resolved_mode,
+        DenseExecutionMode::Balanced as i32
+    );
+    assert_eq!(restricted.filter_selectivity_ppm, 500_000);
+    assert_eq!(restricted.candidate_depth, 2);
+    assert_eq!(
+        restricted.policy_point.unwrap().measured_recall_ppm,
+        980_000
+    );
+    let mismatched_depth = DenseRequestKey {
+        candidate_depth: 1,
+        ..key
+    };
+    let err = reader
+        .resolve_dense_execution(auto(), 16, mismatched_depth)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+}
+
+fn auto() -> crate::dense_execution::DenseRequest {
+    crate::dense_execution::DenseRequest {
+        mode: DenseExecutionMode::Auto,
+        precision: crate::pb::DensePrecisionRequest::Auto,
+        filter_strategy: crate::pb::DenseFilterStrategy::Default,
+    }
+}
 
 #[tokio::test]
 async fn dense_policy_selectivity_uses_authorized_vector_membership() {

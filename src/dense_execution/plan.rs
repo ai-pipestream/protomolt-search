@@ -86,6 +86,8 @@ pub(crate) struct ProviderCaps {
     pub(crate) walks: bool,
     /// The provider can pin enumeration of a mask.
     pub(crate) enumerates: bool,
+    /// Every shard can select by staged top-k over owned bit planes.
+    pub(crate) staged: bool,
     pub(crate) patience: bool,
     pub(crate) floor_pruning: bool,
     pub(crate) candidate_stream: bool,
@@ -104,8 +106,10 @@ pub(crate) enum Route {
     Fp32AllRows,
     /// An uncertified remote quantized scan without per-part receipts.
     UncertifiedScan,
-    /// A graph walk under a built-in preset.
+    /// A graph walk under a built-in preset or a measured point.
     Walk,
+    /// Staged top-k over quantized bit planes.
+    Staged,
     /// A quantized candidate pool rescored in FP32.
     Fp32Pool,
 }
@@ -124,6 +128,13 @@ pub(crate) const HNSW_BALANCED: Preset = Preset {
     name: "hnsw-balanced-v1",
     patience: None,
     default_strategy: Strategy::EnumerateSmall,
+};
+
+/// BALANCED on owned bit planes: the provider's staged top-k.
+pub(crate) const STAGED_BALANCED: Preset = Preset {
+    name: "bitplane-balanced-v1",
+    patience: None,
+    default_strategy: Strategy::Default,
 };
 
 /// FAST on a graph: beam k, patience 0.99 over 15 hops, SPEED routing.
@@ -145,6 +156,8 @@ pub(crate) struct ResolvedDensePlan {
     pub(crate) preset: Option<Preset>,
     /// The technique that selects the candidates of an FP32 pool.
     pub(crate) pool_selection: DenseTechnique,
+    /// Measured evidence, not a built-in preset, admitted the technique.
+    pub(crate) policy_qualified: bool,
     pub(crate) fallback_reason: String,
     pub(crate) planner_reason: String,
 }
@@ -153,12 +166,12 @@ impl ResolvedDensePlan {
     pub(crate) fn approximate(&self) -> bool {
         matches!(
             self.route,
-            Route::Walk | Route::Fp32Pool | Route::UncertifiedScan
+            Route::Walk | Route::Staged | Route::Fp32Pool | Route::UncertifiedScan
         )
     }
 }
 
-fn output_precision(
+pub(crate) fn output_precision(
     request: &DenseRequest,
     caps: &ProviderCaps,
 ) -> Result<Precision, DenseExecutionError> {
@@ -177,23 +190,25 @@ fn output_precision(
 }
 
 /// The technique a mode resolved to, before it is bound to the request.
-struct Choice {
-    mode: Mode,
-    route: Route,
-    selection: Precision,
-    preset: Option<Preset>,
-    reason: &'static str,
-    fallback: String,
+pub(super) struct Choice {
+    pub(super) mode: Mode,
+    pub(super) route: Route,
+    pub(super) selection: Precision,
+    pub(super) preset: Option<Preset>,
+    pub(super) pool: DenseTechnique,
+    pub(super) reason: String,
+    pub(super) fallback: String,
 }
 
 impl Choice {
-    fn new(mode: Mode, route: Route, selection: Precision, reason: &'static str) -> Self {
+    pub(super) fn new(mode: Mode, route: Route, selection: Precision, reason: &str) -> Self {
         Self {
             mode,
             route,
             selection,
             preset: None,
-            reason,
+            pool: DenseTechnique::QuantizedScan,
+            reason: reason.to_string(),
             fallback: String::new(),
         }
     }
@@ -220,24 +235,14 @@ pub(crate) fn resolve(
     }
     let output = output_precision(&request, caps)?;
     let choice = match request.mode {
-        Mode::Exhaustive => {
+        Mode::Exhaustive | Mode::Auto => {
             let (route, selection) = exhaustive(caps, output)?;
-            Choice::new(
-                Mode::Exhaustive,
-                route,
-                selection,
-                "caller required exhaustive coverage",
-            )
-        }
-        Mode::Auto => {
-            let (route, selection) = exhaustive(caps, output)?;
-            Choice::new(
-                Mode::Exhaustive,
-                route,
-                selection,
-                "AUTO selected the exhaustive technique: approximation needs qualifying \
-                 measured evidence",
-            )
+            let reason = if request.mode == Mode::Exhaustive {
+                "caller required exhaustive coverage"
+            } else {
+                "AUTO selected the exhaustive technique: approximation needs qualifying measured evidence"
+            };
+            Choice::new(Mode::Exhaustive, route, selection, reason)
         }
         Mode::Balanced => balanced(caps, output)?,
         Mode::Fast => fast(caps, output)?,
@@ -257,7 +262,18 @@ pub(crate) fn resolve(
         }
         (_, strategy) => strategy,
     };
-    Ok(ResolvedDensePlan {
+    Ok(bind(request, output, filter_strategy, choice, false))
+}
+
+/// Bind a chosen technique to the request it serves.
+pub(super) fn bind(
+    request: DenseRequest,
+    output: Precision,
+    filter_strategy: Strategy,
+    choice: Choice,
+    policy_qualified: bool,
+) -> ResolvedDensePlan {
+    ResolvedDensePlan {
         request,
         resolved_mode: choice.mode,
         route: choice.route,
@@ -265,38 +281,54 @@ pub(crate) fn resolve(
         output_precision: output,
         filter_strategy,
         preset: choice.preset,
-        pool_selection: if caps.exhaustive_scan {
-            DenseTechnique::QuantizedScan
-        } else if caps.walks {
-            DenseTechnique::HnswWalk
-        } else {
-            DenseTechnique::Unspecified
-        },
+        pool_selection: choice.pool,
+        policy_qualified,
         fallback_reason: choice.fallback,
-        planner_reason: choice.reason.to_string(),
-    })
+        planner_reason: choice.reason,
+    }
 }
 
-/// BALANCED: the graph preset, a quantized pool rescored in FP32, an
-/// uncertified remote quantized scan, or the disclosed same-precision
-/// exhaustive technique.
+/// BALANCED: the graph preset, staged bit-plane selection, an FP32 pool over
+/// either, an uncertified remote quantized scan, or the same-precision exhaustive scan.
 fn balanced(caps: &ProviderCaps, output: Precision) -> Result<Choice, DenseExecutionError> {
-    if caps.walks && output != caps.native {
-        return Ok(Choice::new(
-            Mode::Balanced,
-            Route::Fp32Pool,
-            caps.native,
-            "BALANCED rescored the traversal's quantized candidate pool in FP32",
-        ));
-    }
     if caps.walks {
-        let mut choice = Choice::new(
-            Mode::Balanced,
-            Route::Walk,
-            output,
-            "BALANCED walked the graph under its built-in preset",
-        );
+        let mut choice = if output == caps.native {
+            Choice::new(
+                Mode::Balanced,
+                Route::Walk,
+                output,
+                "BALANCED walked the graph under its built-in preset",
+            )
+        } else {
+            Choice::new(
+                Mode::Balanced,
+                Route::Fp32Pool,
+                caps.native,
+                "BALANCED rescored the traversal's quantized candidate pool in FP32",
+            )
+        };
+        choice.pool = DenseTechnique::HnswWalk;
         choice.preset = Some(HNSW_BALANCED);
+        return Ok(choice);
+    }
+    if caps.exhaustive_scan && caps.staged && (output != Precision::Fp32 || caps.fp32_sidecar) {
+        let mut choice = if output == Precision::Fp32 {
+            Choice::new(
+                Mode::Balanced,
+                Route::Fp32Pool,
+                Precision::Quantized,
+                "BALANCED rescored a staged bit-plane candidate pool in FP32",
+            )
+        } else {
+            Choice::new(
+                Mode::Balanced,
+                Route::Staged,
+                Precision::Quantized,
+                "BALANCED selected by staged top-k over bit planes",
+            )
+        };
+        choice.pool = DenseTechnique::BitplaneStaged;
+        choice.preset = Some(STAGED_BALANCED);
         return Ok(choice);
     }
     if caps.exhaustive_scan && output == Precision::Fp32 && caps.fp32_sidecar {
@@ -306,7 +338,7 @@ fn balanced(caps: &ProviderCaps, output: Precision) -> Result<Choice, DenseExecu
             Precision::Quantized,
             "BALANCED rescored a quantized candidate pool in FP32",
         );
-        choice.fallback = "staged bit-plane selection is not enabled on this provider; an \
+        choice.fallback = "staged bit-plane selection is not available on every shard; an \
             exhaustive quantized scan selected the pool"
             .to_string();
         return Ok(choice);
@@ -322,8 +354,8 @@ fn balanced(caps: &ProviderCaps, output: Precision) -> Result<Choice, DenseExecu
         "BALANCED ran the same-precision exhaustive technique",
     );
     choice.fallback = format!(
-        "provider {} has no balanced approximate technique; the exhaustive technique ran \
-         at the same precision",
+        "provider {} has no balanced approximate technique available; the exhaustive \
+         technique ran at the same precision",
         caps.provider
     );
     Ok(choice)
@@ -333,27 +365,30 @@ fn balanced_uncertified(
     caps: &ProviderCaps,
     output: Precision,
 ) -> Result<Choice, DenseExecutionError> {
-    match output {
-        Precision::Quantized => Ok(Choice::new(
-            Mode::Balanced,
+    let (route, reason) = match output {
+        Precision::Quantized => (
             Route::UncertifiedScan,
-            Precision::Quantized,
             "BALANCED ran a remote quantized scan without per-part coverage receipts",
-        )),
-        Precision::Fp32 if caps.fp32_sidecar => Ok(Choice::new(
-            Mode::Balanced,
+        ),
+        Precision::Fp32 if caps.fp32_sidecar => (
             Route::Fp32Pool,
-            Precision::Quantized,
             "BALANCED rescored a remote quantized candidate pool in FP32",
-        )),
-        Precision::Fp32 => Err(DenseExecutionError::FailedPrecondition(format!(
-            "BALANCED FP32 rescoring on provider {} requires product-owned FP32 sidecars",
-            caps.provider
-        ))),
-        Precision::Unspecified => Err(DenseExecutionError::InvalidRequest(
-            "dense query: output precision must be resolved".to_string(),
-        )),
-    }
+        ),
+        Precision::Fp32 => {
+            return Err(DenseExecutionError::FailedPrecondition(format!(
+                "BALANCED FP32 rescoring on provider {} requires product-owned FP32 sidecars",
+                caps.provider
+            )))
+        }
+        Precision::Unspecified => {
+            return Err(DenseExecutionError::InvalidRequest(
+                "dense query: output precision must be resolved".to_string(),
+            ))
+        }
+    };
+    let mut choice = Choice::new(Mode::Balanced, route, Precision::Quantized, reason);
+    choice.pool = DenseTechnique::Unspecified;
+    Ok(choice)
 }
 
 /// FAST: the graph's speed preset, never a substitute.

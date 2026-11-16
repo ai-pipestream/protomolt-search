@@ -21,6 +21,7 @@ fn scan_job(
         enumerate_max_rows: None,
         filter_strategy: 0,
         enumerate_all: false,
+        staged_selection: false,
         patience_saturation_ppm: None,
         patience_hops: None,
         floor_prune: None,

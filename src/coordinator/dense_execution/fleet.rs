@@ -3,7 +3,6 @@
 use super::*;
 
 impl CoordinatorServiceImpl {
-    #[cfg(test)]
     pub(in crate::coordinator) async fn dense_filter_selectivity(
         &self,
         filters: Option<&RequestFilters>,

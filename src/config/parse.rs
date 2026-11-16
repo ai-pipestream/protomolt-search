@@ -76,7 +76,8 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             query_dim, save_on_shutdown];
         stream => [stream_search, stream_finish_settle_us, stream_finish_deadline_us,
             stream_poll_delay_us, relay, bm25_stream];
-        lexical => [analysis_addr, bm25_k1, bm25_b, dense_quality_profile, synonyms];
+        lexical => [analysis_addr, bm25_k1, bm25_b, dense_quality_profile, synonyms,
+            dense_execution_policy];
         columns => [bm25_fields, facet_fields, numeric_fields, map_facet_fields,
             map_numeric_fields, map_integer_fields, map_unsigned_integer_fields, integer_fields,
             unsigned_integer_fields, geo_fields];

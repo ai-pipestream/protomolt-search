@@ -111,11 +111,24 @@ impl NodeServiceImpl {
         _request: Request<GetVectorBackendRequest>,
     ) -> Result<Response<GetVectorBackendResponse>, Status> {
         let guard = read_shard(&self.state);
+        let physical_docs = physical_rows(&guard);
+        let deleted_docs = guard.live_docs.deleted_count().min(physical_docs);
+        let (wal_generation, wal_high_watermark) = guard
+            .wal
+            .as_ref()
+            .map_or((0, 0), |wal| (wal.generation(), wal.high_watermark()));
+        let stats_epoch = guard.stats_epoch;
+        let stats_incarnation = guard.stats_incarnation.bytes()?;
         let Some(index) = guard.index.as_ref() else {
             return Ok(Response::new(GetVectorBackendResponse {
                 descriptor: None,
                 config: None,
                 num_vectors: 0,
+                deleted_docs,
+                wal_generation,
+                wal_high_watermark,
+                stats_epoch,
+                stats_incarnation,
             }));
         };
         let config = index
@@ -125,6 +138,11 @@ impl NodeServiceImpl {
             descriptor: Some(wire_backend_descriptor(index)),
             config: Some(wire_backend_config(&config)),
             num_vectors: index.len() as u64,
+            deleted_docs,
+            wal_generation,
+            wal_high_watermark,
+            stats_epoch,
+            stats_incarnation,
         }))
     }
 

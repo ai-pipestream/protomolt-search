@@ -24,6 +24,9 @@ pub fn merge_vector_backend(
     };
     let name = |shard: usize| children.get(shard).map_or("", String::as_str);
     let mut num_vectors: u64 = 0;
+    let mut deleted_docs: u64 = 0;
+    let mut state_hash = turbo_sha256::Sha256::new();
+    state_hash.update(b"relay-vector-state-v1");
     for (shard, report) in reports.iter().enumerate() {
         if report.descriptor.is_none() {
             return Err(Status::failed_precondition(format!(
@@ -54,12 +57,45 @@ pub fn merge_vector_backend(
                 name(shard)
             ))
         })?;
+        deleted_docs = deleted_docs
+            .checked_add(report.deleted_docs)
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "relay: child {shard} ({}) overflows the summed deleted_docs count",
+                    name(shard)
+                ))
+            })?;
+        fold_child_mutation_state(&mut state_hash, shard, report);
     }
     Ok(crate::pb::GetVectorBackendResponse {
         descriptor: first.descriptor.clone(),
         config: first.config.clone(),
         num_vectors,
+        deleted_docs,
+        wal_generation: reports.iter().map(|r| r.wal_generation).max().unwrap_or(0),
+        wal_high_watermark: reports
+            .iter()
+            .fold(0u64, |acc, r| acc.wrapping_add(r.wal_high_watermark)),
+        stats_epoch: reports
+            .iter()
+            .fold(0u64, |acc, r| acc.wrapping_add(r.stats_epoch)),
+        stats_incarnation: state_hash.finish().0.to_vec(),
     })
+}
+
+fn fold_child_mutation_state(
+    hasher: &mut turbo_sha256::Sha256,
+    shard: usize,
+    report: &crate::pb::GetVectorBackendResponse,
+) {
+    hasher.update(&(shard as u64).to_le_bytes());
+    hasher.update(&report.num_vectors.to_le_bytes());
+    hasher.update(&report.deleted_docs.to_le_bytes());
+    hasher.update(&report.wal_generation.to_le_bytes());
+    hasher.update(&report.wal_high_watermark.to_le_bytes());
+    hasher.update(&report.stats_epoch.to_le_bytes());
+    hasher.update(&(report.stats_incarnation.len() as u64).to_le_bytes());
+    hasher.update(&report.stats_incarnation);
 }
 
 impl RelayService {

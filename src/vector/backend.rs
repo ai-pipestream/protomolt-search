@@ -51,6 +51,10 @@ pub enum VectorCapability {
     /// Layer-0 graph walks support monotone candidate pruning against an active
     /// score floor behind the ascent gate and clamp.
     FloorPruning,
+    /// This generation can select by staged top-k over owned bit planes: a
+    /// sign-plane shortlist, a lower-plane ranking and an exact rescore,
+    /// whose id set may miss rows the whole scan would return.
+    StagedTopK,
 }
 
 impl VectorCapability {
@@ -69,6 +73,7 @@ impl VectorCapability {
             Self::MaskEnumeration => "mask_enumeration",
             Self::PatienceEarlyStop => "patience_early_stop",
             Self::FloorPruning => "floor_pruning",
+            Self::StagedTopK => "staged_top_k",
         }
     }
 }

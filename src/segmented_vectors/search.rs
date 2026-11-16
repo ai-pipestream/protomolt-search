@@ -27,6 +27,7 @@ pub(super) fn segment_options<'a>(
         filter_routing,
         patience,
         floor_prune,
+        staged,
     } = *options;
     let floor_prune = floor_prune.map(|fp| {
         let seg_eligible = part_allow.map_or(part_rows, |m| m.count());
@@ -41,6 +42,7 @@ pub(super) fn segment_options<'a>(
         filter_routing,
         patience,
         floor_prune,
+        staged,
     }
 }
 

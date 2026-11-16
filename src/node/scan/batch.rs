@@ -43,7 +43,12 @@ impl BatchContext<'_> {
             )));
         }
         check_enumerate_threshold(index, job.enumerate_max_rows)?;
-        let controls = selection_controls(index, job.filter_strategy, job.enumerate_all)?;
+        let controls = selection_controls(
+            index,
+            job.filter_strategy,
+            job.enumerate_all,
+            job.staged_selection,
+        )?;
         let patience =
             check_patience_options(index, job.patience_saturation_ppm, job.patience_hops)?;
         let floor_prune = check_floor_prune_options(

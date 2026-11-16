@@ -118,7 +118,94 @@ struct EmbeddedTurboVec {
     index: TurboQuantIndex,
 }
 
+/// Rows at which turbovec searches an owned image through its bit-plane
+/// cache, on a host and geometry whose kernels read it.
+const STAGED_MIN_ROWS: usize = 32_768;
+
+fn vector_major_enabled() -> bool {
+    if std::env::var("TURBOVEC_NO_VECTOR_MAJOR").is_ok_and(|v| v != "0")
+        || std::env::var("TURBOVEC_NO_VNNI").is_ok_and(|v| v != "0")
+    {
+        return false;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx512vbmi")
+            && std::arch::is_x86_feature_detected!("avx512vnni")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512f")
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("dotprod")
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
+/// Mirror `turbovec::pack::planes_wanted` so `staged_top_k` is advertised and
+/// reported only when the engine's bit-plane shortlist path actually runs.
+fn bit_planes_eligible(bits: usize, dim: usize) -> bool {
+    if dim == 0 || !dim.is_multiple_of(8) {
+        return false;
+    }
+    let n_byte_groups = (bits * dim) / 8;
+    let vm8_2bit = std::env::var_os("TURBOVEC_2BIT_VM8").is_some_and(|v| v == "1");
+    let sign_scans = if cfg!(target_arch = "x86_64") {
+        vector_major_enabled()
+    } else {
+        cfg!(target_arch = "aarch64") && !vm8_2bit
+    };
+    match bits {
+        2 => {
+            n_byte_groups.is_multiple_of(8)
+                && !std::env::var_os("TURBOVEC_2BIT_PLANES").is_some_and(|v| v == "0")
+                && sign_scans
+        }
+        4 => {
+            n_byte_groups.is_multiple_of(16)
+                && !std::env::var_os("TURBOVEC_4BIT_PLANES").is_some_and(|v| v == "0")
+                && sign_scans
+                && vector_major_enabled()
+        }
+        _ => false,
+    }
+}
+
 impl EmbeddedTurboVec {
+    fn capabilities(&self) -> Vec<VectorCapability> {
+        let mut capabilities = vec![
+            VectorCapability::BatchQuery,
+            VectorCapability::CandidateStream,
+            VectorCapability::LiveBoundInput,
+            VectorCapability::DenseMask,
+            VectorCapability::CandidateRescore,
+            VectorCapability::Append,
+            VectorCapability::Flush,
+            VectorCapability::SnapshotInstall,
+            VectorCapability::RawVectorRebuild,
+            VectorCapability::ExhaustiveCompletion,
+        ];
+        if self.staged_eligible() {
+            capabilities.push(VectorCapability::StagedTopK);
+        }
+        capabilities
+    }
+
+    /// An owned image of at least [`STAGED_MIN_ROWS`] rows at a supported
+    /// bit-width and dimension geometry on a host whose kernels read bit
+    /// planes is searched in stages unless exhaustive search is required.
+    fn staged_eligible(&self) -> bool {
+        !self.index.is_mapped()
+            && self.index.len() >= STAGED_MIN_ROWS
+            && self
+                .index
+                .dim_opt()
+                .is_some_and(|dim| bit_planes_eligible(self.index.bit_width(), dim))
+    }
+
     fn payload(&self) -> ConfigPayload {
         let (shift, scale) = match self.index.calibration_state() {
             CalibrationState::Calibrated => (
@@ -140,12 +227,12 @@ impl EmbeddedTurboVec {
         options: VectorSearchOptions<'_>,
         allow: Option<&'a [bool]>,
     ) -> SearchOptions<'a> {
-        // This provider advertises `ExhaustiveQuantized`: every top-k
-        // is the whole-index scan's, bit for bit. On a bit-plane cache
-        // (32,768+ rows on aarch64 or AVX-512 VBMI + VNNI hosts) turbovec
-        // would otherwise search in stages, with an approximate id set
-        // that also depends on the caller's thread count.
-        let mut native = SearchOptions::new().with_exhaustive(true);
+        // This provider advertises `ExhaustiveQuantized`: unless a plan asks
+        // for staged selection, every top-k is the whole-index scan's, bit
+        // for bit. On a bit-plane cache (32,768+ rows on aarch64 or AVX-512
+        // VBMI + VNNI hosts) turbovec otherwise searches in stages, with an
+        // approximate id set that also depends on the caller's thread count.
+        let mut native = SearchOptions::new().with_exhaustive(!options.staged);
         if let Some(allow) = allow {
             native = native.with_mask(allow);
         }
@@ -263,18 +350,7 @@ impl VectorProvider for EmbeddedTurboVec {
             )
             .to_hex(),
             quality_contract: QualityContract::ExhaustiveQuantized,
-            capabilities: vec![
-                VectorCapability::BatchQuery,
-                VectorCapability::CandidateStream,
-                VectorCapability::LiveBoundInput,
-                VectorCapability::DenseMask,
-                VectorCapability::CandidateRescore,
-                VectorCapability::Append,
-                VectorCapability::Flush,
-                VectorCapability::SnapshotInstall,
-                VectorCapability::RawVectorRebuild,
-                VectorCapability::ExhaustiveCompletion,
-            ],
+            capabilities: self.capabilities(),
         }
     }
 
@@ -319,6 +395,7 @@ impl VectorProvider for EmbeddedTurboVec {
         options: VectorSearchOptions<'_>,
     ) -> Result<VectorSearchResults, VectorError> {
         let allow_mask = options.allow;
+        let ran_staged = options.staged && self.staged_eligible();
         let allow = allow_mask.map(|mask| mask.bools());
         let result = self
             .index
@@ -330,6 +407,12 @@ impl VectorProvider for EmbeddedTurboVec {
             PartCounts {
                 total: 1,
                 skipped: 1,
+                ..Default::default()
+            }
+        } else if ran_staged {
+            PartCounts {
+                total: 1,
+                staged: 1,
                 ..Default::default()
             }
         } else {
