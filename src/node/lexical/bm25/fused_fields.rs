@@ -101,15 +101,16 @@ impl<'a> FusedFields<'a> {
                 .zip(&self.legs)
                 .map(|(view, &li)| (view.as_ref(), self.req.fields[li].terms.as_slice()))
                 .collect();
-            (response.facets, response.range_facets, _, _) = store.count_facets(
-                &pairs,
-                &self.req.facet_fields,
-                &self.req.map_facet_fields,
-                &self.req.range_facet_fields,
-                &[],
-                &[],
-                filter,
-            )?;
+            (response.facets, response.range_facets, _, _) =
+                store.count_facets(crate::node::shard::FacetCountRequest {
+                    views: &pairs,
+                    facet_fields: &self.req.facet_fields,
+                    map_facet_fields: &self.req.map_facet_fields,
+                    range_facet_fields: &self.req.range_facet_fields,
+                    stats_fields: &[],
+                    cardinality_fields: &[],
+                    filter,
+                })?;
         }
         Ok(())
     }

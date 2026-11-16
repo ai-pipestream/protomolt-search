@@ -2,6 +2,8 @@
 
 use crate::node::*;
 
+#[path = "seal_flush.rs"]
+mod seal_flush;
 #[path = "seal_write.rs"]
 mod seal_write;
 
@@ -20,6 +22,37 @@ pub(in crate::node) struct SealPlan {
     pub(in crate::node) stage: PathBuf,
     pub(in crate::node) segment_id: String,
     pub(in crate::node) generation: u64,
+}
+
+/// Freeze the vector tail over the same `rows` as the documents (or pick
+/// up the frozen image a failed seal left). `None` when it holds no vector.
+fn freeze_vector_image(
+    provider: Option<&mut SegmentedProvider>,
+    rows: usize,
+) -> Result<Option<Arc<VectorIndex>>, Status> {
+    match provider {
+        Some(provider) => match provider.frozen() {
+            Some((_, frozen_rows, image)) => Ok((frozen_rows > 0).then(|| Arc::clone(image))),
+            None => {
+                let held = provider.tail().len();
+                let backend = provider
+                    .tail()
+                    .backend_config()
+                    .map_err(|e| Status::internal(format!("tail backend: {e}")))?;
+                let dim = provider
+                    .tail()
+                    .dim_opt()
+                    .ok_or_else(|| Status::internal("segmented tail image has no dimension"))?;
+                let fresh = VectorIndex::from_backend_config(dim, &backend)
+                    .map_err(|e| Status::internal(format!("fresh tail image: {e}")))?;
+                let image = provider
+                    .freeze_tail(fresh, rows)
+                    .map_err(|e| Status::internal(format!("freeze vectors: {e}")))?;
+                Ok((held > 0).then_some(image))
+            }
+        },
+        None => Ok(None),
+    }
 }
 
 impl NodeServiceImpl {
@@ -155,29 +188,7 @@ impl NodeServiceImpl {
                 (base, rows, store)
             }
         };
-        let image = match provider {
-            Some(provider) => match provider.frozen() {
-                Some((_, frozen_rows, image)) => (frozen_rows > 0).then(|| Arc::clone(image)),
-                None => {
-                    let held = provider.tail().len();
-                    let backend = provider
-                        .tail()
-                        .backend_config()
-                        .map_err(|e| Status::internal(format!("tail backend: {e}")))?;
-                    let dim = provider
-                        .tail()
-                        .dim_opt()
-                        .ok_or_else(|| Status::internal("segmented tail image has no dimension"))?;
-                    let fresh = VectorIndex::from_backend_config(dim, &backend)
-                        .map_err(|e| Status::internal(format!("fresh tail image: {e}")))?;
-                    let image = provider
-                        .freeze_tail(fresh, rows)
-                        .map_err(|e| Status::internal(format!("freeze vectors: {e}")))?;
-                    (held > 0).then_some(image)
-                }
-            },
-            None => None,
-        };
+        let image = freeze_vector_image(provider, rows)?;
         let backend_kind = image
             .as_ref()
             .map(|i| i.descriptor().backend_kind)
@@ -258,249 +269,5 @@ impl NodeServiceImpl {
         tokio::task::spawn_blocking(move || service.seal_if_due_blocking())
             .await
             .map_err(|e| Status::internal(format!("seal task failed: {e}")))?
-    }
-
-    /// Persist the index to its configured path, if any. Shared by `Flush` and shutdown.
-    pub fn flush_index(&self) -> Result<FlushResponse, Status> {
-        let Some(config_path) = self.config.index_path.clone() else {
-            let mut guard = write_shard(&self.state);
-            if let Some(index) = guard.index.as_mut() {
-                if index.as_segmented().is_none() {
-                    index
-                        .prepare()
-                        .map_err(|e| Status::internal(format!("prepare index: {e}")))?;
-                }
-            }
-            return Ok(FlushResponse {
-                path: String::new(),
-                num_vectors: guard.index.as_ref().map_or(0, |i| i.len() as u64),
-                num_documents: guard.bm25.as_ref().map_or(0, |b| b.doc_count()),
-                written: false,
-            });
-        };
-        // Log before data: fsync the WAL BEFORE the index images are
-        // written, so a crash between the two leaves the log a superset
-        // of the on-disk indexes — never the reverse. An index image
-        // whose records the log lost would silently drop those records
-        // from every future replay (reshard, recovery).
-        {
-            let mut guard = write_shard(&self.state);
-            guard.check_catalog_publication()?;
-            if guard.mapped_binding.is_some() && guard.bm25.is_none() {
-                guard.bm25 = Some(self.new_builder(guard.generation.as_ref())?);
-            }
-            if let Some(wal) = guard.wal.as_mut() {
-                wal.flush().map_err(|e| {
-                    Status::internal(format!("wal fsync {}: {e}", wal.dir().display()))
-                })?;
-            }
-        }
-        // A segmented shard seals its tail with the lock free (see
-        // `seal_tail`); the single-image writes below hold it.
-        let sealed = self.seal_tail()?;
-        let mut guard = write_shard(&self.state);
-        guard.check_catalog_publication()?;
-        let num_vectors = guard.index.as_ref().map_or(0, |i| i.len() as u64);
-        let num_documents = guard.bm25.as_ref().map_or(0, |b| b.doc_count());
-        let (vector_path, exact_path, bm25_path) =
-            storage_paths(&config_path, guard.generation.as_ref());
-        let live_docs_path = live_docs_storage_path(&config_path, guard.generation.as_ref());
-        if let Some(exact) = guard.exact_vectors.as_ref() {
-            if let Some(index) = guard.index.as_ref() {
-                if exact.len() != index.len() || exact.dim() != index.dim_opt() {
-                    return Err(Status::failed_precondition(format!(
-                        "exact-vector sidecar shape {:?}x{} does not match provider shape {:?}x{}",
-                        exact.dim(),
-                        exact.len(),
-                        index.dim_opt(),
-                        index.len()
-                    )));
-                }
-            } else if guard
-                .bm25
-                .as_ref()
-                .is_some_and(|bm25| exact.len() != bm25.next_doc_id() as usize)
-            {
-                return Err(Status::failed_precondition(
-                    "exact-vector sidecar row count does not match product document rows",
-                ));
-            }
-        }
-        // Publish the old-reader refusal before the first retained image can
-        // become durable, including when this shard deliberately has no WAL.
-        if !guard.multi_res_vectors.is_empty()
-            && !guard.live_docs.requires_retained_vectors()
-            && guard
-                .index
-                .as_ref()
-                .and_then(VectorIndex::as_segmented)
-                .is_none()
-        {
-            guard.live_docs = guard
-                .live_docs
-                .clone()
-                .with_retained_vectors()
-                .write(&live_docs_path, physical_rows(&guard))
-                .map_err(|error| {
-                    Status::internal(format!("publish retained reader gate: {error}"))
-                })?;
-        }
-        if let Some(index) = guard.index.as_mut() {
-            if let Some(provider) = index.as_segmented() {
-                // With no rows, no sealed image carries the provider state.
-                // Persist the empty tail so reopening without WAL retains its
-                // dimension and calibration, including after full compaction.
-                if index.is_empty() {
-                    provider.tail().write(&vector_path).map_err(|e| {
-                        Status::internal(format!("write {}: {e}", vector_path.display()))
-                    })?;
-                }
-            } else {
-                index.prepare().map_err(|e| {
-                    Status::internal(format!("prepare {}: {e}", vector_path.display()))
-                })?;
-                index.write(&vector_path).map_err(|e| {
-                    Status::internal(format!("write {}: {e}", vector_path.display()))
-                })?;
-            }
-        }
-        let sealed_exact = guard
-            .index
-            .as_ref()
-            .and_then(VectorIndex::as_segmented)
-            .filter(|provider| provider.tail().is_empty() && provider.frozen().is_none())
-            .map(|provider| {
-                let dim = provider
-                    .tail()
-                    .dim_opt()
-                    .ok_or_else(|| Status::internal("segmented provider has no dimension"))?;
-                ExactVectorStore::from_segments(provider.snapshot(), dim)
-                    .map_err(|error| Status::internal(format!("sealed exact-vector view: {error}")))
-            })
-            .transpose()?;
-        if let Some(exact) = sealed_exact {
-            guard.exact_vectors = Some(exact);
-        } else if guard
-            .index
-            .as_ref()
-            .and_then(VectorIndex::as_segmented)
-            .is_some()
-        {
-            // Writes accepted during the seal remain in the private tail. The
-            // catalog already durably owns the sealed prefix; no full copy is
-            // needed. files_current below prevents exporting this newer tail.
-        } else if let Some(exact) = guard.exact_vectors.as_ref() {
-            let mapped = exact
-                .write(&exact_path)
-                .map_err(|e| Status::internal(format!("write {}: {e}", exact_path.display())))?;
-            guard.exact_vectors = Some(mapped);
-        }
-        let physical_rows = physical_rows(&guard);
-        if guard
-            .index
-            .as_ref()
-            .and_then(VectorIndex::as_segmented)
-            .is_none()
-        {
-            let payload = crate::multi_res::storage_path(&config_path, guard.generation.as_ref());
-            crate::multi_res_storage::write(
-                &guard.multi_res_vectors,
-                &payload,
-                physical_rows,
-                guard.live_docs.requires_retained_vectors(),
-            )
-            .map_err(|error| Status::internal(format!("persist retained vectors: {error}")))?;
-        }
-        if !guard.multi_res_vectors.is_empty()
-            && guard
-                .index
-                .as_ref()
-                .and_then(VectorIndex::as_segmented)
-                .is_none()
-        {
-            guard.live_docs = guard.live_docs.clone().with_retained_vectors();
-        }
-        guard.live_docs = guard
-            .live_docs
-            .write(&live_docs_path, physical_rows)
-            .map_err(|e| Status::internal(format!("write {}: {e}", live_docs_path.display())))?;
-        // Save the builder as v3 and immediately reopen it disk-resident:
-        // after Flush a shard holds no postings or texts in heap.
-        // Already-resident shards have nothing to write.
-        // The binding persists with the store bytes (the kinded binding
-        // entry), so the flushed file carries exactly what the shard is
-        // bound to.
-        let binding = guard.mapped_binding.clone();
-        let derived = stored_derived(&self.config);
-        let built = match guard.bm25.as_mut() {
-            Some(Bm25Shard::Building(store)) => {
-                store.set_binding(binding);
-                store.set_derived(derived);
-                store
-                    .save(&bm25_path)
-                    .map_err(|e| Status::internal(format!("write {}: {e}", bm25_path.display())))?;
-                true
-            }
-            Some(Bm25Shard::Spilling(builder)) => {
-                builder.set_binding(binding);
-                builder.set_derived(derived);
-                builder
-                    .finish(&bm25_path)
-                    .map_err(|e| Status::internal(format!("write {}: {e}", bm25_path.display())))?;
-                true
-            }
-            _ => false,
-        };
-        if built {
-            guard.bm25 = Some(
-                Bm25Reader::open(&bm25_path)
-                    .map(Bm25Shard::Resident)
-                    .map_err(|e| {
-                        Status::internal(format!("reopen {}: {e}", bm25_path.display()))
-                    })?,
-            );
-            // The stats are the same numbers after a flush, but a
-            // Spilling shard was refusing TermStats until now — the
-            // bump is what tells a cache to come look again.
-            guard.advance_stats_epoch();
-        }
-        let written = sealed
-            || guard.index.is_some()
-            || guard.exact_vectors.is_some()
-            || guard.bm25.is_some();
-        // Finalize any pending compaction cutover now that its images are durable.
-        if let Some(pending) = guard.pending_compaction.take() {
-            pending
-                .complete()
-                .map_err(|e| Status::internal(format!("complete compaction cutover: {e}")))?;
-        }
-        // Durability point reached: the log was fsynced above, then the
-        // indexes hit disk. The marker records that a flush happened;
-        // its own fsync failing degrades the log rather than un-flushing
-        // the indexes (they are already durable and consistent).
-        wal_append_or_degrade(&mut guard.wal, wal_record::Op::Flush(FlushMarker {}));
-        if let Some(wal) = guard.wal.as_mut() {
-            if let Err(e) = wal.flush() {
-                eprintln!("wal: post-flush marker fsync failed: {e}");
-            }
-        }
-        if let Some(notify) = &self.flush_notify {
-            notify.notify_one();
-        }
-        // Writes arriving while the frozen segment was being written may
-        // occupy a new tail. They require another flush before snapshot copy.
-        guard.files_current = !matches!(guard.bm25.as_ref(), Some(Bm25Shard::Segmented(shard))
-            if shard.tail().next_doc_id() != 0 || shard.frozen().is_some())
-            && !guard
-                .index
-                .as_ref()
-                .and_then(VectorIndex::as_segmented)
-                .is_some_and(|provider| !provider.tail().is_empty() || provider.frozen().is_some());
-        Ok(FlushResponse {
-            path: vector_path.display().to_string(),
-            num_vectors,
-            num_documents,
-            written,
-        })
     }
 }
