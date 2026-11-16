@@ -146,7 +146,8 @@ pub struct ScoredDoc {
     pub doc_id: u32,
     /// Summed BM25 score over all query terms.
     pub score: f64,
-    /// `(query term index, offsets)` for the terms present in this doc.
+    /// `(query term index, offsets)` for the terms present in this doc,
+    /// or empty when the request disables offset decoding.
     pub term_offsets: Vec<(usize, Vec<(u32, u32)>)>,
 }
 
@@ -177,7 +178,7 @@ pub struct FusedDoc {
     /// `sum over fields f of w_f * bm25_f(q, d)`.
     pub score: f64,
     /// `(field id, term index within that field's terms, offsets)` for
-    /// the (field, term) pairs present in this doc.
+    /// the pairs present in this doc, or empty when offsets are disabled.
     pub term_offsets: Vec<FusedTermOffset>,
 }
 

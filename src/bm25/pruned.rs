@@ -47,39 +47,33 @@ fn run(
             scan.advance(doc, true);
             continue;
         }
-        let entry = scan.score(doc, controls.chain, prune);
-        if passes(controls.filter, doc) && entry.score >= controls.floor {
-            admit(&mut scan, entry, controls.k, hooks);
+        let score = scan.score(doc, controls.chain, prune);
+        if passes(controls.filter, doc) && score >= controls.floor {
+            if let Some(sink) = hooks.candidate.as_mut() {
+                sink(doc, score as f32);
+            }
+            scan.admit(doc, score, controls.k, controls.include_offsets);
         }
         scan.advance(doc, false);
     }
     Some(scan.finish(prune))
 }
 
-/// Emit `entry` as a candidate and keep it if it beats the heap's worst.
-fn admit(scan: &mut Scan<'_>, entry: HeapEntry, k: usize, hooks: &mut Hooks<'_>) {
-    if let Some(sink) = hooks.candidate.as_mut() {
-        sink(entry.doc_id, entry.score as f32);
-    }
-    if scan.heap.len() < k {
-        scan.heap.push(entry);
-    } else if entry < *scan.heap.peek().expect("full heap") {
-        scan.heap.pop();
-        scan.heap.push(entry);
-    }
-}
-
-/// The (field, term, offsets) triples `entry`'s membership mask records,
-/// in pair order.
+/// Decode offsets for the matched `(field, term)` pairs in query order.
 fn matched(fields: &[FieldQuery<'_>], entry: &HeapEntry) -> Vec<super::FusedTermOffset> {
-    let pairs = fields
+    if entry.matched.is_empty() {
+        return Vec::new();
+    }
+    let pairs: Vec<_> = fields
         .iter()
         .enumerate()
-        .flat_map(|(field, query)| (0..query.terms.len()).map(move |term| (field, term)));
-    pairs
-        .enumerate()
-        .filter(|&(position, _)| entry.mask >> position & 1 == 1)
-        .map(|(_, (field, term))| {
+        .flat_map(|(field, query)| (0..query.terms.len()).map(move |term| (field, term)))
+        .collect();
+    entry
+        .matched
+        .iter()
+        .map(|&position| {
+            let (field, term) = pairs[position];
             let query = &fields[field];
             let offsets = query
                 .index

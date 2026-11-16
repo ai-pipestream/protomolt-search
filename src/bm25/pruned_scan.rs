@@ -30,12 +30,62 @@ pub(super) struct Scan<'a> {
     pub heap: BinaryHeap<HeapEntry>,
     finished: (u64, u64),
     order: Vec<usize>,
+    rank: Vec<usize>,
     nonessential: Vec<bool>,
-    prefix: Vec<usize>,
     lengths: Vec<u32>,
     contributions: Vec<f64>,
     touched: Vec<usize>,
     last_selected: Option<u32>,
+}
+
+fn prefix_bound(len: usize, bound_at: &impl Fn(usize) -> f64, rank: &[usize], count: usize) -> f64 {
+    let mut bound = 0.0;
+    for (position, &item_rank) in rank.iter().take(len).enumerate() {
+        if item_rank < count {
+            bound += bound_at(position);
+        }
+    }
+    bound
+}
+
+fn partition_by(
+    len: usize,
+    bound_at: impl Fn(usize) -> f64,
+    cutoff: &Cutoff<'_>,
+    order: &mut Vec<usize>,
+    rank: &mut Vec<usize>,
+    nonessential: &mut Vec<bool>,
+) {
+    order.clear();
+    order.extend(0..len);
+    order.sort_by(|&a, &b| {
+        bound_at(a)
+            .partial_cmp(&bound_at(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    rank.resize(len, 0);
+    for (item_rank, &position) in order.iter().enumerate() {
+        rank[position] = item_rank;
+    }
+    let count = if (0..len).all(|i| bound_at(i) >= 0.0) {
+        let (mut lo, mut hi) = (0, len);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if cutoff.inert(prefix_bound(len, &bound_at, rank, mid)) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo
+    } else {
+        (1..=len)
+            .take_while(|&n| cutoff.inert(prefix_bound(len, &bound_at, rank, n)))
+            .last()
+            .unwrap_or(0)
+    };
+    nonessential.clear();
+    nonessential.extend(rank.iter().take(len).map(|&item_rank| item_rank < count));
 }
 
 impl<'a> Scan<'a> {
@@ -45,8 +95,8 @@ impl<'a> Scan<'a> {
             heap: BinaryHeap::new(),
             finished: (0, 0),
             order: Vec::new(),
+            rank: Vec::new(),
             nonessential: Vec::new(),
-            prefix: Vec::new(),
             lengths: Vec::new(),
             contributions: vec![0.0; count],
             touched: Vec::new(),
@@ -105,32 +155,15 @@ impl<'a> Scan<'a> {
     }
 
     fn partition(&mut self, cutoff: &Cutoff<'_>) {
-        self.order.clear();
-        self.order.extend(0..self.pairs.len());
-        self.order.sort_by(|&a, &b| {
-            self.pairs[a]
-                .block_max
-                .partial_cmp(&self.pairs[b].block_max)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        self.nonessential.clear();
-        self.nonessential.resize(self.pairs.len(), false);
-        self.prefix.clear();
-        for &next in &self.order {
-            let mut bound = 0.0;
-            for (position, pair) in self.pairs.iter().enumerate() {
-                if position == next || self.prefix.contains(&position) {
-                    bound += pair.block_max;
-                }
-            }
-            if !cutoff.inert(bound) {
-                break;
-            }
-            self.prefix.push(next);
-        }
-        for &position in &self.prefix {
-            self.nonessential[position] = true;
-        }
+        let pairs = &self.pairs;
+        partition_by(
+            pairs.len(),
+            |i| pairs[i].block_max,
+            cutoff,
+            &mut self.order,
+            &mut self.rank,
+            &mut self.nonessential,
+        );
     }
 
     pub fn candidate(&mut self, cutoff: &Cutoff<'_>) -> Option<u32> {
@@ -179,15 +212,13 @@ impl<'a> Scan<'a> {
         bound
     }
 
-    pub fn score(&mut self, doc: u32, chain: ChainCtx<'_>, prune: &mut PruneStats) -> HeapEntry {
+    pub fn score(&mut self, doc: u32, chain: ChainCtx<'_>, prune: &mut PruneStats) -> f64 {
         self.touched.clear();
-        let mut mask = 0;
         for pair in &mut self.pairs {
             pair.cursor.advance_shallow(doc);
             if pair.cursor.doc_id() == doc {
                 self.contributions[pair.order] = pair.contribution(&self.lengths);
                 self.touched.push(pair.order);
-                mask |= 1u128 << pair.order;
             }
         }
         self.touched.sort_unstable();
@@ -198,11 +229,32 @@ impl<'a> Scan<'a> {
         let score = chain.map_or(score, |(chain, columns)| chain.eval(score, doc, columns));
         prune.candidates_evaluated += 1;
         prune.postings_scored += self.touched.len() as u64;
-        HeapEntry {
+        score
+    }
+
+    pub fn admit(&mut self, doc: u32, score: f64, k: usize, include_offsets: bool) {
+        let replace = if self.heap.len() < k {
+            false
+        } else if self.heap.peek().is_some_and(|worst| {
+            super::ranking::compare((doc, score), (worst.doc_id, worst.score)).is_lt()
+        }) {
+            true
+        } else {
+            return;
+        };
+        if replace {
+            self.heap.pop();
+        }
+        let matched = if include_offsets {
+            Box::from(self.touched.as_slice())
+        } else {
+            Box::default()
+        };
+        self.heap.push(HeapEntry {
             doc_id: doc,
             score,
-            mask,
-        }
+            matched,
+        });
     }
 
     pub fn advance(&mut self, doc: u32, shallow: bool) {
@@ -234,5 +286,78 @@ impl<'a> Scan<'a> {
         let mut hits = self.heap.into_vec();
         hits.sort();
         hits
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{partition_by, Cutoff};
+
+    fn sequential_oracle(bounds: &[f64], cutoff: &Cutoff<'_>) -> Vec<bool> {
+        let mut order: Vec<usize> = (0..bounds.len()).collect();
+        order.sort_by(|&a, &b| {
+            bounds[a]
+                .partial_cmp(&bounds[b])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut nonessential = vec![false; bounds.len()];
+        for &next in &order {
+            let mut bound = 0.0;
+            for (position, &value) in bounds.iter().enumerate() {
+                if position == next || nonessential[position] {
+                    bound += value;
+                }
+            }
+            if !cutoff.inert(bound) {
+                break;
+            }
+            nonessential[next] = true;
+        }
+        nonessential
+    }
+
+    fn assert_partition_parity(bounds: &[f64], floor: f64, kth: Option<f32>) {
+        let cutoff = Cutoff {
+            floor,
+            kth,
+            chain: None,
+        };
+        let (mut order, mut rank, mut actual) = (Vec::new(), Vec::new(), Vec::new());
+        partition_by(
+            bounds.len(),
+            |i| bounds[i],
+            &cutoff,
+            &mut order,
+            &mut rank,
+            &mut actual,
+        );
+        assert_eq!(actual, sequential_oracle(bounds, &cutoff));
+    }
+
+    #[test]
+    fn partition_matches_sequential_oracle_across_edges_and_1024_terms() {
+        for floor in [f64::NEG_INFINITY, 0.0, 0.5, 10.0] {
+            assert_partition_parity(&[], floor, None);
+            assert_partition_parity(&[0.0, 0.0, 0.0], floor, Some(0.0));
+            assert_partition_parity(&[f64::NAN, 0.0, 0.5, 1.2], floor, None);
+            assert_partition_parity(&[-0.25, 0.1, 0.4, 0.9], floor, None);
+        }
+        let wide: Vec<f64> = (0..1_024u64)
+            .map(|i| {
+                let bits = i.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17);
+                if i % 37 == 0 {
+                    0.0
+                } else {
+                    (bits % 10_000) as f64 * 1e-4 + (i as f64) * 1e-16
+                }
+            })
+            .collect();
+        let total: f64 = wide.iter().sum();
+        for step in 0..=32 {
+            let floor = total * (step as f64 / 32.0);
+            assert_partition_parity(&wide, floor, None);
+            assert_partition_parity(&wide, f64::NEG_INFINITY, Some(floor as f32));
+        }
+        assert_partition_parity(&wide, total + 1.0, None);
     }
 }

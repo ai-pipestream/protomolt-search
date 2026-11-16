@@ -14,8 +14,8 @@ type CandidateFn<'h> = dyn FnMut(u32, f32) + 'h;
 /// One top-k scoring request.
 ///
 /// Defaults: no floor (`-inf`), no chain, no filter, no hooks, no skip
-/// accounting, block-max pruning allowed. A bare `usize` converts into a
-/// request with those defaults.
+/// accounting, block-max pruning and offset decoding allowed. A bare `usize`
+/// converts into a request with those defaults.
 ///
 /// A finite `floor` keeps hits with `score >= floor`, so ties at a seeded
 /// floor survive. The `live` hook is polled once per block-max iteration
@@ -39,6 +39,8 @@ pub struct TopK<'a> {
     pub prune: Option<&'a mut PruneStats>,
     /// Whether impact pruning may be used.
     pub block_max: bool,
+    /// Whether matched terms and their positional offsets are returned.
+    pub include_offsets: bool,
 }
 
 impl<'a> TopK<'a> {
@@ -53,6 +55,7 @@ impl<'a> TopK<'a> {
             candidate: None,
             prune: None,
             block_max: true,
+            include_offsets: true,
         }
     }
 
@@ -98,6 +101,12 @@ impl<'a> TopK<'a> {
         self
     }
 
+    /// Return matched terms and decode their positional offsets when requested.
+    pub fn include_offsets(mut self, include_offsets: bool) -> Self {
+        self.include_offsets = include_offsets;
+        self
+    }
+
     pub(super) fn split(self) -> (Controls<'a>, Hooks<'a>, Option<&'a mut PruneStats>) {
         let controls = Controls {
             k: self.k,
@@ -105,6 +114,7 @@ impl<'a> TopK<'a> {
             chain: self.chain,
             filter: self.filter,
             block_max: self.block_max,
+            include_offsets: self.include_offsets,
         };
         let hooks = Hooks {
             live: self.live,
@@ -138,6 +148,7 @@ pub(super) struct Controls<'a> {
     pub chain: ChainCtx<'a>,
     pub filter: FilterCtx<'a>,
     pub block_max: bool,
+    pub include_offsets: bool,
 }
 
 impl Controls<'_> {
@@ -207,9 +218,9 @@ pub fn top_k_fused<'a>(fields: &[FieldQuery], request: impl Into<TopK<'a>>) -> V
     pruned::fused(fields, request)
 }
 
-/// The single-field exactness oracle: walks every posting with offsets.
-/// Honors `k`, the chain, the filter, and the floor (applied before
-/// truncating to `k`); ignores the hooks and skip accounting.
+/// The single-field exhaustive scorer and exactness oracle. Honors `k`, the
+/// chain, the filter, and the floor (applied before truncating to `k`);
+/// ignores the hooks and skip accounting. Offset decoding follows the request.
 pub fn top_k_exhaustive<'a>(
     store: &dyn Bm25Index,
     terms: &[String],
@@ -224,7 +235,11 @@ pub fn top_k_exhaustive<'a>(
         params,
     };
     let (controls, _, _) = request.into().split();
-    exhaustive::oracle(&query, &controls)
+    if controls.include_offsets {
+        exhaustive::oracle(&query, &controls)
+    } else {
+        exhaustive::flat(&query, &controls)
+    }
 }
 
 /// The fused exhaustive scorer and oracle: weighted per-field sum, each

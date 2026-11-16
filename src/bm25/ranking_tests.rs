@@ -170,12 +170,12 @@ fn signed_zero_heap_and_pruning_bounds_use_the_same_tie() {
     let negative = HeapEntry {
         score: -0.0,
         doc_id: 0,
-        mask: 1,
+        matched: Box::new([0]),
     };
     let positive = HeapEntry {
         score: 0.0,
         doc_id: 1,
-        mask: 1,
+        matched: Box::new([0]),
     };
     let heap = BinaryHeap::from([negative, positive]);
     assert_eq!(

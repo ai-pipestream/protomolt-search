@@ -72,14 +72,21 @@ fn flat_with<M: Members>(query: &Flat<'_>, controls: &Controls<'_>) -> Vec<Score
         .collect();
     super::ranking::sort_truncate(&mut docs, controls.k);
     docs.into_iter()
-        .map(|(doc_id, score, members)| ScoredDoc {
-            doc_id,
-            score,
-            term_offsets: members
-                .terms(terms.len())
-                .into_iter()
-                .map(|ti| (ti, store.posting_offsets(&terms[ti], doc_id)))
-                .collect(),
+        .map(|(doc_id, score, members)| {
+            let term_offsets = if controls.include_offsets {
+                members
+                    .terms(terms.len())
+                    .into_iter()
+                    .map(|ti| (ti, store.posting_offsets(&terms[ti], doc_id)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            ScoredDoc {
+                doc_id,
+                score,
+                term_offsets,
+            }
         })
         .collect()
 }
@@ -135,6 +142,21 @@ pub(super) fn oracle(query: &Flat<'_>, controls: &Controls<'_>) -> Vec<ScoredDoc
 /// phrase-group contribution, and every matched (field, term) offset list.
 type FusedEntry = (f64, Option<f64>, Vec<super::FusedTermOffset>);
 
+fn accumulate_fused(
+    entry: &mut FusedEntry,
+    contribution: f64,
+    group: Option<Phrase<'_>>,
+    term: usize,
+) {
+    match group {
+        Some(group) => {
+            let weighted = contribution * group.weights[term];
+            entry.1 = Some(entry.1.unwrap_or(0.0).max(weighted));
+        }
+        None => entry.0 += contribution,
+    }
+}
+
 /// The fused exhaustive scorer: a weighted per-field sum, accumulated in
 /// field-id then term-index order. With a [`Phrase`] group, that field
 /// contributes only its strongest weighted term instead of a sum. A finite
@@ -154,19 +176,23 @@ pub(super) fn fused(
                 continue;
             }
             let idf = idf(fq.stats.doc_count, fq.stats.dfs[ti]);
-            fq.index.for_each_posting(term, &mut |doc_id, tf, offsets| {
-                let contribution =
-                    fq.weight * idf * tf_norm(fq.params, tf, fq.index.doc_length(doc_id), avgdl);
-                let entry = scores.entry(doc_id).or_default();
-                match group {
-                    Some(group) => {
-                        let weighted = contribution * group.weights[ti];
-                        entry.1 = Some(entry.1.unwrap_or(0.0).max(weighted));
-                    }
-                    None => entry.0 += contribution,
-                }
-                entry.2.push((fi, ti, offsets.to_vec()));
-            });
+            if controls.include_offsets {
+                fq.index.for_each_posting(term, &mut |doc_id, tf, offsets| {
+                    let contribution = fq.weight
+                        * idf
+                        * tf_norm(fq.params, tf, fq.index.doc_length(doc_id), avgdl);
+                    let entry = scores.entry(doc_id).or_default();
+                    accumulate_fused(entry, contribution, group, ti);
+                    entry.2.push((fi, ti, offsets.to_vec()));
+                });
+            } else {
+                fq.index.for_each_doc_tf(term, &mut |doc_id, tf| {
+                    let contribution = fq.weight
+                        * idf
+                        * tf_norm(fq.params, tf, fq.index.doc_length(doc_id), avgdl);
+                    accumulate_fused(scores.entry(doc_id).or_default(), contribution, group, ti);
+                });
+            }
         }
     }
     let floor = controls.floor;
