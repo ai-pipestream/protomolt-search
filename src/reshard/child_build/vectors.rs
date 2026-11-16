@@ -41,15 +41,6 @@ pub(super) fn write_vector_side(
         Some(index) => index,
         None => build_index(manifest, vectors, &flat, hnsw_sources)?,
     };
-    if !remapped.is_empty() {
-        crate::live_docs::LiveDocs::default()
-            .with_retained_vectors()
-            .write(
-                &crate::node::live_docs_sidecar_path(vector_path),
-                vectors.len() as u64,
-            )
-            .map_err(|error| format!("publish retained child reader gate: {error}"))?;
-    }
     index
         .write(vector_path)
         .map_err(|e| format!("write {}: {e}", vector_path.display()))?;

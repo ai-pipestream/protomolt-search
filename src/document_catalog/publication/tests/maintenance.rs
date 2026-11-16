@@ -39,7 +39,7 @@ pub(super) fn simulate_manifest_commit(set: &OpenedSegmentSet) -> SegmentCatalog
     SegmentCatalog::open(set.root()).unwrap()
 }
 async fn reopen_node(fixture: &mut Fixture) -> DocumentProjectionActivation {
-    fixture.node = NodeServiceImpl::open(fixture.node.config.clone(), None, false).unwrap();
+    fixture.node = NodeServiceImpl::open(fixture.node.config.clone(), None).unwrap();
     let node = fixture.node.clone();
     let source = fixture.source.clone();
     tokio::task::spawn_blocking(move || node.recover_document_projection_blocking(&source, INDEX))

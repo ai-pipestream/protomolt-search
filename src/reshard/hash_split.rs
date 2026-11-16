@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use super::child_build::{finish_child, ChildSlot};
+use super::child_catalog::sealed;
 use super::merge_inputs::load_merge_manifests;
 use super::replay::{read_gens_binding, replay_buckets, Replay};
 use super::split_inputs::{
@@ -120,10 +121,7 @@ pub fn split_logs_with(
         );
         split_rehashed(request, &inputs, analyze)?
     };
-    Ok(ReshardOutput {
-        generation: inputs.next_generation()?,
-        children,
-    })
+    sealed(&inputs.manifest, inputs.next_generation()?, children)
 }
 
 /// The cheap path: whole bucket ranges, no re-hashing. Memory is bounded
@@ -258,10 +256,7 @@ pub fn split_stable_logs_with(
     })?;
     let children = build_children(request, &inputs, partitions, analyze)?;
     Ok(StableReshardOutput {
-        images: ReshardOutput {
-            generation: inputs.next_generation()?,
-            children,
-        },
+        images: sealed(&inputs.manifest, inputs.next_generation()?, children)?,
         source_cutoffs,
     })
 }
@@ -319,10 +314,7 @@ pub fn split_stable_logs_ranged(
         )?);
     }
     Ok(StableReshardOutput {
-        images: ReshardOutput {
-            generation: inputs.next_generation()?,
-            children,
-        },
+        images: sealed(&inputs.manifest, inputs.next_generation()?, children)?,
         source_cutoffs,
     })
 }
@@ -404,16 +396,19 @@ pub fn merge(
         merged.vectors.len(),
         merged.documents.len()
     );
+    let declared = manifests[0]
+        .columns
+        .as_ref()
+        .filter(|table| !table.fields.is_empty());
+    let columns = declared.map(super::ColumnTables::of_wal);
     let schema = super::child_build::ChildSchema {
-        bm25_fields,
+        bm25_fields: bm25_fields.or(declared.map(|table| table.fields.as_slice())),
         binding: binding.as_ref(),
         derived: derived.as_ref(),
+        columns: columns.as_ref(),
         ..Default::default()
     };
     let slot = ChildSlot::full_range(0, out_dir, slot_base.unwrap_or(min_slot_offset));
     let child = finish_child(&manifests[0], merged, slot, &schema, analyze)?;
-    Ok(ReshardOutput {
-        generation: max_generation + 1,
-        children: vec![child],
-    })
+    sealed(&manifests[0], max_generation + 1, vec![child])
 }

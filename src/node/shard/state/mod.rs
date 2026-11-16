@@ -69,7 +69,7 @@ pub(in crate::node) fn live_document_count(
         return store.doc_count();
     }
     let views: Vec<_> = (0..store.field_count())
-        .filter_map(|field| store.field_view(field))
+        .map(|field| store.field_view(field))
         .collect();
     (0..store.next_doc_id())
         .filter(|slot| {
@@ -111,8 +111,6 @@ pub(crate) struct ShardState {
     pub(crate) bm25: Option<Bm25Shard>,
     /// Generation tombstones shared by every lexical and vector read path.
     pub(crate) live_docs: LiveDocs,
-    /// Active snapshot generation directory when installed via `InstallSnapshot`.
-    pub(crate) generation: Option<PathBuf>,
     /// Write-ahead log (`<index path>.wal/`), or `None` when WAL is disabled.
     pub(crate) wal: Option<WalWriter>,
     /// Cached slot -> parent map for collapse scans (lineage parent_id
@@ -139,13 +137,16 @@ pub(crate) struct ParentMap {
 }
 
 impl ShardState {
-    pub(crate) fn check_legacy_mutation(&self) -> Result<(), Status> {
+    /// Refuse an index-direct write or an index-only snapshot on a
+    /// source-managed index, which changes only through its owning source
+    /// publication journal.
+    pub(crate) fn check_index_owned_write(&self) -> Result<(), Status> {
         self.check_catalog_publication()?;
         if matches!(self.bm25.as_ref(), Some(Bm25Shard::Segmented(shard))
             if shard.snapshot().manifest().source_owner.is_some()
                 || shard.catalog().snapshot().manifest().source_owner.is_some())
         {
-            return Err(Status::failed_precondition("source-managed index requires its owning source publication journal; legacy mutation and index-only snapshots are unavailable"));
+            return Err(Status::failed_precondition("source-managed index requires its owning source publication journal; index-direct mutation and index-only snapshots are unavailable"));
         }
         Ok(())
     }
@@ -205,7 +206,7 @@ impl ShardState {
         if self.live_docs.is_deleted(local_slot as usize) {
             return None;
         }
-        let store = self.bm25.as_ref()?.as_index()?;
+        let store = self.bm25.as_ref()?.as_index();
         let text = store.text(local_slot)?;
         let lineage = store.lineage(local_slot).map(|l| crate::pb::DocLineage {
             parent_id: l.parent_id,

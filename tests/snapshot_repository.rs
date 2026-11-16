@@ -18,7 +18,7 @@ use std::sync::Arc;
 use common::{fit_calibration, start_empty_node, unit_vectors, BIT_WIDTH, DIM};
 use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
 use pipestream_search::coordinator::CoordinatorServiceImpl;
-use pipestream_search::node::{Layout, NodeConfig, NodeServiceImpl};
+use pipestream_search::node::{NodeConfig, NodeServiceImpl};
 use pipestream_search::pb::install_snapshot_from_request::Source;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
@@ -30,7 +30,7 @@ use pipestream_search::pb::{
 use pipestream_search::replication::{sync_once, ReplicaCursor};
 use pipestream_search::snapshot::{export_snapshot, install_snapshot_from};
 use pipestream_search::snapshot_repository::{
-    self as repo, RepositoryManifest, LAYOUT_SEGMENTS, LAYOUT_SINGLE_IMAGE, MANIFEST_FILE,
+    self as repo, RepositoryManifest, LAYOUT_SEGMENTS, MANIFEST_FILE,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -51,12 +51,11 @@ fn tempdir(tag: &str) -> PathBuf {
     dir
 }
 
-fn config(index_path: PathBuf, layout: Layout) -> NodeConfig {
+fn config(index_path: PathBuf) -> NodeConfig {
     NodeConfig {
         index_path: Some(index_path),
         analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
         facet_fields: vec!["court".to_string()],
-        layout,
         wal: true,
         slot_offset: SLOT,
         ..Default::default()
@@ -279,25 +278,20 @@ async fn install(
     .await
 }
 
-/// A source shard: single-image layout, seeded, DOCS rows, flushed.
+/// A source shard: seeded, DOCS rows, flushed twice into two segments.
 async fn source_shard(
     dir: &Path,
-    layout: Layout,
 ) -> (
     String,
     tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
     PathBuf,
 ) {
     let path = dir.join("source.tv");
-    let (addr, handle) = start_empty_node(config(path.clone(), layout)).await;
+    let (addr, handle) = start_empty_node(config(path.clone())).await;
     seed(&addr).await;
-    if layout == Layout::Segments {
-        ingest(&addr, 0, DOCS / 2).await;
-        flush(&addr).await;
-        ingest(&addr, DOCS / 2, DOCS).await;
-    } else {
-        ingest(&addr, 0, DOCS).await;
-    }
+    ingest(&addr, 0, DOCS / 2).await;
+    flush(&addr).await;
+    ingest(&addr, DOCS / 2, DOCS).await;
     flush(&addr).await;
     (addr, handle, path)
 }
@@ -305,11 +299,11 @@ async fn source_shard(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn export_writes_a_hashed_manifest_and_refuses_a_non_empty_directory() {
     let dir = tempdir("export");
-    let (source, handle, _) = source_shard(&dir, Layout::SingleImage).await;
+    let (source, handle, _) = source_shard(&dir).await;
     let repo_dir = dir.join("repo");
     let export = export_snapshot(&source, &repo_dir).await.unwrap();
     let manifest = manifest_of(&export);
-    assert_eq!(manifest.layout, LAYOUT_SINGLE_IMAGE);
+    assert_eq!(manifest.layout, LAYOUT_SEGMENTS);
     assert_eq!(manifest.format_version, repo::FORMAT_VERSION);
     let h = health(&source).await;
     assert_eq!(manifest.slot_offset, SLOT);
@@ -330,7 +324,9 @@ async fn export_writes_a_hashed_manifest_and_refuses_a_non_empty_directory() {
     // the manifest file's own digest is what the response reports.
     let names: Vec<&str> = manifest.artifacts.iter().map(|a| a.file.as_str()).collect();
     assert!(
-        names.contains(&"vector.index") && names.contains(&"documents.bm25"),
+        names.contains(&"catalog/segments.json")
+            && names.iter().any(|n| n.ends_with("/vector.index"))
+            && names.iter().any(|n| n.ends_with("/documents.bm25")),
         "{names:?}"
     );
     let mut total = 0;
@@ -391,7 +387,7 @@ async fn export_writes_a_hashed_manifest_and_refuses_a_non_empty_directory() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn install_from_directory_equals_the_source_and_refuses_tampering() {
     let dir = tempdir("directory");
-    let (source, source_handle, _) = source_shard(&dir, Layout::SingleImage).await;
+    let (source, source_handle, _) = source_shard(&dir).await;
     let want = signature(&source).await;
     let want_counts = counts(&health(&source).await);
     let repo_dir = dir.join("repo");
@@ -400,8 +396,7 @@ async fn install_from_directory_equals_the_source_and_refuses_tampering() {
 
     // A fresh, unseeded shard at the same slot offset adopts the image.
     let target_path = dir.join("target.tv");
-    let (target, target_handle) =
-        start_empty_node(config(target_path.clone(), Layout::SingleImage)).await;
+    let (target, target_handle) = start_empty_node(config(target_path.clone())).await;
     let installed = install(
         &target,
         Source::Directory(repo_dir.display().to_string()),
@@ -421,12 +416,7 @@ async fn install_from_directory_equals_the_source_and_refuses_tampering() {
     // Persistence: reopen the installed shard from disk, same answers.
     target_handle.abort();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let reopened = NodeServiceImpl::open(
-        config(target_path.clone(), Layout::SingleImage),
-        None,
-        false,
-    )
-    .unwrap();
+    let reopened = NodeServiceImpl::open(config(target_path.clone()), None).unwrap();
     let (again, again_handle) = serve(reopened).await;
     assert_eq!(counts(&health(&again).await), want_counts);
     assert_eq!(signature(&again).await, want);
@@ -434,8 +424,7 @@ async fn install_from_directory_equals_the_source_and_refuses_tampering() {
 
     // Refusals, each by name, each leaving the target untouched.
     let fresh_path = dir.join("fresh.tv");
-    let (fresh, fresh_handle) =
-        start_empty_node(config(fresh_path.clone(), Layout::SingleImage)).await;
+    let (fresh, fresh_handle) = start_empty_node(config(fresh_path.clone())).await;
     let tampered = dir.join("tampered");
     for artifact in &manifest.artifacts {
         let to = tampered.join(&artifact.file);
@@ -443,9 +432,21 @@ async fn install_from_directory_equals_the_source_and_refuses_tampering() {
         std::fs::copy(repo_dir.join(&artifact.file), &to).unwrap();
     }
     std::fs::copy(repo_dir.join(MANIFEST_FILE), tampered.join(MANIFEST_FILE)).unwrap();
+    let artifact_ending = |suffix: &str| {
+        manifest
+            .artifacts
+            .iter()
+            .map(|a| a.file.clone())
+            .find(|file| file.ends_with(suffix))
+            .unwrap()
+    };
+    let (bm25_file, vector_file) = (
+        artifact_ending("/documents.bm25"),
+        artifact_ending("/vector.index"),
+    );
     {
         // Flip one byte in the middle of the BM25 image: same size.
-        let path = tampered.join("documents.bm25");
+        let path = tampered.join(&bm25_file);
         let mut bytes = std::fs::read(&path).unwrap();
         let mid = bytes.len() / 2;
         bytes[mid] ^= 0xff;
@@ -460,15 +461,17 @@ async fn install_from_directory_equals_the_source_and_refuses_tampering() {
     .unwrap_err();
     assert_eq!(error.code(), Code::InvalidArgument);
     assert!(
-        error.message().contains("\"documents.bm25\" hashes to"),
+        error
+            .message()
+            .contains(&format!("{bm25_file:?} hashes to")),
         "{}",
         error.message()
     );
     // A truncated artifact names its size.
     {
-        let path = tampered.join("documents.bm25");
-        std::fs::copy(repo_dir.join("documents.bm25"), &path).unwrap();
-        let path = tampered.join("vector.index");
+        let path = tampered.join(&bm25_file);
+        std::fs::copy(repo_dir.join(&bm25_file), &path).unwrap();
+        let path = tampered.join(&vector_file);
         let bytes = std::fs::read(&path).unwrap();
         std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
     }
@@ -480,7 +483,8 @@ async fn install_from_directory_equals_the_source_and_refuses_tampering() {
     .await
     .unwrap_err();
     assert!(
-        error.message().contains("\"vector.index\" has") && error.message().contains("bytes"),
+        error.message().contains(&format!("{vector_file:?} has"))
+            && error.message().contains("bytes"),
         "{}",
         error.message()
     );
@@ -521,7 +525,7 @@ async fn install_from_directory_equals_the_source_and_refuses_tampering() {
     );
     let (other, other_handle) = start_empty_node(NodeConfig {
         slot_offset: SLOT + 1,
-        ..config(dir.join("other.tv"), Layout::SingleImage)
+        ..config(dir.join("other.tv"))
     })
     .await;
     let error = install(
@@ -554,16 +558,15 @@ async fn install_from_directory_equals_the_source_and_refuses_tampering() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn install_from_a_peer_equals_the_source() {
     let dir = tempdir("peer");
-    let (source, source_handle, source_path) = source_shard(&dir, Layout::SingleImage).await;
+    let (source, source_handle, source_path) = source_shard(&dir).await;
     let want = signature(&source).await;
     let want_counts = counts(&health(&source).await);
-    let (target, target_handle) =
-        start_empty_node(config(dir.join("target.tv"), Layout::SingleImage)).await;
+    let (target, target_handle) = start_empty_node(config(dir.join("target.tv"))).await;
     let installed = install(&target, Source::PeerAddr(source.clone()), "")
         .await
         .unwrap();
     let manifest = RepositoryManifest::from_pb(installed.manifest.as_ref().unwrap()).unwrap();
-    assert_eq!(manifest.layout, LAYOUT_SINGLE_IMAGE);
+    assert_eq!(manifest.layout, LAYOUT_SEGMENTS);
     assert_eq!(manifest.vector_rows, DOCS as u64);
     assert_eq!(counts(&health(&target).await), want_counts);
     assert_eq!(signature(&target).await, want);
@@ -719,7 +722,7 @@ async fn serve_files(server: Arc<FileServer>) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn install_from_a_url_equals_the_source_and_resumes_with_range() {
     let dir = tempdir("url");
-    let (source, source_handle, _) = source_shard(&dir, Layout::SingleImage).await;
+    let (source, source_handle, _) = source_shard(&dir).await;
     let want = signature(&source).await;
     let want_counts = counts(&health(&source).await);
     let repo_dir = dir.join("repo");
@@ -742,8 +745,7 @@ async fn install_from_a_url_equals_the_source_and_resumes_with_range() {
         requests: AtomicU64::new(0),
     });
     let base = serve_files(Arc::clone(&server)).await;
-    let (target, target_handle) =
-        start_empty_node(config(dir.join("target.tv"), Layout::SingleImage)).await;
+    let (target, target_handle) = start_empty_node(config(dir.join("target.tv"))).await;
     // Without the bearer: refused by name, nothing staged.
     let error = install(&target, Source::Url(base.clone()), "")
         .await
@@ -799,7 +801,7 @@ async fn install_from_a_url_equals_the_source_and_resumes_with_range() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn segment_layout_exports_installs_reopens_and_never_mixes() {
     let dir = tempdir("segments");
-    let (source, source_handle, source_path) = source_shard(&dir, Layout::Segments).await;
+    let (source, source_handle, source_path) = source_shard(&dir).await;
     let want = signature(&source).await;
     let want_counts = counts(&health(&source).await);
     let staging = pipestream_search::node::segments_root(&source_path).join("staging/unpublished");
@@ -832,8 +834,7 @@ async fn segment_layout_exports_installs_reopens_and_never_mixes() {
         assert_eq!((bytes, sha), (artifact.bytes, artifact.sha256.clone()));
     }
     let target_path = dir.join("target.tv");
-    let (target, target_handle) =
-        start_empty_node(config(target_path.clone(), Layout::Segments)).await;
+    let (target, target_handle) = start_empty_node(config(target_path.clone())).await;
     let installed = install(
         &target,
         Source::Directory(repo_dir.display().to_string()),
@@ -884,59 +885,16 @@ async fn segment_layout_exports_installs_reopens_and_never_mixes() {
     // Reopen from disk: the catalog is the layout, nothing converted.
     target_handle.abort();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let reopened =
-        NodeServiceImpl::open(config(target_path.clone(), Layout::Segments), None, false).unwrap();
+    let reopened = NodeServiceImpl::open(config(target_path.clone()), None).unwrap();
     let (again, again_handle) = serve(reopened).await;
     assert_eq!(counts(&health(&again).await), want_counts);
     assert_eq!(signature(&again).await, want);
     // The peer source carries the catalog too.
-    let (peer_target, peer_handle) =
-        start_empty_node(config(dir.join("peer.tv"), Layout::Segments)).await;
+    let (peer_target, peer_handle) = start_empty_node(config(dir.join("peer.tv"))).await;
     install(&peer_target, Source::PeerAddr(again.clone()), "")
         .await
         .unwrap();
     assert_eq!(signature(&peer_target).await, want);
-    // Layouts do not mix: a catalog on a single-image shard, and a single
-    // image on a populated segment shard, both refuse by name.
-    let (single, single_handle) =
-        start_empty_node(config(dir.join("single.tv"), Layout::SingleImage)).await;
-    let error = install(
-        &single,
-        Source::Directory(repo_dir.display().to_string()),
-        "",
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error.code(), Code::FailedPrecondition);
-    assert!(
-        error.message().contains("--layout=single-image"),
-        "{}",
-        error.message()
-    );
-    let single_repo = dir.join("single-repo");
-    seed(&single).await;
-    ingest(&single, 0, 4).await;
-    flush(&single).await;
-    export_snapshot(&single, &single_repo).await.unwrap();
-    let error = install(
-        &again,
-        Source::Directory(single_repo.display().to_string()),
-        "",
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error.code(), Code::FailedPrecondition);
-    assert!(
-        error.message().contains("layouts do not mix"),
-        "{}",
-        error.message()
-    );
-    assert_eq!(
-        signature(&again).await,
-        want,
-        "the refused install changed nothing"
-    );
-    single_handle.abort();
     peer_handle.abort();
     again_handle.abort();
     source_handle.abort();
@@ -946,13 +904,12 @@ async fn segment_layout_exports_installs_reopens_and_never_mixes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_foreign_scoring_fingerprint_refuses_by_name() {
     let dir = tempdir("foreign");
-    let (source, source_handle, _) = source_shard(&dir, Layout::SingleImage).await;
+    let (source, source_handle, _) = source_shard(&dir).await;
     let repo_dir = dir.join("repo");
     let export = export_snapshot(&source, &repo_dir).await.unwrap();
     let manifest = manifest_of(&export);
     // A shard seeded with ANOTHER calibration scores in another space.
-    let (target, target_handle) =
-        start_empty_node(config(dir.join("target.tv"), Layout::SingleImage)).await;
+    let (target, target_handle) = start_empty_node(config(dir.join("target.tv"))).await;
     let other = unit_vectors(2_000, DIM, 0xBAD5_EED0);
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &other);
     client(&target)
@@ -987,12 +944,11 @@ async fn a_foreign_scoring_fingerprint_refuses_by_name() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_manifest_cutoff_is_where_replication_resumes() {
     let dir = tempdir("cutoff");
-    let (primary, primary_handle, _) = source_shard(&dir, Layout::SingleImage).await;
+    let (primary, primary_handle, _) = source_shard(&dir).await;
     let repo_dir = dir.join("repo");
     let export = export_snapshot(&primary, &repo_dir).await.unwrap();
     let manifest = manifest_of(&export);
-    let (replica, replica_handle) =
-        start_empty_node(config(dir.join("replica.tv"), Layout::SingleImage)).await;
+    let (replica, replica_handle) = start_empty_node(config(dir.join("replica.tv"))).await;
     install(
         &replica,
         Source::Directory(repo_dir.display().to_string()),
@@ -1032,7 +988,7 @@ async fn the_manifest_cutoff_is_where_replication_resumes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn segment_snapshot_refuses_rehashed_misaligned_exact_rows_before_replacing_live_data() {
     let dir = tempdir("exact-shape");
-    let (source, source_handle, _) = source_shard(&dir, Layout::Segments).await;
+    let (source, source_handle, _) = source_shard(&dir).await;
     let repository = dir.join("repository");
     let exported = export_snapshot(&source, &repository).await.unwrap();
     let mut manifest = manifest_of(&exported);

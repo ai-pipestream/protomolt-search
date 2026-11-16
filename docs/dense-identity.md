@@ -107,7 +107,7 @@ IDs, duplicates, response limits, timeout, Stop and request closure.
 `tests/query_api.rs` compares dense public identities and score bits through
 classic/coalesced and streaming scans and terminal query streams.
 `tests/compaction.rs` compares both dense paths after compaction, reopen and
-replay on single-image and segmented layouts. Existing streaming tests retain
+replay. Existing streaming tests retain
 the monolithic bitwise ranking and floor-sharing gates.
 Coordinator protocol tests reject wrong IDs, missing or changed certificates,
 duplicate replies and premature closure. A full request-lane regression failed

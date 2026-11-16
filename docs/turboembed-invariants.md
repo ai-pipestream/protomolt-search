@@ -72,12 +72,9 @@ snapshot installation, source backup/restore, and row renumbering. Recovery
 loads their original float bits; it does not normalize the active tier again
 or invoke an embedder. Tombstones apply before tier rescoring.
 
-A single-image generation writes `<index>.multi` with an authoritative
-`<index>.multi.json` declaration. Snapshot generations use `vectors.multi`
-and `vectors.multi.json`. Single-image retained generations use live-doc
-version 2 (unchanged bitmap geometry), so older node readers refuse even
-when WAL is disabled. This CRC-protected version also requires a retained
-declaration on recovery. Ordinary generations continue writing version 1.
+Each sealed segment that holds retained rows writes `vectors.multi` with an
+authoritative `vectors.multi.json` declaration, published with the
+segment's other artifacts.
 Each immutable segment declares its optional
 `vectors.multi` artifact in the catalog, including its byte count and SHA-256.
 The private `PMMRES01` payload also verifies its row span and integrity footer.

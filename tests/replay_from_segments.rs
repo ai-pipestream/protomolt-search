@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use common::{fit_calibration, start_empty_node, unit_vectors};
 use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
 use pipestream_search::coordinator::CoordinatorServiceImpl;
-use pipestream_search::node::{Layout, NodeConfig};
+use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
@@ -103,7 +103,6 @@ fn config(index_path: PathBuf) -> NodeConfig {
     NodeConfig {
         index_path: Some(index_path),
         analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
-        layout: Layout::Segments,
         seal_tail_docs: SEAL as u32,
         wal: true,
         wal_buckets: 4,
@@ -783,7 +782,7 @@ async fn the_transplant_refuses_by_name() {
     let (index_path, _addr) = source_shard(&dir, true).await;
     let gen = reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap();
     // The column cut's refusals: the placement column, a zero bound, a
-    // column that is not an integer column, a single image.
+    // column that is not an integer column.
     let err = split(
         &gen,
         &dir.join("placement-cut"),
@@ -817,26 +816,6 @@ async fn the_transplant_refuses_by_name() {
     )
     .unwrap_err();
     assert!(err.contains("not an integer column"), "{err}");
-    let err = reshard::split_placement_tree_logs(
-        std::slice::from_ref(&gen),
-        &band_tree(),
-        &dir.join("single"),
-        &[0, 1_000, 2_000],
-        None,
-        reshard::TreeSplitOptions {
-            layout: reshard::TreeChildLayout::SingleImage {
-                max_child_rows: N as u64,
-            },
-            cut: reshard::SpillCut::Column {
-                column: "year".into(),
-                rows_per_cut: 10,
-            },
-            ..Default::default()
-        },
-        &mut analyzer(),
-    )
-    .unwrap_err();
-    assert!(err.contains("needs the segmented layout"), "{err}");
     // A leaf with several shards needs routing keys the segments do not carry.
     let mut two = band_tree();
     two.nodes[0].shards = 2;
@@ -857,53 +836,6 @@ async fn the_transplant_refuses_by_name() {
         err.contains("sealed segments carry no routing keys"),
         "{err}"
     );
-
-    // A single-image source has no catalog to read.
-    let single_dir = dir.join("single-source");
-    std::fs::create_dir_all(&single_dir).unwrap();
-    let single_path = single_dir.join("flat.tv");
-    let (single_addr, _handle) = start_empty_node(NodeConfig {
-        layout: Layout::SingleImage,
-        seal_tail_docs: 0,
-        ..config(single_path.clone())
-    })
-    .await;
-    let mut single = NodeServiceClient::connect(single_addr).await.unwrap();
-    single
-        .configure_vector_backend(calibration())
-        .await
-        .unwrap();
-    let archive = Placement::validate(&old_tree())
-        .unwrap()
-        .leaf_by_name("archive")
-        .unwrap()
-        .code;
-    let (tx, rx) = mpsc::channel(8);
-    for i in 0..8 {
-        tx.send(document(i, archive, true)).await.unwrap();
-    }
-    drop(tx);
-    single.add_documents(ReceiverStream::new(rx)).await.unwrap();
-    let (tx, rx) = mpsc::channel(1);
-    tx.send(AddVectorsRequest {
-        materialized_rows: Vec::new(),
-        vectors: corpus()[..8 * DIM].to_vec(),
-        dim: DIM as u32,
-    })
-    .await
-    .unwrap();
-    drop(tx);
-    single.add_vectors(ReceiverStream::new(rx)).await.unwrap();
-    single.flush(FlushRequest {}).await.unwrap();
-    let single_gen = reshard::resolve_gen(&pipestream_search::wal::wal_dir(&single_path)).unwrap();
-    let err = split(
-        &single_gen,
-        &dir.join("from-single"),
-        reshard::TreeRowSource::Segments,
-        reshard::SpillCut::Hash,
-    )
-    .unwrap_err();
-    assert!(err.contains("no segment catalog"), "{err}");
 
     // An unsealed tail: a row in the log past the catalog (the node is
     // gone; the record is appended to its log as a crashed ingest would
@@ -1025,7 +957,7 @@ async fn serve_child(out: &reshard::TreeReshardOutput, index: usize) -> Served {
 /// One child rebuilt alone: the routing pass covers every child and the
 /// counts are the full split's, but only the named child's catalog is
 /// written, and served alone it answers as the full split's child does.
-/// A single-image split and an index past the tree are refused by name.
+/// An index past the tree is refused by name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_child_is_built_alone_and_equals_the_full_splits() {
     let dir = tempdir("onlychild");
@@ -1112,23 +1044,6 @@ async fn one_child_is_built_alone_and_equals_the_full_splits() {
     )
     .unwrap_err();
     assert!(past.contains("names no child"), "{past}");
-    let single = reshard::split_placement_tree_logs(
-        std::slice::from_ref(&gen),
-        &band_tree(),
-        &dir.join("single"),
-        &[0, 1_000, 2_000],
-        None,
-        reshard::TreeSplitOptions {
-            layout: reshard::TreeChildLayout::SingleImage {
-                max_child_rows: 1_000,
-            },
-            only_child: Some(1),
-            ..Default::default()
-        },
-        &mut analyzer(),
-    )
-    .unwrap_err();
-    assert!(single.contains("single-image"), "{single}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1265,7 +1180,7 @@ fn catalog_digests(root: &Path) -> Vec<(String, String)> {
 /// Buckets sealed by several threads write the catalog the one-thread
 /// build writes, byte for byte, under the hash cut and the year cut,
 /// with or without the bounded backlog and the memory budget; the log
-/// replay and a single image refuse the threads by name.
+/// replay refuses the threads by name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn threaded_buckets_write_the_same_catalog_byte_for_byte() {
     let dir = tempdir("threads");
@@ -1273,7 +1188,6 @@ async fn threaded_buckets_write_the_same_catalog_byte_for_byte() {
     let gen = reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap();
     let build = |out: &str,
                  source: reshard::TreeRowSource,
-                 layout: reshard::TreeChildLayout,
                  threads: usize,
                  queue: Option<usize>,
                  memory: Option<u64>,
@@ -1286,7 +1200,6 @@ async fn threaded_buckets_write_the_same_catalog_byte_for_byte() {
             None,
             reshard::TreeSplitOptions {
                 source,
-                layout,
                 cut,
                 build_threads: threads,
                 build_queue: queue,
@@ -1297,38 +1210,18 @@ async fn threaded_buckets_write_the_same_catalog_byte_for_byte() {
         )
     };
     let segments = reshard::TreeRowSource::Segments;
-    let segmented = || reshard::TreeChildLayout::Segmented;
     let year = || reshard::SpillCut::Column {
         column: "year".into(),
         rows_per_cut: 30,
     };
     for (tag, cut) in [("hash", reshard::SpillCut::Hash), ("year", year())] {
-        let one = build(
-            &format!("{tag}-one"),
-            segments,
-            segmented(),
-            1,
-            None,
-            None,
-            cut.clone(),
-        )
-        .unwrap();
-        let many = build(
-            &format!("{tag}-many"),
-            segments,
-            segmented(),
-            3,
-            None,
-            None,
-            cut.clone(),
-        )
-        .unwrap();
+        let one = build(&format!("{tag}-one"), segments, 1, None, None, cut.clone()).unwrap();
+        let many = build(&format!("{tag}-many"), segments, 3, None, None, cut.clone()).unwrap();
         // The bounded build: a backlog of one finished bucket and a
         // budget above three times the largest bucket's estimate.
         let bounded = build(
             &format!("{tag}-bounded"),
             segments,
-            segmented(),
             3,
             Some(1),
             Some(32 << 20),
@@ -1369,7 +1262,6 @@ async fn threaded_buckets_write_the_same_catalog_byte_for_byte() {
     let err = build(
         "logs",
         reshard::TreeRowSource::Logs,
-        segmented(),
         2,
         None,
         None,
@@ -1377,19 +1269,6 @@ async fn threaded_buckets_write_the_same_catalog_byte_for_byte() {
     )
     .unwrap_err();
     assert!(err.contains("one sidecar session"), "{err}");
-    let err = build(
-        "single",
-        segments,
-        reshard::TreeChildLayout::SingleImage {
-            max_child_rows: 1_000,
-        },
-        2,
-        None,
-        None,
-        reshard::SpillCut::Hash,
-    )
-    .unwrap_err();
-    assert!(err.contains("single-image child is one image"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1407,11 +1286,7 @@ async fn the_build_memory_budget_refuses_by_name() {
         column: "year".into(),
         rows_per_cut: 30,
     };
-    let build = |out: &str,
-                 layout: reshard::TreeChildLayout,
-                 threads: usize,
-                 queue: Option<usize>,
-                 memory: Option<u64>| {
+    let build = |out: &str, threads: usize, queue: Option<usize>, memory: Option<u64>| {
         reshard::split_placement_tree_logs(
             std::slice::from_ref(&gen),
             &band_tree(),
@@ -1420,7 +1295,6 @@ async fn the_build_memory_budget_refuses_by_name() {
             None,
             reshard::TreeSplitOptions {
                 source: reshard::TreeRowSource::Segments,
-                layout,
                 cut: year(),
                 build_threads: threads,
                 build_queue: queue,
@@ -1430,41 +1304,27 @@ async fn the_build_memory_budget_refuses_by_name() {
             &mut analyzer(),
         )
     };
-    let segmented = || reshard::TreeChildLayout::Segmented;
     // Three threads at about 2 MiB a bucket need about 6 MiB, over 2.
-    let err = build("threads", segmented(), 3, None, Some(2 << 20)).unwrap_err();
+    let err = build("threads", 3, None, Some(2 << 20)).unwrap_err();
     assert!(
         err.contains("--build-memory=2 MiB") && err.contains("not lowered"),
         "{err}"
     );
     // One thread still replays one bucket, and one bucket is over 1 MiB.
-    let err = build("one", segmented(), 1, None, Some(1 << 20)).unwrap_err();
+    let err = build("one", 1, None, Some(1 << 20)).unwrap_err();
     assert!(
         err.contains("--build-memory=1 MiB") && err.contains("single bucket"),
         "{err}"
     );
     // The budget fits: the split runs.
-    build("fits", segmented(), 3, None, Some(8 << 20)).unwrap();
-    // The budget sizes bucket replays; a single image is not one.
-    let err = build(
-        "image",
-        reshard::TreeChildLayout::SingleImage {
-            max_child_rows: 1_000,
-        },
-        1,
-        None,
-        Some(64 << 20),
-    )
-    .unwrap_err();
-    assert!(err.contains("single-image child"), "{err}");
+    build("fits", 3, None, Some(8 << 20)).unwrap();
     // A queue of zero passes nothing.
-    let err = build("queue", segmented(), 3, Some(0), None).unwrap_err();
+    let err = build("queue", 3, Some(0), None).unwrap_err();
     assert!(err.contains("--build-queue=0"), "{err}");
     #[cfg(target_pointer_width = "64")]
     {
         let err = build(
             "memory-arithmetic-overflow",
-            segmented(),
             usize::MAX,
             Some(1),
             Some(u64::MAX),

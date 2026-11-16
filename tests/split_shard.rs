@@ -18,7 +18,7 @@ use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
 use pipestream_search::control_plane::{ClusterControlService, ControlPolicy, DurableControlPlane};
 use pipestream_search::coordinator::CoordinatorServiceImpl;
 use pipestream_search::harness::serve_node;
-use pipestream_search::node::{Layout, NodeConfig, NodeServiceImpl};
+use pipestream_search::node::{NodeConfig, NodeServiceImpl};
 use pipestream_search::node_agent::{NodeAgent, NodeAgentConfig, ServedShard};
 use pipestream_search::pb::cluster_control_client::ClusterControlClient;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
@@ -50,7 +50,6 @@ fn shard_config(index_path: PathBuf) -> NodeConfig {
         index_path: Some(index_path),
         analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
         facet_fields: vec!["court".to_string()],
-        layout: Layout::SingleImage,
         wal: true,
         ..Default::default()
     }
@@ -73,7 +72,6 @@ fn agent_config(dir: &std::path::Path, control_addr: &str, node_addr: &str) -> N
         scan_parallel: 2,
         template: shard_config(PathBuf::new()),
         phrase_index: None,
-        allow_missing_bm25: false,
         tls: None,
         max_message_bytes: pipestream_search::MAX_MESSAGE_BYTES,
     }
@@ -205,7 +203,7 @@ async fn reconcile(addr: &str) -> ClusterPlan {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_primary_splits_online_into_two_children_that_tile_its_range() {
     let dir = tempdir("split");
-    let node_a = NodeServiceImpl::open(shard_config(dir.join("a/shard")), None, false).unwrap();
+    let node_a = NodeServiceImpl::open(shard_config(dir.join("a/shard")), None).unwrap();
     let (addr_a, _handle_a) = serve_node(node_a.clone()).await;
     let corpus = unit_vectors(2_000, DIM, 0xCA11_0001);
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &corpus);

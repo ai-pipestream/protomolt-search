@@ -119,7 +119,7 @@ impl Fixture {
 #[tokio::test]
 async fn reopen_preserves_document_only_gaps_without_writing_a_sidecar() {
     let fixture = Fixture::new(true);
-    let node = NodeServiceImpl::open(fixture.config(), None, false)
+    let node = NodeServiceImpl::open(fixture.config(), None)
         .unwrap_or_else(|error| panic!("a catalog with vector gaps must reopen: {error}"));
     let response = fixture.scores(&node).await;
     assert_eq!(
@@ -153,7 +153,7 @@ async fn a_same_sized_stale_sidecar_cannot_replace_sealed_vector_values() {
         .unwrap()
         .write(&path)
         .unwrap();
-    let node = NodeServiceImpl::open(fixture.config(), None, false).unwrap();
+    let node = NodeServiceImpl::open(fixture.config(), None).unwrap();
     let response = fixture.scores(&node).await;
     assert_eq!(
         response
@@ -165,7 +165,7 @@ async fn a_same_sized_stale_sidecar_cannot_replace_sealed_vector_values() {
     );
     drop(node);
     std::fs::write(&path, b"obsolete sidecar").unwrap();
-    let reopened = NodeServiceImpl::open(fixture.config(), None, false).unwrap();
+    let reopened = NodeServiceImpl::open(fixture.config(), None).unwrap();
     assert_eq!(fixture.scores(&reopened).await.hits, response.hits);
 }
 
@@ -257,7 +257,7 @@ fn held_views_share_images_across_retirements_and_keep_gaps_during_appends() {
 #[tokio::test]
 async fn sparse_flush_export_install_and_reopen_keep_exact_scores() {
     let fixture = Fixture::new(true);
-    let node = NodeServiceImpl::open(fixture.config(), None, false).unwrap();
+    let node = NodeServiceImpl::open(fixture.config(), None).unwrap();
     let before = fixture.scores(&node).await;
     node.flush_index().unwrap();
     assert!(!exact_vector_sidecar_path(&fixture.index).exists());
@@ -272,7 +272,6 @@ async fn sparse_flush_export_install_and_reopen_keep_exact_scores() {
             ..Default::default()
         },
         None,
-        false,
     )
     .unwrap();
     receiver
@@ -294,7 +293,6 @@ async fn sparse_flush_export_install_and_reopen_keep_exact_scores() {
             ..Default::default()
         },
         None,
-        false,
     )
     .unwrap();
     assert_eq!(fixture.scores(&reopened).await.hits, before.hits);
@@ -346,7 +344,7 @@ async fn sealed_retirements_remain_hidden_on_reopen_and_snapshot_install() {
             vec![],
         )
         .unwrap();
-    let node = NodeServiceImpl::open(fixture.config(), None, false).unwrap();
+    let node = NodeServiceImpl::open(fixture.config(), None).unwrap();
     let scores = fixture.scores(&node).await;
     assert_eq!(
         scores.hits.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
@@ -370,7 +368,6 @@ async fn sealed_retirements_remain_hidden_on_reopen_and_snapshot_install() {
             ..Default::default()
         },
         None,
-        false,
     )
     .unwrap();
     receiver
@@ -407,7 +404,6 @@ async fn an_empty_configured_catalog_does_not_reuse_retired_sidecar_rows() {
             ..Default::default()
         },
         None,
-        false,
     )
     .unwrap();
     let health = node
@@ -427,7 +423,7 @@ fn publication_switches_sealed_rows_and_read_version_together() {
     use pipestream_search::segments::{OpenedSegmentSet, SegmentRowRetirement};
     use pipestream_search::stats_identity::StatsClaim;
     let fixture = Fixture::new(true);
-    let node = NodeServiceImpl::open(fixture.config(), None, false).unwrap();
+    let node = NodeServiceImpl::open(fixture.config(), None).unwrap();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -509,7 +505,7 @@ fn publication_switches_sealed_rows_and_read_version_together() {
         .publish_segment_rows_blocking(claim, held.epoch(), &[], vec![])
         .is_err());
     drop(node);
-    let reopened = NodeServiceImpl::open(fixture.config(), None, false).unwrap();
+    let reopened = NodeServiceImpl::open(fixture.config(), None).unwrap();
     let restored = runtime
         .block_on(
             reopened.exact_vector_rescore(Request::new(ExactVectorRescoreRequest {

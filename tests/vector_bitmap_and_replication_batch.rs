@@ -264,7 +264,6 @@ impl Pair {
         std::fs::create_dir_all(&root).unwrap();
         let config = |name: &str| NodeConfig {
             index_path: Some(root.join(format!("{name}.tv"))),
-            layout: pipestream_search::node::Layout::SingleImage,
             wal: true,
             analysis_addr: Some(pipestream_search::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
             ..Default::default()

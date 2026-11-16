@@ -112,7 +112,7 @@ fn run_pending_snapshot() {
         .is_none());
     assert!(!marker_path(index_path).exists());
     assert!(!super::super::manifest_backup_path(&crate::node::segments_root(index_path)).exists());
-    let reopened = NodeServiceImpl::open(recipient.config.clone(), None, false).unwrap();
+    let reopened = NodeServiceImpl::open(recipient.config.clone(), None).unwrap();
     assert_eq!(Fixture::texts(&reopened), texts);
     assert_eq!(
         reopened

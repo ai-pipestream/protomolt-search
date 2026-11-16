@@ -181,8 +181,7 @@ cannot be resharded from its log.
 
 ## Segment layout
 
-A new persisted shard uses the segment layout by default (`--layout=segments`;
-`--layout=single-image` keeps the one-file shape). A segment is four row-aligned
+Every persisted shard uses the segment layout. A segment is four row-aligned
 artifacts: the provider vector image, the exact FP32 rows, the BM25 image, and a
 live-document bitmap, with a `segment.json` recording generation, row range,
 counts, fingerprints, and the SHA-256 of every artifact. Opening a set verifies
@@ -193,9 +192,6 @@ chained block-max cursors. `--seal-tail-docs` (default 500,000) seals a full
 tail into a new immutable segment between documents; 0 seals on flush only.
 Sealed vector images are memory-mapped by default (`--vector-mmap=false` loads
 them into memory instead).
-
-A shard has the layout its files have. No file converts on open, and a path
-holding both a single image and a catalog is rejected by name.
 
 ## Collections
 

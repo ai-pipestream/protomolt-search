@@ -1,7 +1,7 @@
 //! Commit a caught-up shadow while holding the serving and catalog fences.
 
 use super::super::recovery::{recover_interrupted, write_marker, CommitMarker, PendingCommit};
-use super::super::{layout_name, manifest_backup_path, MARKER_FORMAT};
+use super::super::{manifest_backup_path, MARKER_FORMAT};
 use super::*;
 use crate::segments::{CatalogCutover, SegmentCatalog};
 use crate::vector::VectorIndex;
@@ -14,9 +14,6 @@ impl NodeServiceImpl {
         shadow: &mut Shadow,
         live: &mut ShardState,
     ) -> Result<ShardState, Status> {
-        if !pre.segmented {
-            return self.install_and_activate(pre, shadow, live, None);
-        }
         let Some(Bm25Shard::Segmented(serving)) = live.bm25.as_ref() else {
             return Err(Status::aborted(
                 "serving shard changed layout before compaction cutover",
@@ -30,7 +27,7 @@ impl NodeServiceImpl {
         let prepared = prepared.catalog().clone();
         prepared
             .with_caught_up_shadow(&serving, &serving_snapshot, |cutover| {
-                self.install_and_activate(pre, shadow, live, Some(cutover))
+                self.install_and_activate(pre, shadow, live, cutover)
             })
             .map_err(Status::aborted)?
     }
@@ -40,25 +37,13 @@ impl NodeServiceImpl {
         pre: &Preflight,
         shadow: &mut Shadow,
         live: &mut ShardState,
-        cutover: Option<&CatalogCutover<'_>>,
+        cutover: &CatalogCutover<'_>,
     ) -> Result<ShardState, Status> {
-        let marker = prepare_marker(pre, shadow, live)?;
+        let marker = prepare_marker(pre, shadow)?;
         write_marker(&pre.index_path, &marker)
             .map_err(|e| Status::internal(format!("write the compaction marker: {e}")))?;
-        let result = move_shadow_generation(pre, shadow).and_then(|()| {
-            if let Some(cutover) = cutover {
-                publish_segment_shadow(shadow, live, cutover)
-            } else {
-                let staged = shadow
-                    .state
-                    .generation
-                    .clone()
-                    .expect("the single-image shadow serves a generation directory");
-                let snap = Self::adopt_generation(&pre.index_path, &staged, false)?;
-                shadow.state.generation = Some(snap);
-                Ok(())
-            }
-        });
+        let result = move_shadow_generation(pre, shadow)
+            .and_then(|()| publish_segment_shadow(shadow, live, cutover));
         if let Err(status) = result {
             recover_interrupted(&pre.index_path);
             return Err(status);
@@ -74,55 +59,25 @@ impl NodeServiceImpl {
     }
 }
 
-fn prepare_marker(
-    pre: &Preflight,
-    shadow: &Shadow,
-    live: &ShardState,
-) -> Result<CommitMarker, Status> {
-    let previous_snapshot = live.generation.is_some();
-    let legacy_files = if pre.segmented || previous_snapshot {
-        Vec::new()
-    } else {
-        [
-            pre.index_path.clone(),
-            crate::node::exact_vector_sidecar_path(&pre.index_path),
-            crate::node::bm25_sidecar_path(&pre.index_path),
-            crate::node::live_docs_sidecar_path(&pre.index_path),
-            crate::multi_res::sidecar_path(&pre.index_path),
-            crate::multi_res_storage::declaration_path(&crate::multi_res::sidecar_path(
-                &pre.index_path,
-            )),
-        ]
-        .into_iter()
-        .filter(|p| p.exists())
-        .collect()
-    };
-    let replaced_segments = if pre.segmented {
-        let root = crate::node::segments_root(&pre.index_path);
-        let current = SegmentCatalog::read_manifest(&root)
-            .map_err(Status::internal)?
-            .unwrap_or_default();
-        crate::segments::write_manifest_file(&manifest_backup_path(&root), &current)
-            .map_err(Status::internal)?;
-        current
-            .segments
-            .into_iter()
-            .map(|segment| segment.segment_id)
-            .collect()
-    } else {
-        shadow.replaced.clone()
-    };
+fn prepare_marker(pre: &Preflight, shadow: &Shadow) -> Result<CommitMarker, Status> {
+    let root = crate::node::segments_root(&pre.index_path);
+    let current = SegmentCatalog::read_manifest(&root)
+        .map_err(Status::internal)?
+        .unwrap_or_default();
+    crate::segments::write_manifest_file(&manifest_backup_path(&root), &current)
+        .map_err(Status::internal)?;
     Ok(CommitMarker {
         format: MARKER_FORMAT,
-        layout: layout_name(pre.segmented).to_string(),
         old_wal_generation: pre.cutoff_generation,
         new_wal_generation: pre.cutoff_generation + 1,
         walless: false,
         work_dir: pre.work_dir.clone(),
-        previous_snapshot,
-        legacy_files,
         staged_segments: shadow.staged.iter().map(|s| s.segment_id.clone()).collect(),
-        replaced_segments,
+        replaced_segments: current
+            .segments
+            .into_iter()
+            .map(|segment| segment.segment_id)
+            .collect(),
     })
 }
 

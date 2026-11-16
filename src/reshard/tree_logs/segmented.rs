@@ -10,7 +10,14 @@ use super::super::parallel_build::{refusing_analyzer, ParallelBuild};
 use super::super::tree_split::{check_slot_bound, image_rows, live_rows, SpillCut};
 use super::super::{Analyzer, ChildImage};
 use super::build::TreeBuild;
-use super::single::BuiltChildren;
+
+/// The catalogs, one per child, and the most rows one replay held.
+pub(super) struct BuiltChildren {
+    pub(super) images: Vec<ChildImage>,
+    /// Sealed segments per child.
+    pub(super) segments: Vec<usize>,
+    pub(super) peak_replay_rows: u64,
+}
 
 const REFUSAL: &str =
     "a transplant from segments analyzes nothing; every row's fields come from the spill";

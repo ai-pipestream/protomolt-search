@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use common::{fit_calibration, start_empty_node, unit_vectors};
 use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
 use pipestream_search::coordinator::CoordinatorServiceImpl;
-use pipestream_search::node::{Layout, NodeConfig};
+use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
@@ -44,7 +44,6 @@ fn config(index_path: PathBuf, slot_offset: u64) -> NodeConfig {
     NodeConfig {
         index_path: Some(index_path),
         analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
-        layout: Layout::Segments,
         seal_tail_docs: SEAL as u32,
         wal: false,
         slot_offset,
@@ -304,7 +303,6 @@ async fn uneven_fleet(tag: &str) -> Fleet {
     // Shard 0: every row is a document, the first SHARD_ROWS - VECTORLESS
     // of them with a vector.
     let (addr, handle) = start_empty_node(NodeConfig {
-        layout: Layout::SingleImage,
         seal_tail_docs: 0,
         ..config(dir.join("shard-0.tv"), 0)
     })
@@ -315,41 +313,47 @@ async fn uneven_fleet(tag: &str) -> Fleet {
         .await
         .unwrap();
     let with_vectors = SHARD_ROWS - VECTORLESS;
-    let (tx, rx) = mpsc::channel(SHARD_ROWS);
-    for i in 0..SHARD_ROWS {
-        tx.send(AddDocumentsRequest {
-            text: text(i),
-            analysis: Some(body_spec()),
-            integers: vec![IntegerValue {
-                field: "year".into(),
-                value: year(i),
-            }],
-            facets: vec![FacetValue {
-                field: "court".into(),
-                value: court(i).into(),
-            }],
-            numerics: vec![NumericValue {
-                field: "pages".into(),
-                value: pages(i),
-            }],
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+    // The rows with vectors seal aligned; the vectorless documents after
+    // them seal as a documents-only segment.
+    for rows in [0..with_vectors, with_vectors..SHARD_ROWS] {
+        let (tx, rx) = mpsc::channel(SHARD_ROWS);
+        for i in rows.clone() {
+            tx.send(AddDocumentsRequest {
+                text: text(i),
+                analysis: Some(body_spec()),
+                integers: vec![IntegerValue {
+                    field: "year".into(),
+                    value: year(i),
+                }],
+                facets: vec![FacetValue {
+                    field: "court".into(),
+                    value: court(i).into(),
+                }],
+                numerics: vec![NumericValue {
+                    field: "pages".into(),
+                    value: pages(i),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        client.add_documents(ReceiverStream::new(rx)).await.unwrap();
+        if rows.start == 0 {
+            let (tx, rx) = mpsc::channel(2);
+            tx.send(AddVectorsRequest {
+                materialized_rows: Vec::new(),
+                vectors: vectors[..with_vectors * DIM].to_vec(),
+                dim: DIM as u32,
+            })
+            .await
+            .unwrap();
+            drop(tx);
+            client.add_vectors(ReceiverStream::new(rx)).await.unwrap();
+        }
+        client.flush(FlushRequest {}).await.unwrap();
     }
-    drop(tx);
-    client.add_documents(ReceiverStream::new(rx)).await.unwrap();
-    let (tx, rx) = mpsc::channel(2);
-    tx.send(AddVectorsRequest {
-        materialized_rows: Vec::new(),
-        vectors: vectors[..with_vectors * DIM].to_vec(),
-        dim: DIM as u32,
-    })
-    .await
-    .unwrap();
-    drop(tx);
-    client.add_vectors(ReceiverStream::new(rx)).await.unwrap();
-    client.flush(FlushRequest {}).await.unwrap();
     addrs.push(addr);
     handles.push(handle);
     // Shard 1: vectors only.

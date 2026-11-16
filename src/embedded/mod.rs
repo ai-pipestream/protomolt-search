@@ -87,12 +87,9 @@ impl EmbeddedSearch {
 
         let mut nodes = Vec::with_capacity(config.shards.len());
         for (shard, shard_config) in config.shards.iter().enumerate() {
-            let node = NodeServiceImpl::open(
-                shard_config.node.clone(),
-                config.phrase_index.clone(),
-                shard_config.allow_missing_bm25,
-            )
-            .map_err(|message| EmbeddedError::OpenShard { shard, message })?;
+            let node =
+                NodeServiceImpl::open(shard_config.node.clone(), config.phrase_index.clone())
+                    .map_err(|message| EmbeddedError::OpenShard { shard, message })?;
             nodes.push(Arc::new(node));
         }
 

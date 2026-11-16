@@ -1,4 +1,4 @@
-//! Tail catch-up and the single-image cutover under the write fences.
+//! Tail catch-up and the cutover under the write fences.
 
 use std::time::Instant;
 
@@ -8,10 +8,7 @@ use crate::node::{Bm25Shard, NodeServiceImpl, ShardState};
 use crate::vector::VectorIndex;
 use crate::wal::ClockedTail;
 
-use super::{
-    Analyze, Preflight, Shadow, CUTOVER_RETRIES, MAX_TAIL_PASSES, PAIRED_APPEND_PAUSE,
-    PAIRED_APPEND_WAIT, STALLED_TAIL_PASSES,
-};
+use super::{Analyze, Preflight, Shadow, CUTOVER_RETRIES, MAX_TAIL_PASSES, STALLED_TAIL_PASSES};
 
 #[path = "cutover_install.rs"]
 mod install;
@@ -124,55 +121,34 @@ impl NodeServiceImpl {
     // over segments sealed after the cutoff, and swap behind the commit marker.
 
     /// Seal the tail when it holds rows (or a frozen part is waiting on
-    /// its publication), waiting out a legacy two-RPC append caught
-    /// mid-row the way the closing flush waits it out. Returns the rows
+    /// its publication). A tail whose documents have not met their vectors
+    /// refuses by name instead of sealing documents alone. Returns the rows
     /// the seal covered, 0 when there was nothing to seal.
-    pub(super) fn seal_tail_wait(&self) -> Result<u64, Status> {
-        let deadline = Instant::now() + PAIRED_APPEND_WAIT;
-        loop {
-            let (pending, frozen) = {
-                let guard = crate::node::read_shard(&self.state);
-                let (documents, vectors) = match guard.bm25.as_ref() {
-                    Some(Bm25Shard::Segmented(shard)) => (
-                        shard.tail().next_doc_id() as usize,
-                        guard
-                            .index
-                            .as_ref()
-                            .and_then(VectorIndex::as_segmented)
-                            .map_or(0, |p| p.tail().len()),
-                    ),
-                    _ => (0, 0),
-                };
-                (
-                    documents.max(vectors) as u64,
-                    matches!(guard.bm25.as_ref(), Some(Bm25Shard::Segmented(shard)) if shard.frozen().is_some()),
-                )
-            };
-            if pending == 0 && !frozen {
+    pub(super) fn seal_cutoff_tail(&self) -> Result<u64, Status> {
+        let (pending, frozen) = {
+            let guard = crate::node::read_shard(&self.state);
+            let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
                 return Ok(0);
-            }
-            // Paired: a fresh tail holding a document whose vectors have
-            // not arrived yet is that same mid-row append; sealing it
-            // would strand the document without its vectors.
-            match self.seal_tail_paired() {
-                Ok(_) => return Ok(pending),
-                Err(status)
-                    if Instant::now() < deadline
-                        && status.code() == tonic::Code::FailedPrecondition
-                        && status
-                            .message()
-                            .contains("a segment's artifacts cover the same rows") =>
-                {
-                    std::thread::sleep(PAIRED_APPEND_PAUSE);
-                }
-                Err(status) => return Err(status),
-            }
+            };
+            let vectors = guard
+                .index
+                .as_ref()
+                .and_then(VectorIndex::as_segmented)
+                .map_or(0, |p| p.tail().len());
+            (
+                (shard.tail().next_doc_id() as usize).max(vectors) as u64,
+                shard.frozen().is_some(),
+            )
+        };
+        if pending == 0 && !frozen {
+            return Ok(0);
         }
+        self.seal_tail_aligned()?;
+        Ok(pending)
     }
 
-    /// The tail holds documents whose vectors have not arrived: a
-    /// two-call append between its calls, which only the writer can
-    /// finish (see `ShardService::seal_tail_paired`).
+    /// The tail holds documents whose vectors have not arrived, which only
+    /// the writer can finish (see `NodeServiceImpl::seal_tail_aligned`).
     pub(super) fn tail_awaits_vectors(guard: &ShardState) -> bool {
         let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
             return false;

@@ -14,7 +14,7 @@ use common::start_empty_node;
 use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
 use pipestream_search::coordinator::CoordinatorServiceImpl;
 use pipestream_search::derived::Declaration;
-use pipestream_search::node::{Layout, NodeConfig, NodeServiceImpl};
+use pipestream_search::node::{NodeConfig, NodeServiceImpl};
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
@@ -122,7 +122,6 @@ fn config(index_path: Option<PathBuf>, derived: Option<Arc<Declaration>>) -> Nod
     NodeConfig {
         index_path: index_path.clone(),
         analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
-        layout: Layout::Segments,
         seal_tail_docs: SEAL as u32,
         wal: index_path.is_some(),
         wal_buckets: 4,
@@ -382,14 +381,14 @@ async fn derived_columns_are_computed_stored_pinned_and_queryable() {
     let mut changed = spec();
     changed.columns[0].expression = "calendar.year(decided) - 1900".into();
     let other = Arc::new(Declaration::compile(&changed).unwrap());
-    let err = NodeServiceImpl::open(config(Some(index_path.clone()), Some(other)), None, false)
+    let err = NodeServiceImpl::open(config(Some(index_path.clone()), Some(other)), None)
         .err()
         .unwrap();
     assert!(
         err.contains("written under derived-column declaration") && err.contains("rebuild"),
         "{err}"
     );
-    let err = NodeServiceImpl::open(config(Some(index_path.clone()), None), None, false)
+    let err = NodeServiceImpl::open(config(Some(index_path.clone()), None), None)
         .err()
         .unwrap();
     assert!(err.contains("does not declare"), "{err}");
@@ -490,7 +489,7 @@ fn a_declaration_the_tables_cannot_satisfy_is_refused_at_startup() {
         })
         .unwrap(),
     );
-    let err = NodeServiceImpl::open(config(None, Some(bad)), None, false)
+    let err = NodeServiceImpl::open(config(None, Some(bad)), None)
         .err()
         .unwrap();
     assert!(
@@ -503,7 +502,7 @@ fn a_declaration_the_tables_cannot_satisfy_is_refused_at_startup() {
         })
         .unwrap(),
     );
-    let err = NodeServiceImpl::open(config(None, Some(collides)), None, false)
+    let err = NodeServiceImpl::open(config(None, Some(collides)), None)
         .err()
         .unwrap();
     assert!(err.contains("collides with a source column"), "{err}");
@@ -534,7 +533,6 @@ fn a_declaration_the_tables_cannot_satisfy_is_refused_at_startup() {
             ..config(None, Some(declaration()))
         },
         None,
-        false,
     )
     .err()
     .unwrap();
@@ -822,9 +820,7 @@ async fn the_backfill_stores_what_direct_ingest_stores() {
         )),
         ..config(Some(image.vector_path.clone()), derived)
     };
-    let err = NodeServiceImpl::open(child(None), None, false)
-        .err()
-        .unwrap();
+    let err = NodeServiceImpl::open(child(None), None).err().unwrap();
     assert!(
         err.contains("written under derived-column declaration"),
         "{err}"
@@ -847,36 +843,33 @@ async fn the_backfill_stores_what_direct_ingest_stores() {
 
 #[tokio::test]
 async fn an_undeclared_fingerprint_is_refused_without_allocating_a_row() {
-    for layout in [Layout::SingleImage, Layout::Segments] {
-        let (addr, server) = start_empty_node(NodeConfig {
-            layout,
-            analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
+    let (addr, server) = start_empty_node(NodeConfig {
+        analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
+        ..Default::default()
+    })
+    .await;
+    let mut client = NodeServiceClient::connect(addr).await.unwrap();
+    let error = client
+        .add_documents(tokio_stream::iter([AddDocumentsRequest {
+            text: "opinion".into(),
+            analysis: Some(body_spec()),
+            derived_fingerprint: declaration().fingerprint().to_string(),
             ..Default::default()
-        })
-        .await;
-        let mut client = NodeServiceClient::connect(addr).await.unwrap();
-        let error = client
-            .add_documents(tokio_stream::iter([AddDocumentsRequest {
-                text: "opinion".into(),
-                analysis: Some(body_spec()),
-                derived_fingerprint: declaration().fingerprint().to_string(),
-                ..Default::default()
-            }]))
-            .await
-            .unwrap_err();
-        assert!(
-            error.message().contains("declares no derived columns"),
-            "{error}"
-        );
-        let health = client
-            .health(pipestream_search::pb::HealthRequest {})
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(health.document_slots, 0);
-        server.abort();
-        let _ = server.await;
-    }
+        }]))
+        .await
+        .unwrap_err();
+    assert!(
+        error.message().contains("declares no derived columns"),
+        "{error}"
+    );
+    let health = client
+        .health(pipestream_search::pb::HealthRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(health.document_slots, 0);
+    server.abort();
+    let _ = server.await;
 }
 
 /// A changed declaration: `calendar.year(decided) - 1900` reads the
@@ -889,9 +882,8 @@ fn changed_declaration() -> Arc<Declaration> {
 }
 
 #[test]
-fn an_empty_store_keeps_its_declaration_through_save_and_attach() {
+fn an_empty_store_keeps_its_declaration_through_save_and_no_catalog_admits_it() {
     let dir = tempdir("empty-store");
-    let index_path = dir.join("shard.tv");
     let declaration = declaration();
     // A zero-row store written under the declaration: the kind-15
     // entry and the complete tables, no rows.
@@ -902,7 +894,7 @@ fn an_empty_store_keeps_its_declaration_through_save_and_attach() {
     store.set_derived(Some(pipestream_search::postings::StoredDerived::of(
         &declaration,
     )));
-    let path = pipestream_search::node::bm25_sidecar_path(&index_path);
+    let path = dir.join("empty.bm25");
     store.save(&path).unwrap();
     let reader = pipestream_search::postings::Bm25Reader::open(&path).unwrap();
     let stored = reader
@@ -920,31 +912,8 @@ fn an_empty_store_keeps_its_declaration_through_save_and_attach() {
     assert_eq!(unsigned, vec!["court_hash"]);
     drop(reader);
 
-    // It attaches under its own declaration; every other pairing
-    // refuses by name, both fingerprints in the message.
-    let single = |derived: Option<Arc<Declaration>>| NodeConfig {
-        layout: Layout::SingleImage,
-        ..config(Some(index_path.clone()), derived)
-    };
-    NodeServiceImpl::open(single(Some(declaration.clone())), None, false).unwrap();
-    let other = changed_declaration();
-    let err = NodeServiceImpl::open(single(Some(other.clone())), None, false)
-        .err()
-        .unwrap();
-    assert!(
-        err.contains("written under derived-column declaration")
-            && err.contains(declaration.fingerprint())
-            && err.contains(other.fingerprint()),
-        "{err}"
-    );
-    let err = NodeServiceImpl::open(single(None), None, false)
-        .err()
-        .unwrap();
-    assert!(err.contains("does not declare"), "{err}");
-
-    // A zero-row SEGMENT, though, never enters a catalog: the row
-    // alignment check refuses it by name rather than publishing an
-    // empty part.
+    // A zero-row segment never enters a catalog: the row alignment check
+    // refuses it by name rather than publishing an empty part.
     let live_path = dir.join("live-docs.bin");
     pipestream_search::live_docs::LiveDocs::default()
         .write(&live_path, 0)
@@ -967,38 +936,6 @@ fn an_empty_store_keeps_its_declaration_through_save_and_attach() {
         .unwrap_err();
     assert!(err.contains("not aligned"), "{err}");
 
-    // A zero-row store written under NO declaration may still attach:
-    // "written under none" is refused only once the store holds rows.
-    // Each open gets its own store: the first open's log records the
-    // declaration, so a later open of the same path under none would
-    // refuse the log, not the store.
-    let plain = |name: &str| {
-        let index_path = dir.join(name);
-        pipestream_search::postings::Bm25Store::with_fields(&["body"])
-            .with_facets(&["court"])
-            .with_integers(&["decided", "placement"])
-            .save(&pipestream_search::node::bm25_sidecar_path(&index_path))
-            .unwrap();
-        index_path
-    };
-    NodeServiceImpl::open(
-        NodeConfig {
-            layout: Layout::SingleImage,
-            ..config(Some(plain("plain-declared.tv")), Some(declaration.clone()))
-        },
-        None,
-        false,
-    )
-    .expect("an empty store written under none attaches");
-    NodeServiceImpl::open(
-        NodeConfig {
-            layout: Layout::SingleImage,
-            ..config(Some(plain("plain-undeclared.tv")), None)
-        },
-        None,
-        false,
-    )
-    .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1006,21 +943,13 @@ fn an_empty_store_keeps_its_declaration_through_save_and_attach() {
 fn a_log_written_under_another_declaration_refuses_to_resume() {
     let dir = tempdir("wal-declaration");
     let index_path = dir.join("shard.tv");
-    let node = NodeServiceImpl::open(
-        config(Some(index_path.clone()), Some(declaration())),
-        None,
-        false,
-    )
-    .expect("the first open creates the log");
+    let node = NodeServiceImpl::open(config(Some(index_path.clone()), Some(declaration())), None)
+        .expect("the first open creates the log");
     drop(node);
     let other = changed_declaration();
-    let err = NodeServiceImpl::open(
-        config(Some(index_path.clone()), Some(other.clone())),
-        None,
-        false,
-    )
-    .err()
-    .unwrap();
+    let err = NodeServiceImpl::open(config(Some(index_path.clone()), Some(other.clone())), None)
+        .err()
+        .unwrap();
     assert!(
         err.contains("the log was written under derived-column declaration")
             && err.contains(declaration().fingerprint())
@@ -1033,11 +962,10 @@ fn a_log_written_under_another_declaration_refuses_to_resume() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_installed_snapshot_keeps_the_declaration_and_tables() {
     let dir = tempdir("snapshot");
-    // The source: documents ingested under the declaration and flushed
-    // to a single image.
+    // The source: documents ingested under the declaration, flushed and
+    // exported to a repository.
     let source_path = dir.join("source.tv");
     let source_config = NodeConfig {
-        layout: Layout::SingleImage,
         ..config(Some(source_path.clone()), Some(declaration()))
     };
     let (addr, handle) = start_empty_node(source_config).await;
@@ -1060,9 +988,34 @@ async fn an_installed_snapshot_keeps_the_declaration_and_tables() {
         .flush(FlushRequest {})
         .await
         .unwrap();
+    let repository = dir.join("repository");
+    NodeServiceClient::connect(addr.clone())
+        .await
+        .unwrap()
+        .export_snapshot(pipestream_search::pb::ExportSnapshotRequest {
+            directory: repository.display().to_string(),
+        })
+        .await
+        .unwrap();
     handle.abort();
-    let source_bm25 = pipestream_search::node::bm25_sidecar_path(&source_path);
-    assert!(source_path.exists() && source_bm25.exists());
+    let install = |addr: String| {
+        let request = pipestream_search::pb::InstallSnapshotFromRequest {
+            source: Some(
+                pipestream_search::pb::install_snapshot_from_request::Source::Directory(
+                    repository.display().to_string(),
+                ),
+            ),
+            ..Default::default()
+        };
+        async move {
+            NodeServiceClient::connect(addr)
+                .await
+                .unwrap()
+                .install_snapshot_from(request)
+                .await
+                .map(tonic::Response::into_inner)
+        }
+    };
 
     // The target installs it under the same declaration; the installed
     // generation's store keeps the fingerprint and the complete tables,
@@ -1070,20 +1023,14 @@ async fn an_installed_snapshot_keeps_the_declaration_and_tables() {
     // restart.
     let target_path = dir.join("target.tv");
     let target_config = |derived: Option<Arc<Declaration>>| NodeConfig {
-        layout: Layout::SingleImage,
         ..config(Some(target_path.clone()), derived)
     };
     let declaration = declaration();
     let (taddr, thandle) = start_empty_node(target_config(Some(declaration.clone()))).await;
     seed(&taddr, shift.clone(), scale.clone()).await;
-    let report =
-        pipestream_search::snapshot::install_snapshot(&taddr, &source_path, Some(&source_bm25))
-            .await
-            .unwrap();
+    let report = install(taddr.clone()).await.unwrap();
     assert_eq!(report.num_documents, N as u64);
-    let installed = pipestream_search::node::generation_bm25(
-        &pipestream_search::node::generation_dir(&target_path),
-    );
+    let installed = common::catalog::segment_bm25(&target_path, 0);
     let reader = pipestream_search::postings::Bm25Reader::open(&installed).unwrap();
     let stored = reader
         .derived()
@@ -1121,15 +1068,11 @@ async fn an_installed_snapshot_keeps_the_declaration_and_tables() {
     let other_path = dir.join("other.tv");
     let other = changed_declaration();
     let (oaddr, ohandle) = start_empty_node(NodeConfig {
-        layout: Layout::SingleImage,
         ..config(Some(other_path.clone()), Some(other.clone()))
     })
     .await;
     seed(&oaddr, shift, scale).await;
-    let err =
-        pipestream_search::snapshot::install_snapshot(&oaddr, &source_path, Some(&source_bm25))
-            .await
-            .unwrap_err();
+    let err = install(oaddr.clone()).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(
         err.message()
@@ -1226,7 +1169,6 @@ async fn a_seal_interrupted_mid_publish_never_serves_a_partial_segment() {
     let err = NodeServiceImpl::open(
         config(Some(index_path.clone()), Some(declaration.clone())),
         None,
-        false,
     )
     .err()
     .unwrap();
@@ -1241,13 +1183,9 @@ async fn a_seal_interrupted_mid_publish_never_serves_a_partial_segment() {
     let manifest_path = root_path.join("segments.json");
     let manifest = std::fs::read(&manifest_path).unwrap();
     std::fs::write(&manifest_path, &manifest[..manifest.len() / 2]).unwrap();
-    let err = NodeServiceImpl::open(
-        config(Some(index_path.clone()), Some(declaration)),
-        None,
-        false,
-    )
-    .err()
-    .unwrap();
+    let err = NodeServiceImpl::open(config(Some(index_path.clone()), Some(declaration)), None)
+        .err()
+        .unwrap();
     assert!(err.contains("segment set"), "{err}");
     std::fs::write(&manifest_path, &manifest).unwrap();
     let _ = std::fs::remove_dir_all(&dir);

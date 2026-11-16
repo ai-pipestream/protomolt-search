@@ -167,7 +167,7 @@ impl NodeServiceImpl {
     ) -> Result<PublicationSnapshot, Status> {
         let guard = read_shard(&self.state);
         if !is_projection {
-            guard.check_legacy_mutation()?;
+            guard.check_index_owned_write()?;
         }
         self.check_segment_publication(&guard, expected, catalog_epoch)?;
         let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
@@ -273,7 +273,6 @@ impl NodeServiceImpl {
         guard.check_stats_epoch(expected.epoch, &expected.incarnation())?;
         if self.config.index_path.is_none()
             || self.config.wal
-            || guard.generation.is_some()
             || guard.wal.is_some()
             || guard.pending_compaction.is_some()
             || self.compacting.load(std::sync::atomic::Ordering::Acquire)

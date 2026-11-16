@@ -1,6 +1,6 @@
 //! Flat query hits: known columns, projections, scoring, rendering.
 
-use super::{explain_stages, min_score_floor, FlatRun, FlatView, BULK_BUILD};
+use super::{explain_stages, min_score_floor, FlatRun, FlatView};
 use crate::node::*;
 use crate::scorefn::NumericRead;
 
@@ -11,9 +11,6 @@ impl FlatRun<'_> {
         response: &mut Bm25QueryResponse,
     ) -> Result<(), Status> {
         response.stage_columns_known = match store {
-            Some(Bm25Shard::Spilling(_)) if !self.stages.is_empty() => {
-                return Err(Status::failed_precondition(BULK_BUILD));
-            }
             Some(store) => store
                 .resolve_chain(&self.stages)
                 .stages

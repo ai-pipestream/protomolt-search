@@ -12,16 +12,19 @@ use super::replay::{
     read_gen_manifest, read_gens_binding, replay_buckets, require_backend_config,
     require_complete_history, same_backend_config, Replay,
 };
-use super::WalCutoff;
+use super::{ColumnTables, WalCutoff};
 
 /// The checked inputs of a split: the first input's manifest (the
 /// children's provider state), the highest input generation, and the
-/// binding and declaration every child keeps.
+/// binding, declaration and tables every child keeps.
 pub(super) struct SplitInputs {
     pub(super) manifest: WalManifest,
     pub(super) top_generation: u64,
     pub(super) binding: Option<StoredBinding>,
     pub(super) derived: Option<StoredDerived>,
+    /// The BM25 field table and column tables the log's manifest records,
+    /// so a child declares exactly what its source shard served.
+    tables: Option<(Vec<String>, ColumnTables)>,
 }
 
 impl SplitInputs {
@@ -32,6 +35,11 @@ impl SplitInputs {
         let (manifest, top_generation) = check_manifests(gens, what, same_geometry)?;
         Ok(Self {
             derived: manifest_derived(&manifest)?,
+            tables: manifest
+                .columns
+                .as_ref()
+                .filter(|table| !table.fields.is_empty())
+                .map(|table| (table.fields.clone(), ColumnTables::of_wal(table))),
             manifest,
             top_generation,
             binding: read_gens_binding(gens)?,
@@ -39,13 +47,14 @@ impl SplitInputs {
     }
 
     /// The schema a split's children are written under: the given BM25
-    /// field table, the inputs' binding, and the declaration the log's
-    /// manifest records.
+    /// field table (else the log's), the inputs' binding, and the
+    /// declaration and column tables the log's manifest records.
     pub(super) fn schema<'a>(&'a self, bm25_fields: Option<&'a [String]>) -> ChildSchema<'a> {
         ChildSchema {
-            bm25_fields,
+            bm25_fields: bm25_fields.or(self.tables.as_ref().map(|(fields, _)| fields.as_slice())),
             binding: self.binding.as_ref(),
             derived: self.derived.as_ref(),
+            columns: self.tables.as_ref().map(|(_, columns)| columns),
             ..ChildSchema::default()
         }
     }

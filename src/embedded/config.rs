@@ -18,9 +18,6 @@ pub struct EmbeddedShardConfig {
     /// The ordinary node configuration. Embedded startup accepts only the
     /// native analyzer (or no value, which is resolved to native).
     pub node: NodeConfig,
-    /// Explicit recovery escape hatch matching the server flag. The default
-    /// refuses an unfinished BM25 bulk build.
-    pub allow_missing_bm25: bool,
 }
 
 impl EmbeddedShardConfig {
@@ -34,10 +31,7 @@ impl EmbeddedShardConfig {
             analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
             ..NodeConfig::default()
         };
-        Self {
-            node,
-            allow_missing_bm25: false,
-        }
+        Self { node }
     }
 
     /// A persisted shard with WAL enabled. Opening an absent path creates an
@@ -51,10 +45,7 @@ impl EmbeddedShardConfig {
             wal: true,
             ..NodeConfig::default()
         };
-        Self {
-            node,
-            allow_missing_bm25: false,
-        }
+        Self { node }
     }
 }
 

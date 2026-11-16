@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use pipestream_search::analyzer::*;
-use pipestream_search::node::{Layout, NodeConfig, NodeServiceImpl};
+use pipestream_search::node::{NodeConfig, NodeServiceImpl};
 use pipestream_search::pb::ingest_mapped_request::Payload;
 use pipestream_search::pb::*;
 use pipestream_search::reshard::{self, SplitRequest};
@@ -78,10 +78,9 @@ fn mapped_stream(vectors: &[f32], count: usize) -> Vec<IngestMappedRequest> {
         .collect()
 }
 
-fn node_config(index_path: &Path, layout: Layout, backend: &str) -> NodeConfig {
+fn node_config(index_path: &Path, backend: &str) -> NodeConfig {
     NodeConfig {
         index_path: Some(index_path.to_path_buf()),
-        layout,
         vector_backend: backend.into(),
         analysis_addr: Some("native".into()),
         integer_fields: vec!["id".into()],
@@ -116,10 +115,10 @@ fn assert_locked_manifest_and_split(gen_dir: &Path, split_out: &Path, backend: &
     assert_eq!((c.num_vectors, c.num_documents), (4, 4));
 }
 
-async fn verify_lazy_case(root: &Path, layout: Layout, backend: &str) {
+async fn verify_lazy_case(root: &Path, backend: &str) {
     let shard = root.join("shard.tv");
-    let cfg = node_config(&shard, layout, backend);
-    let open = |c| NodeLink::local(Arc::new(NodeServiceImpl::open(c, None, false).unwrap()));
+    let cfg = node_config(&shard, backend);
+    let open = |c| NodeLink::local(Arc::new(NodeServiceImpl::open(c, None).unwrap()));
     let mut link = open(cfg.clone());
     let gen_dir = reshard::resolve_gen(&wal::wal_dir(&shard)).unwrap();
     let initial = wal::read_manifest(&gen_dir).unwrap();
@@ -150,14 +149,9 @@ async fn verify_lazy_case(root: &Path, layout: Layout, backend: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lazy_mapped_ingest_locks_wal_manifest_and_recovers_cleanly() {
-    for (tag, layout, backend) in [
-        ("single_tv", Layout::SingleImage, EMBEDDED_TURBOVEC),
-        ("seg_tv", Layout::Segments, EMBEDDED_TURBOVEC),
-        ("single_hnsw", Layout::SingleImage, HNSW),
-        ("seg_hnsw", Layout::Segments, HNSW),
-    ] {
+    for (tag, backend) in [("seg_tv", EMBEDDED_TURBOVEC), ("seg_hnsw", HNSW)] {
         let dir = tempdir(tag);
-        verify_lazy_case(&dir, layout, backend).await;
+        verify_lazy_case(&dir, backend).await;
         std::fs::remove_dir_all(&dir).ok();
     }
 }
@@ -169,8 +163,8 @@ async fn mapped_ingest_retires_wal_when_initial_manifest_rewrite_fails() {
     let chmod = |p, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
     let root = tempdir("retire_broken");
     let shard = root.join("shard.tv");
-    let cfg = node_config(&shard, Layout::SingleImage, EMBEDDED_TURBOVEC);
-    let mut link = NodeLink::local(Arc::new(NodeServiceImpl::open(cfg, None, false).unwrap()));
+    let cfg = node_config(&shard, EMBEDDED_TURBOVEC);
+    let mut link = NodeLink::local(Arc::new(NodeServiceImpl::open(cfg, None).unwrap()));
     let gen_dir = reshard::resolve_gen(&wal::wal_dir(&shard)).unwrap();
     for b in 0..4 {
         std::fs::File::create(gen_dir.join(format!("bucket-{b:04}.wal"))).unwrap();

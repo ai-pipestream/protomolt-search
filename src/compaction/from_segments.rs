@@ -17,8 +17,8 @@ use super::shadow::{
     StageImagesSpec,
 };
 use super::{
-    layout_name, PreparedSegmentCutover, SegmentPreflight, CUTOVER_RETRIES, MAX_TAIL_PASSES,
-    PAIRED_APPEND_PAUSE, PAIRED_APPEND_WAIT, STALLED_TAIL_PASSES,
+    PreparedSegmentCutover, SegmentPreflight, CUTOVER_RETRIES, LAYOUT, MAX_TAIL_PASSES,
+    STALLED_TAIL_PASSES,
 };
 
 #[path = "segment_cutover_install.rs"]
@@ -46,7 +46,7 @@ impl NodeServiceImpl {
                 rows_before: pre.rows_now,
                 rows_after: pre.rows_now,
                 tombstones_reclaimed: pre.tombstones_now,
-                layout: layout_name(true).to_string(),
+                layout: LAYOUT.to_string(),
                 dry_run: true,
                 stats_epoch: pre.stats_epoch,
                 partition_column: pre.partition.clone(),
@@ -126,7 +126,7 @@ impl NodeServiceImpl {
             write_lock_ms,
             wal_generation: 0,
             cutoff_clock: 0,
-            layout: layout_name(true).to_string(),
+            layout: LAYOUT.to_string(),
             dry_run: false,
             closing_flush_ms,
             tail_passes,
@@ -144,7 +144,7 @@ impl NodeServiceImpl {
         // later writes, which the catch-up seals and the cutover carries
         // as segments past the cutoff set. The seal lock keeps a seal
         // from publishing between the set and the overlay read.
-        self.seal_tail_wait()?;
+        self.seal_cutoff_tail()?;
         let _seal = self.seal_lock.lock().expect("seal lock poisoned");
         let guard = crate::node::read_shard(&self.state);
         let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
@@ -192,7 +192,7 @@ impl NodeServiceImpl {
                      tail empty"
                 )));
             }
-            let sealed = self.seal_tail_wait()?;
+            let sealed = self.seal_cutoff_tail()?;
             if sealed == 0 {
                 break;
             }
@@ -226,28 +226,21 @@ impl NodeServiceImpl {
         // The cutover. Reserve commits first: with the gate held, no
         // write but a gate-bypassing one can land, and the fence below
         // catches those. The seal lock keeps a seal from racing the
-        // manifest read. The gate is taken per attempt: a two-call append
-        // caught between its calls cannot land its vectors while the gate
-        // is held, so the attempt releases the gate until it has.
+        // manifest read. A tail whose documents still wait for their
+        // vectors cannot seal, so the cutover refuses it by name.
         let mut attempt = 0usize;
-        let pair_deadline = Instant::now() + PAIRED_APPEND_WAIT;
         loop {
             let mutation = self.mutation_gate.blocking_write();
             if Self::tail_awaits_vectors(&crate::node::read_shard(&self.state)) {
                 drop(mutation);
-                if Instant::now() >= pair_deadline {
-                    crate::segments::remove_segment_dirs(root, staged);
-                    return Err(Status::failed_precondition(format!(
-                        "the tail holds documents whose vectors did not arrive within {}s; \
-                         send AddVectors for each AddDocuments batch, then retry the compaction",
-                        PAIRED_APPEND_WAIT.as_secs()
-                    )));
-                }
-                std::thread::sleep(PAIRED_APPEND_PAUSE);
-                continue;
+                crate::segments::remove_segment_dirs(root, staged);
+                return Err(Status::failed_precondition(
+                    "the tail holds documents whose vectors have not arrived; send AddVectors \
+                     for each AddDocuments batch, then retry the compaction",
+                ));
             }
             attempt += 1;
-            self.seal_tail_wait()?;
+            self.seal_cutoff_tail()?;
             let _seal = self.seal_lock.lock().expect("seal lock poisoned");
             {
                 let guard = crate::node::read_shard(&self.state);

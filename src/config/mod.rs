@@ -127,19 +127,6 @@ pub struct Config {
     /// its column tables and pins it to the store, the log and every
     /// segment.
     pub derived: Option<std::sync::Arc<crate::derived::Declaration>>,
-    /// Serve a shard whose BM25 bulk build was interrupted: a
-    /// `.bm25.build` spill directory with no `.bm25` beside it.
-    ///
-    /// Off by default. `Flush` removes the spill directory on success,
-    /// so that pair cannot occur on a shard that finished, and serving it
-    /// is the bad kind of quiet: the node comes up healthy, answers
-    /// vector queries normally, and contributes NOTHING to every lexical
-    /// query, so a fleet ranks against a corpus short one shard's share
-    /// with nothing anywhere saying so.
-    ///
-    /// A shard with neither file is NOT affected — that is what a
-    /// vector-only deployment looks like, and it is a real one.
-    pub allow_missing_bm25: bool,
     /// Coalesce concurrent vector scans into batched kernel calls (up to
     /// four queries per pass over the packed codes). `false` runs one
     /// scan per RPC — the A/B baseline; results are identical either way.
@@ -353,9 +340,6 @@ pub struct Config {
     /// The key that authenticates UDP floor and cancel datagrams
     /// (`--udp-hmac-key=<file>`).
     pub udp_hmac_key: Option<crate::security::UdpKey>,
-    /// The layout a NEW persisted shard gets (`--layout=segments|single-image`);
-    /// an existing shard keeps its own.
-    pub layout: crate::node::Layout,
     /// Documents a segmented shard's tail may hold before it seals a
     /// segment on its own (`--seal-tail-docs`); 0 seals on flush only.
     pub seal_tail_docs: u32,

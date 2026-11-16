@@ -1,8 +1,6 @@
-//! Shard index sources: the generated demo corpus, or the image on disk.
+//! The generated demo corpus a `[demo]` shard serves.
 
-use std::path::Path;
-
-use pipestream_search::config::{DemoConfig, ShardConfig};
+use pipestream_search::config::DemoConfig;
 use pipestream_search::harness;
 use pipestream_search::vector::VectorIndex;
 
@@ -27,37 +25,11 @@ fn build_demo_index(demo: DemoConfig, backend_kind: &str) -> Result<VectorIndex,
     Ok(index)
 }
 
-/// Load a shard's index, or `None` when the shard starts empty: its index
-/// path does not exist yet (a from-scratch shard awaiting
-/// ConfigureVectorBackend + AddVectors; Flush later writes that path). When a snapshot
-/// generation is active, the index loads from INSIDE it — the generation
-/// always reflects the newest installed or flushed image.
-pub(super) fn load_shard_index(
-    shard: &ShardConfig,
-    generation: Option<&Path>,
-) -> Result<Option<VectorIndex>, String> {
-    if let Some(demo) = shard.demo {
-        eprintln!(
-            "building demo index: {} vectors x dim {} @ {} bits",
-            demo.vectors, demo.dim, demo.bit_width
-        );
-        return build_demo_index(demo, &shard.vector_backend).map(Some);
-    }
-    let path = match generation {
-        Some(dir) => pipestream_search::node::generation_vector(dir),
-        None => shard
-            .index_path
-            .as_ref()
-            .expect("config validated an index source")
-            .clone(),
-    };
-    if !path.exists() {
-        return Ok(None);
-    }
-    let mut index = VectorIndex::load(&shard.vector_backend, &path)
-        .map_err(|e| format!("load {}: {e}", path.display()))?;
-    index
-        .prepare()
-        .map_err(|e| format!("prepare {}: {e}", path.display()))?;
-    Ok(Some(index))
+/// The demo corpus a `[demo]` shard serves from memory.
+pub(super) fn load_demo_index(demo: DemoConfig, backend_kind: &str) -> Result<VectorIndex, String> {
+    eprintln!(
+        "building demo index: {} vectors x dim {} @ {} bits",
+        demo.vectors, demo.dim, demo.bit_width
+    );
+    build_demo_index(demo, backend_kind)
 }

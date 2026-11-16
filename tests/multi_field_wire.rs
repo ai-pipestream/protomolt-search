@@ -11,15 +11,13 @@
 //! - per-field TermStats shares (zeros for fields a shard lacks);
 //! - ingest validation: unknown / duplicate / "body" / empty fields are
 //!   refused before any effect;
-//! - `Bm25Shard::open` maps every reader-supported format resident
-//!   (v5/v6 heap-loaded on restart before this increment);
 //! - ShardLegs k1/b reach the BM25 leg (compute_legs hardcoded
 //!   defaults before this increment).
 
 mod common;
 
 use pipestream_search::coordinator::CoordinatorServiceImpl;
-use pipestream_search::node::{Bm25Shard, NodeConfig};
+use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::{
     AddDocumentsRequest, Bm25Hit, DocumentField, FieldTerms, FlushRequest, QueryField,
@@ -455,42 +453,6 @@ async fn multi_field_ingest_validation_refuses_bad_fields() {
 
     node.abort();
     mock.abort();
-}
-
-/// `Bm25Shard::open` maps single-field and multi-field `.bm25` saves
-/// disk-resident and refuses unsupported legacy headers cleanly.
-#[test]
-fn bm25_shard_open_maps_current_formats_resident() {
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("tvmfw_open_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut store = pipestream_search::postings::Bm25Store::with_fields(&["body", "case_name"]);
-    let mut single = pipestream_search::postings::Bm25Store::new();
-    for i in 0..40u32 {
-        let doc = pipestream_search::postings::AnalyzedDoc::body(
-            vec![("court".to_string(), 1 + i % 3, vec![(0, 5)])],
-            1 + i % 3,
-        );
-        store.add_document(i, format!("doc {i}"), doc.clone());
-        single.add_document(i, format!("doc {i}"), doc);
-    }
-    let v6 = dir.join("v6.bm25");
-    store.save(&v6).unwrap();
-    assert!(matches!(
-        Bm25Shard::open(&v6).unwrap(),
-        Bm25Shard::Resident(_)
-    ));
-    let single_path = dir.join("single.bm25");
-    single.save(&single_path).unwrap();
-    assert!(matches!(
-        Bm25Shard::open(&single_path).unwrap(),
-        Bm25Shard::Resident(_)
-    ));
-    let legacy = dir.join("legacy.bm25");
-    std::fs::write(&legacy, b"TVBM2505\0\0\0\0\0\0\0\0").unwrap();
-    assert!(Bm25Shard::open(&legacy).is_err());
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// ShardLegs BM25 params reach scoring: non-default k1/b change the

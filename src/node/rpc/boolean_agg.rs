@@ -153,9 +153,7 @@ impl NodeServiceImpl {
                 stats_incarnation: guard.stats_incarnation.bytes()?,
             }));
         };
-        let index = shard.as_index().ok_or_else(|| {
-            Status::failed_precondition("bm25 bulk build in progress; Flush first")
-        })?;
+        let index = shard.as_index();
         let label_count = usize::try_from(shard.next_doc_id())
             .map_err(|_| Status::resource_exhausted("lexical row count does not fit usize"))?;
         let visible = self.resolve_visibility_bits(&guard, label_count, view_filter)?;
@@ -338,11 +336,6 @@ impl NodeServiceImpl {
                     counts: vec![0; req.targets.len()],
                 }));
             };
-            if store.as_index().is_none() {
-                return Err(Status::failed_precondition(
-                    "bm25 bulk build in progress; Flush before aggregating",
-                ));
-            }
             let exprs = resolve_quantile_exprs(store, &req.exprs, &req.targets)?;
             let pass = self.admitted_doc_pass(
                 &guard,

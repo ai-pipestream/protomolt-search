@@ -10,6 +10,20 @@ mod seal_write;
 /// What a seal in flight writes out (`NodeServiceImpl::seal_tail`):
 /// the frozen part's rows and shared artifacts, gathered under the
 /// write lock, written with no lock held.
+/// What a seal does with a tail whose documents and vectors disagree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::node) enum TailSeal {
+    /// Seal a documents-only tail; refuse documents and vectors that
+    /// disagree (a flush).
+    Any,
+    /// Also refuse documents whose vectors have not arrived (a sealer
+    /// beside live ingest: compaction).
+    Aligned,
+    /// Leave a tail whose documents and vectors disagree in place for the
+    /// next flush (a compaction's closing flush).
+    Deferred,
+}
+
 pub(in crate::node) struct SealPlan {
     pub(in crate::node) retained: crate::multi_res::MultiResVectors,
     pub(in crate::node) base: usize,
@@ -81,23 +95,21 @@ impl NodeServiceImpl {
     /// publish the manifest unlocked, then republish the new snapshot under the
     /// write lock without altering WAL history.
     pub(crate) fn seal_tail(&self) -> Result<bool, Status> {
-        self.seal_tail_with(false)
+        self.seal_tail_with(TailSeal::Any)
     }
 
     /// [`Self::seal_tail`] for a sealer that runs beside live ingest
     /// (compaction): with a vector provider configured it refuses, under
     /// the same write lock that would freeze the tail, a tail whose
-    /// documents outnumber their vectors. Such a tail is a two-call
-    /// append between its calls; freezing it would seal the documents
-    /// alone and the vectors that follow would be refused. The refusal
-    /// carries the misaligned-tail message, which the caller retries.
-    pub(crate) fn seal_tail_paired(&self) -> Result<bool, Status> {
-        self.seal_tail_with(true)
+    /// documents have no vectors yet. Freezing it would seal the documents
+    /// alone and the vectors that follow would be refused.
+    pub(crate) fn seal_tail_aligned(&self) -> Result<bool, Status> {
+        self.seal_tail_with(TailSeal::Aligned)
     }
 
-    pub(in crate::node) fn seal_tail_with(&self, paired: bool) -> Result<bool, Status> {
+    pub(in crate::node) fn seal_tail_with(&self, mode: TailSeal) -> Result<bool, Status> {
         let _one_at_a_time = self.seal_lock.lock().expect("seal lock poisoned");
-        let Some(plan) = self.freeze_tail(paired)? else {
+        let Some(plan) = self.freeze_tail(mode)? else {
             return Ok(false);
         };
         let outcome = self.write_segment(&plan);
@@ -137,10 +149,10 @@ impl NodeServiceImpl {
 
     /// Step one of a seal, under the write lock: freeze the tail (or
     /// pick up the frozen part a failed seal left) and gather what the
-    /// writer needs. `None` when there is nothing to seal. `paired`
-    /// refuses a document-only tail when a vector provider is configured
-    /// (see [`Self::seal_tail_paired`]).
-    pub(in crate::node) fn freeze_tail(&self, paired: bool) -> Result<Option<SealPlan>, Status> {
+    /// writer needs. `None` when there is nothing to seal, or when `mode`
+    /// defers a tail whose documents and vectors disagree (see
+    /// [`TailSeal`]).
+    pub(in crate::node) fn freeze_tail(&self, mode: TailSeal) -> Result<Option<SealPlan>, Status> {
         let mut guard = write_shard(&self.state);
         guard.check_catalog_publication()?;
         if let Some(binding) = guard.mapped_binding.clone() {
@@ -171,12 +183,17 @@ impl NodeServiceImpl {
                 if docs == 0 && vectors == 0 {
                     return Ok(None);
                 }
-                let awaits_vectors = paired && provider.is_some() && vectors == 0;
+                let awaits_vectors =
+                    mode == TailSeal::Aligned && provider.is_some() && vectors == 0;
                 if docs != 0 && (vectors != 0 || awaits_vectors) && docs != vectors {
+                    if mode == TailSeal::Deferred {
+                        return Ok(None);
+                    }
                     return Err(Status::failed_precondition(format!(
                         "the tail has {docs} documents and {vectors} vectors; a segment's \
-                         artifacts cover the same rows, so ingest through the mapped path, \
-                         which keeps them aligned, or run this shard with --layout=single-image"
+                         artifacts cover the same rows, so send AddVectors for each \
+                         AddDocuments batch before flushing, or ingest through the mapped \
+                         path, which keeps them aligned"
                     )));
                 }
                 let fresh = heap_store(&self.config).map_err(Status::failed_precondition)?;
@@ -232,10 +249,9 @@ impl NodeServiceImpl {
             .map_or(0, |p| p.tail().len());
         // A segment's artifacts cover the same rows, so a tail that holds
         // both documents and vectors seals only at a moment when the two
-        // agree: the legacy two-call append (AddDocuments, then
-        // AddVectors for the same rows) is between its calls otherwise,
-        // and the seal waits for the vectors rather than sealing a
-        // document-only segment the vectors could never join.
+        // agree: AddVectors has not yet caught up with AddDocuments
+        // otherwise, and the seal waits for the vectors rather than
+        // sealing a document-only segment the vectors could never join.
         if docs == 0 {
             vectors >= bound
         } else if guard.index.is_some() {

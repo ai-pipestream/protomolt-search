@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use common::files::{FileServer, DROP_AFTER};
 use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
-use pipestream_search::node::{Layout, NodeConfig, NodeServiceImpl};
+use pipestream_search::node::{NodeConfig, NodeServiceImpl};
 use pipestream_search::pb::install_snapshot_from_request::Source;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::{
@@ -112,7 +112,6 @@ fn config(index_path: PathBuf) -> NodeConfig {
     NodeConfig {
         index_path: Some(index_path),
         analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
-        layout: Layout::SingleImage,
         wal: true,
         ..Default::default()
     }
@@ -123,8 +122,7 @@ async fn the_https_source_trusts_the_cluster_ca_and_resumes_with_range() {
     install_client_tls(Some(client_tls()));
     let dir = tempdir("https");
     let source =
-        serve_tls_node(NodeServiceImpl::open(config(dir.join("source.tv")), None, false).unwrap())
-            .await;
+        serve_tls_node(NodeServiceImpl::open(config(dir.join("source.tv")), None).unwrap()).await;
     let endpoint = Endpoint::from_shared(source.clone())
         .unwrap()
         .tls_config(client_tls().client_config())
@@ -196,8 +194,7 @@ async fn the_https_source_trusts_the_cluster_ca_and_resumes_with_range() {
     let port = serve_tls_files(Arc::clone(&server), "server.pem", "server.key.pem").await;
 
     let target =
-        serve_tls_node(NodeServiceImpl::open(config(dir.join("target.tv")), None, false).unwrap())
-            .await;
+        serve_tls_node(NodeServiceImpl::open(config(dir.join("target.tv")), None).unwrap()).await;
     // Under the cluster CA and the certificate's name: the manifest and
     // every artifact come over TLS, the interrupted one resumes.
     let installed = install_snapshot_from(

@@ -372,7 +372,6 @@ async fn the_wal_manifest_carries_the_collection_and_refuses_a_foreign_one() {
             ..config("a")
         },
         None,
-        true,
     )
     .unwrap();
     drop(node);
@@ -392,7 +391,6 @@ async fn the_wal_manifest_carries_the_collection_and_refuses_a_foreign_one() {
                 ..config("a")
             },
             None,
-            true,
         )
     }));
     let message = match outcome {

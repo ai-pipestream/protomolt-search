@@ -1,6 +1,6 @@
 //! Online compaction (`docs/mutations.md`): a shard keeps taking writes
 //! while `CompactShard` rebuilds it dense, tails the log into the
-//! rebuild, and cuts over under one brief write lock — on both layouts.
+//! rebuild, and cuts over under one brief write lock.
 //!
 //! Pinned here:
 //!
@@ -31,20 +31,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pipestream_search::coordinator::CoordinatorServiceImpl;
-use pipestream_search::node::{Layout, NodeConfig};
+use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
-    search_query, selection_query, snapshot_chunk, AddDocumentsRequest, AddDocumentsResponse,
-    AddVectorsRequest, AddVectorsResponse, Bm25SearchRequest, BrowseShardRequest, BrowseSort,
+    search_query, selection_query, AddDocumentsRequest, AddDocumentsResponse, AddVectorsRequest,
+    AddVectorsResponse, Bm25SearchRequest, BrowseShardRequest, BrowseSort,
     CommitReplacementsRequest, CompactShardRequest, CompactShardResponse, DeleteDocumentsRequest,
     DenseQuery, DocLineage, FacetValue, FlushRequest, GetDocumentsRequest, HealthRequest,
     HybridSearchRequest, IntegerValue, QueryRequest, Replacement, ResolveParentsRequest,
-    SearchQuery, SearchRequest, SelectionQuery, SnapshotChunk, SnapshotManifest,
+    SearchQuery, SearchRequest, SelectionQuery,
 };
 use pipestream_search::segments::{SegmentCatalog, SegmentMetadata, SegmentSetManifest};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tonic::Request;
 
@@ -65,13 +63,12 @@ fn tempdir(tag: &str) -> PathBuf {
     dir
 }
 
-fn config(index_path: Option<PathBuf>, layout: Layout, analysis: &str) -> NodeConfig {
+fn config(index_path: Option<PathBuf>, analysis: &str) -> NodeConfig {
     NodeConfig {
         index_path,
         analysis_addr: Some(analysis.to_string()),
         wal: true,
         wal_buckets: 8,
-        layout,
         facet_fields: vec!["grp".into()],
         integer_fields: vec!["num".into(), "other".into()],
         numeric_fields: vec!["score".into()],
@@ -703,7 +700,6 @@ async fn observe(addrs: &[String], analysis: &str, queries: &[Vec<f32>]) -> Read
 async fn reference_shard(
     dir: &Path,
     name: &str,
-    layout: Layout,
     analysis: &str,
     shift: &[f32],
     scale: &[f32],
@@ -712,7 +708,7 @@ async fn reference_shard(
     String,
     tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
 ) {
-    let (addr, handle) = start_empty_node(config(Some(dir.join(name)), layout, analysis)).await;
+    let (addr, handle) = start_empty_node(config(Some(dir.join(name)), analysis)).await;
     calibrate(&addr, shift, scale).await;
     let mut client = client(&addr).await;
     for row in rows {
@@ -723,7 +719,7 @@ async fn reference_shard(
 }
 
 use pipestream_search::compaction::{default_work_dir, marker_path};
-use pipestream_search::node::{generation_bm25, generation_dir, segments_root};
+use pipestream_search::node::segments_root;
 use pipestream_search::postings::{Bm25Index, Bm25Reader};
 use pipestream_search::reshard::{split_logs_with, SplitRequest};
 use pipestream_search::segments::OpenedSegmentSet;
@@ -759,9 +755,6 @@ fn dense_cursor_query(probe: Vec<f32>, cursor: String) -> QueryRequest {
 }
 
 fn assert_first_compaction_postconditions(
-    layout: Layout,
-    tag: &str,
-    dir: &Path,
     index_path: &Path,
     first: &CompactShardResponse,
     stats: &WriterStats,
@@ -770,7 +763,7 @@ fn assert_first_compaction_postconditions(
     assert!(stats.calls > 0, "the concurrent writer completed no calls");
     assert!(stats.max_call < elapsed / 2, "{stats:?} vs {elapsed:?}");
     assert!(!first.dry_run && first.wal_generation == 1);
-    assert_eq!(first.layout, tag.replace("single", "single-image"));
+    assert_eq!(first.layout, "segments");
     assert!(first.rows_before >= (N + 5) as u64);
     assert!(first.tombstones_reclaimed >= (N.div_ceil(7) + 5) as u64);
     assert!(
@@ -780,22 +773,15 @@ fn assert_first_compaction_postconditions(
     assert!(first.write_lock_ms < 500, "lock {} ms", first.write_lock_ms);
     assert!(!default_work_dir(index_path).exists() && !marker_path(index_path).exists());
     assert!(wal_gen(index_path, 0).exists() && wal_gen(index_path, 1).exists());
-    match layout {
-        Layout::SingleImage => {
-            assert!(!dir.join("shard.vector.snap-old").exists() && !index_path.exists());
-            assert!(generation_dir(index_path).exists());
-        }
-        Layout::Segments => {
-            let root = segments_root(index_path);
-            let manifest = SegmentCatalog::read_manifest(&root).unwrap().unwrap();
-            assert!(manifest.segments.iter().all(|s| {
-                s.segment_id.starts_with("cmp-000001-") || s.segment_id.starts_with("seg-")
-            }));
-            for entry in std::fs::read_dir(root.join("segments")).unwrap() {
-                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
-                assert!(manifest.segments.iter().any(|s| s.segment_id == name));
-            }
-        }
+    let root = segments_root(index_path);
+    let manifest = SegmentCatalog::read_manifest(&root).unwrap().unwrap();
+    assert!(manifest
+        .segments
+        .iter()
+        .all(|s| { s.segment_id.starts_with("cmp-000001-") || s.segment_id.starts_with("seg-") }));
+    for entry in std::fs::read_dir(root.join("segments")).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        assert!(manifest.segments.iter().any(|s| s.segment_id == name));
     }
 }
 
@@ -854,25 +840,16 @@ fn verify_compacted_reader_sources(reader: &Bm25Reader, final_rows: &[Row]) {
     }
 }
 
-fn verify_layout_bm25_sources(layout: Layout, index_path: &Path, final_rows: &[Row]) {
-    match layout {
-        Layout::SingleImage => {
-            let bm25 = generation_bm25(&generation_dir(index_path));
-            verify_compacted_reader_sources(&Bm25Reader::open(&bm25).unwrap(), final_rows);
-        }
-        Layout::Segments => {
-            let set = OpenedSegmentSet::open(segments_root(index_path)).unwrap();
-            for part in 0..set.manifest().segments.len() {
-                verify_compacted_reader_sources(set.bm25(part), final_rows);
-            }
-        }
+fn verify_catalog_bm25_sources(index_path: &Path, final_rows: &[Row]) {
+    let set = OpenedSegmentSet::open(segments_root(index_path)).unwrap();
+    for part in 0..set.manifest().segments.len() {
+        verify_compacted_reader_sources(set.bm25(part), final_rows);
     }
 }
 
 struct ReplayCheck<'a> {
     dir: &'a Path,
     index_path: &'a Path,
-    layout: Layout,
     analysis: &'a str,
     cal: (&'a [f32], &'a [f32]),
     addr: &'a str,
@@ -910,13 +887,8 @@ async fn verify_compacted_wal_replay(
     let child = &replayed.children[0];
     let live = check.final_rows.len() as u64;
     assert_eq!((child.num_vectors, child.num_documents), (live, live));
-    let reader = Bm25Reader::open(child.bm25_path.as_ref().unwrap()).unwrap();
-    verify_compacted_reader_sources(&reader, check.final_rows);
-    let cfg = config(
-        Some(child.vector_path.clone()),
-        Layout::SingleImage,
-        check.analysis,
-    );
+    verify_catalog_bm25_sources(&child.vector_path, check.final_rows);
+    let cfg = config(Some(child.vector_path.clone()), check.analysis);
     let (r_addr, r_handle) = start_opened_node(cfg).await;
     let got = observe(std::slice::from_ref(&r_addr), check.analysis, check.queries).await;
     assert_eq!(&got, expected, "rewritten WAL replays differently");
@@ -925,11 +897,7 @@ async fn verify_compacted_wal_replay(
 
 async fn verify_distributed_matches_monolithic(check: &ReplayCheck<'_>, reopened: &str) {
     let other_rows: Vec<Row> = (5_000..5_300).map(|i| row(i, false)).collect();
-    let other_cfg = config(
-        Some(check.dir.join("other.vector")),
-        check.layout,
-        check.analysis,
-    );
+    let other_cfg = config(Some(check.dir.join("other.vector")), check.analysis);
     let (other, other_h) = start_empty_node(NodeConfig {
         slot_offset: 1_000_000,
         ..other_cfg
@@ -948,7 +916,6 @@ async fn verify_distributed_matches_monolithic(check: &ReplayCheck<'_>, reopened
     let (mono, mono_h) = reference_shard(
         check.dir,
         "monolithic.vector",
-        check.layout,
         check.analysis,
         check.cal.0,
         check.cal.1,
@@ -971,11 +938,10 @@ async fn verify_reopened_and_replayed_equivalence(
     mut handle: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
 ) {
     let live_rows = ctx.final_rows.len() as u64;
-    verify_layout_bm25_sources(ctx.layout, ctx.index_path, ctx.final_rows);
+    verify_catalog_bm25_sources(ctx.index_path, ctx.final_rows);
     let (ref_addr, ref_h) = reference_shard(
         ctx.dir,
         "reference.vector",
-        ctx.layout,
         ctx.analysis,
         ctx.cal.0,
         ctx.cal.1,
@@ -989,7 +955,7 @@ async fn verify_reopened_and_replayed_equivalence(
 
     handle.abort();
     let _ = (&mut handle).await;
-    let cfg = config(Some(ctx.index_path.to_path_buf()), ctx.layout, ctx.analysis);
+    let cfg = config(Some(ctx.index_path.to_path_buf()), ctx.analysis);
     let (reopened, reopened_h) = start_opened_node(cfg).await;
     let h = shard_health(&reopened).await;
     assert_eq!(
@@ -1008,18 +974,12 @@ async fn verify_reopened_and_replayed_equivalence(
     replayed_h.abort();
 }
 
-async fn run_online_compaction(layout: Layout) {
+async fn run_online_compaction() {
     let (analysis, _mock) = start_mock_analysis().await;
-    let tag = if matches!(layout, Layout::Segments) {
-        "segments"
-    } else {
-        "single"
-    };
-    let dir = tempdir(tag);
+    let dir = tempdir("segments");
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &unit_vectors(256, DIM, SEED));
     let index_path = dir.join("shard.vector");
-    let (addr, handle) =
-        start_empty_node(config(Some(index_path.clone()), layout, &analysis)).await;
+    let (addr, handle) = start_empty_node(config(Some(index_path.clone()), &analysis)).await;
     let tracked = Arc::new(Mutex::new(seed_shard(&addr, &shift, &scale).await));
     let queries: Vec<Vec<f32>> = (0..3)
         .map(|q| unit_vectors(1, DIM, 0x5E61_0000 + q))
@@ -1046,7 +1006,7 @@ async fn run_online_compaction(layout: Layout) {
     let elapsed = started.elapsed();
     stop.store(true, Ordering::Release);
     let stats = w_task.await.unwrap();
-    assert_first_compaction_postconditions(layout, tag, &dir, &index_path, &first, &stats, elapsed);
+    assert_first_compaction_postconditions(&index_path, &first, &stats, elapsed);
 
     let stale_id = tracked.lock().unwrap().ids.values().next().unwrap().0;
     assert_stale_gen_and_cursor_refusals(&addr, &analysis, stale_id, probe, page1.next_cursor)
@@ -1070,7 +1030,6 @@ async fn run_online_compaction(layout: Layout) {
     let ctx = ReplayCheck {
         dir: &dir,
         index_path: &index_path,
-        layout,
         analysis: &analysis,
         cal: (&shift, &scale),
         addr: &addr,
@@ -1082,13 +1041,8 @@ async fn run_online_compaction(layout: Layout) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn single_image_shard_compacts_online() {
-    run_online_compaction(Layout::SingleImage).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn segmented_shard_compacts_online() {
-    run_online_compaction(Layout::Segments).await;
+    run_online_compaction().await;
 }
 
 async fn expect_refusal(
@@ -1115,7 +1069,7 @@ async fn refusals_name_the_cause_and_a_dry_run_writes_nothing() {
     // An in-memory shard has no log.
     let (memory, memory_handle) = start_empty_node(NodeConfig {
         wal: false,
-        ..config(None, Layout::SingleImage, &analysis)
+        ..config(None, &analysis)
     })
     .await;
     expect_refusal(
@@ -1129,11 +1083,7 @@ async fn refusals_name_the_cause_and_a_dry_run_writes_nothing() {
     // A persisted shard without a WAL.
     let (unlogged, unlogged_handle) = start_empty_node(NodeConfig {
         wal: false,
-        ..config(
-            Some(dir.join("unlogged.vector")),
-            Layout::SingleImage,
-            &analysis,
-        )
+        ..config(Some(dir.join("unlogged.vector")), &analysis)
     })
     .await;
     expect_refusal(
@@ -1144,26 +1094,15 @@ async fn refusals_name_the_cause_and_a_dry_run_writes_nothing() {
     .await;
     unlogged_handle.abort();
 
-    // A bulk BM25 build in progress (single-image, documents before the
-    // first flush spill to disk).
+    // A shard with documents in its tail.
     let building_path = dir.join("building.vector");
-    let (building, building_handle) = start_empty_node(config(
-        Some(building_path.clone()),
-        Layout::SingleImage,
-        &analysis,
-    ))
-    .await;
+    let (building, building_handle) =
+        start_empty_node(config(Some(building_path.clone()), &analysis)).await;
     calibrate(&building, &shift, &scale).await;
     {
         let mut client = client(&building).await;
         append(&mut client, &row(1, false)).await;
     }
-    expect_refusal(
-        compact(&building, CompactShardRequest::default()).await,
-        tonic::Code::FailedPrecondition,
-        "bulk BM25 build is in progress",
-    )
-    .await;
     client(&building)
         .await
         .flush(FlushRequest {})
@@ -1213,7 +1152,7 @@ async fn refusals_name_the_cause_and_a_dry_run_writes_nothing() {
     assert!(dry.dry_run);
     assert_eq!((dry.rows_before, dry.tombstones_reclaimed), (2, 1));
     assert_eq!(dry.wal_generation, 1);
-    assert_eq!(dry.layout, "single-image");
+    assert_eq!(dry.layout, "segments");
     assert!(!pipestream_search::compaction::default_work_dir(&building_path).exists());
     assert!(!wal_gen(&building_path, 1).exists());
     assert_eq!(
@@ -1235,7 +1174,6 @@ async fn refusals_name_the_cause_and_a_dry_run_writes_nothing() {
 async fn slow_shard(
     dir: &Path,
     name: &str,
-    layout: Layout,
     analysis: &str,
 ) -> (
     String,
@@ -1245,7 +1183,7 @@ async fn slow_shard(
     let sample = unit_vectors(64, DIM, SEED);
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &sample);
     let index_path = dir.join(name);
-    let (addr, handle) = start_empty_node(config(Some(index_path.clone()), layout, analysis)).await;
+    let (addr, handle) = start_empty_node(config(Some(index_path.clone()), analysis)).await;
     calibrate(&addr, &shift, &scale).await;
     let mut client = client(&addr).await;
     for i in 0..4_000 {
@@ -1308,10 +1246,9 @@ async fn add_block(client: &mut NodeServiceClient<Channel>, rows: &[Row]) {
 /// configured first, then documents and vectors arrive in blocks. The
 /// seal bound lands mid-block, so the tail must wait for the block's
 /// vectors before sealing; every sealed segment then carries its
-/// vectors and FP32 rows, and the flush succeeds. The old order (every
-/// document, then every vector) seals document-only segments the
-/// vectors can never join, which the first vector batch refuses by
-/// name.
+/// vectors and FP32 rows, and the flush succeeds. Every document first,
+/// then every vector, seals document-only segments the vectors can never
+/// join, which the first vector batch refuses by name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn blocks_seal_with_their_vectors_and_documents_first_is_refused_by_name() {
     let (analysis, _mock) = start_mock_analysis().await;
@@ -1325,7 +1262,7 @@ async fn blocks_seal_with_their_vectors_and_documents_first_is_refused_by_name()
     let index_path = dir.join("blocks.vector");
     let (addr, handle) = start_empty_node(NodeConfig {
         seal_tail_docs: 100,
-        ..config(Some(index_path.clone()), Layout::Segments, &analysis)
+        ..config(Some(index_path.clone()), &analysis)
     })
     .await;
     calibrate(&addr, &shift, &scale).await;
@@ -1378,7 +1315,7 @@ async fn blocks_seal_with_their_vectors_and_documents_first_is_refused_by_name()
     let other_path = dir.join("docs-first.vector");
     let (addr, handle) = start_empty_node(NodeConfig {
         seal_tail_docs: 100,
-        ..config(Some(other_path.clone()), Layout::Segments, &analysis)
+        ..config(Some(other_path.clone()), &analysis)
     })
     .await;
     calibrate(&addr, &shift, &scale).await;
@@ -1392,18 +1329,14 @@ async fn blocks_seal_with_their_vectors_and_documents_first_is_refused_by_name()
             .map_or(true, |set| set.is_empty()),
         "no document-only segment sealed on its own"
     );
-    // The flush seals the document-only segment, then refuses by name
-    // itself: the sidecar and the provider no longer agree.
+    // The flush seals the document-only segment; its rows have no FP32
+    // rows, and the exact view over the catalog says so.
     let flushed = docs_first
         .flush(FlushRequest {})
         .await
-        .expect_err("a flush that sealed documents without their vectors");
-    assert_eq!(
-        flushed.code(),
-        tonic::Code::FailedPrecondition,
-        "{}",
-        flushed.message()
-    );
+        .unwrap()
+        .into_inner();
+    assert_eq!(flushed.num_documents, 250);
     let vectors: Vec<f32> = rows[..250].iter().flat_map(|r| r.vector.clone()).collect();
     let status = docs_first
         .add_vectors(tokio_stream::iter([AddVectorsRequest {
@@ -1443,7 +1376,7 @@ async fn a_node_reopened_without_a_flush_shares_its_exact_segment_images() {
     let index_path = dir.join("reopen.vector");
     let (addr, handle) = start_empty_node(NodeConfig {
         seal_tail_docs: 64,
-        ..config(Some(index_path.clone()), Layout::Segments, &analysis)
+        ..config(Some(index_path.clone()), &analysis)
     })
     .await;
     calibrate(&addr, &shift, &scale).await;
@@ -1456,12 +1389,7 @@ async fn a_node_reopened_without_a_flush_shares_its_exact_segment_images() {
     let exact_path = pipestream_search::node::exact_vector_sidecar_path(&index_path);
     assert!(!exact_path.exists(), "no flush, no finalized sidecar");
 
-    let (addr, handle) = start_opened_node(config(
-        Some(index_path.clone()),
-        Layout::Segments,
-        &analysis,
-    ))
-    .await;
+    let (addr, handle) = start_opened_node(config(Some(index_path.clone()), &analysis)).await;
     assert!(
         !exact_path.exists(),
         "reopening must not copy the full FP32 corpus"
@@ -1504,18 +1432,13 @@ async fn a_node_reopened_without_a_flush_shares_its_exact_segment_images() {
 /// compaction waits at the row boundary and, when the row never completes,
 /// refuses naming the counts; once the vector lands, the same call runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_mid_row_append_holds_the_cut_at_a_row_boundary() {
+async fn a_mid_row_append_refuses_the_cut_until_the_row_completes() {
     let (analysis, _mock) = start_mock_analysis().await;
     let dir = tempdir("mid_row");
     let sample = unit_vectors(64, DIM, SEED);
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &sample);
     let index_path = dir.join("shard.vector");
-    let (addr, handle) = start_empty_node(config(
-        Some(index_path.clone()),
-        Layout::Segments,
-        &analysis,
-    ))
-    .await;
+    let (addr, handle) = start_empty_node(config(Some(index_path.clone()), &analysis)).await;
     calibrate(&addr, &shift, &scale).await;
     let mut client = client(&addr).await;
     for i in 0..2 {
@@ -1524,18 +1447,12 @@ async fn a_mid_row_append_holds_the_cut_at_a_row_boundary() {
     let half = row(2, false);
     add_document(&mut client, &half).await;
 
-    let started = Instant::now();
     expect_refusal(
         compact(&addr, CompactShardRequest::default()).await,
         tonic::Code::FailedPrecondition,
         "the tail has 3 documents and 2 vectors",
     )
     .await;
-    assert!(
-        started.elapsed() >= Duration::from_secs(1),
-        "the cut did not wait for the row: {:?}",
-        started.elapsed()
-    );
 
     add_vector(&mut client, &half).await;
     let done = compact(&addr, CompactShardRequest::default())
@@ -1551,8 +1468,7 @@ async fn a_mid_row_append_holds_the_cut_at_a_row_boundary() {
 async fn a_second_compaction_and_a_snapshot_install_during_one_refuse_by_name() {
     let (analysis, _mock) = start_mock_analysis().await;
     let dir = tempdir("concurrent");
-    let (addr, handle, index_path) =
-        slow_shard(&dir, "shard.vector", Layout::SingleImage, &analysis).await;
+    let (addr, handle, index_path) = slow_shard(&dir, "shard.vector", &analysis).await;
 
     // Two at once: the second refuses while the first runs.
     let first = tokio::spawn({
@@ -1572,43 +1488,31 @@ async fn a_second_compaction_and_a_snapshot_install_during_one_refuse_by_name() 
 
     // A snapshot installed under a running compaction rotates the WAL;
     // the compaction aborts by name and the shard serves the snapshot.
-    let snap = pipestream_search::node::generation_dir(&index_path);
-    let image = std::fs::read(pipestream_search::node::generation_vector(&snap)).unwrap();
-    let exact = std::fs::read(pipestream_search::node::generation_exact_vectors(&snap)).unwrap();
-    let bm25 = std::fs::read(pipestream_search::node::generation_bm25(&snap)).unwrap();
+    let repository = dir.join("repository");
+    client(&addr)
+        .await
+        .export_snapshot(pipestream_search::pb::ExportSnapshotRequest {
+            directory: repository.display().to_string(),
+        })
+        .await
+        .unwrap();
     let running = tokio::spawn({
         let addr = addr.clone();
         async move { compact(&addr, CompactShardRequest::default()).await }
     });
     tokio::time::sleep(Duration::from_millis(40)).await;
-    {
-        let (tx, rx) = mpsc::channel(8);
-        tx.send(SnapshotChunk {
-            payload: Some(snapshot_chunk::Payload::Manifest(SnapshotManifest {
-                multi_res_vector_bytes: 0,
-                multi_res_declaration: Vec::new(),
-                vector_bytes: image.len() as u64,
-                bm25_bytes: bm25.len() as u64,
-                exact_vector_bytes: exact.len() as u64,
-                live_docs_bytes: 0,
-            })),
+    client(&addr)
+        .await
+        .install_snapshot_from(pipestream_search::pb::InstallSnapshotFromRequest {
+            source: Some(
+                pipestream_search::pb::install_snapshot_from_request::Source::Directory(
+                    repository.display().to_string(),
+                ),
+            ),
+            ..Default::default()
         })
         .await
         .unwrap();
-        for bytes in [image, exact, bm25] {
-            tx.send(SnapshotChunk {
-                payload: Some(snapshot_chunk::Payload::Data(bytes)),
-            })
-            .await
-            .unwrap();
-        }
-        drop(tx);
-        client(&addr)
-            .await
-            .install_snapshot(ReceiverStream::new(rx))
-            .await
-            .unwrap();
-    }
     let aborted = running.await.unwrap();
     expect_refusal(aborted, tonic::Code::Aborted, "snapshot was installed").await;
     let health = client(&addr)
@@ -1629,66 +1533,6 @@ async fn a_second_compaction_and_a_snapshot_install_during_one_refuse_by_name() 
     )
     .await;
     handle.abort();
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn an_interrupted_cutover_rolls_back_at_open() {
-    // The on-disk state a crash leaves between a single-image cutover
-    // and its closing flush: marker present, old generation aside, new
-    // generation in place, rewritten WAL generation in place.
-    let dir = tempdir("rollback");
-    let index_path = dir.join("shard.vector");
-    let snap = pipestream_search::node::generation_dir(&index_path);
-    let old = dir.join("shard.vector.snap-old");
-    std::fs::create_dir_all(&snap).unwrap();
-    std::fs::create_dir_all(&old).unwrap();
-    std::fs::write(snap.join("vector.index"), b"new").unwrap();
-    std::fs::write(old.join("vector.index"), b"old").unwrap();
-    let wal_dir = pipestream_search::wal::wal_dir(&index_path);
-    std::fs::create_dir_all(wal_gen(&index_path, 0)).unwrap();
-    std::fs::create_dir_all(wal_gen(&index_path, 1)).unwrap();
-    std::fs::write(wal_gen(&index_path, 0).join("manifest.toml"), b"").unwrap();
-    let marker = pipestream_search::compaction::marker_path(&index_path);
-    std::fs::write(
-        &marker,
-        serde_json::json!({
-            "format": 1,
-            "layout": "single-image",
-            "old_wal_generation": 0,
-            "new_wal_generation": 1,
-            "work_dir": dir.join("work"),
-            "previous_snapshot": true,
-            "legacy_files": [],
-            "staged_segments": [],
-            "replaced_segments": []
-        })
-        .to_string(),
-    )
-    .unwrap();
-
-    let recovered = pipestream_search::node::recover_generation(&index_path);
-    assert_eq!(recovered, Some(snap.clone()));
-    assert_eq!(std::fs::read(snap.join("vector.index")).unwrap(), b"old");
-    assert!(!old.exists());
-    assert!(
-        !wal_gen(&index_path, 1).exists(),
-        "the rewritten generation is gone"
-    );
-    assert!(wal_gen(&index_path, 0).exists());
-    assert!(!marker.exists());
-    assert!(wal_dir.exists());
-
-    // Without a marker the swap rules are the snapshot install's own:
-    // both present means the new generation is live.
-    std::fs::create_dir_all(&old).unwrap();
-    std::fs::write(old.join("vector.index"), b"older").unwrap();
-    assert_eq!(
-        pipestream_search::node::recover_generation(&index_path),
-        Some(snap.clone())
-    );
-    assert_eq!(std::fs::read(snap.join("vector.index")).unwrap(), b"old");
-    assert!(!old.exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1788,12 +1632,7 @@ async fn a_segmented_shard_compacts_into_num_partitions() {
     let sample = unit_vectors(256, DIM, SEED);
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &sample);
     let index_path = dir.join("shard.vector");
-    let (addr, mut handle) = start_empty_node(config(
-        Some(index_path.clone()),
-        Layout::Segments,
-        &analysis,
-    ))
-    .await;
+    let (addr, mut handle) = start_empty_node(config(Some(index_path.clone()), &analysis)).await;
     let tracked = seed_shard(&addr, &shift, &scale).await;
     let queries: Vec<Vec<f32>> = (0..3)
         .map(|q| unit_vectors(1, DIM, 0x5E61_0000 + q))
@@ -1851,7 +1690,6 @@ async fn a_segmented_shard_compacts_into_num_partitions() {
     let (reference, reference_handle) = reference_shard(
         &dir,
         "reference.vector",
-        Layout::Segments,
         &analysis,
         &shift,
         &scale,
@@ -1868,12 +1706,8 @@ async fn a_segmented_shard_compacts_into_num_partitions() {
     // Reopen from disk: the key and the ranges survive, the reads equal.
     handle.abort();
     let _ = (&mut handle).await;
-    let (reopened, reopened_handle) = start_opened_node(config(
-        Some(index_path.clone()),
-        Layout::Segments,
-        &analysis,
-    ))
-    .await;
+    let (reopened, reopened_handle) =
+        start_opened_node(config(Some(index_path.clone()), &analysis)).await;
     let manifest = read_manifest(&index_path);
     check_partitions(&manifest, "cmp-000001-", u64::from(bound));
     let got = observe(std::slice::from_ref(&reopened), &analysis, &queries).await;
@@ -1968,12 +1802,7 @@ async fn rows_without_the_partition_column_seal_apart() {
     let sample = unit_vectors(64, DIM, SEED);
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &sample);
     let index_path = dir.join("shard.vector");
-    let (addr, _handle) = start_empty_node(config(
-        Some(index_path.clone()),
-        Layout::Segments,
-        &analysis,
-    ))
-    .await;
+    let (addr, _handle) = start_empty_node(config(Some(index_path.clone()), &analysis)).await;
     calibrate(&addr, &shift, &scale).await;
     let mut node = client(&addr).await;
     // Keyed and unkeyed rows interleaved, so the unkeyed ones are spread
@@ -2030,12 +1859,8 @@ async fn a_partitioned_compaction_rejects_the_wrong_column() {
     let sample = unit_vectors(64, DIM, SEED);
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &sample);
 
-    let (segmented, _segmented_handle) = start_empty_node(config(
-        Some(dir.join("segmented.vector")),
-        Layout::Segments,
-        &analysis,
-    ))
-    .await;
+    let (segmented, _segmented_handle) =
+        start_empty_node(config(Some(dir.join("segmented.vector")), &analysis)).await;
     calibrate(&segmented, &shift, &scale).await;
     let mut node = client(&segmented).await;
     for i in 0..40 {
@@ -2087,25 +1912,6 @@ async fn a_partitioned_compaction_rejects_the_wrong_column() {
         read_manifest(&dir.join("segmented.vector")).segments.len(),
         1
     );
-
-    let (single, _single_handle) = start_empty_node(config(
-        Some(dir.join("single.vector")),
-        Layout::SingleImage,
-        &analysis,
-    ))
-    .await;
-    calibrate(&single, &shift, &scale).await;
-    let mut node = client(&single).await;
-    for i in 0..8 {
-        append(&mut node, &row(i, false)).await;
-    }
-    node.flush(FlushRequest {}).await.unwrap();
-    expect_refusal(
-        compact(&single, partition_request("num", 16)).await,
-        tonic::Code::FailedPrecondition,
-        "needs the segment layout",
-    )
-    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2117,7 +1923,7 @@ async fn a_plain_seal_records_column_summaries() {
     let index_path = dir.join("shard.vector");
     let (addr, _handle) = start_empty_node(NodeConfig {
         seal_tail_docs: 100,
-        ..config(Some(index_path.clone()), Layout::Segments, &analysis)
+        ..config(Some(index_path.clone()), &analysis)
     })
     .await;
     calibrate(&addr, &shift, &scale).await;

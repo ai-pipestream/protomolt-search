@@ -1,4 +1,4 @@
-//! Publication of retained vector rows beside a single-image generation.
+//! Publication of retained vector rows beside the vector image they extend.
 //!
 //! The declaration is authoritative: a missing declared payload is corruption,
 //! and an undeclared payload is an interrupted publication, never legacy data.
@@ -33,31 +33,6 @@ pub(crate) fn declaration_path(payload: &Path) -> PathBuf {
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
-}
-
-#[cfg(feature = "net")]
-pub(crate) fn export_declaration(payload: &Path) -> io::Result<Option<Vec<u8>>> {
-    let file = match File::open(declaration_path(payload)) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if payload.try_exists()? {
-                return Err(invalid(
-                    "retained vector payload has no publication declaration",
-                ));
-            }
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
-    };
-    let mut bytes = Vec::new();
-    file.take(MAX_DECLARATION_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_DECLARATION_BYTES {
-        return Err(invalid("retained vector declaration exceeds size bound"));
-    }
-    let declared: Declaration = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-    open(payload, declared.physical_rows)?;
-    Ok(Some(bytes))
 }
 
 pub(crate) fn open_generation(

@@ -42,7 +42,6 @@ impl Fixture {
             collection: "books".into(),
             index_path: Some(self.0.join(name)),
             wal: false,
-            layout: Layout::Segments,
             ..Default::default()
         }
     }
@@ -55,7 +54,7 @@ impl Drop for Fixture {
 fn refused<T>(result: Result<T, Status>) {
     let error = result
         .err()
-        .expect("source ownership must refuse legacy mutation");
+        .expect("source ownership must refuse index-direct mutation");
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert!(error.message().contains("source-managed index"), "{error}");
 }
@@ -65,7 +64,7 @@ fn every_row_commit_boundary_refuses_an_owned_empty_index() {
     let fixture = Fixture::new();
     let config = fixture.config("index");
     fixture.owned_catalog(&segments_root(config.index_path.as_ref().unwrap()));
-    let node = NodeServiceImpl::open(config, None, false).unwrap();
+    let node = NodeServiceImpl::open(config, None).unwrap();
     {
         let mut state = write_shard(&node.state);
         let mut added = 0;
@@ -103,7 +102,7 @@ fn every_row_commit_boundary_refuses_an_owned_empty_index() {
         .unwrap();
     let _runtime = runtime.enter();
     refused(node.compact_shard(&crate::pb::CompactShardRequest::default()));
-    refused(node.apply_snapshot(&fixture.0.join("missing"), false, false, false));
+    refused(node.export_snapshot_blocking(&fixture.0.join("export")));
 }
 
 #[test]
@@ -130,7 +129,7 @@ fn index_only_snapshot_cannot_import_or_overwrite_source_ownership() {
     };
     let fresh = fixture.config("fresh");
     let root = segments_root(fresh.index_path.as_ref().unwrap());
-    let node = NodeServiceImpl::open(fresh, None, false).unwrap();
+    let node = NodeServiceImpl::open(fresh, None).unwrap();
     let before = std::fs::read(root.join("segments.json")).ok();
     refused(node.apply_segment_snapshot(&repository, &manifest));
     assert_eq!(std::fs::read(root.join("segments.json")).ok(), before);
@@ -141,35 +140,11 @@ fn index_only_snapshot_cannot_import_or_overwrite_source_ownership() {
     let config = fixture.config("owned");
     let root = segments_root(config.index_path.as_ref().unwrap());
     fixture.owned_catalog(&root);
-    let owned = NodeServiceImpl::open(config, None, false).unwrap();
+    let owned = NodeServiceImpl::open(config, None).unwrap();
     let before = std::fs::read(root.join("segments.json")).unwrap();
     refused(owned.install_staged_repository(&repository, &manifest));
     refused(owned.apply_segment_snapshot(&repository, &manifest));
     assert_eq!(std::fs::read(root.join("segments.json")).unwrap(), before);
-}
-
-#[test]
-fn owned_catalog_cannot_be_hidden_by_a_competing_snapshot_generation() {
-    let fixture = Fixture::new();
-    for old in [false, true] {
-        let config = fixture.config(if old { "old" } else { "current" });
-        let path = config.index_path.as_ref().unwrap();
-        let root = segments_root(path);
-        fixture.owned_catalog(&root);
-        let directory = if old {
-            generation_old_dir(path)
-        } else {
-            generation_dir(path)
-        };
-        std::fs::create_dir(&directory).unwrap();
-        let before = std::fs::read(root.join("segments.json")).unwrap();
-        let error = NodeServiceImpl::open(config.clone(), None, false)
-            .err()
-            .expect("competing generation must refuse before recovery");
-        assert!(error.contains("source-managed index"));
-        assert!(directory.exists());
-        assert_eq!(std::fs::read(root.join("segments.json")).unwrap(), before);
-    }
 }
 
 #[test]

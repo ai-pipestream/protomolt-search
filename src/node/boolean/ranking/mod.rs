@@ -159,9 +159,7 @@ impl NodeServiceImpl {
         let Some(store) = guard.bm25.as_ref() else {
             return Ok((vec![None; slots.len()], vec![false; stage_specs.len()]));
         };
-        let index = store.as_index().ok_or_else(|| {
-            Status::failed_precondition("bm25 bulk build in progress; Flush first")
-        })?;
+        let index = store.as_index();
         let chain = store.resolve_chain(&stage_specs);
         let stage_columns_known = chain
             .stages

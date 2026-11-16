@@ -282,7 +282,6 @@ impl NodeServiceImpl {
             config.slot_offset = 0;
             config.wal = false;
             config.vocab = false;
-            config.layout = Layout::Segments;
             // One bounded source is private until the closing flush. Avoid
             // detached seal tasks outliving cancellation and stage ownership.
             config.seal_tail_docs = 0;

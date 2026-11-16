@@ -3,7 +3,7 @@ use pipestream_search::{
     analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND},
     coordinator::CoordinatorServiceImpl,
     harness::start_relay,
-    node::{Layout, NodeConfig},
+    node::NodeConfig,
     pb::{self, node_service_client::NodeServiceClient, search_service_server::SearchService},
 };
 use prost::Message;
@@ -228,124 +228,121 @@ async fn verify(address: String) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn typed_map_score_values_explain_and_fetch_survive_relay_reopen_and_compaction() {
     let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 92371));
-    for layout in [Layout::SingleImage, Layout::Segments] {
-        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("map-score-{layout:?}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let config = NodeConfig {
-            index_path: Some(dir.join("index.tv")),
-            layout,
-            wal: true,
-            wal_buckets: 2,
-            seal_tail_docs: 3,
-            map_integer_fields: vec!["signed".into()],
-            map_unsigned_integer_fields: vec!["unsigned".into()],
-            integer_fields: vec!["row".into()],
-            analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
-            ..Default::default()
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("map-score-segments-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = NodeConfig {
+        index_path: Some(dir.join("index.tv")),
+        wal: true,
+        wal_buckets: 2,
+        seal_tail_docs: 3,
+        map_integer_fields: vec!["signed".into()],
+        map_unsigned_integer_fields: vec!["unsigned".into()],
+        integer_fields: vec!["row".into()],
+        analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
+        ..Default::default()
+    };
+    let (addr, handle) = common::start_empty_node(config.clone()).await;
+    let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+    client
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            8, 4, &shift, &scale,
+        ))
+        .await
+        .unwrap();
+    for row in 0..16 {
+        let keys = if row < 8 {
+            vec!["", KEY]
+        } else {
+            vec!["", "a", KEY]
         };
-        let (addr, handle) = common::start_empty_node(config.clone()).await;
-        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
         client
-            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-                8, 4, &shift, &scale,
-            ))
+            .add_documents(tokio_stream::iter([pb::AddDocumentsRequest {
+                text: vec!["word"; 1 + row % 3].join(" "),
+                analysis: Some(body_spec()),
+                integers: vec![pb::IntegerValue {
+                    field: "row".into(),
+                    value: row as i64,
+                }],
+                map_integers: keys
+                    .iter()
+                    .flat_map(|key| {
+                        SIGNED[row % 8].map(|value| pb::MapIntegerEntry {
+                            field: "signed".into(),
+                            key: (*key).into(),
+                            value,
+                        })
+                    })
+                    .collect(),
+                map_unsigned_integers: keys
+                    .iter()
+                    .flat_map(|key| {
+                        UNSIGNED[row % 8].map(|value| pb::MapUnsignedIntegerEntry {
+                            field: "unsigned".into(),
+                            key: (*key).into(),
+                            value,
+                        })
+                    })
+                    .collect(),
+                ..Default::default()
+            }]))
             .await
             .unwrap();
-        for row in 0..16 {
-            let keys = if row < 8 {
-                vec!["", KEY]
-            } else {
-                vec!["", "a", KEY]
-            };
-            client
-                .add_documents(tokio_stream::iter([pb::AddDocumentsRequest {
-                    text: vec!["word"; 1 + row % 3].join(" "),
-                    analysis: Some(body_spec()),
-                    integers: vec![pb::IntegerValue {
-                        field: "row".into(),
-                        value: row as i64,
-                    }],
-                    map_integers: keys
-                        .iter()
-                        .flat_map(|key| {
-                            SIGNED[row % 8].map(|value| pb::MapIntegerEntry {
-                                field: "signed".into(),
-                                key: (*key).into(),
-                                value,
-                            })
-                        })
-                        .collect(),
-                    map_unsigned_integers: keys
-                        .iter()
-                        .flat_map(|key| {
-                            UNSIGNED[row % 8].map(|value| pb::MapUnsignedIntegerEntry {
-                                field: "unsigned".into(),
-                                key: (*key).into(),
-                                value,
-                            })
-                        })
-                        .collect(),
-                    ..Default::default()
-                }]))
-                .await
-                .unwrap();
-            client
-                .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
-                    materialized_rows: Vec::new(),
-                    dim: 8,
-                    vectors: common::unit_vectors(1, 8, 511 + row as u64),
-                }]))
-                .await
-                .unwrap();
-            if row == 7 {
-                client.flush(pb::FlushRequest {}).await.unwrap();
-            }
+        client
+            .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
+                materialized_rows: Vec::new(),
+                dim: 8,
+                vectors: common::unit_vectors(1, 8, 511 + row as u64),
+            }]))
+            .await
+            .unwrap();
+        if row == 7 {
+            client.flush(pb::FlushRequest {}).await.unwrap();
         }
-        verify(addr.clone()).await;
-        let (empty, empty_h) = common::start_empty_node(NodeConfig {
-            slot_offset: 16,
-            map_integer_fields: vec!["signed".into()],
-            map_unsigned_integer_fields: vec!["unsigned".into()],
-            ..Default::default()
-        })
-        .await;
-        NodeServiceClient::connect(empty.clone())
-            .await
-            .unwrap()
-            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-                8, 4, &shift, &scale,
-            ))
-            .await
-            .unwrap();
-        let (relay, _, rh) = start_relay(vec![addr.clone(), empty]).await;
-        let (root, _, root_h) = start_relay(vec![relay]).await;
-        verify(root).await;
-        root_h.abort();
-        rh.abort();
-        empty_h.abort();
-        client.flush(pb::FlushRequest {}).await.unwrap();
+    }
+    verify(addr.clone()).await;
+    let (empty, empty_h) = common::start_empty_node(NodeConfig {
+        slot_offset: 16,
+        map_integer_fields: vec!["signed".into()],
+        map_unsigned_integer_fields: vec!["unsigned".into()],
+        ..Default::default()
+    })
+    .await;
+    NodeServiceClient::connect(empty.clone())
+        .await
+        .unwrap()
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            8, 4, &shift, &scale,
+        ))
+        .await
+        .unwrap();
+    let (relay, _, rh) = start_relay(vec![addr.clone(), empty]).await;
+    let (root, _, root_h) = start_relay(vec![relay]).await;
+    verify(root).await;
+    root_h.abort();
+    rh.abort();
+    empty_h.abort();
+    client.flush(pb::FlushRequest {}).await.unwrap();
+    handle.abort();
+    let _ = handle.await;
+    for compact in [true, false] {
+        let (addr, handle) = common::start_opened_node(config.clone()).await;
+        if compact {
+            NodeServiceClient::connect(addr.clone())
+                .await
+                .unwrap()
+                .compact_shard(pb::CompactShardRequest {
+                    work_dir: dir.join("compact").display().to_string(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        verify(addr).await;
         handle.abort();
         let _ = handle.await;
-        for compact in [true, false] {
-            let (addr, handle) = common::start_opened_node(config.clone()).await;
-            if compact {
-                NodeServiceClient::connect(addr.clone())
-                    .await
-                    .unwrap()
-                    .compact_shard(pb::CompactShardRequest {
-                        work_dir: dir.join("compact").display().to_string(),
-                        ..Default::default()
-                    })
-                    .await
-                    .unwrap();
-            }
-            verify(addr).await;
-            handle.abort();
-            let _ = handle.await;
-        }
-        std::fs::remove_dir_all(dir).unwrap();
     }
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 mod pruning {

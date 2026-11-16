@@ -17,7 +17,7 @@ use pipestream_search::analyzer::{
     analysis_fingerprint, body_spec, cased_body_spec, cased_twin_spec, NATIVE_ANALYSIS_BACKEND,
 };
 use pipestream_search::coordinator::CoordinatorServiceImpl;
-use pipestream_search::node::{bm25_sidecar_path, Layout, NodeConfig};
+use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
@@ -51,7 +51,6 @@ fn config(analysis: &str, index_path: Option<PathBuf>) -> NodeConfig {
         bm25_fields: vec!["body".into(), "body_cased".into()],
         position_fields: vec!["body".into(), "body_cased".into()],
         sentence_fields: vec!["body".into(), "body_cased".into()],
-        layout: Layout::SingleImage,
         ..Default::default()
     }
 }
@@ -132,7 +131,7 @@ async fn one_analysis_yields_both_identities_and_each_field_answers_its_own() {
         "one Analyze per document: the cased field cost no second pass"
     );
 
-    // A single-image node serves after its flush.
+    // The node serves after its flush.
     let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
     assert!(
         client
@@ -176,7 +175,7 @@ async fn one_analysis_yields_both_identities_and_each_field_answers_its_own() {
 
     // The flushed image: both fields, twin fingerprints, coinciding spans
     // and positions for the same tokens.
-    let reader = Bm25Reader::open(&bm25_sidecar_path(&index_path)).unwrap();
+    let reader = Bm25Reader::open(&common::catalog::segment_bm25(&index_path, 0)).unwrap();
     assert_eq!(reader.field_index("body_cased"), Some(1));
     assert_eq!(
         reader.analysis_fingerprint(0),
@@ -309,7 +308,7 @@ async fn the_native_analyzer_produces_the_pair_from_one_pass() {
         .await
         .unwrap();
     assert_eq!(ids(&cased), vec![0, 1]);
-    let reader = Bm25Reader::open(&bm25_sidecar_path(&index_path)).unwrap();
+    let reader = Bm25Reader::open(&common::catalog::segment_bm25(&index_path, 0)).unwrap();
     let body = reader.field(0);
     let cased = reader.field(1);
     assert_eq!(
@@ -339,7 +338,7 @@ async fn the_native_analyzer_produces_the_pair_from_one_pass() {
 
 fn verify_replayed_cased_child(child_bm25: &std::path::Path, index_path: &std::path::Path) {
     let child = Bm25Reader::open(child_bm25).unwrap();
-    let parent = Bm25Reader::open(&bm25_sidecar_path(index_path)).unwrap();
+    let parent = Bm25Reader::open(&common::catalog::segment_bm25(index_path, 0)).unwrap();
     assert_eq!(child.field_index("body_cased"), Some(1));
     assert_eq!(
         child.analysis_fingerprint(1),
@@ -417,7 +416,10 @@ async fn wal_replay_analyzes_each_document_once_and_keeps_the_pair() {
         4,
         "replay analyzed each document once; the cased field rode that pass"
     );
-    verify_replayed_cased_child(output.children[0].bm25_path.as_ref().unwrap(), &index_path);
+    verify_replayed_cased_child(
+        &common::catalog::segment_bm25(&output.children[0].vector_path, 0),
+        &index_path,
+    );
     mock.abort();
     let _ = std::fs::remove_dir_all(&dir);
 }

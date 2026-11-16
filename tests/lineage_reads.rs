@@ -2,7 +2,7 @@ mod common;
 use pipestream_search::{
     analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND},
     coordinator::CoordinatorServiceImpl,
-    node::{Layout, NodeConfig},
+    node::NodeConfig,
     pb::{node_service_client::NodeServiceClient, *},
     visibility::VisibilityScope,
 };
@@ -157,80 +157,70 @@ async fn lineage_projects_only_requested_keys_and_never_returns_hidden_candidate
 }
 #[tokio::test]
 async fn lineage_survives_compaction_and_restart_with_fresh_physical_claims() {
-    for layout in [Layout::SingleImage, Layout::Segments] {
-        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("lineage-{layout:?}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let cfg = NodeConfig {
-            index_path: Some(dir.join("shard.tv")),
-            layout,
-            wal: true,
-            ..config()
-        };
-        let (address, server) = common::start_empty_node(cfg.clone()).await;
-        let mut client = NodeServiceClient::connect(address).await.unwrap();
-        seed(&mut client).await;
-        if layout == Layout::SingleImage {
-            assert_eq!(
-                client.resolve_parents(scoped()).await.unwrap_err().code(),
-                Code::FailedPrecondition
-            );
-            client.flush(FlushRequest {}).await.unwrap();
-        }
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("lineage-segments-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = NodeConfig {
+        index_path: Some(dir.join("shard.tv")),
+        wal: true,
+        ..config()
+    };
+    let (address, server) = common::start_empty_node(cfg.clone()).await;
+    let mut client = NodeServiceClient::connect(address).await.unwrap();
+    seed(&mut client).await;
 
-        client
-            .delete_documents(DeleteDocumentsRequest {
-                doc_ids: vec![0],
-                expected_wal_generation: None,
-            })
-            .await
-            .unwrap();
-        let before = client.resolve_parents(scoped()).await.unwrap().into_inner();
-        client.flush(FlushRequest {}).await.unwrap();
-        client
-            .compact_shard(CompactShardRequest::default())
-            .await
-            .unwrap();
-        let after = client.resolve_parents(scoped()).await.unwrap().into_inner();
-        check_view(&after);
-        assert_eq!(after.parents.len(), 2);
-        assert!(after
-            .parents
-            .iter()
-            .any(|p| p.parent_id == 13 && p.group_id == 23));
-        assert!(after.stats_epoch > before.stats_epoch);
-        let stale = ResolveParentsRequest {
-            expected_stats_epoch: before.stats_epoch,
-            expected_stats_incarnation: before.stats_incarnation,
-            ..scoped()
-        };
-        assert_eq!(
-            client.resolve_parents(stale).await.unwrap_err().code(),
-            Code::FailedPrecondition
-        );
-        client.flush(FlushRequest {}).await.unwrap();
-        drop(client);
-        server.abort();
-        let _ = server.await;
-        let (address, server) = common::start_opened_node(cfg).await;
-        let mut client = NodeServiceClient::connect(address).await.unwrap();
-        let reopened = client.resolve_parents(scoped()).await.unwrap().into_inner();
-        check_view(&reopened);
-        assert_eq!(reopened.parents, after.parents);
-        let stale = ResolveParentsRequest {
-            expected_stats_epoch: after.stats_epoch,
-            expected_stats_incarnation: after.stats_incarnation,
-            ..scoped()
-        };
-        assert_eq!(
-            client.resolve_parents(stale).await.unwrap_err().code(),
-            Code::FailedPrecondition
-        );
-        server.abort();
-        let _ = server.await;
-        std::fs::remove_dir_all(dir).unwrap();
-    }
+    client
+        .delete_documents(DeleteDocumentsRequest {
+            doc_ids: vec![0],
+            expected_wal_generation: None,
+        })
+        .await
+        .unwrap();
+    let before = client.resolve_parents(scoped()).await.unwrap().into_inner();
+    client.flush(FlushRequest {}).await.unwrap();
+    client
+        .compact_shard(CompactShardRequest::default())
+        .await
+        .unwrap();
+    let after = client.resolve_parents(scoped()).await.unwrap().into_inner();
+    check_view(&after);
+    assert_eq!(after.parents.len(), 2);
+    assert!(after
+        .parents
+        .iter()
+        .any(|p| p.parent_id == 13 && p.group_id == 23));
+    assert!(after.stats_epoch > before.stats_epoch);
+    let stale = ResolveParentsRequest {
+        expected_stats_epoch: before.stats_epoch,
+        expected_stats_incarnation: before.stats_incarnation,
+        ..scoped()
+    };
+    assert_eq!(
+        client.resolve_parents(stale).await.unwrap_err().code(),
+        Code::FailedPrecondition
+    );
+    client.flush(FlushRequest {}).await.unwrap();
+    drop(client);
+    server.abort();
+    let _ = server.await;
+    let (address, server) = common::start_opened_node(cfg).await;
+    let mut client = NodeServiceClient::connect(address).await.unwrap();
+    let reopened = client.resolve_parents(scoped()).await.unwrap().into_inner();
+    check_view(&reopened);
+    assert_eq!(reopened.parents, after.parents);
+    let stale = ResolveParentsRequest {
+        expected_stats_epoch: after.stats_epoch,
+        expected_stats_incarnation: after.stats_incarnation,
+        ..scoped()
+    };
+    assert_eq!(
+        client.resolve_parents(stale).await.unwrap_err().code(),
+        Code::FailedPrecondition
+    );
+    server.abort();
+    let _ = server.await;
+    std::fs::remove_dir_all(dir).unwrap();
 }
 #[tokio::test]
 async fn vector_only_and_empty_shards_cannot_satisfy_a_document_view() {

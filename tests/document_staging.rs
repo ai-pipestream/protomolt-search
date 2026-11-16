@@ -271,7 +271,7 @@ async fn accepted_rows_are_analyzed_materialized_and_sealed_without_publication(
     let fixture = Fixture::new();
     let original = source(3, false);
     let receipt = fixture.accept(1, Some(original.clone()));
-    let node = NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap();
+    let node = NodeServiceImpl::open(fixture.config.clone(), None).unwrap();
     let before = fixture.manifest();
     let candidate = node
         .stage_document_projection(fixture.catalog.clone(), fixture.request(&receipt))
@@ -368,7 +368,7 @@ async fn staged_projection_keeps_present_empty_secondary_text_but_ingest_omits_i
         assert_eq!(empty.text, "");
     }
 
-    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap());
+    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None).unwrap());
     let candidate = node
         .stage_document_projection(fixture.catalog.clone(), request)
         .await
@@ -395,7 +395,7 @@ async fn staged_projection_keeps_present_empty_secondary_text_but_ingest_omits_i
 async fn late_row_failure_and_output_budget_leave_no_live_rows_or_private_files() {
     let fixture = Fixture::new();
     let receipt = fixture.accept(1, Some(source(2, true)));
-    let node = NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap();
+    let node = NodeServiceImpl::open(fixture.config.clone(), None).unwrap();
     let before = fixture.manifest();
     let error = node
         .stage_document_projection(fixture.catalog.clone(), fixture.request(&receipt))
@@ -424,7 +424,7 @@ async fn zero_row_sources_keep_binding_and_original_bytes_distinct_from_deletion
     let fixture = Fixture::new();
     let original = source(0, false);
     let receipt = fixture.accept(1, Some(original.clone()));
-    let node = NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap();
+    let node = NodeServiceImpl::open(fixture.config.clone(), None).unwrap();
     let empty = node
         .stage_document_projection(fixture.catalog.clone(), fixture.request(&receipt))
         .await
@@ -460,7 +460,7 @@ async fn wrong_collection_or_unpinned_analysis_cannot_build_a_candidate() {
     let receipt = fixture.accept(1, Some(source(1, false)));
     let mut config = fixture.config.clone();
     config.collection = "another".into();
-    let node = NodeServiceImpl::open(config, None, false).unwrap();
+    let node = NodeServiceImpl::open(config, None).unwrap();
     let error = node
         .stage_document_projection(fixture.catalog.clone(), fixture.request(&receipt))
         .await
@@ -468,7 +468,7 @@ async fn wrong_collection_or_unpinned_analysis_cannot_build_a_candidate() {
         .unwrap();
     assert_eq!(error.code(), Code::FailedPrecondition);
     assert!(error.message().contains("collection"));
-    let node = NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap();
+    let node = NodeServiceImpl::open(fixture.config.clone(), None).unwrap();
     let mut request = fixture.request(&receipt);
     request.field_analysis.clear();
     assert_eq!(
@@ -486,7 +486,7 @@ async fn wrong_collection_or_unpinned_analysis_cannot_build_a_candidate() {
 async fn staging_keeps_provider_calibration_and_refuses_a_changed_analysis_contract() {
     let fixture = Fixture::new();
     let receipt = fixture.accept(1, Some(source(2, false)));
-    let node = NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap();
+    let node = NodeServiceImpl::open(fixture.config.clone(), None).unwrap();
     node.configure_vector_backend(Request::new(
         pipestream_search::harness::embedded_backend_request(8, 4, &[-1.0; 8], &[0.5; 8]),
     ))
@@ -553,7 +553,6 @@ async fn embedded_owner_stages_from_its_catalog_without_a_socket_or_searchable_r
     let fixture = Fixture::new();
     let mut config = EmbeddedSearchConfig::single(EmbeddedShardConfig {
         node: fixture.config.clone(),
-        allow_missing_bm25: false,
     });
     config.document_catalog = Some(EmbeddedDocumentCatalogConfig {
         collection: "books".into(),
@@ -599,7 +598,7 @@ async fn empty_sources_validate_the_configured_analyzer_before_building_artifact
     for address in [None, Some("native://"), Some(" native ")] {
         let mut config = fixture.config.clone();
         config.analysis_addr = address.map(str::to_owned);
-        let node = NodeServiceImpl::open(config, None, false).unwrap();
+        let node = NodeServiceImpl::open(config, None).unwrap();
         let mut request = fixture.request(&receipt);
         if address.is_some() {
             // Tokenizer 2 is a valid sidecar tokenizer, unsupported natively.
@@ -725,7 +724,7 @@ async fn assert_active_rows(
 #[tokio::test]
 async fn accepted_versions_activate_both_search_legs_and_recover_with_identity() {
     let fixture = Fixture::new();
-    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap());
+    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None).unwrap());
     let receipt = fixture.accept(1, Some(source(3, false)));
     let first = node
         .stage_document_projection(fixture.catalog.clone(), fixture.request(&receipt))
@@ -768,7 +767,7 @@ async fn accepted_versions_activate_both_search_legs_and_recover_with_identity()
     );
     assert!(!fixture.accept(1, Some(source(3, false))).searchable);
     drop(node);
-    let reopened = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap());
+    let reopened = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None).unwrap());
     let recovered = recover_activation(reopened.clone(), fixture.catalog.clone())
         .await
         .unwrap();
@@ -781,7 +780,7 @@ async fn accepted_versions_activate_both_search_legs_and_recover_with_identity()
 #[tokio::test]
 async fn zero_rows_and_deletion_publish_without_dummy_documents() {
     let fixture = Fixture::new();
-    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap());
+    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None).unwrap());
     let empty_receipt = fixture.accept(1, Some(source(0, false)));
     let empty = node
         .stage_document_projection(fixture.catalog.clone(), fixture.request(&empty_receipt))
@@ -854,7 +853,7 @@ async fn zero_rows_and_deletion_publish_without_dummy_documents() {
 #[tokio::test]
 async fn volatile_acceptance_cannot_activate_a_durable_target() {
     let fixture = Fixture::new();
-    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap());
+    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None).unwrap());
     let catalog = Arc::new(DocumentCatalog::in_memory("books").unwrap());
     let receipt = catalog
         .accept(&AcceptDocumentRequest {
@@ -893,7 +892,6 @@ async fn embedded_owner_publishes_and_recovers_through_the_real_search_path() {
     let fixture = Fixture::new();
     let mut config = EmbeddedSearchConfig::single(EmbeddedShardConfig {
         node: fixture.config.clone(),
-        allow_missing_bm25: false,
     });
     config.document_catalog = Some(EmbeddedDocumentCatalogConfig {
         collection: "books".into(),
@@ -976,7 +974,7 @@ async fn embedded_owner_publishes_and_recovers_through_the_real_search_path() {
 #[tokio::test]
 async fn source_owner_refuses_runtime_deletion_and_preserves_next_publication() {
     let fixture = Fixture::new();
-    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap());
+    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None).unwrap());
     let receipt = fixture.accept(1, Some(source(2, false)));
     let candidate = node
         .stage_document_projection(fixture.catalog.clone(), fixture.request(&receipt))
@@ -1025,7 +1023,7 @@ async fn source_owner_survives_reopen_and_fences_legacy_storage_and_snapshots() 
     };
     for rows in [0, 2] {
         let fixture = Fixture::new();
-        let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap());
+        let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None).unwrap());
         let receipt = fixture.accept(
             1,
             if rows == 0 {
@@ -1051,7 +1049,7 @@ async fn source_owner_survives_reopen_and_fences_legacy_storage_and_snapshots() 
         publish_candidate(node, fixture.catalog.clone(), candidate)
             .await
             .unwrap();
-        let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap());
+        let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None).unwrap());
         let root = segments_root(fixture.config.index_path.as_ref().unwrap());
         let set = OpenedSegmentSet::open(&root).unwrap();
         let owner = set
@@ -1093,14 +1091,13 @@ async fn source_owner_survives_reopen_and_fences_legacy_storage_and_snapshots() 
         assert!(error.message().contains("source-managed index"));
         assert!(!fixture.root.join("index-only-backup").exists());
         assert_eq!(fixture.manifest(), before);
-        for kind in 0..3 {
+        for kind in 0..2 {
             let mut config = fixture.config.clone();
             match kind {
                 0 => config.collection = "another-collection".into(),
-                1 => config.wal = true,
-                _ => config.layout = pipestream_search::node::Layout::SingleImage,
+                _ => config.wal = true,
             }
-            let error = NodeServiceImpl::open(config, None, false)
+            let error = NodeServiceImpl::open(config, None)
                 .err()
                 .expect("owner configuration must be preserved");
             assert!(error.contains("source-managed index"), "{error}");
@@ -1121,7 +1118,7 @@ async fn source_owner_survives_reopen_and_fences_legacy_storage_and_snapshots() 
 async fn source_owner_refuses_local_view_substitution_without_losing_valid_reads() {
     use pipestream_search::{exact_vectors::ExactVectorStore, live_docs::LiveDocs};
     let fixture = Fixture::new();
-    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap());
+    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None).unwrap());
     let receipt = fixture.accept(1, Some(source(2, false)));
     let candidate = node
         .stage_document_projection(fixture.catalog.clone(), fixture.request(&receipt))
@@ -1153,12 +1150,6 @@ async fn source_owner_refuses_local_view_substitution_without_losing_valid_reads
     assert!(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| clone.with_bm25(None))).is_err()
     );
-    let clone = node.as_ref().clone();
-    let dir = fixture.root.join("other-generation");
-    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-        || clone.with_generation(Some(dir))
-    ))
-    .is_err());
     let catalog = fixture.catalog.clone();
     let recovered = tokio::task::spawn_blocking(move || {
         node.recover_document_projection_blocking(&catalog, b"books-index")
@@ -1174,7 +1165,7 @@ async fn source_owner_refuses_local_view_substitution_without_losing_valid_reads
 async fn empty_declared_generation_reopens_with_schema_analysis_and_vector_state() {
     use pipestream_search::segments::OpenedSegmentSet;
     let fixture = Fixture::new();
-    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap());
+    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None).unwrap());
     let receipt = fixture.accept(1, Some(source(2, false)));
     let candidate = node
         .stage_document_projection(fixture.catalog.clone(), fixture.request(&receipt))
@@ -1214,7 +1205,7 @@ async fn empty_declared_generation_reopens_with_schema_analysis_and_vector_state
     .unwrap();
     // A stale legacy vector image must not override the declaration.
     std::fs::write(config.index_path.as_ref().unwrap(), b"retired legacy image").unwrap();
-    let empty = NodeServiceImpl::open(config.clone(), None, false).unwrap();
+    let empty = NodeServiceImpl::open(config.clone(), None).unwrap();
     let health = empty
         .health(Request::new(HealthRequest {}))
         .await
@@ -1240,7 +1231,7 @@ async fn empty_declared_generation_reopens_with_schema_analysis_and_vector_state
             2 => wrong.vector_backend = "different-provider".into(),
             _ => unreachable!(),
         }
-        let error = NodeServiceImpl::open(wrong, None, false)
+        let error = NodeServiceImpl::open(wrong, None)
             .err()
             .expect("changed configuration must refuse even with no segments");
         assert!(

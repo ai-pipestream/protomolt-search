@@ -303,7 +303,7 @@ the same split:
    agent honors across restarts until the shard is removed from the
    configuration and the marker deleted.
 
-The children are single-image shards built from images, so they carry
+The children are one-segment catalogs built from images, so they carry
 `preexisting` rows in their WAL manifests: a later split of a child
 waits on image-aware resharding (`docs/resharding.md`). Ingest routed
 by the old topology between the fence and the publication is refused,

@@ -71,7 +71,7 @@ impl NodeServiceImpl {
         doc_ids: &[u64],
         expected_wal_generation: Option<u64>,
     ) -> Result<DeleteDocumentsResponse, Status> {
-        guard.check_legacy_mutation()?;
+        guard.check_index_owned_write()?;
         let wal_generation = Self::check_wal_generation(guard, expected_wal_generation)?;
         let offset = self.config.slot_offset;
         let rows = physical_rows(guard);
@@ -118,7 +118,7 @@ impl NodeServiceImpl {
         replacements: &[Replacement],
         expected_wal_generation: Option<u64>,
     ) -> Result<CommitReplacementsResponse, Status> {
-        guard.check_legacy_mutation()?;
+        guard.check_index_owned_write()?;
         let wal_generation = Self::check_wal_generation(guard, expected_wal_generation)?;
         let offset = self.config.slot_offset;
         let artifact_rows = active_artifact_rows(guard);

@@ -62,8 +62,8 @@ chain branch: 43 binaries, 512 tests, all green.
 
 `VectorIndex::load_mapped` opens an image mapped; `VectorIndex::is_mapped`
 says so. A segment catalog opens its sealed images mapped by default
-(`segments::VectorLoad::Mapped`); the tail and single-image shards stay
-owned, because they take writes. `--vector-mmap=false` (config
+(`segments::VectorLoad::Mapped`); the tail stays owned, because it takes
+writes. `--vector-mmap=false` (config
 `vector_mmap`) loads sealed images into memory instead. The exact FP32
 sidecar was already mapped and is untouched when serving. While a
 persisted shard ingests, the sidecar builds on disk beside its final
@@ -75,7 +75,7 @@ heap builder.
 
 **Exactness since turbovec 1.1.** Upstream searches an image whose cache is
 in the bit-plane layout (32,768 rows or more on those hosts, served from
-memory: the tail, a single-image shard, or any sealed image under
+memory: the tail, an in-memory shard, or any sealed image under
 `--vector-mmap=false`) in stages: a sign-plane shortlist, a ranking on the
 lower planes, and an exact rescore of the best. Scores are exact for the ids
 returned, but the id set is approximate, and a single query's shortlist

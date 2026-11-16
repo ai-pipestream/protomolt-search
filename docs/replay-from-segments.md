@@ -67,7 +67,7 @@ transposed cheaply and is refused by name.
 `reshard --from-segments` takes the same `--logs` as the WAL replay. Each
 log names its generation directory; the catalog is the sibling
 `<index>.tv.segments` of the log's `<index>.tv.wal`, refused by name when
-it is absent (a single-image source has no segments to read). Before
+it is absent (a source that was never opened has no segments to read). Before
 anything is written the sources are checked:
 
 - every source's WAL has no row past its catalog (the catalog's row
@@ -214,8 +214,7 @@ still replays one bucket, so the single-bucket rule applies at
 `--build-threads=1` too. Nothing is lowered to fit: the operator
 raises the budget, lowers the thread count, or cuts finer. The budget
 does not account for wide protobuf/text/vector values, queued id maps, mapped
-sources, or page cache. A single image has no buckets and refuses the flag by
-name. Without the flag, there is no memory-estimate admission check. Use the
+sources, or page cache. Without the flag, there is no memory-estimate admission check. Use the
 operational cgroup limit (`MemoryMax=8G`, `MemorySwapMax=0`) to enforce actual
 memory usage independently of this estimate.
 
@@ -255,9 +254,8 @@ catalog and are removed. `CompactShard` on such a catalog compacts it
 from the segments now (`src/compaction.rs`, the from-segments path;
 `src/reshard.rs`, `compact_segments_partitioned`): the transplant above,
 online, under the shadow and cutover contract of `docs/mutations.md`.
-Anything less qualified keeps the old refusal by name — the single-image
-layout, a catalog with no sealed segment, one with no generation binding
-— and a catalog with a WAL replays it as before; the build knobs below
+Anything less qualified keeps the old refusal by name — a catalog with no
+sealed segment, one with no generation binding — and a catalog with a WAL replays it as before; the build knobs below
 are the from-segments path's alone and a logged shard refuses them by
 name.
 

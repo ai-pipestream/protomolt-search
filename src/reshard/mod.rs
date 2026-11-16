@@ -29,6 +29,7 @@
 mod analysis_sidecar;
 mod bucket_replay;
 mod child_build;
+mod child_catalog;
 mod compact_log;
 mod cuts;
 mod hash_split;
@@ -71,8 +72,8 @@ pub(crate) use self::segment_sources::{
 pub use self::segmented_split::split_logs_segmented_with;
 pub use self::tree_logs::split_placement_tree_logs;
 pub use self::tree_split::{
-    tree_children, tree_shard_map_toml, SpillCut, TreeChild, TreeChildLayout, TreeReshardOutput,
-    TreeRowSource, TreeSplitOptions, BUILD_BYTES_PER_ROW,
+    tree_children, tree_shard_map_toml, SpillCut, TreeChild, TreeReshardOutput, TreeRowSource,
+    TreeSplitOptions, BUILD_BYTES_PER_ROW,
 };
 
 use std::path::PathBuf;
@@ -253,6 +254,23 @@ pub struct ColumnTables {
     pub integers: Vec<String>,
     pub unsigned_integers: Vec<String>,
     pub geo: Vec<String>,
+}
+
+impl ColumnTables {
+    /// The column tables a log's manifest records for its shard.
+    pub(crate) fn of_wal(table: &crate::wal::ColumnTable) -> Self {
+        Self {
+            facets: table.facets.clone(),
+            numerics: table.numerics.clone(),
+            map_facets: table.map_facets.clone(),
+            map_numerics: table.map_numerics.clone(),
+            map_integers: table.map_integers.clone(),
+            map_unsigned_integers: table.map_unsigned_integers.clone(),
+            integers: table.integers.clone(),
+            unsigned_integers: table.unsigned_integers.clone(),
+            geo: table.geo.clone(),
+        }
+    }
 }
 
 /// Render the coordinator shard map for a reshard result (see

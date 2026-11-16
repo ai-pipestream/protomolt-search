@@ -9,6 +9,7 @@
 //! sequences) rather than probabilistic.
 #![allow(dead_code, unused_imports)]
 
+pub mod catalog;
 pub mod files;
 pub mod mock;
 

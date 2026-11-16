@@ -16,7 +16,7 @@ use super::super::replay::read_gens_binding;
 use super::super::segment_sources::{open_segment_sources, SegmentSourceShard, SourceTables};
 use super::super::split_inputs::{check_manifests, create_out_dir};
 use super::super::tree_split::{
-    tree_children, SpillCut, TreeChild, TreeChildLayout, TreeRowSource, TreeSplitOptions,
+    tree_children, SpillCut, TreeChild, TreeRowSource, TreeSplitOptions,
 };
 use super::super::ColumnTables;
 
@@ -95,13 +95,6 @@ impl<'a> TreePlan<'a> {
     /// The sealed segments under `--from-segments`, and the sources'
     /// column tables either way.
     fn open_sources(&mut self) -> Result<(), String> {
-        if matches!(self.options.cut, SpillCut::Column { .. })
-            && matches!(self.options.layout, TreeChildLayout::SingleImage { .. })
-        {
-            return Err(
-                "a column cut orders a child's segments; it needs the segmented layout".to_string(),
-            );
-        }
         if self.options.source == TreeRowSource::Segments {
             self.sources = Some(open_segment_sources(self.gens)?);
             if let Some(child) = self

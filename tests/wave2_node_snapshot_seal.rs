@@ -10,7 +10,7 @@ use pipestream_search::coordinator::CoordinatorServiceImpl;
 use pipestream_search::derived::Declaration;
 use pipestream_search::harness::{start_empty_node, start_opened_node};
 use pipestream_search::hnsw::HNSW;
-use pipestream_search::node::{segments_root, Layout, NodeConfig};
+use pipestream_search::node::{segments_root, NodeConfig};
 use pipestream_search::pb::install_snapshot_from_request::Source;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
@@ -155,7 +155,6 @@ fn config(root: &Path, name: &str) -> NodeConfig {
         analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
         facet_fields: vec!["tag".into()],
         collection: "snapshot-fixture".into(),
-        layout: Layout::Segments,
         wal: true,
         seal_tail_docs: 100,
         ..Default::default()
@@ -273,12 +272,10 @@ enum SchemaMismatch {
     Positions,
 }
 
-async fn incompatible_snapshot(mismatch: SchemaMismatch, layout: Layout) {
+async fn incompatible_snapshot(mismatch: SchemaMismatch) {
     let dir = Directory::new();
     let mut target_config = config(&dir.0, "target");
     let mut source_config = config(&dir.0, "source");
-    target_config.layout = layout;
-    source_config.layout = layout;
     match mismatch {
         SchemaMismatch::Derived => {
             target_config.derived = Some(derived("1"));
@@ -333,27 +330,22 @@ async fn incompatible_snapshot(mismatch: SchemaMismatch, layout: Layout) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incompatible_derived_snapshot_preserves_disk_live_and_restart() {
-    incompatible_snapshot(SchemaMismatch::Derived, Layout::Segments).await;
+    incompatible_snapshot(SchemaMismatch::Derived).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incompatible_column_snapshot_preserves_disk_live_and_restart() {
-    incompatible_snapshot(SchemaMismatch::Facet, Layout::Segments).await;
+    incompatible_snapshot(SchemaMismatch::Facet).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn single_image_column_mismatch_preserves_disk_live_and_restart() {
-    incompatible_snapshot(SchemaMismatch::Facet, Layout::SingleImage).await;
+async fn segment_field_mismatch_preserves_disk_live_and_restart() {
+    incompatible_snapshot(SchemaMismatch::Field).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn single_image_field_mismatch_preserves_disk_live_and_restart() {
-    incompatible_snapshot(SchemaMismatch::Field, Layout::SingleImage).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn single_image_position_mismatch_preserves_disk_live_and_restart() {
-    incompatible_snapshot(SchemaMismatch::Positions, Layout::SingleImage).await;
+async fn segment_position_mismatch_preserves_disk_live_and_restart() {
+    incompatible_snapshot(SchemaMismatch::Positions).await;
 }
 
 fn copy_tail(set: &OpenedSegmentSet, root: &Path) {

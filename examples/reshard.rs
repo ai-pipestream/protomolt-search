@@ -26,9 +26,7 @@
 //!
 //! A re-placement split writes each child as a segment catalog
 //! (`<out>/shard-<i>.tv.segments`, served with `--index=<out>/shard-<i>.tv`),
-//! one sealed segment per spill bucket, so memory is one bucket of one child;
-//! `--single-image=<max child rows>` writes one image per child instead and
-//! refuses a child above the bound.
+//! one sealed segment per spill bucket, so memory is one bucket of one child.
 //!
 //! # Merge several shards -> 1 (identical provider configuration required):
 //! reshard --logs=/data/shard-0.vector.wal,/data/shard-1.vector.wal --out-dir=/data/merged \
@@ -39,9 +37,10 @@
 //! snapshot install supersedes earlier generations) or one generation
 //! directory. Documents are re-analyzed with the SAME analysis options
 //! they were ingested with, so point `--analysis-addr` at the same
-//! sidecar configuration the cluster ingests through. Writes
-//! `<out>/shard-<i>.vector` (+ `.bm25`), `<out>/shard-map.toml`, and prints
-//! the matching `[[shards]]` node config blocks.
+//! sidecar configuration the cluster ingests through. Writes each child as
+//! a one-segment catalog (`<out>/shard-<i>.vector.segments`, served with
+//! `--index=<out>/shard-<i>.vector`), `<out>/shard-map.toml`, and prints the
+//! matching `[[shards]]` node config blocks.
 
 use std::path::{Path, PathBuf};
 
@@ -69,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(
             "usage: reshard (--log=<wal dir|generation dir> --split=N | --logs=a,b,c) \
              --out-dir=<dir> [--slot-base=B] [--slot-stride=S] [--analysis-addr=ADDR] \
-             [--stable-routing] [--placement-tree=<file> [--single-image=<max child rows>] \
+             [--stable-routing] [--placement-tree=<file> \
              [--spill-bucket-bits=<bits>] [--from-segments] [--build-threads=<n>] [--build-queue=<n>] \
              [--build-memory=<MiB>] [--only-child=<index>] [--cut-column=<col> \
              [--cut-rows=<n>]] [--derived-columns=<file> [--derive=a,b]]]"
@@ -164,14 +163,6 @@ fn parse_derived_declaration(
 }
 
 fn parse_tree_split_options() -> Result<reshard::TreeSplitOptions, ReshardErr> {
-    let layout = match opt("single-image") {
-        Some(bound) => reshard::TreeChildLayout::SingleImage {
-            max_child_rows: bound
-                .parse()
-                .map_err(|e| format!("--single-image takes the most rows a child may have: {e}"))?,
-        },
-        None => reshard::TreeChildLayout::Segmented,
-    };
     let spill_bucket_bits = opt("spill-bucket-bits")
         .map(|b| b.parse::<u32>())
         .transpose()?;
@@ -225,7 +216,6 @@ fn parse_tree_split_options() -> Result<reshard::TreeSplitOptions, ReshardErr> {
         })
         .unwrap_or_default();
     Ok(reshard::TreeSplitOptions {
-        layout,
         spill_bucket_bits,
         source,
         cut,
@@ -288,8 +278,8 @@ fn report_tree_reshard(
     eprintln!("wrote {}", map_path.display());
     eprintln!("{} documents changed code under the new tree", placed.moved);
     eprintln!(
-        "spill logs of {} buckets; the largest replay held {} rows ({:?})",
-        placed.spill_bucket_count, placed.peak_replay_rows, placed.layout
+        "spill logs of {} buckets; the largest replay held {} rows",
+        placed.spill_bucket_count, placed.peak_replay_rows
     );
     eprintln!(
         "analysis: {:?}, {} documents transplanted, largest transpose {} bytes; spill cut {:?}",

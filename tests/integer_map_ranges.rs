@@ -4,7 +4,7 @@ use pipestream_search::{
     coordinator::CoordinatorServiceImpl,
     node::{Bm25Shard, NodeConfig, NodeServiceImpl},
     pb::{self, node_service_server::NodeService, search_service_server::SearchService},
-    postings::{AnalyzedDoc, Bm25Reader, Bm25Store},
+    postings::{AnalyzedDoc, Bm25Store},
     relay::merge_bm25_responses,
 };
 use prost::Message;
@@ -158,19 +158,24 @@ async fn integer_map_ranges_keep_adjacent_large_values_in_distinct_buckets() {
     }
     let path = dir.join("index.bm25");
     store.save(&path).unwrap();
-    for shard in [
-        Bm25Shard::Building(store),
-        Bm25Shard::Resident(Bm25Reader::open(&path).unwrap()),
-    ] {
-        let node = NodeServiceImpl::new(
-            None,
-            NodeConfig {
-                map_integer_fields: vec!["signed".into()],
-                map_unsigned_integer_fields: vec!["unsigned".into()],
-                ..Default::default()
-            },
-        )
-        .with_bm25(Some(shard));
+    let config = NodeConfig {
+        map_integer_fields: vec!["signed".into()],
+        map_unsigned_integer_fields: vec!["unsigned".into()],
+        ..Default::default()
+    };
+    let heap =
+        NodeServiceImpl::new(None, config.clone()).with_bm25(Some(Bm25Shard::Building(store)));
+    let index_path = dir.join("index.tv");
+    common::catalog::seal_bm25_file(&index_path, &path);
+    let sealed = NodeServiceImpl::open(
+        NodeConfig {
+            index_path: Some(index_path),
+            ..config
+        },
+        None,
+    )
+    .unwrap();
+    for node in [heap, sealed] {
         for column in ["signed", "unsigned"] {
             for key in ["", KEY] {
                 let req = raw_request(column, key);
@@ -279,138 +284,136 @@ async fn verify(addresses: Vec<String>, fused_supported: bool) {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn integer_map_ranges_compose_through_relays_and_compaction() {
-    use pipestream_search::{
-        harness::start_relay, node::Layout, pb::node_service_client::NodeServiceClient,
-    };
+    use pipestream_search::{harness::start_relay, pb::node_service_client::NodeServiceClient};
     let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 92372));
-    for layout in [Layout::SingleImage, Layout::Segments] {
-        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("map-range-relay-{layout:?}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut configs = vec![];
-        let mut addresses = vec![];
-        let mut handles = vec![];
-        for rows in [0..5, 5..10, 10..10] {
-            let config = NodeConfig {
-                index_path: Some(dir.join(format!("{}.tv", rows.start))),
-                layout,
-                wal: true,
-                wal_buckets: 2,
-                slot_offset: rows.start as u64,
-                seal_tail_docs: 2,
-                integer_fields: vec!["row".into()],
-                map_integer_fields: vec!["signed".into()],
-                map_unsigned_integer_fields: vec!["unsigned".into()],
-                analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
-                ..Default::default()
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("map-range-relay-segments-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut configs = vec![];
+    let mut addresses = vec![];
+    let mut handles = vec![];
+    for rows in [0..5, 5..10, 10..10] {
+        let config = NodeConfig {
+            index_path: Some(dir.join(format!("{}.tv", rows.start))),
+            wal: true,
+            wal_buckets: 2,
+            slot_offset: rows.start as u64,
+            seal_tail_docs: 2,
+            integer_fields: vec!["row".into()],
+            map_integer_fields: vec!["signed".into()],
+            map_unsigned_integer_fields: vec!["unsigned".into()],
+            analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
+            ..Default::default()
+        };
+        let (addr, handle) = common::start_empty_node(config.clone()).await;
+        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+        client
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                8, 4, &shift, &scale,
+            ))
+            .await
+            .unwrap();
+        for row in rows.clone() {
+            let keys = if row % 5 < 2 {
+                vec!["", KEY]
+            } else {
+                vec!["", "a", KEY]
             };
-            let (addr, handle) = common::start_empty_node(config.clone()).await;
-            let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
             client
-                .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-                    8, 4, &shift, &scale,
-                ))
+                .add_documents(tokio_stream::iter([pb::AddDocumentsRequest {
+                    text: "word".into(),
+                    analysis: Some(body_spec()),
+                    integers: vec![pb::IntegerValue {
+                        field: "row".into(),
+                        value: row as i64,
+                    }],
+                    map_integers: keys
+                        .iter()
+                        .flat_map(|key| {
+                            I[row].map(|value| pb::MapIntegerEntry {
+                                field: "signed".into(),
+                                key: (*key).into(),
+                                value,
+                            })
+                        })
+                        .collect(),
+                    map_unsigned_integers: keys
+                        .iter()
+                        .flat_map(|key| {
+                            U[row].map(|value| pb::MapUnsignedIntegerEntry {
+                                field: "unsigned".into(),
+                                key: (*key).into(),
+                                value,
+                            })
+                        })
+                        .collect(),
+                    ..Default::default()
+                }]))
                 .await
                 .unwrap();
-            for row in rows.clone() {
-                let keys = if row % 5 < 2 {
-                    vec!["", KEY]
-                } else {
-                    vec!["", "a", KEY]
-                };
-                client
-                    .add_documents(tokio_stream::iter([pb::AddDocumentsRequest {
-                        text: "word".into(),
-                        analysis: Some(body_spec()),
-                        integers: vec![pb::IntegerValue {
-                            field: "row".into(),
-                            value: row as i64,
-                        }],
-                        map_integers: keys
-                            .iter()
-                            .flat_map(|key| {
-                                I[row].map(|value| pb::MapIntegerEntry {
-                                    field: "signed".into(),
-                                    key: (*key).into(),
-                                    value,
-                                })
-                            })
-                            .collect(),
-                        map_unsigned_integers: keys
-                            .iter()
-                            .flat_map(|key| {
-                                U[row].map(|value| pb::MapUnsignedIntegerEntry {
-                                    field: "unsigned".into(),
-                                    key: (*key).into(),
-                                    value,
-                                })
-                            })
-                            .collect(),
-                        ..Default::default()
-                    }]))
-                    .await
-                    .unwrap();
-                client
-                    .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
-                        materialized_rows: Vec::new(),
-                        dim: 8,
-                        vectors: common::unit_vectors(1, 8, 712 + row as u64),
-                    }]))
-                    .await
-                    .unwrap();
-                if row % 5 == 1 {
-                    client.flush(pb::FlushRequest {}).await.unwrap();
-                }
+            client
+                .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
+                    materialized_rows: Vec::new(),
+                    dim: 8,
+                    vectors: common::unit_vectors(1, 8, 712 + row as u64),
+                }]))
+                .await
+                .unwrap();
+            if row % 5 == 1 {
+                client.flush(pb::FlushRequest {}).await.unwrap();
             }
-            configs.push(config);
-            addresses.push(addr);
-            handles.push(handle);
         }
-        for phase in 0..3 {
-            if phase > 0 {
-                addresses.clear();
-                for (part, config) in configs.iter().enumerate() {
-                    let (addr, handle) = common::start_opened_node(config.clone()).await;
-                    if phase == 1 && part < 2 {
-                        NodeServiceClient::connect(addr.clone())
-                            .await
-                            .unwrap()
-                            .compact_shard(pb::CompactShardRequest {
-                                work_dir: dir.join(format!("compact-{part}")).display().to_string(),
-                                ..Default::default()
-                            })
-                            .await
-                            .unwrap();
-                    }
-                    addresses.push(addr);
-                    handles.push(handle);
-                }
-            }
-            verify(addresses.clone(), true).await;
-            let (left, _, lh) = start_relay(addresses[..1].to_vec()).await;
-            let (right, _, rh) = start_relay(addresses[1..].to_vec()).await;
-            let (root, _, root_h) = start_relay(vec![left, right]).await;
-            verify(vec![root], false).await;
-            root_h.abort();
-            lh.abort();
-            rh.abort();
-            if phase == 0 {
-                for addr in &addresses {
+        configs.push(config);
+        addresses.push(addr);
+        handles.push(handle);
+    }
+    for phase in 0..3 {
+        if phase > 0 {
+            addresses.clear();
+            for (part, config) in configs.iter().enumerate() {
+                let (addr, handle) = common::start_opened_node(config.clone()).await;
+                if phase == 1 && part < 2 {
                     NodeServiceClient::connect(addr.clone())
                         .await
                         .unwrap()
-                        .flush(pb::FlushRequest {})
+                        .compact_shard(pb::CompactShardRequest {
+                            work_dir: dir.join(format!("compact-{part}")).display().to_string(),
+                            ..Default::default()
+                        })
                         .await
                         .unwrap();
                 }
-            }
-            for h in handles.drain(..) {
-                h.abort();
-                let _ = h.await;
+                addresses.push(addr);
+                handles.push(handle);
             }
         }
-        std::fs::remove_dir_all(dir).unwrap();
+        verify(addresses.clone(), true).await;
+        let (left, _, lh) = start_relay(addresses[..1].to_vec()).await;
+        let (right, _, rh) = start_relay(addresses[1..].to_vec()).await;
+        let (root, _, root_h) = start_relay(vec![left, right]).await;
+        // The empty third shard has no field table until a flush or a
+        // reopen opens its catalog, so before that a fused query through
+        // the relays refuses for heterogeneous capabilities.
+        verify(vec![root], phase > 0).await;
+        root_h.abort();
+        lh.abort();
+        rh.abort();
+        if phase == 0 {
+            for addr in &addresses {
+                NodeServiceClient::connect(addr.clone())
+                    .await
+                    .unwrap()
+                    .flush(pb::FlushRequest {})
+                    .await
+                    .unwrap();
+            }
+        }
+        for h in handles.drain(..) {
+            h.abort();
+            let _ = h.await;
+        }
     }
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[derive(Clone, PartialEq, Message)]

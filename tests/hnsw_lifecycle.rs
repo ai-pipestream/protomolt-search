@@ -12,24 +12,24 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use common::{monolithic_topk, start_empty_node, start_opened_node, unit_vectors};
+use common::{start_empty_node, start_opened_node, unit_vectors};
 use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
 use pipestream_search::coordinator::CoordinatorServiceImpl;
-use pipestream_search::exact_vectors::{dot, ExactVectorStore};
+use pipestream_search::exact_vectors::dot;
 use pipestream_search::hnsw::{HnswConfig, HNSW};
-use pipestream_search::node::{segments_root, Layout, NodeConfig};
+use pipestream_search::node::{segments_root, NodeConfig};
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
-    search_query, search_shard_request, search_shard_response, selection_query,
-    AddDocumentsRequest, AddVectorsRequest, CommitReplacementsRequest, CompactShardRequest,
-    ConfigureVectorBackendRequest, DeleteDocumentsRequest, DenseExecutionMode, DenseQuery,
-    FlushRequest, GetDocumentsRequest, HealthRequest, QueryRequest, Replacement, ScoredHit,
-    SearchQuery, SearchShardRequest, SelectionQuery, StartShardSearch, VectorBackendConfig,
+    install_snapshot_from_request, search_query, search_shard_request, search_shard_response,
+    selection_query, AddDocumentsRequest, AddVectorsRequest, CommitReplacementsRequest,
+    CompactShardRequest, ConfigureVectorBackendRequest, DeleteDocumentsRequest, DenseExecutionMode,
+    DenseQuery, ExportSnapshotRequest, FlushRequest, GetDocumentsRequest, HealthRequest,
+    InstallSnapshotFromRequest, QueryRequest, Replacement, ScoredHit, SearchQuery,
+    SearchShardRequest, SelectionQuery, StartShardSearch, VectorBackendConfig,
 };
-use pipestream_search::postings::{AnalyzedDoc, Bm25Store, DocTerms};
 use pipestream_search::segments::{OpenedSegmentSet, SegmentCatalog, VectorLoad};
-use pipestream_search::vector::{VectorIndex, VectorProvider};
+use pipestream_search::vector::VectorProvider;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
@@ -51,7 +51,6 @@ fn config(index_path: &Path, mmap: bool, wal: bool) -> NodeConfig {
         index_path: Some(index_path.to_path_buf()),
         vector_backend: HNSW.to_string(),
         analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
-        layout: Layout::Segments,
         vector_mmap: mmap,
         wal,
         wal_buckets: 8,
@@ -466,32 +465,6 @@ async fn replacements_retire_the_old_row_and_serve_the_revision() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A one-document BM25 image containing the given text (as the snapshot
-/// tests build it).
-fn build_bm25(dir: &Path, text: &str) -> PathBuf {
-    let mut store = Bm25Store::new();
-    let mut terms: DocTerms = Vec::new();
-    let mut offset = 0u32;
-    for token in text.split_whitespace() {
-        let start = text[offset as usize..].find(token).unwrap() as u32 + offset;
-        terms.push((
-            token.to_string(),
-            1,
-            vec![(start, start + token.len() as u32)],
-        ));
-        offset = start + token.len() as u32;
-    }
-    let length = terms.iter().map(|(_, f, _)| f).sum();
-    store.add_document_with_lineage(0, text.to_string(), AnalyzedDoc::body(terms, length), None);
-    store
-        .source_archive_mut()
-        .attach_source(0, &common::protobuf_source(text, "snapshot"), None)
-        .unwrap();
-    let path = dir.join("source.bm25");
-    store.save(&path).unwrap();
-    path
-}
-
 /// The node's own shard search (the coordinator's unary leg).
 async fn search_shard(
     client: &mut NodeServiceClient<Channel>,
@@ -539,62 +512,55 @@ async fn observe_shard(addr: &str, probes: &[Vec<f32>]) -> Vec<Vec<(u64, u32)>> 
     out
 }
 
-/// An hnsw image built elsewhere installs as a snapshot with its exact
-/// sidecar, serves the image's own top-k, and is what the shard reopens.
+/// An hnsw catalog exported from one shard installs on another through a
+/// repository, serves the source's own top-k with its exact sidecar, and is
+/// what the target reopens.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_snapshot_of_the_graph_installs_and_survives_a_restart() {
     let dir = tempdir("snapshot");
     let n = 500;
-    let corpus = unit_vectors(n, DIM, 0x5A4B_0001);
-    let mut reference = VectorIndex::create(HNSW, DIM, 32).unwrap();
-    reference.add(&corpus, DIM).unwrap();
-    reference.prepare().unwrap();
-    let image = dir.join("source.hnsw");
-    reference.write(&image).unwrap();
-    let exact = dir.join("source.exact");
-    ExactVectorStore::from_values(DIM, corpus.clone())
-        .unwrap()
-        .write(&exact)
-        .unwrap();
-    let bm25 = build_bm25(&dir, "graph snapshot install");
-
-    let path = dir.join("shard.hnsw");
-    let (addr, handle) = start_empty_node(NodeConfig {
+    let at = |name: &str| NodeConfig {
         slot_offset: 100,
-        ..config(&path, true, false)
-    })
-    .await;
-    let report = pipestream_search::snapshot::install_snapshot_with_exact(
-        &addr,
-        &image,
-        Some(&exact),
-        Some(&bm25),
-    )
-    .await
-    .unwrap();
-    assert_eq!(report.num_vectors, n as u64);
-    assert_eq!(report.num_documents, 1);
-
+        ..config(&dir.join(name), true, false)
+    };
+    let (source, source_handle) = start_empty_node(at("source.hnsw")).await;
+    configure(&source).await;
+    ingest(&source, &rows(0..n)).await;
+    flush(&source).await;
+    let repository = dir.join("repository");
+    client(&source)
+        .await
+        .export_snapshot(ExportSnapshotRequest {
+            directory: repository.display().to_string(),
+        })
+        .await
+        .unwrap();
     let probes = queries(4, 0x5A4B_1000);
-    let expected: Vec<Vec<(u64, u32)>> = probes
-        .iter()
-        .map(|q| monolithic_topk(&reference, q, K))
-        .collect();
+    let expected = observe_shard(&source, &probes).await;
+    source_handle.abort();
+
+    let (addr, handle) = start_empty_node(at("shard.hnsw")).await;
+    let report = client(&addr)
+        .await
+        .install_snapshot_from(InstallSnapshotFromRequest {
+            source: Some(install_snapshot_from_request::Source::Directory(
+                repository.display().to_string(),
+            )),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(report.num_vectors, n as u64);
+    assert_eq!(report.num_documents, n as u64);
     let installed = observe_shard(&addr, &probes).await;
-    for (q, (got, want)) in installed.iter().zip(&expected).enumerate() {
-        let want: Vec<(u64, u32)> = want.iter().map(|(id, bits)| (100 + id, *bits)).collect();
-        assert_eq!(got, &want, "query {q}");
-    }
+    assert_eq!(installed, expected);
     let health = health(&addr).await;
     assert_eq!(health.vector_backend, HNSW);
     assert_eq!(health.exact_vector_rows, n as u64);
     handle.abort();
 
-    let (addr, handle) = start_opened_node(NodeConfig {
-        slot_offset: 100,
-        ..config(&path, true, false)
-    })
-    .await;
+    let (addr, handle) = start_opened_node(at("shard.hnsw")).await;
     assert_eq!(observe_shard(&addr, &probes).await, installed);
     handle.abort();
     let _ = std::fs::remove_dir_all(&dir);

@@ -55,7 +55,7 @@ fn claim(node: &NodeServiceImpl) -> StatsClaim {
 #[test]
 fn uncertain_manifest_keeps_old_runtime_and_blocks_flush_until_reopen() {
     let (root, config, old) = fixture("uncertain");
-    let node = NodeServiceImpl::open(config.clone(), None, false).unwrap();
+    let node = NodeServiceImpl::open(config.clone(), None).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -101,7 +101,7 @@ fn uncertain_manifest_keeps_old_runtime_and_blocks_flush_until_reopen() {
         .contains("uncertain"));
     assert_eq!(old.live_docs(0).deleted_count(), 0);
     drop(node);
-    let recovered = NodeServiceImpl::open(config, None, false).unwrap();
+    let recovered = NodeServiceImpl::open(config, None).unwrap();
     let recovered_health = runtime
         .block_on(recovered.health(Request::new(crate::pb::HealthRequest {})))
         .unwrap()
@@ -114,7 +114,7 @@ fn uncertain_manifest_keeps_old_runtime_and_blocks_flush_until_reopen() {
 #[test]
 fn publication_refuses_stale_owners_and_unsealed_rows_without_changing_disk() {
     let (root, config, old) = fixture("preconditions");
-    let node = NodeServiceImpl::open(config.clone(), None, false).unwrap();
+    let node = NodeServiceImpl::open(config.clone(), None).unwrap();
     let expected = claim(&node);
     let manifest_path = segments_root(config.index_path.as_ref().unwrap()).join("segments.json");
     let before = std::fs::read(&manifest_path).unwrap();
@@ -171,7 +171,7 @@ fn publication_refuses_stale_owners_and_unsealed_rows_without_changing_disk() {
 fn publication_cannot_bypass_wal_recovery() {
     let (root, mut config, old) = fixture("wal");
     config.wal = true;
-    let node = NodeServiceImpl::open(config.clone(), None, false).unwrap();
+    let node = NodeServiceImpl::open(config.clone(), None).unwrap();
     let manifest_path = segments_root(config.index_path.as_ref().unwrap()).join("segments.json");
     let before = std::fs::read(&manifest_path).unwrap();
     let error = node

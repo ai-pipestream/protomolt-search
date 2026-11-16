@@ -36,7 +36,7 @@ impl ParentWalk<'_> {
                 return None;
             }
         }
-        let store = guard.bm25.as_ref().and_then(|store| store.as_index());
+        let store = guard.bm25.as_ref().map(Bm25Shard::as_index);
         let lineage = u32::try_from(local)
             .ok()
             .and_then(|local| store.and_then(|store| store.lineage(local)));
@@ -86,15 +86,6 @@ impl NodeServiceImpl {
             .and_then(|view| view.filter.as_ref());
         let (_, visibility_columns_known) =
             filter_known_flags(guard.bm25.as_ref(), &[], visibility);
-        if guard
-            .bm25
-            .as_ref()
-            .is_some_and(|store| store.as_index().is_none())
-        {
-            return Err(Status::failed_precondition(
-                "bm25 bulk build in progress; Flush before reading lineage",
-            ));
-        }
         let walk = ParentWalk {
             guard: &guard,
             doc_filter: crate::filter::DocFilter {
@@ -141,9 +132,7 @@ impl NodeServiceImpl {
             let mut documents = Vec::new();
             if let Some(store) = guard.bm25.as_ref() {
                 let source_metadata = store;
-                let store = store.as_index().ok_or_else(|| {
-                    Status::failed_precondition("bm25 bulk build in progress; Flush first")
-                })?;
+                let store = store.as_index();
                 for id in req.doc_ids {
                     if id < offset {
                         continue;

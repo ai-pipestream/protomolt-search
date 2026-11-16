@@ -155,9 +155,7 @@ impl NodeServiceImpl {
         doc_filter: Option<&crate::filter::DocFilter<'_>>,
         k: usize,
     ) -> Result<RawLeg, Status> {
-        let index = store.as_index().ok_or_else(|| {
-            Status::failed_precondition("bm25 bulk build in progress; Flush first")
-        })?;
+        let index = store.as_index();
         let numeric_read = ShardNumericRead(store);
         let filter = doc_filter.map(|f| (f, &numeric_read as &dyn crate::scorefn::NumericRead));
         let request = bm25::TopK::new(k)

@@ -563,8 +563,7 @@ Old version claims are rejected after activation, and held immutable segment
 snapshots retain their previous rows and tombstones.
 
 This trusted local, blocking operation requires a persistent segmented layout
-with no mutable/frozen tail, WAL, installed single-image generation or active
-compaction. It refuses incompatible states instead of losing pending rows or
+with no mutable/frozen tail, WAL or active compaction. It refuses incompatible states instead of losing pending rows or
 bypassing replay. Call it off Tokio workers. It introduces no public RPC,
 authentication boundary or document receipt: its returned statistics claim only
 identifies the activated runtime. An owner must fence independent catalog writers.

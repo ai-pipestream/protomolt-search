@@ -72,7 +72,7 @@ impl NodeServiceImpl {
             ),
         };
         let mut guard = write_shard(&self.state);
-        guard.check_legacy_mutation()?;
+        guard.check_index_owned_write()?;
         let vector = plan
             .vector_binding
             .as_ref()
@@ -231,7 +231,7 @@ impl NodeServiceImpl {
         guard: &mut ShardState,
         incoming: crate::postings::StoredBinding,
     ) -> Result<bool, Status> {
-        guard.check_legacy_mutation()?;
+        guard.check_index_owned_write()?;
         crate::mapped_analysis::decode_contract(
             &incoming.analysis_sha,
             &incoming.analysis_contract,

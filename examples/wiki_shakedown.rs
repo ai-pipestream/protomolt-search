@@ -251,19 +251,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("shard {shard}: {n} docs in {t_docs:?}, {n} vectors in {t_vecs:?}");
     }
 
-    // --- 7. Persist (reusable .tv + .bm25 for the two-machine run) ------
+    // --- 7. Persist (a reusable segment catalog for the two-machine run) -
     for (shard, addr) in node_addrs.iter().enumerate() {
         let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
         let flushed = client.flush(FlushRequest {}).await.unwrap().into_inner();
         assert!(flushed.written);
         let tv = PathBuf::from(&out_dir).join(format!("shard-{shard}.tv"));
-        let bm = pipestream_search::node::bm25_sidecar_path(&tv);
         eprintln!(
-            "shard {shard}: flushed {} vectors + {} docs ({:.0} MiB + {:.0} MiB)",
+            "shard {shard}: flushed {} vectors + {} docs into {}",
             flushed.num_vectors,
             flushed.num_documents,
-            tv.metadata().map(|m| m.len() as f64 / 1e6).unwrap_or(0.0),
-            bm.metadata().map(|m| m.len() as f64 / 1e6).unwrap_or(0.0),
+            pipestream_search::node::segments_root(&tv).display(),
         );
     }
 

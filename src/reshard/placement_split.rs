@@ -227,10 +227,7 @@ pub fn split_placement_logs_with(
         )?);
     }
     Ok(PlacementReshardOutput {
-        images: ReshardOutput {
-            generation: inputs.next_generation()?,
-            children: out,
-        },
+        images: super::child_catalog::sealed(&inputs.manifest, inputs.next_generation()?, out)?,
         source_cutoffs,
         ranges: request.children.to_vec(),
         default_child: request.default_child,

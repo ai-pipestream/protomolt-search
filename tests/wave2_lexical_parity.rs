@@ -1,9 +1,11 @@
 //! Lexical wire-score ties agree across local scoring, RPCs, and certified streams.
 
+mod common;
+
 use pipestream_search::analyzer::{analysis_fingerprint, body_spec};
 use pipestream_search::bm25::{self, Bm25Params, CorpusStats, FieldQuery, PruneStats, TopK};
 use pipestream_search::coordinator::CoordinatorServiceImpl;
-use pipestream_search::node::{Bm25Shard, Layout, NodeConfig, NodeServiceImpl};
+use pipestream_search::node::{NodeConfig, NodeServiceImpl};
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{Bm25SearchRequest, Bm25SearchResponse, QueryField};
 use pipestream_search::postings::{AnalyzedDoc, Bm25Reader, Bm25Store};
@@ -67,20 +69,23 @@ async fn serve(path: &Path, slot: u64, texts: &[&str], block_max: bool) -> Serve
     serve_image(path, slot, block_max, Vec::new()).await
 }
 
+/// Serve the store saved at `path` as the one segment of a catalog beside it.
 async fn serve_image(path: &Path, slot: u64, block_max: bool, numerics: Vec<String>) -> Server {
-    let node = NodeServiceImpl::new(
-        None,
+    let index_path = path.with_extension("tv");
+    common::catalog::seal_bm25_file(&index_path, path);
+    let node = NodeServiceImpl::open(
         NodeConfig {
+            index_path: Some(index_path),
             slot_offset: slot,
             analysis_addr: Some("native".into()),
             bm25_fields: vec!["body".into()],
-            layout: Layout::SingleImage,
             block_max,
             numeric_fields: numerics,
             ..Default::default()
         },
+        None,
     )
-    .with_bm25(Some(Bm25Shard::open(path).unwrap()));
+    .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = format!("http://{}", listener.local_addr().unwrap());
     let handle = tokio::spawn(

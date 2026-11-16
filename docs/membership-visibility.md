@@ -77,7 +77,7 @@ no stored index, original source or WAL format.
 
 `tests/membership_visibility.rs` checks independent public/private views,
 conflicting user predicates and attempts to widen them, vector-only rows,
-malformed and unknown views, deletes, single-image and segmented storage,
+malformed and unknown views, deletes, segmented storage,
 compaction and reopen. All membership responses are compared with one another
 and with their read versions; fresh lifetimes differ after reopening.
 

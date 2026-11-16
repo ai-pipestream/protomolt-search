@@ -21,9 +21,7 @@ fn store_term_stats(
     store: &Bm25Shard,
     visibility: Option<&crate::boolean_bits::Bits>,
 ) -> Result<(u64, u64, Vec<u32>, Vec<crate::pb::FieldStats>), Status> {
-    let index = store
-        .as_index()
-        .ok_or_else(|| Status::failed_precondition("bm25 bulk build in progress; Flush first"))?;
+    let index = store.as_index();
     // Per-field shares: a shard without a named field
     // answers zeros — that IS its share of the globals.
     let field_stats = req
@@ -31,9 +29,7 @@ fn store_term_stats(
         .iter()
         .map(|ft| match store.field_index(&ft.field) {
             Some(fi) => {
-                let view = store
-                    .field_view(fi)
-                    .expect("as_index above proves the shard is searchable");
+                let view = store.field_view(fi);
                 let (total_doc_length, doc_frequencies) = live_field_stats(
                     view.as_ref(),
                     &ft.terms,
@@ -90,15 +86,6 @@ impl NodeServiceImpl {
                 visibility_columns_known,
                 ..Default::default()
             }));
-        }
-        if guard
-            .bm25
-            .as_ref()
-            .is_some_and(|store| store.as_index().is_none())
-        {
-            return Err(Status::failed_precondition(
-                "bm25 bulk build in progress; Flush first",
-            ));
         }
         let (_, visibility_columns_known) =
             filter_known_flags(guard.bm25.as_ref(), &[], visibility_filter);

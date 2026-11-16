@@ -386,7 +386,7 @@ async fn node_recovery_joins_both_crash_windows_after_reopening_source_and_index
             .into_inner();
         assert_eq!(health.num_vectors, u64::from(after_activation));
         fixture.reopen_source();
-        fixture.node = NodeServiceImpl::open(fixture.node.config.clone(), None, false).unwrap();
+        fixture.node = NodeServiceImpl::open(fixture.node.config.clone(), None).unwrap();
         let source = fixture.source.clone();
         let node = fixture.node.clone();
         let recovered = tokio::task::spawn_blocking(move || {

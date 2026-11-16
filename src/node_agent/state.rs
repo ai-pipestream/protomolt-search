@@ -143,17 +143,3 @@ fn publish_toml(dir: &Path, path: &Path, text: &str, sync_file: bool) -> Result<
 pub(super) fn retired_marker(data_dir: &Path, shard_id: &str) -> PathBuf {
     data_dir.join("retired").join(shard_id)
 }
-
-/// Move one built image file into a placed shard's directory: a rename
-/// on the same filesystem, a copy across.
-pub(super) fn move_image_file(from: &Path, to: &Path) -> Result<(), String> {
-    if let Some(parent) = to.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-    }
-    if std::fs::rename(from, to).is_ok() {
-        return Ok(());
-    }
-    std::fs::copy(from, to)
-        .map_err(|e| format!("copy {} to {}: {e}", from.display(), to.display()))?;
-    std::fs::remove_file(from).map_err(|e| format!("remove {}: {e}", from.display()))
-}

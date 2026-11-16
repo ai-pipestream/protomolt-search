@@ -1,6 +1,6 @@
 //! Regression tests for crash-recovery filesystem error propagation and
 //! structured stale-statistics refusal classification:
-//! - `recover_segments_swap`, `try_recover_generation`, and `NodeServiceImpl::open`
+//! - `recover_segments_swap` and `NodeServiceImpl::open`
 //!   must propagate real filesystem errors and fail closed rather than opening an
 //!   empty or half-swapped shard when `remove_dir_all` or `rename` fails.
 //! - Node and relay stale-statistics refusals carry the structured
@@ -10,12 +10,10 @@
 mod common;
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use pipestream_search::node::{
-    generation_bm25, generation_dir, segments_root, Layout, NodeConfig, NodeServiceImpl,
-};
-use pipestream_search::postings::{AnalyzedDoc, Bm25Store, DocTerms};
+use pipestream_search::node::{segments_root, NodeConfig, NodeServiceImpl};
+use pipestream_search::postings::{AnalyzedDoc, Bm25Store};
 use pipestream_search::segments::{SegmentCatalog, SegmentSetManifest};
 
 fn tempdir(tag: &str) -> PathBuf {
@@ -29,28 +27,6 @@ fn tempdir(tag: &str) -> PathBuf {
 fn is_effective_root() -> bool {
     // SAFETY: `geteuid` is thread-safe and takes no arguments.
     unsafe { libc::geteuid() == 0 }
-}
-
-fn write_single_doc_bm25(path: &Path, text: &str) {
-    let mut store = Bm25Store::new();
-    let mut terms: DocTerms = Vec::new();
-    let mut offset = 0u32;
-    for token in text.split_whitespace() {
-        let start = text[offset as usize..].find(token).unwrap() as u32 + offset;
-        terms.push((
-            token.to_string(),
-            1,
-            vec![(start, start + token.len() as u32)],
-        ));
-        offset = start + token.len() as u32;
-    }
-    let length = terms.iter().map(|(_, freq, _)| freq).sum();
-    store.add_document_with_lineage(0, text.to_string(), AnalyzedDoc::body(terms, length), None);
-    store
-        .source_archive_mut()
-        .attach_source(0, &common::protobuf_source(text, "recovery"), None)
-        .unwrap();
-    store.save(path).unwrap();
 }
 
 #[cfg(unix)]
@@ -72,11 +48,9 @@ fn segments_swap_cleanup_io_error_refuses_shard_open() {
     let opened = NodeServiceImpl::open(
         NodeConfig {
             index_path: Some(index_path.clone()),
-            layout: Layout::Segments,
             ..Default::default()
         },
         None,
-        true,
     );
     assert!(
         opened.is_err(),
@@ -91,11 +65,9 @@ fn segments_swap_cleanup_io_error_refuses_shard_open() {
     let opened_export = NodeServiceImpl::open(
         NodeConfig {
             index_path: Some(index_path),
-            layout: Layout::Segments,
             ..Default::default()
         },
         None,
-        true,
     );
     assert!(
         opened_export.is_err(),
@@ -131,11 +103,9 @@ fn segments_swap_rollback_rename_error_refuses_shard_open() {
     let opened = NodeServiceImpl::open(
         NodeConfig {
             index_path: Some(index_path),
-            layout: Layout::Segments,
             ..Default::default()
         },
         None,
-        true,
     );
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -147,68 +117,6 @@ fn segments_swap_rollback_rename_error_refuses_shard_open() {
         SegmentCatalog::manifest_path(&old).exists(),
         "backup segment catalog manifest must remain intact when rollback fails"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[cfg(unix)]
-#[test]
-fn generation_swap_cleanup_and_rollback_io_errors_refuse_shard_open() {
-    let dir = tempdir("generation_swap_err");
-    let index_path = dir.join("shard.idx");
-    let snap = generation_dir(&index_path);
-    let old = dir.join("shard.idx.snap-old");
-    let tmp = dir.join("shard.idx.snap-tmp");
-
-    std::fs::create_dir_all(&old).unwrap();
-    write_single_doc_bm25(&generation_bm25(&old), "court opinion preserved in backup");
-    // `.snap-tmp` as a regular file causes `remove_dir_all(&tmp)` to fail
-    // deterministically with `ENOTDIR` even under UID 0, before rollback runs.
-    std::fs::write(&tmp, b"corrupt-non-dir-staging").unwrap();
-
-    let opened = NodeServiceImpl::open(
-        NodeConfig {
-            index_path: Some(index_path.clone()),
-            ..Default::default()
-        },
-        None,
-        true,
-    );
-    assert!(
-        opened.is_err(),
-        "NodeServiceImpl::open must fail closed when generation recovery cleanup fails"
-    );
-    assert!(
-        generation_bm25(&old).exists(),
-        "backup generation must remain intact when pre-rollback cleanup fails"
-    );
-    assert!(!snap.exists());
-    std::fs::remove_file(&tmp).unwrap();
-
-    if !is_effective_root() {
-        // Make the parent directory read-only (`0o555`) while `.snap` is absent and
-        // `.snap-old` holds the shard's generation so `rename(&old, &snap)` fails
-        // with `EACCES`; `open` must refuse rather than opening an empty shard with
-        // its installed generation stranded in `.snap-old`.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let rollback_opened = NodeServiceImpl::open(
-            NodeConfig {
-                index_path: Some(index_path),
-                ..Default::default()
-            },
-            None,
-            true,
-        );
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(
-            rollback_opened.is_err(),
-            "NodeServiceImpl::open must fail closed when `rename(&old, &snap)` fails"
-        );
-        assert!(
-            generation_bm25(&old).exists(),
-            "backup generation must remain intact when rollback rename fails"
-        );
-    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }

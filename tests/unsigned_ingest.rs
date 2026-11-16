@@ -2,7 +2,7 @@ mod common;
 
 use pipestream_search::{
     analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND},
-    node::{self, Layout, NodeConfig},
+    node::{self, NodeConfig},
     pb::{self, node_service_client::NodeServiceClient},
     postings::{Bm25Index, Bm25Reader},
     segments::OpenedSegmentSet,
@@ -10,7 +10,7 @@ use pipestream_search::{
 use std::collections::BTreeMap;
 use std::path::Path;
 
-fn verify_disk(index: &Path, layout: Layout, expected: &BTreeMap<String, Option<u64>>) {
+fn verify_disk(index: &Path, expected: &BTreeMap<String, Option<u64>>) {
     let mut actual = BTreeMap::new();
     let mut inspect = |reader: &Bm25Reader| {
         reader.verify_integrity().unwrap();
@@ -76,30 +76,17 @@ fn verify_disk(index: &Path, layout: Layout, expected: &BTreeMap<String, Option<
                 .is_none());
         }
     };
-    match layout {
-        Layout::SingleImage => {
-            let generation = node::generation_dir(index);
-            let path = if generation.exists() {
-                node::generation_bm25(&generation)
-            } else {
-                node::bm25_sidecar_path(index)
-            };
-            inspect(&Bm25Reader::open(&path).unwrap());
-        }
-        Layout::Segments => {
-            let set = OpenedSegmentSet::open(node::segments_root(index)).unwrap();
-            for part in 0..set.len() {
-                inspect(set.bm25(part));
-            }
-        }
+    let set = OpenedSegmentSet::open(node::segments_root(index)).unwrap();
+    for part in 0..set.len() {
+        inspect(set.bm25(part));
     }
+
     assert_eq!(&actual, expected);
 }
 
-fn unsigned_ingest_config(index: std::path::PathBuf, layout: Layout) -> NodeConfig {
+fn unsigned_ingest_config(index: std::path::PathBuf) -> NodeConfig {
     NodeConfig {
         index_path: Some(index),
-        layout,
         wal: true,
         wal_buckets: 2,
         analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
@@ -275,10 +262,11 @@ fn verify_unsigned_wal_split_replay(
     let split = split_logs_with(&req, &mut analyze).unwrap();
     let mut replayed = BTreeMap::new();
     for child in split.children {
-        let Some(path) = child.bm25_path else {
+        if child.num_documents == 0 {
             continue;
-        };
-        let reader = Bm25Reader::open(&path).unwrap();
+        }
+        let reader =
+            Bm25Reader::open(&common::catalog::segment_bm25(&child.vector_path, 0)).unwrap();
         let column = reader.unsigned_integer_index("value");
         for row in 0..reader.next_doc_id() {
             let text = reader.text(row).unwrap();
@@ -315,7 +303,6 @@ fn verify_unsigned_wal_split_replay(
 async fn ingest_unsigned_batches(
     client: &mut NodeServiceClient<tonic::transport::Channel>,
     index: &std::path::Path,
-    layout: Layout,
     values: &[Option<u64>],
     vectors: &[f32],
 ) -> BTreeMap<String, Option<u64>> {
@@ -339,14 +326,13 @@ async fn ingest_unsigned_batches(
             .await
             .unwrap();
         client.flush(pb::FlushRequest {}).await.unwrap();
-        verify_disk(index, layout, &expected);
+        verify_disk(index, &expected);
     }
     expected
 }
 
 async fn run_unsigned_ingest_layout_case(
     label: &str,
-    layout: Layout,
     values: &[Option<u64>],
     vectors: &[f32],
     cal: (&[f32], &[f32]),
@@ -355,20 +341,20 @@ async fn run_unsigned_ingest_layout_case(
         .join(format!("unsigned_ingest_{label}_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let index = dir.join("shard.tv");
-    let config = unsigned_ingest_config(index.clone(), layout);
+    let config = unsigned_ingest_config(index.clone());
     let (addr, server) = common::start_empty_node(config.clone()).await;
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     let backend_req = pipestream_search::harness::embedded_backend_request(8, 4, cal.0, cal.1);
     client.configure_vector_backend(backend_req).await.unwrap();
     let h = client.health(pb::HealthRequest {}).await.unwrap();
     assert!(h.into_inner().document_contract_version >= 1);
-    let mut expected = ingest_unsigned_batches(&mut client, &index, layout, values, vectors).await;
+    let mut expected = ingest_unsigned_batches(&mut client, &index, values, vectors).await;
     server.abort();
     let _ = server.await;
     drop(client);
     let (addr, server) = common::start_opened_node(config.clone()).await;
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
-    verify_disk(&index, layout, &expected);
+    verify_disk(&index, &expected);
     let del = pb::DeleteDocumentsRequest {
         doc_ids: vec![1],
         ..Default::default()
@@ -382,7 +368,7 @@ async fn run_unsigned_ingest_layout_case(
             ..Default::default()
         };
         client.compact_shard(req).await.unwrap();
-        verify_disk(&index, layout, &expected);
+        verify_disk(&index, &expected);
     }
     let gen = client
         .health(pb::HealthRequest {})
@@ -395,7 +381,7 @@ async fn run_unsigned_ingest_layout_case(
     let _ = server.await;
     drop(client);
     let (_, server) = common::start_opened_node(config).await;
-    verify_disk(&index, layout, &expected);
+    verify_disk(&index, &expected);
     server.abort();
     let _ = server.await;
     std::fs::remove_dir_all(dir).unwrap();
@@ -415,12 +401,8 @@ async fn exact_integer_grpc_values_survive_flush_reopen_and_compaction() {
     ];
     let vectors = common::unit_vectors(values.len(), 8, 99441);
     let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 99442));
-    for (label, layout) in [
-        ("single", Layout::SingleImage),
-        ("segments", Layout::Segments),
-    ] {
-        run_unsigned_ingest_layout_case(label, layout, &values, &vectors, (&shift, &scale)).await;
-    }
+    let label = "segments";
+    run_unsigned_ingest_layout_case(label, &values, &vectors, (&shift, &scale)).await;
 }
 
 #[tokio::test]
@@ -453,7 +435,7 @@ async fn direct_node_configuration_refuses_column_type_aliases() {
     ] {
         config.unsigned_integer_fields.push("value".into());
         config.analysis_addr = Some(NATIVE_ANALYSIS_BACKEND.into());
-        assert!(node::NodeServiceImpl::open(config.clone(), None, false)
+        assert!(node::NodeServiceImpl::open(config.clone(), None)
             .err()
             .unwrap()
             .contains("declared more than once"));

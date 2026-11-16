@@ -1,4 +1,4 @@
-//! Per-dataset query settings, the on-disk layout of new shards, and the
+//! Per-dataset query settings, segment storage settings of new shards, and the
 //! named collections that carry their own dataset settings.
 
 use std::collections::BTreeMap;
@@ -21,9 +21,8 @@ pub(super) struct Lexical {
     pub(super) dense_execution_policy: Option<PathBuf>,
 }
 
-/// The layout a new persisted shard gets.
+/// How a persisted shard seals and maps its segments.
 pub(super) struct Storage {
-    pub(super) layout: crate::node::Layout,
     pub(super) seal_tail_docs: u32,
     pub(super) vector_mmap: bool,
 }
@@ -58,17 +57,7 @@ pub(super) fn resolve_storage(o: Options, file: &FileConfig) -> Result<Storage, 
             ))
         }
     };
-    let layout = match o.text("layout", file.layout.as_deref()).as_deref() {
-        None | Some("segments") => crate::node::Layout::Segments,
-        Some("single-image") => crate::node::Layout::SingleImage,
-        Some(other) => {
-            return Err(format!(
-                "--layout={other:?} is not a layout; use segments (the default) or single-image"
-            ))
-        }
-    };
     Ok(Storage {
-        layout,
         seal_tail_docs: o.value_or("seal-tail-docs", file.seal_tail_docs, 500_000)?,
         vector_mmap,
     })

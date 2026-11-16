@@ -155,7 +155,7 @@ async fn unsigned_filters_agree_across_monolithic_distributed_and_segmented_sear
     use pipestream_search::{
         analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND},
         coordinator::CoordinatorServiceImpl,
-        node::{Layout, NodeConfig},
+        node::NodeConfig,
         pb,
     };
     let values = [
@@ -210,7 +210,7 @@ async fn unsigned_filters_agree_across_monolithic_distributed_and_segmented_sear
         ("f > 18446744073709551615u", vec![7, 8]),
         ("m[\"x\"] > 18446744073709551615u", vec![7, 8]),
     ];
-    for mode in ["heap", "mapped", "segmented"] {
+    for mode in ["heap", "segmented"] {
         let segmented = mode == "segmented";
         let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
             .join(format!("unsigned_filters_{mode}_{}", std::process::id()));
@@ -220,11 +220,6 @@ async fn unsigned_filters_agree_across_monolithic_distributed_and_segmented_sear
         for (part, range) in [0..10, 0..5, 5..10].into_iter().enumerate() {
             let config = NodeConfig {
                 index_path: (mode != "heap").then(|| dir.join(format!("shard-{part}.tv"))),
-                layout: if segmented {
-                    Layout::Segments
-                } else {
-                    Layout::SingleImage
-                },
                 seal_tail_docs: 2,
                 slot_offset: if part == 2 { 1000 } else { 0 },
                 analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),

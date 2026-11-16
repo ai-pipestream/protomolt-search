@@ -262,7 +262,7 @@ pub async fn start_empty_node(
 pub async fn start_opened_node(
     config: NodeConfig,
 ) -> (String, JoinHandle<Result<(), TransportError>>) {
-    let node = NodeServiceImpl::open(config, None, false).expect("reopen the shard");
+    let node = NodeServiceImpl::open(config, None).expect("reopen the shard");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
     node.spawn_floor_listener(addr);

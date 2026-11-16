@@ -69,18 +69,10 @@ impl StringBounds<'_> {
     }
 }
 
-fn unordered(what: String) -> Status {
-    Status::failed_precondition(format!(
-        "{what} was written with a first-seen (unordered) dictionary; string ordering \
-         and prefixes need a dictionary in byte order, which this version writes at \
-         flush — rebuild or reshard the generation"
-    ))
-}
-
 impl Bm25Shard {
     /// Resolve a string range or prefix over a facet or map-facet column to a
-    /// contiguous ordinal range when byte-sorted (refusing unordered resident
-    /// files) or to an explicit ordinal set on unsorted heap builders.
+    /// contiguous ordinal range when byte-sorted, or to an explicit ordinal
+    /// set on unsorted heap builders.
     pub(in crate::node) fn resolve_string_predicate(
         &self,
         column: &str,
@@ -111,17 +103,6 @@ impl Bm25Shard {
         let (dict, sorted) = match self {
             Bm25Shard::Building(s) => (s.facet_dictionary(fi), s.facet_dictionary_sorted(fi)),
             Bm25Shard::Segmented(g) => (g.facet_dictionary(fi), g.facet_dictionary_sorted(fi)),
-            Bm25Shard::Resident(r) => {
-                if !r.facet_dictionary_sorted(fi) {
-                    return Err(unordered(format!("facet column {column:?}")));
-                }
-                (r.facet_dictionary(fi), true)
-            }
-            Bm25Shard::Spilling(_) => {
-                return Err(Status::failed_precondition(
-                    "bm25 bulk build in progress; Flush first",
-                ))
-            }
         };
         Ok(if sorted {
             let (lo, hi) = bounds.ord_range(dict);
@@ -157,17 +138,6 @@ impl Bm25Shard {
         let (dict, sorted) = match self {
             Bm25Shard::Building(s) => (s.map_facet_values(ci), s.map_facet_values_sorted(ci)),
             Bm25Shard::Segmented(g) => (g.map_facet_values(ci), g.map_facet_values_sorted(ci)),
-            Bm25Shard::Resident(r) => {
-                if !r.map_facet_values_sorted(ci) {
-                    return Err(unordered(format!("map-facet column {column:?} (values)")));
-                }
-                (r.map_facet_values(ci), true)
-            }
-            Bm25Shard::Spilling(_) => {
-                return Err(Status::failed_precondition(
-                    "bm25 bulk build in progress; Flush first",
-                ))
-            }
         };
         Ok(if sorted {
             let (lo, hi) = bounds.ord_range(dict);

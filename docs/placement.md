@@ -291,9 +291,7 @@ fields, columns, text, vectors and identities
 sources must be flushed (an unsealed tail is refused by name), and they
 must share one field table, one analysis fingerprint per field, and one
 set of column tables. The split is offline: no live cutoff is recorded,
-so the sources must be quiescent. `--single-image=<max child rows>`
-writes one image per child instead, the shape the other splits write,
-and refuses a child above the bound before writing anything. Under the
+so the sources must be quiescent. Under the
 hash cut a segment covers one hash bucket of the band, not a year range,
 so the year cut inside a leaf is `CompactShard` with `partition_column`
 on the served child (`docs/segment-pruning.md`); `--cut-column=year

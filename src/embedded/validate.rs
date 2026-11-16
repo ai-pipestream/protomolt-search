@@ -8,9 +8,7 @@ use super::{
     EmbeddedDocumentCatalogConfig, EmbeddedError, EmbeddedSearchConfig, EmbeddedShardConfig,
 };
 use crate::analyzer::NATIVE_ANALYSIS_BACKEND;
-use crate::node::{
-    bm25_sidecar_path, exact_vector_sidecar_path, generation_dir, live_docs_sidecar_path,
-};
+use crate::node::{exact_vector_sidecar_path, live_docs_sidecar_path, segments_root};
 
 pub(super) fn validate_config(config: &mut EmbeddedSearchConfig) -> Result<(), EmbeddedError> {
     validate_limits(config)?;
@@ -95,12 +93,9 @@ fn validate_catalog_separation(
     if let (Some(path), Some(index)) = (catalog_path, &shard_config.node.index_path) {
         for artifact in [
             index.clone(),
-            bm25_sidecar_path(index),
-            crate::node::bm25_build_dir(&bm25_sidecar_path(index)),
             exact_vector_sidecar_path(index),
             live_docs_sidecar_path(index),
-            generation_dir(index),
-            crate::node::segments_root(index),
+            segments_root(index),
             crate::compaction::default_work_dir(index),
             crate::compaction::marker_path(index),
             crate::wal::wal_dir(index),
@@ -157,10 +152,9 @@ fn canonical_storage_path(path: &Path) -> Result<PathBuf, EmbeddedError> {
 pub(super) fn first_existing_artifact(index_path: &Path) -> Option<PathBuf> {
     [
         index_path.to_path_buf(),
-        bm25_sidecar_path(index_path),
         exact_vector_sidecar_path(index_path),
         live_docs_sidecar_path(index_path),
-        generation_dir(index_path),
+        segments_root(index_path),
         crate::wal::wal_dir(index_path),
     ]
     .into_iter()

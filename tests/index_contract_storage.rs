@@ -228,103 +228,99 @@ fn empty_segment_catalog_retains_and_validates_explicit_policy() {
 #[tokio::test]
 async fn empty_binding_recovers_from_synced_wal_without_an_index_image() {
     use pb::node_service_client::NodeServiceClient;
-    use pipestream_search::node::{Layout, NodeConfig};
+    use pipestream_search::node::NodeConfig;
     let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("index_contract_replay_{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
-    for layout in [Layout::SingleImage, Layout::Segments] {
-        let path = root.join(format!("{layout:?}.tv"));
-        let config = NodeConfig {
-            index_path: Some(path.clone()),
-            layout,
-            wal: true,
-            analysis_addr: Some(pipestream_search::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
-            integer_fields: vec!["id".into()],
-            ..Default::default()
-        };
-        use pipestream_search::wal::{self, WalManifest, WalWriter};
-        let mut writer = WalWriter::create(
-            &wal::wal_dir(&path),
-            WalManifest {
-                collection: String::new(),
-                dim: 16,
-                vector_backend: String::new(),
-                vector_config_format: String::new(),
-                vector_config_payload: Vec::new(),
-                slot_offset: 0,
-                generation: 0,
-                bucket_bits: 2,
-                bucket_count: 4,
-                preexisting_vectors: 0,
-                preexisting_documents: 0,
-                format_version: wal::FORMAT_VERSION,
-                derived_fingerprint: String::new(),
-                derived: Vec::new(),
-                columns: None,
-            },
-        )
+    let path = root.join("segments.tv");
+    let config = NodeConfig {
+        index_path: Some(path.clone()),
+        wal: true,
+        analysis_addr: Some(pipestream_search::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
+        integer_fields: vec!["id".into()],
+        ..Default::default()
+    };
+    use pipestream_search::wal::{self, WalManifest, WalWriter};
+    let mut writer = WalWriter::create(
+        &wal::wal_dir(&path),
+        WalManifest {
+            collection: String::new(),
+            dim: 16,
+            vector_backend: String::new(),
+            vector_config_format: String::new(),
+            vector_config_payload: Vec::new(),
+            slot_offset: 0,
+            generation: 0,
+            bucket_bits: 2,
+            bucket_count: 4,
+            preexisting_vectors: 0,
+            preexisting_documents: 0,
+            format_version: wal::FORMAT_VERSION,
+            derived_fingerprint: String::new(),
+            derived: Vec::new(),
+            columns: None,
+        },
+    )
+    .unwrap();
+    let binding = binding();
+    let request = pb::ApplyWalBindingRequest {
+        plan_fingerprint: binding.plan_fingerprint.clone(),
+        body_path: binding.body_path.clone(),
+        vector_binding: binding.vector_binding.clone(),
+        index_contract: binding.index_contract.clone(),
+        ..Default::default()
+    };
+    let generation =
+        pipestream_search::reshard::resolve_gen(&pipestream_search::wal::wal_dir(&path)).unwrap();
+    let logged = pb::wal::LoggedBinding {
+        plan_fingerprint: binding.plan_fingerprint.clone(),
+        body_path: binding.body_path.clone(),
+        vector_binding: binding.vector_binding.clone(),
+        index_contract: binding.index_contract.clone(),
+        ..Default::default()
+    };
+    let mut invalid = logged.clone();
+    invalid.index_contract.extend([8, 1]);
+    assert!(writer
+        .append(pb::wal::wal_record::Op::Bind(invalid))
+        .is_err());
+    writer.flush().unwrap();
+    assert!(wal::read_clocked_records(&generation, 0)
+        .unwrap()
+        .is_empty());
+    writer
+        .append(pb::wal::wal_record::Op::Bind(logged))
         .unwrap();
-        let binding = binding();
-        let request = pb::ApplyWalBindingRequest {
-            plan_fingerprint: binding.plan_fingerprint.clone(),
-            body_path: binding.body_path.clone(),
-            vector_binding: binding.vector_binding.clone(),
-            index_contract: binding.index_contract.clone(),
-            ..Default::default()
-        };
-        let generation =
-            pipestream_search::reshard::resolve_gen(&pipestream_search::wal::wal_dir(&path))
-                .unwrap();
-        let logged = pb::wal::LoggedBinding {
-            plan_fingerprint: binding.plan_fingerprint.clone(),
-            body_path: binding.body_path.clone(),
-            vector_binding: binding.vector_binding.clone(),
-            index_contract: binding.index_contract.clone(),
-            ..Default::default()
-        };
-        let mut invalid = logged.clone();
-        invalid.index_contract.extend([8, 1]);
-        assert!(writer
-            .append(pb::wal::wal_record::Op::Bind(invalid))
-            .is_err());
-        writer.flush().unwrap();
-        assert!(wal::read_clocked_records(&generation, 0)
-            .unwrap()
-            .is_empty());
-        writer
-            .append(pb::wal::wal_record::Op::Bind(logged))
-            .unwrap();
-        // Sync only the WAL: no node Flush and no index image may mask recovery.
-        writer.flush().unwrap();
-        drop(writer);
-        assert!(!path.exists());
-        assert!(!path.with_extension("bm25").exists());
-        let records = wal::read_clocked_records(&generation, 0).unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].clock, 1);
-        let (address, server) = common::start_opened_node(config).await;
-        let mut client = NodeServiceClient::connect(address).await.unwrap();
-        let acknowledged = client
-            .apply_wal_binding(request.clone())
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(acknowledged.already_bound);
-        assert_eq!(acknowledged.index_contract, request.index_contract);
-        assert_eq!(
-            pipestream_search::reshard::read_generation_binding(&generation).unwrap(),
-            Some(binding)
-        );
-        let mut missing = request;
-        missing.index_contract.clear();
-        assert_eq!(
-            client.apply_wal_binding(missing).await.unwrap_err().code(),
-            tonic::Code::FailedPrecondition
-        );
-        drop(client);
-        server.abort();
-        let _ = server.await;
-    }
+    // Sync only the WAL: no node Flush and no index image may mask recovery.
+    writer.flush().unwrap();
+    drop(writer);
+    assert!(!path.exists());
+    assert!(!path.with_extension("bm25").exists());
+    let records = wal::read_clocked_records(&generation, 0).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].clock, 1);
+    let (address, server) = common::start_opened_node(config).await;
+    let mut client = NodeServiceClient::connect(address).await.unwrap();
+    let acknowledged = client
+        .apply_wal_binding(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(acknowledged.already_bound);
+    assert_eq!(acknowledged.index_contract, request.index_contract);
+    assert_eq!(
+        pipestream_search::reshard::read_generation_binding(&generation).unwrap(),
+        Some(binding)
+    );
+    let mut missing = request;
+    missing.index_contract.clear();
+    assert_eq!(
+        client.apply_wal_binding(missing).await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+    drop(client);
+    server.abort();
+    let _ = server.await;
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -395,22 +391,20 @@ where
 async fn replication_requires_policy_acknowledgment_and_persists_it_on_empty_receivers() {
     use pb::node_service_client::NodeServiceClient;
     use pipestream_search::{
-        node::{Layout, NodeConfig, NodeServiceImpl},
+        node::{NodeConfig, NodeServiceImpl},
         replication::{sync_once, ReplicaCursor},
     };
     let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("index_contract_replication_{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
-    let config = |name: &str, layout| NodeConfig {
+    let config = |name: &str| NodeConfig {
         index_path: Some(root.join(format!("{name}.tv"))),
-        layout,
         wal: true,
         analysis_addr: Some(pipestream_search::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
         integer_fields: vec!["id".into()],
         ..Default::default()
     };
-    let (primary, primary_server) =
-        common::start_empty_node(config("primary", Layout::SingleImage)).await;
+    let (primary, primary_server) = common::start_empty_node(config("primary")).await;
     let mut source = NodeServiceClient::connect(primary.clone()).await.unwrap();
     let binding = binding();
     let request = pb::ApplyWalBindingRequest {
@@ -426,7 +420,7 @@ async fn replication_requires_policy_acknowledgment_and_persists_it_on_empty_rec
     let volatile_config = NodeConfig {
         index_path: None,
         wal: false,
-        ..config("volatile", Layout::SingleImage)
+        ..config("volatile")
     };
     let (replica, volatile_server) = common::start_empty_node(volatile_config).await;
     let error = sync_once(&ReplicaCursor {
@@ -442,7 +436,7 @@ async fn replication_requires_policy_acknowledgment_and_persists_it_on_empty_rec
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let old_address = format!("http://{}", listener.local_addr().unwrap());
-    let old_config = config("old", Layout::SingleImage);
+    let old_config = config("old");
     let old_node = NodeServiceImpl::new(None, old_config.clone());
     let omit_policy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let old_server = tokio::spawn(
@@ -467,10 +461,15 @@ async fn replication_requires_policy_acknowledgment_and_persists_it_on_empty_rec
     // Retry against the same already-bound receiver once it acknowledges the
     // policy. Its first application was accepted but never flushed. A cursor
     // may advance only after this retry makes that state durable.
-    assert!(
-        !pipestream_search::node::bm25_sidecar_path(old_config.index_path.as_ref().unwrap())
-            .exists()
-    );
+    let catalog_binding = |path: &std::path::Path| {
+        pipestream_search::segments::OpenedSegmentSet::open(pipestream_search::node::segments_root(
+            path,
+        ))
+        .ok()
+        .and_then(|set| set.binding().cloned())
+    };
+    let old_path = old_config.index_path.clone().unwrap();
+    assert_eq!(catalog_binding(&old_path), None);
     omit_policy.store(false, std::sync::atomic::Ordering::SeqCst);
     let retry = sync_once(&ReplicaCursor {
         primary: primary.clone(),
@@ -480,76 +479,70 @@ async fn replication_requires_policy_acknowledgment_and_persists_it_on_empty_rec
     .await
     .unwrap();
     assert!(retry.clock > 0);
-    let persisted = Bm25Store::load(&pipestream_search::node::bm25_sidecar_path(
-        old_config.index_path.as_ref().unwrap(),
-    ))
-    .expect(
-        "successful catch-up must flush previously accepted bindings before advancing its cursor",
+    assert_eq!(
+        catalog_binding(&old_path),
+        Some(binding.clone()),
+        "successful catch-up must flush previously accepted bindings before advancing its cursor"
     );
-    assert_eq!(persisted.binding(), Some(&binding));
-    drop(persisted);
     old_server.abort();
     let _ = old_server.await;
 
-    for layout in [Layout::SingleImage, Layout::Segments] {
-        let config = config(&format!("target-{layout:?}"), layout);
-        let (replica, server) = common::start_empty_node(config.clone()).await;
-        let cursor = sync_once(&ReplicaCursor {
-            primary: primary.clone(),
-            replica,
+    let config = config("target-segments");
+    let (replica, server) = common::start_empty_node(config.clone()).await;
+    let cursor = sync_once(&ReplicaCursor {
+        primary: primary.clone(),
+        replica,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert!(cursor.clock > 0);
+    assert_eq!(sync_once(&cursor).await.unwrap(), cursor);
+    // A snapshot receiver has no WAL fallback: the image/catalog itself
+    // must carry the policy even when no source rows exist.
+    let snapshot_config = NodeConfig {
+        index_path: Some(root.join("snapshot-segments.tv")),
+        wal: false,
+        ..config.clone()
+    };
+    let (snapshot_addr, snapshot_server) = common::start_empty_node(snapshot_config.clone()).await;
+    pipestream_search::snapshot::install_snapshot_from(
+        &snapshot_addr,
+        pb::InstallSnapshotFromRequest {
+            source: Some(pb::install_snapshot_from_request::Source::PeerAddr(
+                cursor.replica.clone(),
+            )),
             ..Default::default()
-        })
+        },
+    )
+    .await
+    .unwrap();
+    snapshot_server.abort();
+    let _ = snapshot_server.await;
+    let snapshot = NodeServiceImpl::open(snapshot_config, None).unwrap();
+    use pb::node_service_server::NodeService;
+    let response = snapshot
+        .apply_wal_binding(tonic::Request::new(request.clone()))
         .await
-        .unwrap();
-        assert!(cursor.clock > 0);
-        assert_eq!(sync_once(&cursor).await.unwrap(), cursor);
-        // A snapshot receiver has no WAL fallback: the image/catalog itself
-        // must carry the policy even when no source rows exist.
-        let snapshot_config = NodeConfig {
-            index_path: Some(root.join(format!("snapshot-{layout:?}.tv"))),
-            wal: false,
-            ..config.clone()
-        };
-        let (snapshot_addr, snapshot_server) =
-            common::start_empty_node(snapshot_config.clone()).await;
-        pipestream_search::snapshot::install_snapshot_from(
-            &snapshot_addr,
-            pb::InstallSnapshotFromRequest {
-                source: Some(pb::install_snapshot_from_request::Source::PeerAddr(
-                    cursor.replica.clone(),
-                )),
-                ..Default::default()
-            },
-        )
+        .unwrap()
+        .into_inner();
+    assert!(response.already_bound);
+    assert_eq!(response.index_contract, binding.index_contract);
+    drop(snapshot);
+    server.abort();
+    let _ = server.await;
+    let (address, server) = common::start_opened_node(config).await;
+    let mut target = NodeServiceClient::connect(address).await.unwrap();
+    let response = target
+        .apply_wal_binding(request.clone())
         .await
-        .unwrap();
-        snapshot_server.abort();
-        let _ = snapshot_server.await;
-        let snapshot = NodeServiceImpl::open(snapshot_config, None, false).unwrap();
-        use pb::node_service_server::NodeService;
-        let response = snapshot
-            .apply_wal_binding(tonic::Request::new(request.clone()))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(response.already_bound);
-        assert_eq!(response.index_contract, binding.index_contract);
-        drop(snapshot);
-        server.abort();
-        let _ = server.await;
-        let (address, server) = common::start_opened_node(config).await;
-        let mut target = NodeServiceClient::connect(address).await.unwrap();
-        let response = target
-            .apply_wal_binding(request.clone())
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(response.already_bound);
-        assert_eq!(response.index_contract, binding.index_contract);
-        drop(target);
-        server.abort();
-        let _ = server.await;
-    }
+        .unwrap()
+        .into_inner();
+    assert!(response.already_bound);
+    assert_eq!(response.index_contract, binding.index_contract);
+    drop(target);
+    server.abort();
+    let _ = server.await;
     drop(source);
     primary_server.abort();
     let _ = primary_server.await;

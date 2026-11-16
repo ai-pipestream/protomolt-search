@@ -303,7 +303,7 @@ fn chunks_are_explicit_and_do_not_enable_arbitrary_repeated_traversal() {
 
 #[tokio::test]
 async fn explicit_policy_crosses_rpc_bind_and_persistent_source_boundaries() {
-    use pipestream_search::node::{Layout, NodeConfig};
+    use pipestream_search::node::NodeConfig;
     use pipestream_search::pb::node_service_client::NodeServiceClient;
     use pipestream_search::pb::search_service_server::SearchService;
     let bytes = schema();
@@ -337,7 +337,6 @@ async fn explicit_policy_crosses_rpc_bind_and_persistent_source_boundaries() {
     let path = root.join("shard.tv");
     let config = NodeConfig {
         index_path: Some(path.clone()),
-        layout: Layout::SingleImage,
         wal: true,
         analysis_addr: Some(pipestream_search::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
         facet_fields: vec!["left_value".into()],
@@ -440,10 +439,9 @@ async fn explicit_policy_crosses_rpc_bind_and_persistent_source_boundaries() {
         .into_inner();
     assert_eq!(found.hits.len(), 2);
     client.flush(pb::FlushRequest {}).await.unwrap();
-    let before = pipestream_search::postings::Bm25Store::load(
-        &pipestream_search::node::bm25_sidecar_path(&path),
-    )
-    .unwrap();
+    let before =
+        pipestream_search::postings::Bm25Store::load(&common::catalog::segment_bm25(&path, 0))
+            .unwrap();
     assert!(
         before.document_identity(1).is_none(),
         "mapping a source id does not invent catalog identity"
@@ -467,10 +465,9 @@ async fn explicit_policy_crosses_rpc_bind_and_persistent_source_boundaries() {
     drop(coordinator);
     server.abort();
     let _ = server.await;
-    let stored = pipestream_search::postings::Bm25Store::load(
-        &pipestream_search::node::generation_bm25(&pipestream_search::node::generation_dir(&path)),
-    )
-    .unwrap();
+    let stored =
+        pipestream_search::postings::Bm25Store::load(&common::catalog::segment_bm25(&path, 0))
+            .unwrap();
     assert_eq!(
         stored.protobuf_source(0).unwrap().unwrap().0.payload,
         retained
@@ -526,9 +523,10 @@ async fn explicit_policy_crosses_rpc_bind_and_persistent_source_boundaries() {
     .unwrap()
     .unwrap();
     assert_eq!(output.children.len(), 1);
-    let child = pipestream_search::postings::Bm25Store::load(
-        output.children[0].bm25_path.as_ref().unwrap(),
-    )
+    let child = pipestream_search::postings::Bm25Store::load(&common::catalog::segment_bm25(
+        &output.children[0].vector_path,
+        0,
+    ))
     .unwrap();
     assert_eq!(child.binding(), stored.binding());
     assert_eq!(

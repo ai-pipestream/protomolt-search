@@ -76,30 +76,6 @@ fn facet_and_numeric_tables_refuse_repeats_and_overlap() {
 }
 
 #[test]
-fn allow_missing_bm25_is_off_unless_asked_for() {
-    // The default has to be the strict one: a shard silently serving
-    // no postings is the failure this exists to catch, and a default
-    // of "permit" would mean the check never fires where it matters.
-    assert!(!parse(&args(&NODE)).unwrap().allow_missing_bm25);
-    assert!(
-        parse(&with(&NODE, &["--allow-missing-bm25"]))
-            .unwrap()
-            .allow_missing_bm25,
-        "the bare flag must work; an operator will not write =true"
-    );
-    assert!(
-        parse(&with(&NODE, &["--allow-missing-bm25=true"]))
-            .unwrap()
-            .allow_missing_bm25
-    );
-    assert!(
-        !parse(&with(&NODE, &["--allow-missing-bm25=false"]))
-            .unwrap()
-            .allow_missing_bm25
-    );
-}
-
-#[test]
 fn bm25_fields_default_body_and_validation() {
     assert_eq!(parse(&args(&NODE)).unwrap().bm25_fields, ["body"]);
     let cfg = parse(&with(&NODE, &["--bm25-fields=body, case_name"])).unwrap();

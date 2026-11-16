@@ -9,7 +9,7 @@ use std::sync::Arc;
 use common::start_empty_node;
 use pipestream_search::analyzer::{body_spec, SessionLayers, NATIVE_ANALYSIS_BACKEND};
 use pipestream_search::derived::{spec_from_config, Declaration, DerivedColumnConfig};
-use pipestream_search::node::{Layout, NodeConfig};
+use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::wal::{wal_record, FlushMarker, LoggedAddDocuments, LoggedAddVectors};
 use pipestream_search::pb::{
@@ -270,7 +270,6 @@ async fn sealed_source(dir: &Path, n: usize, derived: Option<Arc<Declaration>>) 
     let (addr, handle) = start_empty_node(NodeConfig {
         index_path: Some(index_path.clone()),
         analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
-        layout: Layout::Segments,
         seal_tail_docs: 8,
         wal: true,
         wal_buckets: 4,

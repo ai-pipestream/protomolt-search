@@ -2,11 +2,6 @@
 
 use crate::node::*;
 
-struct RecoveredOpenPaths {
-    generation: Option<PathBuf>,
-    declared_generation: bool,
-}
-
 struct LoadedArtifacts {
     index: Option<VectorIndex>,
     exact_vectors: Option<ExactVectorStore>,
@@ -14,56 +9,47 @@ struct LoadedArtifacts {
     live_docs: LiveDocs,
 }
 
-fn recover_open_paths(config: &NodeConfig) -> Result<RecoveredOpenPaths, String> {
+/// Recover an interrupted catalog swap and compaction cutover, then refuse
+/// a source-managed catalog opened under another collection or with a WAL.
+/// Returns whether the catalog declares its generation.
+fn recover_open_paths(config: &NodeConfig) -> Result<bool, String> {
     let Some(path) = config.index_path.as_ref() else {
-        return Ok(RecoveredOpenPaths {
-            generation: None,
-            declared_generation: false,
-        });
+        return Ok(false);
     };
-    refuse_retired_generation(path)?;
     recover_segments_swap(path)
         .map_err(|error| format!("recover segment catalog swap {}: {error}", path.display()))?;
-    let mut declared_generation = false;
-    if let Some(manifest) = crate::segments::SegmentCatalog::read_manifest(&segments_root(path))? {
-        declared_generation = manifest.generation_declaration.is_some();
-        if let Some(owner) = &manifest.source_owner {
-            let owner = owner.decode()?;
-            if owner.collection != config.collection
-                || config.wal
-                || config.layout != Layout::Segments
-                || probe_path_exists(&generation_dir(path), "snapshot generation")?
-                || probe_path_exists(&generation_old_dir(path), "snapshot backup")?
-            {
-                return Err("source-managed index requires its original collection, segmented layout, WAL disabled and no competing snapshot generation".into());
-            }
+    crate::compaction::recover_interrupted(path);
+    let Some(manifest) = crate::segments::SegmentCatalog::read_manifest(&segments_root(path))?
+    else {
+        return Ok(false);
+    };
+    if let Some(owner) = &manifest.source_owner {
+        let owner = owner.decode()?;
+        if owner.collection != config.collection || config.wal {
+            return Err(
+                "source-managed index requires its original collection and WAL disabled".into(),
+            );
         }
     }
-    let generation = try_recover_generation(path).map_err(|error| error.to_string())?;
-    Ok(RecoveredOpenPaths {
-        generation,
-        declared_generation,
-    })
+    Ok(manifest.generation_declaration.is_some())
 }
 
+/// The empty tail image a flush persists at the index path so a catalog
+/// without sealed vectors keeps its dimension and calibration.
 fn load_root_vector_index(
     config: &NodeConfig,
-    recovered: &RecoveredOpenPaths,
+    declared_generation: bool,
 ) -> Result<Option<VectorIndex>, String> {
-    if recovered.declared_generation {
+    if declared_generation {
         return Ok(None);
     }
-    let Some(index_path) = config.index_path.as_ref() else {
+    let Some(path) = config.index_path.as_ref() else {
         return Ok(None);
     };
-    let path = recovered
-        .generation
-        .as_ref()
-        .map_or_else(|| index_path.clone(), |dir| generation_vector(dir));
-    if !probe_path_exists(&path, "vector index")? {
+    if !probe_path_exists(path, "vector index")? {
         return Ok(None);
     }
-    let mut loaded = VectorIndex::load(&config.vector_backend, &path)
+    let mut loaded = VectorIndex::load(&config.vector_backend, path)
         .map_err(|error| format!("load {}: {error}", path.display()))?;
     loaded
         .prepare()
@@ -84,9 +70,10 @@ fn open_segmented_layout(
     let set = shard.snapshot().clone();
     if let Some(owner) = &set.manifest().source_owner {
         let owner = owner.decode()?;
-        if owner.collection != config.collection || config.wal || config.layout != Layout::Segments
-        {
-            return Err("source-managed index requires its original collection, segmented layout and WAL disabled".into());
+        if owner.collection != config.collection || config.wal {
+            return Err(
+                "source-managed index requires its original collection and WAL disabled".into(),
+            );
         }
     }
     let declared_backend = set
@@ -119,10 +106,19 @@ fn open_segmented_layout(
         index = Some(VectorIndex::from_provider(provider));
     } else if declared_generation {
         index = None;
-    } else if index.as_ref().is_some_and(VectorIndex::is_empty) {
-        exact_vectors = Some(ExactVectorStore::empty(
-            index.as_ref().and_then(VectorIndex::dim_opt),
-        ));
+    } else if let Some(image) = index.take() {
+        if !image.is_empty() {
+            return Err(format!(
+                "the vector image at the index path holds {} rows outside the segment catalog \
+                 {}; vectors live only in sealed segments and their tail",
+                image.len(),
+                root.display(),
+            ));
+        }
+        exact_vectors = Some(ExactVectorStore::empty(image.dim_opt()));
+        let provider = SegmentedProvider::adopt(set, image)
+            .map_err(|error| format!("segment tail image: {error}"))?;
+        index = Some(VectorIndex::from_provider(provider));
     } else if probe_path_exists(exact_path, "exact vector sidecar")? {
         exact_vectors = Some(
             ExactVectorStore::open(exact_path)
@@ -132,14 +128,8 @@ fn open_segmented_layout(
     Ok((index, exact_vectors, Bm25Shard::Segmented(shard)))
 }
 
-fn open_persisted_live_docs(
-    index_path: &Path,
-    generation: Option<&PathBuf>,
-) -> Result<LiveDocs, String> {
-    let live_path = generation.map_or_else(
-        || live_docs_sidecar_path(index_path),
-        |dir| generation_live_docs(dir),
-    );
+fn open_persisted_live_docs(index_path: &Path) -> Result<LiveDocs, String> {
+    let live_path = live_docs_sidecar_path(index_path);
     if !probe_path_exists(&live_path, "live-docs sidecar")? {
         return Ok(LiveDocs::default());
     }
@@ -148,84 +138,34 @@ fn open_persisted_live_docs(
 
 fn load_persisted_artifacts(
     config: &NodeConfig,
-    recovered: &RecoveredOpenPaths,
-    mut index: Option<VectorIndex>,
-    allow_missing_bm25: bool,
+    declared_generation: bool,
+    index: Option<VectorIndex>,
 ) -> Result<LoadedArtifacts, String> {
-    let mut exact_vectors = None;
-    let mut bm25 = None;
     let Some(index_path) = config.index_path.as_ref() else {
         return Ok(LoadedArtifacts {
             index,
-            exact_vectors,
-            bm25,
+            exact_vectors: None,
+            bm25: None,
             live_docs: LiveDocs::default(),
         });
     };
-    let (_, exact_path, bm25_path) = storage_paths(index_path, recovered.generation.as_ref());
-    let root = segments_root(index_path);
-    let catalog_exists =
-        probe_path_exists(&root.join("segments.json"), "segment catalog manifest")?;
-    if probe_path_exists(&exact_path, "exact vector sidecar")?
-        && (!catalog_exists || recovered.generation.is_some())
-    {
-        exact_vectors = Some(
-            ExactVectorStore::open(&exact_path)
-                .map_err(|error| format!("load {}: {error}", exact_path.display()))?,
-        );
-    }
-    let build_dir = bm25_build_dir(&bm25_path);
-    let build_dir_exists = probe_path_exists(&build_dir, "BM25 build directory")?;
-    if probe_path_exists(&bm25_path, "BM25 sidecar")? {
-        if catalog_exists && recovered.generation.is_none() {
-            return Err(format!(
-                "{} has both a single-image file and a segment catalog at {}; a shard has \
-                 one layout, and nothing converts on open",
-                bm25_path.display(),
-                root.display()
-            ));
-        }
-        bm25 = Some(
-            Bm25Shard::open(&bm25_path)
-                .map_err(|error| format!("load {}: {error}", bm25_path.display()))?,
-        );
-    } else if recovered.generation.is_none()
-        && (catalog_exists
-            || (config.layout == Layout::Segments && !build_dir_exists && index.is_none()))
-    {
-        let (seg_idx, seg_exact, seg_bm25) = open_segmented_layout(
-            config,
-            &root,
-            &exact_path,
-            recovered.declared_generation,
-            index,
-        )?;
-        index = seg_idx;
-        exact_vectors = seg_exact;
-        bm25 = Some(seg_bm25);
-    } else if build_dir_exists && !allow_missing_bm25 {
-        return Err(format!(
-            "BM25 build directory {} exists but {} does not. The bulk build was \
-             interrupted; this shard would answer lexical queries with silence, \
-             which is indistinguishable from a corpus that genuinely lacks those \
-             terms. Re-run ingest for this shard, or pass --allow-missing-bm25 to \
-             serve it vector-only on purpose.",
-            build_dir.display(),
-            bm25_path.display()
-        ));
-    }
-    let live_docs = open_persisted_live_docs(index_path, recovered.generation.as_ref())?;
+    let (index, exact_vectors, bm25) = open_segmented_layout(
+        config,
+        &segments_root(index_path),
+        &exact_vector_sidecar_path(index_path),
+        declared_generation,
+        index,
+    )?;
     Ok(LoadedArtifacts {
         index,
         exact_vectors,
-        bm25,
-        live_docs,
+        bm25: Some(bm25),
+        live_docs: open_persisted_live_docs(index_path)?,
     })
 }
 
 fn load_retained_vectors(
     config: &NodeConfig,
-    generation: Option<&PathBuf>,
     artifacts: &LoadedArtifacts,
 ) -> Result<crate::multi_res::MultiResVectors, String> {
     let Some(path) = config.index_path.as_ref() else {
@@ -237,7 +177,7 @@ fn load_retained_vectors(
             .as_ref()
             .map_or(0, |s| s.next_doc_id() as usize),
     );
-    let payload = crate::multi_res::storage_path(path, generation);
+    let payload = crate::multi_res::sidecar_path(path);
     let multi_res_vectors = if let Some(provider) =
         artifacts.index.as_ref().and_then(VectorIndex::as_segmented)
     {
@@ -262,23 +202,19 @@ fn load_retained_vectors(
 }
 
 impl NodeServiceImpl {
-    /// Open a local shard using the same persisted-generation rules as the
-    /// network server. A missing vector/BM25 image starts an empty shard;
-    /// an unfinished BM25 spill is refused unless the caller explicitly
-    /// allows a vector-only recovery.
+    /// Open a local shard using the same persisted-catalog rules as the
+    /// network server. A path without a catalog starts an empty one.
     pub fn open(
         mut config: NodeConfig,
         phrase_index: Option<Arc<crate::phrases::PhraseIndex>>,
-        allow_missing_bm25: bool,
     ) -> Result<Self, String> {
         declare_placement_column(&mut config);
         declare_derived_columns(&mut config)?;
         check_placement_columns(&config)?;
         validate_column_tables(&config)?;
-        let recovered = recover_open_paths(&config)?;
-        let root_index = load_root_vector_index(&config, &recovered)?;
-        let artifacts =
-            load_persisted_artifacts(&config, &recovered, root_index, allow_missing_bm25)?;
+        let declared_generation = recover_open_paths(&config)?;
+        let root_index = load_root_vector_index(&config, declared_generation)?;
+        let artifacts = load_persisted_artifacts(&config, declared_generation, root_index)?;
         if let Some(store) = artifacts.bm25.as_ref() {
             check_attached_derived(&config, store.derived(), store.doc_count(), "the store")?;
         }
@@ -294,8 +230,7 @@ impl NodeServiceImpl {
                 ));
             }
         }
-        let multi_res_vectors =
-            load_retained_vectors(&config, recovered.generation.as_ref(), &artifacts)?;
+        let multi_res_vectors = load_retained_vectors(&config, &artifacts)?;
         let LoadedArtifacts {
             index,
             exact_vectors,
@@ -306,8 +241,7 @@ impl NodeServiceImpl {
             .with_bm25(bm25)
             .with_exact_vectors(exact_vectors)?
             .with_live_docs(live_docs)?
-            .with_phrase_index(phrase_index)
-            .with_generation(recovered.generation);
+            .with_phrase_index(phrase_index);
         write_shard(&service.state).multi_res_vectors = multi_res_vectors;
         Ok(service)
     }

@@ -8,7 +8,6 @@ use crate::pb::{ClusterPlan, PlacementAction};
 use crate::replication::{LiveChild, LiveReshardState};
 use crate::reshard::{ChildImage, StableReshardOutput};
 
-use super::super::state::move_image_file;
 use super::super::{NodeAgent, PlacedShard, SplitChild, SplitState};
 use super::{Split, SplitSource};
 
@@ -154,7 +153,7 @@ impl NodeAgent {
         .map_err(|e| format!("split build task: {e}"))?
     }
 
-    /// Move one child's built image into its shard directory and serve it.
+    /// Move one child's built catalog into its shard directory and serve it.
     async fn place_split_child(
         &self,
         child: &SplitChild,
@@ -164,14 +163,26 @@ impl NodeAgent {
         let dir = self.shard_dir(&child.shard_id);
         std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         let target = dir.join("shard");
-        move_image_file(&image.vector_path, &target)?;
-        move_image_file(
-            &image.exact_vector_path,
-            &crate::node::exact_vector_sidecar_path(&target),
-        )?;
-        if let Some(bm25) = &image.bm25_path {
-            move_image_file(bm25, &crate::node::bm25_sidecar_path(&target))?;
+        // An empty child carries only its empty provider image, which the
+        // node adopts as its tail with the parent's calibration.
+        if image.vector_path.exists() {
+            std::fs::rename(&image.vector_path, &target).map_err(|e| {
+                format!(
+                    "move image {} to {}: {e}",
+                    image.vector_path.display(),
+                    target.display()
+                )
+            })?;
         }
+        let built = crate::node::segments_root(&image.vector_path);
+        let placed = crate::node::segments_root(&target);
+        std::fs::rename(&built, &placed).map_err(|e| {
+            format!(
+                "move catalog {} to {}: {e}; the split builds beside the shard directory",
+                built.display(),
+                placed.display()
+            )
+        })?;
         let placed = PlacedShard {
             shard_id: child.shard_id.clone(),
             collection: self.inner.config.collection.clone(),

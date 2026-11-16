@@ -73,7 +73,6 @@ pub struct NodeAgentConfig {
     /// shard.
     pub template: NodeConfig,
     pub phrase_index: Option<Arc<crate::phrases::PhraseIndex>>,
-    pub allow_missing_bm25: bool,
     /// Listener TLS for placed replicas (the node listeners' material).
     pub tls: Option<crate::security::ServerTls>,
     pub max_message_bytes: usize,

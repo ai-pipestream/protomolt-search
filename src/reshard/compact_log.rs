@@ -8,8 +8,6 @@ use crate::vector::VectorIndex;
 use crate::wal::WalManifest;
 
 use super::child_build::{child_order, finish_child_ordered, ChildSchema, ChildSlot};
-#[cfg(doc)]
-use super::hash_split::split_logs_with;
 use super::hnsw_sources::HnswCompactionSources;
 use super::replay::{
     read_gen_manifest, read_gens_binding, replay_buckets_through, require_backend_config,
@@ -53,8 +51,7 @@ pub struct CompactionBuild {
     pub tombstones: u64,
     /// Source global id -> dense LOCAL slot, for every live row.
     pub id_map: BTreeMap<u64, u64>,
-    /// The dense image(s): one for the single-image layout; one per
-    /// non-empty WAL bucket for the segment layout, each with its
+    /// The dense images: one per non-empty WAL bucket, each with its
     /// `slot_offset` set to its local base label.
     pub images: Vec<ChildImage>,
     /// The mapped-plan binding the source carried, to be logged first in
@@ -318,28 +315,18 @@ impl RowCounts {
 /// (the rewritten log), and the image is written under `out_dir`. Local slots start
 /// at 0; the caller owns the global offset.
 ///
-/// `segmented` selects the bucket-bounded shape: one sealed image per non-empty WAL
-/// bucket, slots dense across them in bucket order, memory holding one bucket's
-/// replay at a time — the same shape [`split_logs_segmented_with`] gives a catalog.
-/// Otherwise one image over the whole replay, as [`split_logs_with`] with a factor
-/// of one.
+/// The bucket-bounded shape: one sealed image per non-empty WAL bucket,
+/// slots dense across them in bucket order, memory holding one bucket's
+/// replay at a time — the same shape [`split_logs_segmented_with`] gives a
+/// catalog.
 pub fn compact_log(
     request: &CompactionRequest<'_>,
-    segmented: bool,
     analyze: &mut Analyzer,
     sink: &mut RowSink,
 ) -> Result<CompactionBuild, String> {
     let source = CompactionSource::open(request)?;
     let mut counts = RowCounts::default();
-    let images = if segmented {
-        compact_buckets(&source, &mut counts, analyze, sink)?
-    } else {
-        let mut replay = source.replay(0..source.manifest.bucket_count)?;
-        counts.count(&replay);
-        replay.compact();
-        let (image, _) = compact_image(&source, replay, 0, 0, &mut counts, analyze, sink)?;
-        vec![image]
-    };
+    let images = compact_buckets(&source, &mut counts, analyze, sink)?;
     Ok(source.build(counts, images))
 }
 

@@ -13,11 +13,6 @@ pub(super) type FusedPhrase = (usize, Vec<f64>);
 
 impl<'a> FusedFields<'a> {
     pub(super) fn new(req: &'a Bm25QueryRequest, store: &'a Bm25Shard) -> Result<Self, Status> {
-        if store.as_index().is_none() {
-            return Err(Status::failed_precondition(
-                "bm25 bulk build in progress; Flush first",
-            ));
-        }
         let mut fields = Self {
             req,
             views: Vec::new(),
@@ -25,9 +20,7 @@ impl<'a> FusedFields<'a> {
         };
         for (li, leg) in req.fields.iter().enumerate() {
             if let Some(fi) = store.field_index(&leg.field) {
-                fields
-                    .views
-                    .push(store.field_view(fi).expect("searchable, checked above"));
+                fields.views.push(store.field_view(fi));
                 fields.legs.push(li);
             }
         }
@@ -43,9 +36,7 @@ impl<'a> FusedFields<'a> {
                     let fi = store
                         .field_index(&self.req.fields[li].field)
                         .expect("the field resolved above");
-                    store
-                        .field_view_masked(fi, mask)
-                        .expect("searchable, checked above")
+                    store.field_view_masked(fi, mask)
                 })
                 .collect();
         }
@@ -171,9 +162,7 @@ impl<'a> FusedFields<'a> {
     ) -> Result<Vec<Bm25Hit>, Status> {
         let highlight = highlight_plan(store, self.req.highlight.as_ref())?;
         let body = store.field_name(0);
-        let text_index = store.as_index().ok_or_else(|| {
-            Status::failed_precondition("bm25 bulk build in progress; Flush first")
-        })?;
+        let text_index = store.as_index();
         let presence = self.req.explain.then(|| {
             let ids: Vec<u32> = docs.iter().map(|doc| doc.doc_id).collect();
             bm25::breakdown(queries, &ids)

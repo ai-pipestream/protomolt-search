@@ -39,7 +39,9 @@ impl Bm25Build<'_> {
             None => MappedAnalysisContract::default(),
         };
         let tables = ChildTables::derive(&mapped.rows, schema, &contract)?;
-        let path = crate::node::bm25_sidecar_path(self.vector_path);
+        let rows = u32::try_from(mapped.row_parent_ids.len())
+            .map_err(|_| "a child's rows exceed u32".to_string())?;
+        let path = documents_path(self.vector_path);
         let mut builder = open_builder(&path, &tables)?;
         pin_fingerprints(&mut builder, &tables, schema.pinned_fingerprints, &contract)?;
         let mut i = 0;
@@ -61,6 +63,11 @@ impl Bm25Build<'_> {
         // The children stay bound to the plan the parents were written
         // under, and to the derived-column declaration (the kind-15
         // entry); replay must not launder either away.
+        // Rows past the last document carry vectors only: empty slots keep
+        // the store covering every row of the child, as a segment requires.
+        builder
+            .reserve_slots(rows)
+            .map_err(|e| format!("reserve {rows} rows in {}: {e}", path.display()))?;
         builder.set_binding(schema.binding.cloned());
         builder.set_derived(schema.derived.cloned());
         builder
@@ -205,4 +212,11 @@ fn add_row(
     document::set_fingerprints(builder, &tables.fields, doc)?;
     document::add_document(builder, local, doc, fields)?;
     super::columns::set_columns(builder, &tables.columns, local, doc)
+}
+
+/// Where a child image's documents are written: `<vector path>.bm25`.
+fn documents_path(vector_path: &std::path::Path) -> std::path::PathBuf {
+    let mut path = vector_path.as_os_str().to_owned();
+    path.push(".bm25");
+    std::path::PathBuf::from(path)
 }

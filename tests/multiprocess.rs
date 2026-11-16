@@ -86,9 +86,6 @@ fn node_args(port: u16, index: &Path, slot_offset: u64) -> Vec<String> {
         format!("--node-listen=127.0.0.1:{port}"),
         format!("--index={}", index.display()),
         format!("--slot-offset={slot_offset}"),
-        // These tests read the single `.tv` image the shard writes; the
-        // default segment layout seals into a catalog instead.
-        "--layout=single-image".into(),
         "--chunk-blocks=8".into(),
     ]
 }
@@ -240,13 +237,18 @@ async fn ingest_across_processes_is_lossless_and_persistent() {
         .unwrap()
         .into_inner();
     assert!(flushed.written && flushed.num_vectors == 3_000);
-    assert!(shard0_path.exists());
+    let sealed = |path: &Path| {
+        pipestream_search::node::segments_root(path)
+            .join("segments.json")
+            .exists()
+    };
+    assert!(sealed(&shard0_path));
 
     // ... and save-on-shutdown persists node 1: SIGTERM, restart, re-verify.
-    assert!(!shard1_path.exists(), "no flush expected before shutdown");
+    assert!(!sealed(&shard1_path), "no flush expected before shutdown");
     let pid = proc1.pid();
     proc1.terminate();
-    assert!(shard1_path.exists(), "save-on-shutdown wrote no index");
+    assert!(sealed(&shard1_path), "save-on-shutdown wrote no catalog");
 
     proc1 = Proc::spawn(&node_args(p1, &shard1_path, SHARD_VECTORS as u64));
     wait_ready(&node1).await;
@@ -275,68 +277,4 @@ async fn ingest_across_processes_is_lossless_and_persistent() {
     drop(proc0);
     drop(proc1);
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// An interrupted BM25 build must stop the node, not be served quietly.
-///
-/// `Flush` removes the spill directory on success, so a `.bm25.build`
-/// with no `.bm25` beside it cannot be reached by a shard that finished.
-/// Coming up anyway is the failure that hides: the node is healthy, the
-/// vector leg is correct, and every lexical query silently ranks against
-/// a corpus missing this shard's share -- which reads exactly like a
-/// corpus that never held those terms.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_interrupted_bm25_build_refuses_to_serve() {
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("tv_interrupted_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let index = dir.join("shard.tv");
-
-    // A real index with vectors, then the wreckage of a build.
-    let port = free_port();
-    {
-        let node = Proc::spawn(&node_args(port, &index, 0));
-        let addr = format!("127.0.0.1:{port}");
-        wait_ready(&addr).await;
-        let corpus = unit_vectors(256, DIM, 0x9C33_0009);
-        let (shift, scale) = common::fit_calibration(DIM, BIT_WIDTH, &corpus);
-        NodeServiceClient::connect(format!("http://{addr}"))
-            .await
-            .unwrap()
-            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-                DIM, BIT_WIDTH, &shift, &scale,
-            ))
-            .await
-            .unwrap();
-        add_vectors(&format!("http://{addr}"), corpus).await;
-        // SIGTERM so save-on-shutdown runs; a kill would leave no index.
-        node.terminate();
-    }
-    assert!(index.exists(), "the shard should have saved its vectors");
-    let build = pipestream_search::node::bm25_build_dir(
-        &pipestream_search::node::bm25_sidecar_path(&index),
-    );
-    std::fs::create_dir_all(&build).unwrap();
-
-    // Refused: the process exits rather than serving a half-built shard.
-    let port2 = free_port();
-    let out = Command::new(BIN)
-        .args(node_args(port2, &index, 0))
-        .output()
-        .expect("spawn node");
-    assert!(!out.status.success(), "a half-built shard must not serve");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("interrupted") && stderr.contains("allow-missing-bm25"),
-        "the refusal must say what happened and how to override: {stderr}"
-    );
-
-    // And the override really does override.
-    let port3 = free_port();
-    let mut args = node_args(port3, &index, 0);
-    args.push("--allow-missing-bm25".into());
-    let node = Proc::spawn(&args);
-    wait_ready(&format!("127.0.0.1:{port3}")).await;
-    drop(node);
-    std::fs::remove_dir_all(&dir).ok();
 }

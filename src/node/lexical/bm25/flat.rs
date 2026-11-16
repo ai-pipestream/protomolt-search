@@ -39,7 +39,7 @@ impl FlatRun<'_> {
             Some(store) if self.req.k > 0 => self.hits(
                 FlatView {
                     store,
-                    index: flat_index(store, masked)?,
+                    index: flat_index(store, masked),
                     filter: filter.as_ref(),
                     projections: &projections,
                 },
@@ -95,7 +95,7 @@ impl FlatRun<'_> {
         let Some(constraint) = self.req.phrase.as_ref() else {
             return Ok(Vec::new());
         };
-        let index = flat_index(store, None)?;
+        let index = flat_index(store, None);
         if !index.has_positions() {
             return Err(Status::failed_precondition(
                 "field \"body\" has no token positions on this shard; a phrase or \
@@ -136,7 +136,7 @@ impl FlatRun<'_> {
         let columns = ShardNumericRead(store);
         let (facets, range_facets, stats, distinct) =
             store.count_facets(crate::node::shard::FacetCountRequest {
-                views: &[(flat_index(store, masked)?, &req.terms)],
+                views: &[(flat_index(store, masked), &req.terms)],
                 facet_fields: &req.facet_fields,
                 map_facet_fields: &req.map_facet_fields,
                 range_facet_fields: &req.range_facet_fields,

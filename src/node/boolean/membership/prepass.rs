@@ -125,9 +125,7 @@ impl LexicalPrepass<'_> {
         let Some(store) = guard.bm25.as_ref() else {
             return Ok(bits);
         };
-        let index = store.as_index().ok_or_else(|| {
-            Status::failed_precondition("bm25 bulk build in progress; Flush first")
-        })?;
+        let index = store.as_index();
         // A sealed segment none of the terms occur in contributes no member.
         let (masked, stats) = match store {
             Bm25Shard::Segmented(segmented) => {

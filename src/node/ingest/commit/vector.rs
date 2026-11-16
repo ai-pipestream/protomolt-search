@@ -113,7 +113,7 @@ impl NodeServiceImpl {
                      sidecar; rebuild or backfill the generation before mapped ingest"
                 )));
             }
-            let store = self.fresh_exact_store(guard.generation.as_ref(), dim)?;
+            let store = self.fresh_exact_store(dim)?;
             guard.exact_vectors = Some(store);
         }
         let exact = guard.exact_vectors.as_ref().expect("ensured above");

@@ -97,6 +97,40 @@ impl PreparedSegments {
         })
     }
 
+    /// Refuse a manifest whose row counts, dimension or scoring identity
+    /// disagree with the staged catalog it describes.
+    pub(super) fn check_claims(&self, manifest: &RepositoryManifest) -> Result<(), Status> {
+        let vectors = self.index.as_ref().map_or(0, |index| index.len() as u64);
+        let documents = u64::from(self.shard.next_doc_id());
+        let physical = vectors.max(documents);
+        let live = physical - self.live.deleted_count().min(physical);
+        let dim = self
+            .index
+            .as_ref()
+            .and_then(VectorIndex::dim_opt)
+            .unwrap_or(0) as u32;
+        let fingerprint = self
+            .index
+            .as_ref()
+            .map(|index| index.descriptor().scoring_fingerprint)
+            .unwrap_or_default();
+        let claimed = (
+            manifest.vector_rows,
+            manifest.document_rows,
+            manifest.live_rows,
+            manifest.dim,
+            manifest.scoring_fingerprint.as_str(),
+        );
+        if claimed != (vectors, documents, live, dim, fingerprint.as_str()) {
+            return Err(Status::failed_precondition(format!(
+                "the repository manifest claims {claimed:?} as (vector rows, document rows, live \
+                 rows, dim, scoring fingerprint) but its catalog holds {:?}",
+                (vectors, documents, live, dim, fingerprint)
+            )));
+        }
+        Ok(())
+    }
+
     pub(super) fn check_provider(&self, guard: &ShardState) -> Result<(), Status> {
         let Some(incoming) = self.index.as_ref().map(VectorIndex::descriptor) else {
             return Ok(());
@@ -141,7 +175,6 @@ impl PreparedSegments {
         guard.multi_res_vectors = self.retained;
         guard.live_docs = self.live;
         guard.parents = None;
-        guard.generation = None;
         guard.advance_stats_epoch();
         counts
     }

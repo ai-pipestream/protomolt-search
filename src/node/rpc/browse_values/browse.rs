@@ -55,9 +55,7 @@ impl LexicalMembership {
         if terms.is_empty() {
             return Ok(Self(None));
         }
-        let index = store.as_index().ok_or_else(|| {
-            Status::failed_precondition("bm25 bulk build in progress; Flush first")
-        })?;
+        let index = store.as_index();
         let count = n as usize;
         let mut bits = vec![0u8; count.div_ceil(8)];
         for term in terms {
@@ -151,11 +149,6 @@ impl NodeServiceImpl {
         filter: Option<&crate::pb::FilterExpr>,
         geo_regions: &[crate::geo::GeoRegion],
     ) -> Result<BrowseWalk<'a>, Status> {
-        if store.as_index().is_none() {
-            return Err(Status::failed_precondition(
-                "bm25 bulk build in progress; Flush before browsing",
-            ));
-        }
         let n = u64::from(store.next_doc_id());
         let lexical = LexicalMembership::build(store, &req.lexical_terms, n)?;
         let doc_filter = crate::filter::DocFilter {

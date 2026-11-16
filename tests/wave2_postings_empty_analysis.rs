@@ -14,7 +14,7 @@ use pipestream_search::harness::{
 };
 use pipestream_search::live_docs::LiveDocs;
 use pipestream_search::mapping::derive_plan;
-use pipestream_search::node::{segments_root, Layout, NodeConfig};
+use pipestream_search::node::{segments_root, NodeConfig};
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::*;
@@ -194,7 +194,6 @@ fn shard_node_config(index_path: PathBuf, wal: bool) -> NodeConfig {
     NodeConfig {
         index_path: Some(index_path),
         analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
-        layout: Layout::Segments,
         seal_tail_docs: SEAL_ROWS as u32,
         wal,
         wal_buckets: if wal { 2 } else { 1 },

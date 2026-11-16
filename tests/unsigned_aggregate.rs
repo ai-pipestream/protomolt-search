@@ -3,7 +3,7 @@ mod common;
 use pipestream_search::{
     analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND},
     coordinator::CoordinatorServiceImpl,
-    node::{Layout, NodeConfig},
+    node::NodeConfig,
     pb::{
         self, aggregate_result::Value as A, node_service_client::NodeServiceClient,
         percentile_value::Value as P, search_service_server::SearchService,
@@ -255,75 +255,96 @@ async fn verify(addresses: Vec<String>) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unsigned_folds_and_percentiles_survive_reopen_compaction_and_query_pools() {
     let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 21572));
-    for layout in [Layout::SingleImage, Layout::Segments] {
-        let temp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("uint_aggregate_{layout:?}_{}", std::process::id()));
-        std::fs::create_dir_all(&temp).unwrap();
-        let mut configs = Vec::new();
-        let mut addresses = Vec::new();
-        let mut servers = Vec::new();
-        for shard in 0..3 {
-            let config = NodeConfig {
-                index_path: Some(temp.join(format!("{shard}.tv"))),
-                layout,
-                wal: true,
-                wal_buckets: 2,
-                seal_tail_docs: 2,
-                slot_offset: shard as u64 * 100,
-                analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
-                facet_fields: vec!["row".into(), "group".into()],
-                unsigned_integer_fields: if shard < 2 {
-                    vec!["counter".into()]
-                } else {
-                    vec![]
-                },
-                ..Default::default()
-            };
-            let (addr, server) = common::start_empty_node(config.clone()).await;
-            let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+    let temp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("uint_aggregate_segments_{}", std::process::id()));
+    std::fs::create_dir_all(&temp).unwrap();
+    let mut configs = Vec::new();
+    let mut addresses = Vec::new();
+    let mut servers = Vec::new();
+    for shard in 0..3 {
+        let config = NodeConfig {
+            index_path: Some(temp.join(format!("{shard}.tv"))),
+            wal: true,
+            wal_buckets: 2,
+            seal_tail_docs: 2,
+            slot_offset: shard as u64 * 100,
+            analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
+            facet_fields: vec!["row".into(), "group".into()],
+            unsigned_integer_fields: if shard < 2 {
+                vec!["counter".into()]
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        };
+        let (addr, server) = common::start_empty_node(config.clone()).await;
+        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+        client
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                8, 4, &shift, &scale,
+            ))
+            .await
+            .unwrap();
+        for (row, value) in VALUES.iter().enumerate().filter(|(i, _)| i / 6 == shard) {
             client
-                .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-                    8, 4, &shift, &scale,
-                ))
+                .add_documents(tokio_stream::iter([pb::AddDocumentsRequest {
+                    text: "word".into(),
+                    analysis: Some(body_spec()),
+                    facets: vec![
+                        pb::FacetValue {
+                            field: "row".into(),
+                            value: row.to_string(),
+                        },
+                        pb::FacetValue {
+                            field: "group".into(),
+                            value: if row % 2 == 0 { "even" } else { "odd" }.into(),
+                        },
+                    ],
+                    unsigned_integers: value
+                        .map(|v| pb::UnsignedIntegerValue {
+                            field: "counter".into(),
+                            value: v,
+                        })
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                }]))
                 .await
                 .unwrap();
-            for (row, value) in VALUES.iter().enumerate().filter(|(i, _)| i / 6 == shard) {
-                client
-                    .add_documents(tokio_stream::iter([pb::AddDocumentsRequest {
-                        text: "word".into(),
-                        analysis: Some(body_spec()),
-                        facets: vec![
-                            pb::FacetValue {
-                                field: "row".into(),
-                                value: row.to_string(),
-                            },
-                            pb::FacetValue {
-                                field: "group".into(),
-                                value: if row % 2 == 0 { "even" } else { "odd" }.into(),
-                            },
-                        ],
-                        unsigned_integers: value
-                            .map(|v| pb::UnsignedIntegerValue {
-                                field: "counter".into(),
-                                value: v,
-                            })
-                            .into_iter()
-                            .collect(),
-                        ..Default::default()
-                    }]))
+            client
+                .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
+                    materialized_rows: Vec::new(),
+                    dim: 8,
+                    vectors: common::unit_vectors(1, 8, 816 + row as u64),
+                }]))
+                .await
+                .unwrap();
+        }
+        client.flush(pb::FlushRequest {}).await.unwrap();
+        configs.push(config);
+        addresses.push(addr);
+        servers.push(server);
+    }
+    verify(addresses).await;
+    for server in servers.drain(..) {
+        server.abort();
+        let _ = server.await;
+    }
+    for round in 0..2 {
+        let mut addresses = Vec::new();
+        for (shard, config) in configs.iter().enumerate() {
+            let (addr, server) = common::start_opened_node(config.clone()).await;
+            if round == 0 {
+                NodeServiceClient::connect(addr.clone())
                     .await
-                    .unwrap();
-                client
-                    .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
-                        materialized_rows: Vec::new(),
-                        dim: 8,
-                        vectors: common::unit_vectors(1, 8, 816 + row as u64),
-                    }]))
+                    .unwrap()
+                    .compact_shard(pb::CompactShardRequest {
+                        work_dir: temp.join(format!("compact-{shard}")).display().to_string(),
+                        ..Default::default()
+                    })
                     .await
                     .unwrap();
             }
-            client.flush(pb::FlushRequest {}).await.unwrap();
-            configs.push(config);
             addresses.push(addr);
             servers.push(server);
         }
@@ -332,30 +353,6 @@ async fn unsigned_folds_and_percentiles_survive_reopen_compaction_and_query_pool
             server.abort();
             let _ = server.await;
         }
-        for round in 0..2 {
-            let mut addresses = Vec::new();
-            for (shard, config) in configs.iter().enumerate() {
-                let (addr, server) = common::start_opened_node(config.clone()).await;
-                if round == 0 {
-                    NodeServiceClient::connect(addr.clone())
-                        .await
-                        .unwrap()
-                        .compact_shard(pb::CompactShardRequest {
-                            work_dir: temp.join(format!("compact-{shard}")).display().to_string(),
-                            ..Default::default()
-                        })
-                        .await
-                        .unwrap();
-                }
-                addresses.push(addr);
-                servers.push(server);
-            }
-            verify(addresses).await;
-            for server in servers.drain(..) {
-                server.abort();
-                let _ = server.await;
-            }
-        }
-        std::fs::remove_dir_all(temp).unwrap();
     }
+    std::fs::remove_dir_all(temp).unwrap();
 }

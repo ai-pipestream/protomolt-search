@@ -3,7 +3,7 @@ use super::*;
 fn manifest() -> RepositoryManifest {
     RepositoryManifest {
         format_version: FORMAT_VERSION,
-        layout: LAYOUT_SINGLE_IMAGE.into(),
+        layout: LAYOUT_SEGMENTS.into(),
         backend_kind: "embedded-turbovec".into(),
         scoring_fingerprint: "fp".into(),
         dim: 4,

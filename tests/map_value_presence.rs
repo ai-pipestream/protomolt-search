@@ -3,7 +3,7 @@ mod common;
 use pipestream_search::{
     analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND},
     coordinator::CoordinatorServiceImpl,
-    node::{Layout, NodeConfig},
+    node::NodeConfig,
     pb::{
         self, node_service_client::NodeServiceClient, search_service_client::SearchServiceClient,
     },
@@ -295,7 +295,6 @@ fn build_map_presence_requests(
 
 async fn seed_map_presence_shard(
     root: &std::path::Path,
-    layout: Layout,
     shards: usize,
     shard: usize,
     map_key: &str,
@@ -305,8 +304,7 @@ async fn seed_map_presence_shard(
     tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
 ) {
     let config = NodeConfig {
-        index_path: Some(root.join(format!("{layout:?}-{shards}-{shard}.tv"))),
-        layout,
+        index_path: Some(root.join(format!("segments-{shards}-{shard}.tv"))),
         wal: true,
         slot_offset: (shard * 3) as u64,
         map_facet_fields: vec!["meta".into()],
@@ -344,7 +342,6 @@ async fn seed_map_presence_shard(
 
 fn verify_map_presence_wal_replay(
     root: &std::path::Path,
-    layout: Layout,
     shards: usize,
     shard: usize,
     config: &NodeConfig,
@@ -353,7 +350,7 @@ fn verify_map_presence_wal_replay(
     let path = config.index_path.as_ref().unwrap();
     let gen =
         pipestream_search::reshard::resolve_gen(&pipestream_search::wal::wal_dir(path)).unwrap();
-    let out_dir = root.join(format!("replay-{layout:?}-{shards}-{shard}"));
+    let out_dir = root.join(format!("replay-segments-{shards}-{shard}"));
     let req =
         pipestream_search::reshard::SplitRequest::new(std::slice::from_ref(&gen), 1, &out_dir)
             .slot_base(config.slot_offset)
@@ -369,7 +366,7 @@ fn verify_map_presence_wal_replay(
     })
     .unwrap();
     let child = &output.children[0];
-    let reader = Bm25Reader::open(child.bm25_path.as_ref().unwrap()).unwrap();
+    let reader = Bm25Reader::open(&common::catalog::segment_bm25(&child.vector_path, 0)).unwrap();
     reader.verify_integrity().unwrap();
     assert_eq!(child.num_documents, if shards == 1 { 6 } else { 3 });
     let facet = reader.map_facet_index("meta").unwrap();
@@ -396,17 +393,12 @@ fn verify_map_presence_wal_replay(
     }
 }
 
-async fn run_map_presence_case(
-    root: &std::path::Path,
-    layout: Layout,
-    shards: usize,
-    map_key: &str,
-) {
+async fn run_map_presence_case(root: &std::path::Path, shards: usize, map_key: &str) {
     let mut configs = Vec::new();
     let mut addresses = Vec::new();
     let mut servers = Vec::new();
     for shard in 0..shards {
-        let (cfg, addr, srv) = seed_map_presence_shard(root, layout, shards, shard, map_key).await;
+        let (cfg, addr, srv) = seed_map_presence_shard(root, shards, shard, map_key).await;
         configs.push(cfg);
         addresses.push(addr);
         servers.push(srv);
@@ -420,7 +412,7 @@ async fn run_map_presence_case(
             .unwrap();
     }
     for (shard, config) in configs.iter().enumerate() {
-        verify_map_presence_wal_replay(root, layout, shards, shard, config, map_key);
+        verify_map_presence_wal_replay(root, shards, shard, config, map_key);
     }
     verify(addresses.clone(), &[], map_key).await;
     for server in servers.drain(..) {
@@ -445,7 +437,7 @@ async fn run_map_presence_case(
         .unwrap();
     for (shard, address) in addresses.iter().enumerate() {
         let work_dir = root
-            .join(format!("compact-{layout:?}-{shards}-{shard}"))
+            .join(format!("compact-segments-{shards}-{shard}"))
             .display()
             .to_string();
         NodeServiceClient::connect(address.clone())
@@ -473,10 +465,8 @@ async fn empty_value_and_absent_key_stay_distinct_through_rpc_flush_reopen_and_c
     for map_key in ["key", ""] {
         let case_root = root.join(if map_key.is_empty() { "empty" } else { "named" });
         std::fs::create_dir_all(&case_root).unwrap();
-        for layout in [Layout::SingleImage, Layout::Segments] {
-            for shards in [1, 2] {
-                run_map_presence_case(&case_root, layout, shards, map_key).await;
-            }
+        for shards in [1, 2] {
+            run_map_presence_case(&case_root, shards, map_key).await;
         }
     }
     std::fs::remove_dir_all(root).unwrap();

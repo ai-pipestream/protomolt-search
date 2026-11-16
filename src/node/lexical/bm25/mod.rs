@@ -209,9 +209,7 @@ fn rescore_store(
         .into_iter()
         .map(|slot| slot as u32)
         .collect();
-    let index = store
-        .as_index()
-        .ok_or_else(|| Status::failed_precondition(BULK_BUILD))?;
+    let index = store.as_index();
     let chain = store.resolve_chain(stage_specs);
     let stage_columns_known = chain
         .stages
@@ -244,8 +242,6 @@ fn rescore_store(
         .collect();
     Ok((hits, stage_columns_known))
 }
-
-const BULK_BUILD: &str = "bm25 bulk build in progress; Flush first";
 
 struct FlatRun<'a> {
     node: &'a NodeServiceImpl,
@@ -295,13 +291,8 @@ fn min_score_floor(min_score: f32) -> f64 {
     }
 }
 
-fn flat_index<'a>(
-    store: &'a Bm25Shard,
-    masked: Option<&'a dyn Bm25Index>,
-) -> Result<&'a dyn Bm25Index, Status> {
-    masked
-        .or_else(|| store.as_index())
-        .ok_or_else(|| Status::failed_precondition(BULK_BUILD))
+fn flat_index<'a>(store: &'a Bm25Shard, masked: Option<&'a dyn Bm25Index>) -> &'a dyn Bm25Index {
+    masked.unwrap_or_else(|| store.as_index())
 }
 
 struct FlatView<'a> {

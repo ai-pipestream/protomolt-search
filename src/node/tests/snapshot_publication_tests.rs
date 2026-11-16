@@ -3,10 +3,9 @@
 use super::*;
 use crate::postings::StoredBinding;
 
-fn single_image_config(index_path: PathBuf) -> NodeConfig {
+fn persisted_config(index_path: PathBuf) -> NodeConfig {
     NodeConfig {
         index_path: Some(index_path),
-        layout: Layout::SingleImage,
         ..Default::default()
     }
 }
@@ -19,17 +18,15 @@ fn configuring_and_appending_vectors_require_a_new_snapshot_flush() {
     ));
     std::fs::create_dir_all(&root).unwrap();
     for wal in [false, true] {
-        for layout in [Layout::SingleImage, Layout::Segments] {
-            let path = root.join(format!("{wal}-{layout:?}.tv"));
+        {
+            let path = root.join(format!("{wal}.tv"));
             let service = NodeServiceImpl::open(
                 NodeConfig {
                     index_path: Some(path.clone()),
-                    layout,
                     wal,
                     ..Default::default()
                 },
                 None,
-                false,
             )
             .unwrap();
             service.flush_index().unwrap();
@@ -40,7 +37,7 @@ fn configuring_and_appending_vectors_require_a_new_snapshot_flush() {
                 ))
                 .unwrap();
             assert_ne!(read_shard(&service.state).stats_epoch, epoch);
-            let directory = root.join(format!("copy-{wal}-{layout:?}"));
+            let directory = root.join(format!("copy-{wal}"));
             std::fs::create_dir_all(&directory).unwrap();
             assert!(service
                 .export_if_flushed(&path, &directory)
@@ -70,21 +67,11 @@ fn configuring_and_appending_vectors_require_a_new_snapshot_flush() {
                 .unwrap()
                 .unwrap();
             assert_eq!(manifest.vector_rows, 1);
-            if manifest.layout == LAYOUT_SEGMENTS {
-                let set =
-                    crate::segments::OpenedSegmentSet::open(directory.join(CATALOG_DIR)).unwrap();
-                let image = set.vector(0).unwrap();
-                assert_eq!(image.len(), 1);
-                assert_eq!(image.dim_opt(), Some(8));
-            } else {
-                let image = VectorIndex::load(
-                    &service.config.vector_backend,
-                    &directory.join("vector.index"),
-                )
-                .unwrap();
-                assert_eq!(image.len(), 1);
-                assert_eq!(image.dim_opt(), Some(8));
-            }
+            assert_eq!(manifest.layout, LAYOUT_SEGMENTS);
+            let set = crate::segments::OpenedSegmentSet::open(directory.join(CATALOG_DIR)).unwrap();
+            let image = set.vector(0).unwrap();
+            assert_eq!(image.len(), 1);
+            assert_eq!(image.dim_opt(), Some(8));
         }
     }
     std::fs::remove_dir_all(root).unwrap();
@@ -95,7 +82,7 @@ fn metadata_only_snapshots_reject_false_shape_claims_before_install() {
     let root = std::env::temp_dir().join(format!("snapshot-empty-shape-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let source_path = root.join("source.tv");
-    let source = NodeServiceImpl::new(None, single_image_config(source_path.clone()));
+    let source = NodeServiceImpl::new(None, persisted_config(source_path.clone()));
     let binding = StoredBinding {
         plan_fingerprint: "a".repeat(64),
         body_path: "body".into(),
@@ -111,7 +98,7 @@ fn metadata_only_snapshots_reject_false_shape_claims_before_install() {
         .unwrap()
         .unwrap();
     let target_path = root.join("target.tv");
-    let target = NodeServiceImpl::new(None, single_image_config(target_path.clone()));
+    let target = NodeServiceImpl::new(None, persisted_config(target_path.clone()));
     for case in 0..5 {
         let mut invalid = manifest.clone();
         match case {
@@ -129,7 +116,7 @@ fn metadata_only_snapshots_reject_false_shape_claims_before_install() {
             tonic::Code::FailedPrecondition
         );
         assert!(read_shard(&target.state).mapped_binding.is_none());
-        assert!(!generation_dir(&target_path).exists());
+        assert!(!segments_root(&target_path).join("segments.json").exists());
     }
     target
         .install_staged_repository(&directory, &manifest)
@@ -139,14 +126,10 @@ fn metadata_only_snapshots_reject_false_shape_claims_before_install() {
         Some(binding.clone())
     );
     drop(target);
-    // A crash after retiring the old generation but before adopting its
-    // replacement restores the BM25-only generation, including its binding.
-    std::fs::rename(
-        generation_dir(&target_path),
-        generation_old_dir(&target_path),
-    )
-    .unwrap();
-    let reopened = NodeServiceImpl::open(single_image_config(target_path), None, false).unwrap();
+    // A crash after retiring the old catalog but before adopting its
+    // replacement restores the binding-only catalog.
+    std::fs::rename(segments_root(&target_path), segments_old_dir(&target_path)).unwrap();
+    let reopened = NodeServiceImpl::open(persisted_config(target_path), None).unwrap();
     assert_eq!(read_shard(&reopened.state).mapped_binding, Some(binding));
     assert!(read_shard(&reopened.state).index.is_none());
     drop(reopened);
@@ -163,7 +146,6 @@ fn copy_rechecks_mutations_after_acquiring_the_seal_fence_with_or_without_wal() 
             None,
             NodeConfig {
                 index_path: Some(path.clone()),
-                layout: Layout::SingleImage,
                 wal,
                 ..Default::default()
             },
@@ -208,9 +190,9 @@ fn copy_rechecks_mutations_after_acquiring_the_seal_fence_with_or_without_wal() 
             .unwrap()
             .unwrap();
         assert_eq!(manifest.document_rows, 1);
-        let image = Bm25Reader::open(&directory.join("documents.bm25")).unwrap();
-        assert_eq!(image.next_doc_id(), 1);
-        assert_eq!(image.binding(), Some(&binding));
+        let set = crate::segments::OpenedSegmentSet::open(directory.join(CATALOG_DIR)).unwrap();
+        assert_eq!(set.bm25(0).next_doc_id(), 1);
+        assert_eq!(set.binding(), Some(&binding));
     }
     std::fs::remove_dir_all(root).unwrap();
 }

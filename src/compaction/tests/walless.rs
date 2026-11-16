@@ -169,13 +169,11 @@ async fn walless_compaction_under_a_changed_declaration_refuses_naming_both() {
             index_path: Some(index_path.clone()),
             analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
             wal: false,
-            layout: crate::node::Layout::Segments,
             integer_fields: vec!["num".into()],
             derived: Some(declaration("num_d")),
             ..Default::default()
         },
         None,
-        false,
     )
     .unwrap();
     append_numbered_rows(&node);

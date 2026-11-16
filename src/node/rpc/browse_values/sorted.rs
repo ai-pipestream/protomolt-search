@@ -127,7 +127,7 @@ fn resolve_column(
 /// Reads one candidate's sort keys from the shard's columns.
 struct KeyReader<'a> {
     store: &'a Bm25Shard,
-    index: Option<&'a dyn Bm25Index>,
+    index: &'a dyn Bm25Index,
     columns: Vec<Column>,
     descending: Vec<bool>,
 }
@@ -185,7 +185,7 @@ impl<'a> KeyReader<'a> {
                     values.push(Value::Text(text.to_string()));
                 }
                 Column::Parent | Column::Group => {
-                    let lineage = self.index.and_then(|index| index.lineage(doc))?;
+                    let lineage = self.index.lineage(doc)?;
                     let v = if matches!(column, Column::Parent) {
                         lineage.parent_id
                     } else {

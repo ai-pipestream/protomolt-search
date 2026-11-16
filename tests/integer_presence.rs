@@ -100,11 +100,8 @@ fn legacy_sentinel_values_keep_their_original_meaning_when_rewritten() {
 async fn mapped_numeric_presence_survives_reopen_and_compaction_replay() {
     use pb::{node_service_client::NodeServiceClient, search_service_server::SearchService};
     use pipestream_search::{
-        analyzer::NATIVE_ANALYSIS_BACKEND,
-        coordinator::CoordinatorServiceImpl,
-        mapping::derive_plan,
-        node::{Layout, NodeConfig},
-        pb,
+        analyzer::NATIVE_ANALYSIS_BACKEND, coordinator::CoordinatorServiceImpl,
+        mapping::derive_plan, node::NodeConfig, pb,
     };
     use prost::Message;
     use prost_reflect::{DescriptorPool, DynamicMessage, Value};
@@ -132,138 +129,133 @@ async fn mapped_numeric_presence_survives_reopen_and_compaction_replay() {
     ];
     let vectors = common::unit_vectors(values.len(), 8, 6633);
     let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 6634));
-    for (label, layout) in [
-        ("single", Layout::SingleImage),
-        ("segments", Layout::Segments),
-    ] {
-        let dir = directory(label);
-        let config = NodeConfig {
-            index_path: Some(dir.join("shard.tv")),
-            layout,
-            wal: true,
-            wal_buckets: 2,
-            analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
-            facet_fields: vec!["id".into()],
-            integer_fields: vec!["value".into(), "derived".into()],
-            ..Default::default()
-        };
-        let (addr, server) = common::start_empty_node(config.clone()).await;
-        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+    let label = "segments";
+    let dir = directory(label);
+    let config = NodeConfig {
+        index_path: Some(dir.join("shard.tv")),
+        wal: true,
+        wal_buckets: 2,
+        analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
+        facet_fields: vec!["id".into()],
+        integer_fields: vec!["value".into(), "derived".into()],
+        ..Default::default()
+    };
+    let (addr, server) = common::start_empty_node(config.clone()).await;
+    let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+    client
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            8, 4, &shift, &scale,
+        ))
+        .await
+        .unwrap();
+    let bind = pb::MappedBind {
+        descriptor_set: DESCRIPTOR.to_vec(),
+        message_type: "integer_presence.Record".into(),
+        expected_fingerprint: plan.fingerprint.clone(),
+        body_path: "body".into(),
+        analysis: Some(pipestream_search::analyzer::body_spec()),
+        materialize: Some(pb::MaterializeSpec {
+            columns: vec![pb::MaterializedColumn {
+                name: "derived".into(),
+                expression: "value".into(),
+                kind: pb::MaterializeKind::I64 as i32,
+            }],
+        }),
+        ..Default::default()
+    };
+    for range in [0..5, 5..6] {
+        let mut messages = vec![pb::IngestMappedRequest {
+            payload: Some(pb::ingest_mapped_request::Payload::Bind(bind.clone())),
+        }];
+        for row in range.clone() {
+            let mut doc = DynamicMessage::new(descriptor.clone());
+            doc.set_field_by_name("id", Value::String(format!("doc{row}")));
+            doc.set_field_by_name("body", Value::String("word".into()));
+            doc.set_field_by_name(
+                "embedding",
+                Value::List(
+                    vectors[row * 8..row * 8 + 8]
+                        .iter()
+                        .copied()
+                        .map(Value::F32)
+                        .collect(),
+                ),
+            );
+            if let Some(value) = values[row] {
+                doc.set_field_by_name("value", Value::I64(value));
+            }
+            messages.push(pb::IngestMappedRequest {
+                payload: Some(pb::ingest_mapped_request::Payload::Document(
+                    doc.encode_to_vec(),
+                )),
+            });
+        }
         client
-            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-                8, 4, &shift, &scale,
-            ))
+            .ingest_mapped(tokio_stream::iter(messages))
             .await
             .unwrap();
-        let bind = pb::MappedBind {
-            descriptor_set: DESCRIPTOR.to_vec(),
-            message_type: "integer_presence.Record".into(),
-            expected_fingerprint: plan.fingerprint.clone(),
-            body_path: "body".into(),
-            analysis: Some(pipestream_search::analyzer::body_spec()),
-            materialize: Some(pb::MaterializeSpec {
-                columns: vec![pb::MaterializedColumn {
-                    name: "derived".into(),
-                    expression: "value".into(),
-                    kind: pb::MaterializeKind::I64 as i32,
-                }],
-            }),
-            ..Default::default()
-        };
-        for range in [0..5, 5..6] {
-            let mut messages = vec![pb::IngestMappedRequest {
-                payload: Some(pb::ingest_mapped_request::Payload::Bind(bind.clone())),
-            }];
-            for row in range.clone() {
-                let mut doc = DynamicMessage::new(descriptor.clone());
-                doc.set_field_by_name("id", Value::String(format!("doc{row}")));
-                doc.set_field_by_name("body", Value::String("word".into()));
-                doc.set_field_by_name(
-                    "embedding",
-                    Value::List(
-                        vectors[row * 8..row * 8 + 8]
-                            .iter()
-                            .copied()
-                            .map(Value::F32)
-                            .collect(),
-                    ),
-                );
-                if let Some(value) = values[row] {
-                    doc.set_field_by_name("value", Value::I64(value));
-                }
-                messages.push(pb::IngestMappedRequest {
-                    payload: Some(pb::ingest_mapped_request::Payload::Document(
-                        doc.encode_to_vec(),
-                    )),
-                });
-            }
+        client.flush(pb::FlushRequest {}).await.unwrap();
+    }
+    // Flush is the current shard durability boundary; compaction below
+    // rebuilds these rows from the WAL into a renumbered generation.
+    server.abort();
+    let _ = server.await;
+    drop(client);
+    let (addr, server) = common::start_opened_node(config).await;
+    let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+    for compacted in [false, true] {
+        if compacted {
             client
-                .ingest_mapped(tokio_stream::iter(messages))
+                .compact_shard(pb::CompactShardRequest {
+                    work_dir: dir.join("compact-work").display().to_string(),
+                    ..Default::default()
+                })
                 .await
                 .unwrap();
-            client.flush(pb::FlushRequest {}).await.unwrap();
         }
-        // Flush is the current shard durability boundary; compaction below
-        // rebuilds these rows from the WAL into a renumbered generation.
-        server.abort();
-        let _ = server.await;
-        drop(client);
-        let (addr, server) = common::start_opened_node(config).await;
-        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
-        for compacted in [false, true] {
-            if compacted {
-                client
-                    .compact_shard(pb::CompactShardRequest {
-                        work_dir: dir.join("compact-work").display().to_string(),
-                        ..Default::default()
-                    })
-                    .await
-                    .unwrap();
-            }
-            let coordinator = CoordinatorServiceImpl::new(vec![addr.clone()])
-                .with_bm25(Some(NATIVE_ANALYSIS_BACKEND.into()), Default::default());
-            for (row, value) in values.iter().enumerate() {
-                let filter = value.map_or("!has(value)".into(), |v| format!("value == {v}"));
-                let response = coordinator
-                    .bm25_search(tonic::Request::new(pb::Bm25SearchRequest {
-                        text: "word".into(),
-                        analysis: Some(pipestream_search::analyzer::body_spec()),
-                        k: 10,
-                        filter,
-                        projections: vec![
-                            pb::NamedProjection {
-                                name: "id".into(),
-                                expression: "id".into(),
-                            },
-                            pb::NamedProjection {
-                                name: "copy".into(),
-                                expression: "derived".into(),
-                            },
-                        ],
-                        ..Default::default()
-                    }))
-                    .await
-                    .unwrap()
-                    .into_inner();
-                assert_eq!(
-                    response.hits.len(),
-                    1,
-                    "{label} row {row}, compacted {compacted}"
-                );
-                assert_eq!(
-                    response.hits[0].projected[0].value,
-                    Some(pb::projected_value::Value::StringValue(format!("doc{row}")))
-                );
-                assert_eq!(
-                    response.hits[0].projected[1].value,
-                    value.map(pb::projected_value::Value::IntValue)
-                );
-            }
+        let coordinator = CoordinatorServiceImpl::new(vec![addr.clone()])
+            .with_bm25(Some(NATIVE_ANALYSIS_BACKEND.into()), Default::default());
+        for (row, value) in values.iter().enumerate() {
+            let filter = value.map_or("!has(value)".into(), |v| format!("value == {v}"));
+            let response = coordinator
+                .bm25_search(tonic::Request::new(pb::Bm25SearchRequest {
+                    text: "word".into(),
+                    analysis: Some(pipestream_search::analyzer::body_spec()),
+                    k: 10,
+                    filter,
+                    projections: vec![
+                        pb::NamedProjection {
+                            name: "id".into(),
+                            expression: "id".into(),
+                        },
+                        pb::NamedProjection {
+                            name: "copy".into(),
+                            expression: "derived".into(),
+                        },
+                    ],
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                response.hits.len(),
+                1,
+                "{label} row {row}, compacted {compacted}"
+            );
+            assert_eq!(
+                response.hits[0].projected[0].value,
+                Some(pb::projected_value::Value::StringValue(format!("doc{row}")))
+            );
+            assert_eq!(
+                response.hits[0].projected[1].value,
+                value.map(pb::projected_value::Value::IntValue)
+            );
         }
-        server.abort();
-        let _ = server.await;
-        std::fs::remove_dir_all(dir).unwrap();
     }
+    server.abort();
+    let _ = server.await;
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

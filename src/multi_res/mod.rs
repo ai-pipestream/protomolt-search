@@ -46,10 +46,6 @@ pub(crate) fn sidecar_path(index_path: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-pub(crate) fn storage_path(index_path: &Path, generation: Option<&PathBuf>) -> PathBuf {
-    generation.map_or_else(|| sidecar_path(index_path), |dir| dir.join(FILE_NAME))
-}
-
 #[derive(Clone, Default)]
 pub(crate) struct MultiResVectors {
     // Immutable row payloads are shared by sealed snapshots, frozen ranges and

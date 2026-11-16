@@ -13,7 +13,7 @@ use pipestream_search::chunked::encoded_row_bytes;
 use pipestream_search::control_plane::{ClusterControlService, ControlPolicy, DurableControlPlane};
 use pipestream_search::coordinator::CoordinatorServiceImpl;
 use pipestream_search::harness::serve_node;
-use pipestream_search::node::{Layout, NodeConfig, NodeServiceImpl, SCAN_WINDOW_MIN_SAMPLES};
+use pipestream_search::node::{NodeConfig, NodeServiceImpl, SCAN_WINDOW_MIN_SAMPLES};
 use pipestream_search::node_agent::{NodeAgent, NodeAgentConfig, ServedShard};
 use pipestream_search::pb::cluster_control_client::ClusterControlClient;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
@@ -41,7 +41,6 @@ fn shard_config(index_path: PathBuf) -> NodeConfig {
     NodeConfig {
         index_path: Some(index_path),
         analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
-        layout: Layout::SingleImage,
         wal: true,
         ..Default::default()
     }
@@ -69,7 +68,6 @@ fn agent_config(
         scan_parallel: 2,
         template: shard_config(PathBuf::new()),
         phrase_index: None,
-        allow_missing_bm25: false,
         tls: None,
         max_message_bytes: pipestream_search::MAX_MESSAGE_BYTES,
     }
@@ -98,7 +96,7 @@ async fn serve_control(control: ClusterControlService) -> String {
 
 /// A calibrated node with ROWS vectors, served, plus its corpus.
 async fn seeded_node(dir: &Path) -> (NodeServiceImpl, String, Vec<f32>) {
-    let node = NodeServiceImpl::open(shard_config(dir.join("shard")), None, false).unwrap();
+    let node = NodeServiceImpl::open(shard_config(dir.join("shard")), None).unwrap();
     let (addr, _handle) = serve_node(node.clone()).await;
     let corpus = unit_vectors(ROWS, DIM, 0xB0D6_0001);
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &corpus[..2_048 * DIM]);

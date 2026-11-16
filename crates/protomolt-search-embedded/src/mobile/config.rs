@@ -9,7 +9,20 @@ use pipestream_search::pb::mobile::{MobileOpenRequest, MobileShardConfig};
 
 use super::bridge::BridgeError;
 
+/// A persisted shard is a segment catalog, which has no interrupted bulk
+/// build to serve around; the flag is refused rather than ignored.
+fn refuse_missing_bm25_override(config: &MobileShardConfig) -> Result<(), BridgeError> {
+    if config.allow_missing_bm25 {
+        return Err(BridgeError::invalid(
+            "allow_missing_bm25 has no effect: a persisted shard is a segment catalog, which \
+             has no interrupted bulk build to serve around",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn node_config(config: MobileShardConfig) -> Result<EmbeddedShardConfig, BridgeError> {
+    refuse_missing_bm25_override(&config)?;
     if config.in_memory && !config.index_path.is_empty() {
         return Err(BridgeError::invalid(
             "mobile shard cannot set both in_memory and index_path",
@@ -24,8 +37,6 @@ pub(super) fn node_config(config: MobileShardConfig) -> Result<EmbeddedShardConf
     } else {
         EmbeddedShardConfig::persistent(PathBuf::from(config.index_path), config.slot_offset)
     };
-    shard.allow_missing_bm25 = config.allow_missing_bm25;
-
     let node = &mut shard.node;
     if let Some(value) = config.vector_backend {
         node.vector_backend = value;

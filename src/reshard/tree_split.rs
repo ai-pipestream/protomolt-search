@@ -29,12 +29,12 @@ pub const BUILD_BYTES_PER_ROW: u64 = 70 * 1024;
 /// (parallel to `images.children`), and what moved.
 #[derive(Debug)]
 pub struct TreeReshardOutput {
-    /// One entry per child. Under [`TreeChildLayout::Segmented`] a child's
-    /// `vector_path` is the index path a node serves (`<out>/shard-<i>.tv`,
-    /// its catalog beside it under `.segments`), `bm25_path` is `None`, and
-    /// the id maps are empty: the segments' own metadata carry the rows.
-    /// Under [`TreeChildLayout::SingleImage`] the entries are the images
-    /// as any split writes them.
+    /// One entry per child: a child's `vector_path` is the index path a
+    /// node serves (`<out>/shard-<i>.tv`, its catalog beside it under
+    /// `.segments`), `bm25_path` is `None`, and the id maps are empty: the
+    /// segments' own metadata carry the rows. Each non-empty spill bucket
+    /// of a child seals as one segment, so memory is one bucket's rows plus
+    /// one segment build.
     pub images: ReshardOutput,
     pub children: Vec<TreeChild>,
     /// Live documents whose code under the new tree differs from the
@@ -42,12 +42,9 @@ pub struct TreeReshardOutput {
     pub moved: u64,
     /// Live documents per child.
     pub placed: Vec<u64>,
-    /// How the children were written.
-    pub layout: TreeChildLayout,
-    /// Sealed segments per child (1 per child under a single image).
+    /// Sealed segments per child.
     pub segments: Vec<usize>,
-    /// The most live source rows any one replay held: one spill bucket
-    /// under the segmented layout, one child under a single image.
+    /// The most live source rows any one replay held: one spill bucket.
     pub peak_replay_rows: u64,
     /// The bucket count the spill logs were written with.
     pub spill_bucket_count: u32,
@@ -65,25 +62,9 @@ pub struct TreeReshardOutput {
     pub transplanted_rows: u64,
 }
 
-/// How a re-placement split writes each child.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TreeChildLayout {
-    /// A segment catalog per child (`<out>/shard-<i>.tv.segments`): the child's spill
-    /// log replays one WAL bucket at a time and each non-empty bucket seals as one
-    /// segment, so memory is one bucket's rows plus one segment build, and a node
-    /// starts on the child with `--index=<out>/shard-<i>.tv`.
-    Segmented,
-    /// One image per child, the way the other splits write: the child's
-    /// rows are held together while the image is built. The caller states
-    /// the most rows a child may have; a larger child is refused by name
-    /// before any image is written.
-    SingleImage { max_child_rows: u64 },
-}
-
 /// The knobs of a re-placement split.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeSplitOptions {
-    pub layout: TreeChildLayout,
     /// log2 of the spill logs' bucket count; `None` takes the largest
     /// bucket count among the inputs, so a replay of one spill bucket is
     /// bounded the way a replay of one source bucket is. Ignored under
@@ -97,8 +78,7 @@ pub struct TreeSplitOptions {
     /// others' catalogs unwritten: the routing pass still spills every
     /// child, so the rows and the map are the full split's, but a
     /// child whose build failed (an out-of-memory kill on the archive,
-    /// 2026-09-06) is redone without the five that finished. Segmented
-    /// layout only; a single-image split is refused by name.
+    /// 2026-09-06) is redone without the five that finished.
     pub only_child: Option<usize>,
     /// The open-files limit the spill pass is checked against; `None`
     /// reads the process's own soft limit. A test sets a small number
@@ -114,7 +94,7 @@ pub struct TreeSplitOptions {
     /// Rows already derived under `derived` refuse; rows never derived
     /// need every declared column named (`Declaration::rederive`).
     pub derive: Vec<String>,
-    /// Spill buckets built at once in a segmented child under
+    /// Spill buckets built at once in a child under
     /// `--from-segments` (`--build-threads`): each thread replays one
     /// bucket into memory and seals it, so the build's memory is this
     /// many buckets' replays; the segments append in bucket order and
@@ -130,7 +110,7 @@ pub struct TreeSplitOptions {
     /// `None` takes the thread count; zero is refused.
     pub build_queue: Option<usize>,
     /// A fixed 70 KiB/row planning admission estimate in bytes
-    /// (`--build-memory`, segmented layout only): after the routing
+    /// (`--build-memory`): after the routing
     /// pass, each child's spill counts at [`BUILD_BYTES_PER_ROW`] a row
     /// must fit it — the largest bucket alone, and the thread count
     /// times it. A plan that cannot fit is refused by name; neither
@@ -143,7 +123,6 @@ pub struct TreeSplitOptions {
 impl Default for TreeSplitOptions {
     fn default() -> Self {
         Self {
-            layout: TreeChildLayout::Segmented,
             spill_bucket_bits: None,
             source: TreeRowSource::Logs,
             cut: SpillCut::Hash,

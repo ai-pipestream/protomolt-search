@@ -20,7 +20,6 @@
 //! first request message is kept (up to [`CAPTURE_LIMIT`] bytes) so a test
 //! can decode it and tell apart calls that share a method name.
 
-use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -155,16 +154,6 @@ impl TraceRecorder {
             }
         }
     }
-}
-
-/// Calls per `(node, method)`.
-pub fn counts(spans: &[CallSpan]) -> BTreeMap<(String, String), usize> {
-    let mut out = BTreeMap::new();
-    for span in spans {
-        *out.entry((span.node.clone(), span.method.clone()))
-            .or_default() += 1;
-    }
-    out
 }
 
 /// Most bytes of a request's first message kept in [`CallSpan::first_request`].

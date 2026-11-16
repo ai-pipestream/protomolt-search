@@ -75,8 +75,6 @@ impl crate::filter_bits::ColumnSets for Bm25Shard {
             Bm25Shard::Building(store) => {
                 range.part(store, 0..store.next_doc_id() as usize, want, domain, out)
             }
-            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
-            Bm25Shard::Resident(reader) => range.part(reader, 0..domain.len(), want, domain, out),
             Bm25Shard::Segmented(shard) => shard.number_rows(range, want, domain, out),
         }
     }
@@ -95,13 +93,6 @@ impl crate::filter_bits::ColumnSets for Bm25Shard {
                     }
                 }
             }
-            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
-            Bm25Shard::Resident(reader) => {
-                let inverted = reader.facet_rows(fi);
-                for ord in (0..inverted.values() as u32).filter(|&ord| accept(ord)) {
-                    inverted.union_into(ord, 0, out);
-                }
-            }
             Bm25Shard::Segmented(shard) => shard.facet_rows(fi, accept, out),
         }
     }
@@ -115,8 +106,6 @@ impl crate::filter_bits::ColumnSets for Bm25Shard {
                     }
                 }
             }
-            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
-            Bm25Shard::Resident(reader) => reader.facet_rows(fi).present_into(0, out),
             Bm25Shard::Segmented(shard) => shard.facet_present(fi, out),
         }
     }

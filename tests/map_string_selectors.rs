@@ -161,7 +161,11 @@ async fn empty_key_ranges_and_prefixes_survive_node_and_relay_wire() {
             let path = root.join(format!("{mapped}-{leaf}.bm25"));
             let shard = if mapped {
                 store.save(&path).unwrap();
-                Bm25Shard::open(&path).unwrap()
+                common::catalog::sealed_shard(
+                    &path.with_extension("tv"),
+                    &path,
+                    Bm25Store::new().with_map_facets(&["meta"]),
+                )
             } else {
                 Bm25Shard::Building(store)
             };
