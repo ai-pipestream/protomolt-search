@@ -9,7 +9,7 @@ use tokio::sync::watch;
 use tokio::time::Sleep;
 use tonic::Status;
 
-use crate::coordinator::{RequestFilters, ShardVectorRowProbe, StreamFanout};
+use crate::coordinator::{RequestFilters, ShardVectorRowProbe, StreamFanout, StreamOpen};
 use crate::pb::{stream_search_response, StreamSearchResponse, StreamSearchSummary};
 
 use super::stream_search::{await_vector_rows, sync_map_changes};
@@ -131,7 +131,7 @@ fn discovery_summary(
 
 fn open_fanout(args: &StreamArgs) -> Result<StreamFanout, Status> {
     let start = &args.start;
-    args.coordinator.open_stream_fanout_with_identities(
+    args.coordinator.open_stream_context(StreamOpen::new(
         &start.request_id,
         &start.vector,
         start.initial_floor,
@@ -139,7 +139,7 @@ fn open_fanout(args: &StreamArgs) -> Result<StreamFanout, Status> {
         start.collapse_parents,
         &args.filters,
         start.identity_limits,
-    )
+    )?)
 }
 
 /// The next thing the loop reacts to, in priority order: the parent's
