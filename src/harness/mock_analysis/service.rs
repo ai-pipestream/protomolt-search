@@ -29,7 +29,7 @@ use crate::analyzer::wire::{
 };
 
 use super::analyze::{analyze_text, MockLayers};
-use super::{rerank, DelayedCall, MockAnalysis};
+use super::{rerank, DelayedCall, Lane, MockAnalysis, PriorityLanes};
 
 impl MockAnalysis {
     fn layers(&self) -> MockLayers {
@@ -50,6 +50,9 @@ struct StreamSession {
     layers: MockLayers,
     calls: Arc<AtomicU64>,
     gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// The accelerator slot each document takes a unit of, in the lane the
+    /// stream opened under.
+    lanes: Option<(Arc<PriorityLanes>, Lane)>,
     tx: StreamTx,
 }
 
@@ -104,6 +107,9 @@ impl StreamSession {
                         .await;
                 }
                 Some(analyze_stream_request::Kind::Document(doc)) => {
+                    if let Some((lanes, lane)) = &self.lanes {
+                        lanes.run(*lane).await;
+                    }
                     let response = self.answer(doc);
                     match held.take() {
                         None => held = Some(response),
@@ -213,12 +219,14 @@ impl AnalysisService for MockAnalysis {
             return Err(Status::unimplemented("this server predates AnalyzeStream"));
         }
         self.stream_opens.fetch_add(1, Ordering::Relaxed);
+        let lane = Lane::of(request.metadata());
         let inbound = request.into_inner();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<AnalyzeStreamResponse, Status>>(16);
         let session = StreamSession {
             layers: self.layers(),
             calls: self.calls.clone(),
             gate: self.stream_end_gate.clone(),
+            lanes: self.lanes.clone().map(|lanes| (lanes, lane)),
             tx,
         };
         tokio::spawn(session.run(inbound));
@@ -349,6 +357,9 @@ impl AnalysisService for MockAnalysis {
         &self,
         req: Request<RerankAndHighlightRequest>,
     ) -> Result<Response<RerankAndHighlightResponse>, Status> {
+        if let Some(lanes) = &self.lanes {
+            lanes.run(Lane::of(req.metadata())).await;
+        }
         Ok(Response::new(rerank::rerank_and_highlight(
             req.into_inner(),
         )))
