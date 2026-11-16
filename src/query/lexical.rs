@@ -32,7 +32,7 @@ pub(super) async fn execute_lexical(
         synonym_expansions.extend(bound.synonym_expansions.iter().cloned());
     }
     let mut hits = lexical_hits(&run, id, &response)?;
-    let reranked = turbo_rerank(&base, &query.text, &RerankSources::default(), &mut hits).await?;
+    let reranked = turbo_rerank(&base, &query.text, &RerankSources::disabled(), &mut hits).await?;
     let route = if reranked {
         "bm25_search:turbo_rerank"
     } else {

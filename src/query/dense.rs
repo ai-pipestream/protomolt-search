@@ -33,10 +33,6 @@ pub(super) async fn execute_dense(
         p.segments_skipped = response.segments_skipped;
     }
     report_shard_regimes(&mut run, &response);
-    let mut sources = RerankSources::default();
-    for h in &response.hits {
-        sources.note_candidate(h.vector_id, h.rerank_candidate.as_ref());
-    }
     let matched = matched(vec![id.to_string()], &base.plan.filter_ids);
     let mut hits: Vec<QueryHit> = response
         .hits
@@ -63,6 +59,7 @@ pub(super) async fn execute_dense(
         }
         "search"
     };
+    let sources = rerank_sources(base.coordinator.rerank_spec(), &hits, &response);
     if turbo_rerank(&base, &base.req.request_id, &sources, &mut hits).await? {
         route = "search:turbo_rerank";
     }
@@ -103,6 +100,24 @@ fn report_shard_regimes(run: &mut Run<'_>, response: &SearchResponse) {
         outcome.shards_finished_early = response.shards_finished_early;
         outcome.shards_floor_pruned = response.shards_floor_pruned;
     }
+}
+
+fn rerank_sources(
+    spec: Option<&crate::turbo_bridge::rerank::RerankSpec>,
+    hits: &[QueryHit],
+    response: &SearchResponse,
+) -> RerankSources {
+    let mut sources = RerankSources::for_shortlist(spec, hits);
+    if !sources.is_enabled() {
+        return sources;
+    }
+    for h in &response.hits {
+        sources.note_candidate(h.vector_id, h.rerank_candidate.as_ref());
+        if sources.has_all_inline() {
+            break;
+        }
+    }
+    sources
 }
 
 /// Rescore the candidate pool against the stored FP32 vectors and
