@@ -2,8 +2,10 @@
 
 use super::*;
 use crate::pb::*;
-#[tokio::test]
-async fn lineage_authority_projects_each_key_and_guards_the_selection_version() {
+
+/// One shard holding a public row under parent 10 and a private row under
+/// parent 99, with the link that wrote them.
+async fn lineage_fixture() -> (crate::link::NodeLink, CoordinatorServiceImpl) {
     let node = Arc::new(crate::node::NodeServiceImpl::new(
         None,
         crate::node::NodeConfig {
@@ -32,7 +34,12 @@ async fn lineage_authority_projects_each_key_and_guards_the_selection_version() 
         .unwrap();
     }
     let owner = CoordinatorServiceImpl::with_local_nodes(vec![node]);
-    let access = AccessDecision {
+    (link, owner)
+}
+
+/// Public rows only, with `parent_id` usable and disclosable.
+fn parent_id_access() -> AccessDecision {
+    AccessDecision {
         action: AccessAction::Search as i32,
         document_visibility: Some(DocumentVisibility {
             filter: crate::cel::compile_filter("audience == 'public'").unwrap(),
@@ -45,7 +52,42 @@ async fn lineage_authority_projects_each_key_and_guards_the_selection_version() 
             ..Default::default()
         }),
         ..Default::default()
-    };
+    }
+}
+
+/// Use without disclose, or disclose without use, is refused before any I/O.
+async fn assert_partial_grants_are_denied(reader: &CoordinatorServiceImpl) {
+    let mut denied = reader.clone();
+    denied.node_addrs = vec!["http://must-not-resolve.invalid:50051".into()];
+    for actions in [
+        vec![FieldAction::Use as i32],
+        vec![FieldAction::Disclose as i32],
+    ] {
+        denied.field_permissions = Some(
+            crate::field_permissions::FieldScope::new(&FieldPermissions {
+                grants: vec![FieldGrant {
+                    field: "parent_id".into(),
+                    actions,
+                }],
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        assert_eq!(
+            denied
+                .lineage_key(&[], "parent_id")
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+}
+
+#[tokio::test]
+async fn lineage_authority_projects_each_key_and_guards_the_selection_version() {
+    let (mut link, owner) = lineage_fixture().await;
+    let access = parent_id_access();
     let reader = owner.for_access(Some(&access), "aggregate").unwrap();
     assert_eq!(
         reader.lineage_key(&[0, 1], "parent_id").await.unwrap(),
@@ -79,31 +121,7 @@ async fn lineage_authority_projects_each_key_and_guards_the_selection_version() 
             .code(),
         tonic::Code::FailedPrecondition
     );
-    let mut denied = reader.clone();
-    denied.node_addrs = vec!["http://must-not-resolve.invalid:50051".into()];
-    for actions in [
-        vec![FieldAction::Use as i32],
-        vec![FieldAction::Disclose as i32],
-    ] {
-        denied.field_permissions = Some(
-            crate::field_permissions::FieldScope::new(&FieldPermissions {
-                grants: vec![FieldGrant {
-                    field: "parent_id".into(),
-                    actions,
-                }],
-                ..Default::default()
-            })
-            .unwrap(),
-        );
-        assert_eq!(
-            denied
-                .lineage_key(&[], "parent_id")
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::PermissionDenied
-        );
-    }
+    assert_partial_grants_are_denied(&reader).await;
     let mut unknown = reader;
     unknown.document_visibility = Some(DocumentVisibility {
         filter: crate::cel::compile_filter("internal_secret == 'public'").unwrap(),

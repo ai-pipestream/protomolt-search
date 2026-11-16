@@ -90,7 +90,6 @@ impl CoordinatorServiceImpl {
             fields.fetch_values(projections, stages)?;
         }
         let scope = crate::visibility::VisibilityScope::new(self.document_visibility.as_ref())?;
-        let mut visibility_known = vec![false; scope.column_count()];
         let candidates: std::collections::HashSet<u64> = ids.iter().copied().collect();
         // Stage parameters validate here too, so a malformed stage is
         // refused by name before any fan-out.
@@ -100,8 +99,7 @@ impl CoordinatorServiceImpl {
                 "identity fetch exceeds 1000000 input IDs",
             ));
         }
-        let mut identity_bytes = 0usize;
-        let mut out = FetchedValues {
+        let out = FetchedValues {
             projection_types: vec![crate::pb::ScalarValueType::Unspecified; projections.len()],
             identities: HashMap::new(),
             rows: HashMap::new(),
@@ -118,6 +116,41 @@ impl CoordinatorServiceImpl {
         {
             return Ok(out);
         }
+        let fetch = ValuesFetch {
+            ids,
+            projections,
+            stages,
+            epochs,
+            include_identities,
+        };
+        let mut tasks = self.spawn_value_fetches(fetch)?;
+        // JoinSet aborts outstanding requests if this read is cancelled or a
+        // peer fails. Keep deterministic node order when folding the replies.
+        let mut responses = std::collections::BTreeMap::new();
+        while let Some(joined) = tasks.join_next().await {
+            let (shard, response) =
+                joined.map_err(|e| Status::internal(format!("fetch values task failed: {e}")))?;
+            responses.insert(shard, response?);
+        }
+        let mut fold = ValuesFold::new(fetch, scope, candidates, out);
+        for (shard, resp) in responses {
+            fold.fold_shard(shard, resp)?;
+        }
+        self.check_visibility_columns(&fold.visibility_known)?;
+        fold.finish()
+    }
+
+    fn spawn_value_fetches(
+        &self,
+        fetch: ValuesFetch<'_>,
+    ) -> Result<tokio::task::JoinSet<ValuesReply>, Status> {
+        let ValuesFetch {
+            ids,
+            projections,
+            stages,
+            epochs,
+            include_identities,
+        } = fetch;
         let mut tasks = tokio::task::JoinSet::new();
         for (shard, node) in self.node_addrs.iter().enumerate() {
             let claim = epochs.map_or(StatsClaim::default(), |epochs| epochs[shard]);
@@ -138,6 +171,48 @@ impl CoordinatorServiceImpl {
                 )
             });
         }
+        Ok(tasks)
+    }
+}
+
+type ValuesReply = (usize, Result<crate::pb::FetchValuesResponse, Status>);
+
+/// One candidate-scoped fetch as every shard receives it.
+#[derive(Clone, Copy)]
+struct ValuesFetch<'a> {
+    ids: &'a [u64],
+    projections: &'a [crate::pb::CompiledProjection],
+    stages: &'a [crate::pb::ScoreStage],
+    epochs: Option<&'a [StatsClaim]>,
+    include_identities: bool,
+}
+
+/// The running merge of the shards' value replies, in node order.
+struct ValuesFold<'a> {
+    fetch: ValuesFetch<'a>,
+    scope: crate::visibility::VisibilityScope,
+    candidates: std::collections::HashSet<u64>,
+    visibility_known: Vec<bool>,
+    identity_bytes: usize,
+    projection_leaves: Vec<crate::values::ValueLeaf>,
+    stage_known: Vec<bool>,
+    projection_known: Vec<bool>,
+    projection_types: Vec<crate::pb::ScalarValueType>,
+    out: FetchedValues,
+}
+
+impl<'a> ValuesFold<'a> {
+    fn new(
+        fetch: ValuesFetch<'a>,
+        scope: crate::visibility::VisibilityScope,
+        candidates: std::collections::HashSet<u64>,
+        out: FetchedValues,
+    ) -> Self {
+        let ValuesFetch {
+            projections,
+            stages,
+            ..
+        } = fetch;
         let projection_leaves: Vec<crate::values::ValueLeaf> = {
             let mut leaves = Vec::new();
             for p in projections {
@@ -147,102 +222,143 @@ impl CoordinatorServiceImpl {
             }
             leaves
         };
-        let mut stage_known = vec![false; stages.len()];
-        let mut projection_known = vec![false; projection_leaves.len()];
-        let mut projection_types = vec![crate::pb::ScalarValueType::Unspecified; projections.len()];
-        // JoinSet aborts outstanding requests if this read is cancelled or a
-        // peer fails. Keep deterministic node order when folding the replies.
-        let mut responses = std::collections::BTreeMap::new();
-        while let Some(joined) = tasks.join_next().await {
-            let (shard, response) =
-                joined.map_err(|e| Status::internal(format!("fetch values task failed: {e}")))?;
-            responses.insert(shard, response?);
+        Self {
+            fetch,
+            visibility_known: vec![false; scope.column_count()],
+            scope,
+            candidates,
+            identity_bytes: 0,
+            stage_known: vec![false; stages.len()],
+            projection_known: vec![false; projection_leaves.len()],
+            projection_types: vec![crate::pb::ScalarValueType::Unspecified; projections.len()],
+            projection_leaves,
+            out,
         }
-        for (shard, resp) in responses {
-            crate::values::validate_map_fetch_contract(
-                projections,
-                resp.typed_map_contract_version,
-            )?;
-            scope.validate_echo(&resp.visibility_fingerprint, &resp.visibility_columns_known)?;
-            let claim = StatsClaim::required(resp.stats_epoch, &resp.stats_incarnation)?;
-            if epochs.is_some_and(|epochs| epochs[shard] != claim) {
-                return Err(Status::failed_precondition(
-                    "candidate fetch returned a different selection version",
-                ));
-            }
-            if resp.identities_included != include_identities
-                || (!include_identities && !resp.identities.is_empty())
+    }
+
+    fn fold_shard(
+        &mut self,
+        shard: usize,
+        resp: crate::pb::FetchValuesResponse,
+    ) -> Result<(), Status> {
+        let ValuesFetch {
+            projections,
+            stages,
+            epochs,
+            include_identities,
+            ..
+        } = self.fetch;
+        crate::values::validate_map_fetch_contract(projections, resp.typed_map_contract_version)?;
+        self.scope
+            .validate_echo(&resp.visibility_fingerprint, &resp.visibility_columns_known)?;
+        let claim = StatsClaim::required(resp.stats_epoch, &resp.stats_incarnation)?;
+        if epochs.is_some_and(|epochs| epochs[shard] != claim) {
+            return Err(Status::failed_precondition(
+                "candidate fetch returned a different selection version",
+            ));
+        }
+        if resp.identities_included != include_identities
+            || (!include_identities && !resp.identities.is_empty())
+        {
+            return Err(Status::failed_precondition(
+                "shard omitted or changed identity fetch certificate",
+            ));
+        }
+        self.fold_identities(resp.identities)?;
+        self.out.epochs.push(claim);
+        for (known, shard) in self
+            .visibility_known
+            .iter_mut()
+            .zip(&resp.visibility_columns_known)
+        {
+            *known |= shard;
+        }
+        if resp.projection_types.len() != projections.len()
+            || resp.projection_leaves_known.len() != self.projection_leaves.len()
+            || resp.stage_columns_known.len() != stages.len()
+        {
+            return Err(Status::failed_precondition("shard omitted projection type or known-column metadata; use matching server builds"));
+        }
+        crate::values::merge_projection_types(
+            projections,
+            &mut self.projection_types,
+            &resp.projection_types,
+        )?;
+        for (known, shard) in self.stage_known.iter_mut().zip(&resp.stage_columns_known) {
+            *known |= shard;
+        }
+        for (known, shard) in self
+            .projection_known
+            .iter_mut()
+            .zip(&resp.projection_leaves_known)
+        {
+            *known |= shard;
+        }
+        self.fold_rows(resp.rows, &resp.projection_types)
+    }
+
+    fn fold_identities(
+        &mut self,
+        identities: Vec<crate::pb::CandidateIdentity>,
+    ) -> Result<(), Status> {
+        for row in identities {
+            if !self.candidates.contains(&row.doc_id)
+                || self.out.identities.contains_key(&row.doc_id)
             {
                 return Err(Status::failed_precondition(
-                    "shard omitted or changed identity fetch certificate",
+                    "candidate fetch returned an unrequested or duplicate identity",
                 ));
             }
-            for row in resp.identities {
-                if !candidates.contains(&row.doc_id) || out.identities.contains_key(&row.doc_id) {
-                    return Err(Status::failed_precondition(
-                        "candidate fetch returned an unrequested or duplicate identity",
-                    ));
-                }
-                crate::query_identity::charge_candidate_identity(&row, &mut identity_bytes)?;
-                out.identities.insert(row.doc_id, row.identity);
+            crate::query_identity::charge_candidate_identity(&row, &mut self.identity_bytes)?;
+            self.out.identities.insert(row.doc_id, row.identity);
+        }
+        Ok(())
+    }
+
+    fn fold_rows(
+        &mut self,
+        rows: Vec<crate::pb::FetchedRow>,
+        shard_types: &[i32],
+    ) -> Result<(), Status> {
+        let ValuesFetch {
+            projections,
+            stages,
+            ..
+        } = self.fetch;
+        for row in rows {
+            if !self.candidates.contains(&row.doc_id) || self.out.rows.contains_key(&row.doc_id) {
+                return Err(Status::failed_precondition(
+                    "candidate fetch returned an unrequested or duplicate row",
+                ));
             }
-            out.epochs.push(claim);
-            for (known, shard) in visibility_known
-                .iter_mut()
-                .zip(&resp.visibility_columns_known)
-            {
-                *known |= shard;
+            if row.values.len() != projections.len() || row.stage_values.len() != stages.len() {
+                return Err(Status::failed_precondition(
+                    "shard returned a projection row with the wrong width",
+                ));
             }
-            if resp.projection_types.len() != projections.len()
-                || resp.projection_leaves_known.len() != projection_leaves.len()
-                || resp.stage_columns_known.len() != stages.len()
-            {
-                return Err(Status::failed_precondition("shard omitted projection type or known-column metadata; use matching server builds"));
-            }
-            crate::values::merge_projection_types(
-                projections,
-                &mut projection_types,
-                &resp.projection_types,
-            )?;
-            for (known, shard) in stage_known.iter_mut().zip(&resp.stage_columns_known) {
-                *known |= shard;
-            }
-            for (known, shard) in projection_known
-                .iter_mut()
-                .zip(&resp.projection_leaves_known)
-            {
-                *known |= shard;
-            }
-            for row in resp.rows {
-                if !candidates.contains(&row.doc_id) || out.rows.contains_key(&row.doc_id) {
-                    return Err(Status::failed_precondition(
-                        "candidate fetch returned an unrequested or duplicate row",
-                    ));
-                }
-                if row.values.len() != projections.len() || row.stage_values.len() != stages.len() {
-                    return Err(Status::failed_precondition(
-                        "shard returned a projection row with the wrong width",
-                    ));
-                }
-                crate::values::validate_projection_row(&row.values, &resp.projection_types)?;
-                for (i, sv) in row.stage_values.iter().enumerate() {
-                    match sv.value {
-                        Some(crate::pb::projected_value::Value::DoubleValue(v)) => {
-                            out.stage_rows[i].insert(row.doc_id, v);
-                        }
-                        None => {}
-                        _ => {
-                            return Err(Status::failed_precondition(
-                                "candidate fetch returned a nonnumeric stage contribution",
-                            ))
-                        }
+            crate::values::validate_projection_row(&row.values, shard_types)?;
+            for (i, sv) in row.stage_values.iter().enumerate() {
+                match sv.value {
+                    Some(crate::pb::projected_value::Value::DoubleValue(v)) => {
+                        self.out.stage_rows[i].insert(row.doc_id, v);
+                    }
+                    None => {}
+                    _ => {
+                        return Err(Status::failed_precondition(
+                            "candidate fetch returned a nonnumeric stage contribution",
+                        ))
                     }
                 }
-                out.rows.insert(row.doc_id, row.values);
             }
+            self.out.rows.insert(row.doc_id, row.values);
         }
-        self.check_visibility_columns(&visibility_known)?;
-        for (stage, known) in stages.iter().zip(&stage_known) {
+        Ok(())
+    }
+
+    /// Refuse a stage or projection column no shard resolves, by name.
+    fn finish(mut self) -> Result<FetchedValues, Status> {
+        let stages = self.fetch.stages;
+        for (stage, known) in stages.iter().zip(&self.stage_known) {
             if !known {
                 return Err(Status::invalid_argument(format!(
                     "no shard has numeric column {}: the stored-value dimension would be \
@@ -252,9 +368,10 @@ impl CoordinatorServiceImpl {
                 )));
             }
         }
-        let unknown_projection: Vec<String> = projection_leaves
+        let unknown_projection: Vec<String> = self
+            .projection_leaves
             .iter()
-            .zip(&projection_known)
+            .zip(&self.projection_known)
             .filter(|(_, known)| !**known)
             .map(|(leaf, _)| leaf.describe())
             .collect();
@@ -266,7 +383,7 @@ impl CoordinatorServiceImpl {
                 unknown_projection.join(", ")
             )));
         }
-        out.projection_types = projection_types;
-        Ok(out)
+        self.out.projection_types = self.projection_types;
+        Ok(self.out)
     }
 }

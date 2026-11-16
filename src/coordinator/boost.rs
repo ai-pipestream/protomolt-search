@@ -43,8 +43,32 @@ impl CoordinatorServiceImpl {
             (boost.window as usize).min(len)
         };
 
-        // Analyze the boost text with the SAME options as the main query
-        // (term identity must match the index, as everywhere).
+        let terms = self.boost_terms(boost, spec).await?;
+        let scores = self
+            .boost_window_scores(&terms, analysis_fingerprint, hits, cascade_hits, window)
+            .await?;
+        let weights = BoostWeights { base_w, boost_w };
+        if !hits.is_empty() {
+            reorder_hybrid_window(hits, window, &scores, weights);
+        } else if !cascade_hits.is_empty() {
+            reorder_cascade_window(cascade_hits, window, &scores, weights);
+        }
+
+        if let Some(d) = debug.as_mut() {
+            d.boost_terms = terms;
+            d.boost_ms = t0.elapsed().as_secs_f32() * 1e3;
+            d.total_ms += d.boost_ms;
+        }
+        Ok(())
+    }
+
+    /// Analyze the boost text with the SAME options as the main query (term
+    /// identity must match the index, as everywhere).
+    async fn boost_terms(
+        &self,
+        boost: &crate::pb::BoostRescore,
+        spec: Option<&crate::pb::AnalysisSpec>,
+    ) -> Result<Vec<String>, Status> {
         let addr = self.analysis_addr.clone().ok_or_else(|| {
             Status::unavailable("no analysis backend configured on the coordinator (analysis_addr)")
         })?;
@@ -55,10 +79,20 @@ impl CoordinatorServiceImpl {
                 terms.push(term);
             }
         }
+        Ok(terms)
+    }
 
-        // Candidate-scoped scoring of the window, routed by owning
-        // shard. Stats + rescore run as a round (a stale-stats refusal
-        // reruns them once with fresh stats and a new fenced claim).
+    /// Candidate-scoped scoring of the window, routed by owning shard. Stats
+    /// and rescore run as a round (a stale-stats refusal reruns them once
+    /// with fresh stats and a new fenced claim).
+    async fn boost_window_scores(
+        &self,
+        terms: &[String],
+        analysis_fingerprint: u64,
+        hits: &[HybridHit],
+        cascade_hits: &[CascadeHit],
+        window: usize,
+    ) -> Result<HashMap<u64, f64>, Status> {
         let mut scores: HashMap<u64, f64> = HashMap::new();
         if window > 0 && !terms.is_empty() {
             let mut by_shard: HashMap<u32, Vec<u64>> = HashMap::new();
@@ -75,11 +109,11 @@ impl CoordinatorServiceImpl {
             }
             let mut fresh = false;
             let rescored = loop {
-                let (global, epochs) = self.body_stats(&terms, fresh).await?;
+                let (global, epochs) = self.body_stats(terms, fresh).await?;
                 let claims = epochs;
                 match self
                     .fanout_bm25_rescore_scores(
-                        &terms,
+                        terms,
                         analysis_fingerprint,
                         &global,
                         &claims,
@@ -100,41 +134,56 @@ impl CoordinatorServiceImpl {
                 scores.insert(doc_id, f64::from(score));
             }
         }
+        Ok(scores)
+    }
+}
 
-        if !hits.is_empty() {
-            let window = window.min(hits.len());
-            for h in &mut hits[..window] {
-                h.boost_score = scores.get(&h.doc_id).copied().unwrap_or(0.0) as f32;
-            }
-            hits[..window].sort_by(|a, b| {
-                let fa = base_w * f64::from(a.fused_score) + boost_w * f64::from(a.boost_score);
-                let fb = base_w * f64::from(b.fused_score) + boost_w * f64::from(b.boost_score);
-                fb.total_cmp(&fa)
-                    .then_with(|| a.shard.cmp(&b.shard))
-                    .then_with(|| a.doc_id.cmp(&b.doc_id))
-            });
-        } else if !cascade_hits.is_empty() {
-            let window = window.min(cascade_hits.len());
-            for h in &mut cascade_hits[..window] {
-                h.boost_score = scores.get(&h.doc_id).copied().unwrap_or(0.0) as f32;
-            }
-            cascade_hits[..window].sort_by(|a, b| {
-                let fa = base_w * f64::from(a.bm25_score) + boost_w * f64::from(a.boost_score);
-                let fb = base_w * f64::from(b.bm25_score) + boost_w * f64::from(b.boost_score);
-                fb.total_cmp(&fa)
-                    .then_with(|| b.vector_score.total_cmp(&a.vector_score))
-                    .then_with(|| a.doc_id.cmp(&b.doc_id))
-            });
-            for (i, hit) in cascade_hits.iter_mut().enumerate() {
-                hit.rank = i as u32 + 1;
-            }
-        }
+#[derive(Clone, Copy)]
+struct BoostWeights {
+    base_w: f64,
+    boost_w: f64,
+}
 
-        if let Some(d) = debug.as_mut() {
-            d.boost_terms = terms;
-            d.boost_ms = t0.elapsed().as_secs_f32() * 1e3;
-            d.total_ms += d.boost_ms;
-        }
-        Ok(())
+fn reorder_hybrid_window(
+    hits: &mut [HybridHit],
+    window: usize,
+    scores: &HashMap<u64, f64>,
+    weights: BoostWeights,
+) {
+    let BoostWeights { base_w, boost_w } = weights;
+    let window = window.min(hits.len());
+    for h in &mut hits[..window] {
+        h.boost_score = scores.get(&h.doc_id).copied().unwrap_or(0.0) as f32;
+    }
+    hits[..window].sort_by(|a, b| {
+        let fa = base_w * f64::from(a.fused_score) + boost_w * f64::from(a.boost_score);
+        let fb = base_w * f64::from(b.fused_score) + boost_w * f64::from(b.boost_score);
+        fb.total_cmp(&fa)
+            .then_with(|| a.shard.cmp(&b.shard))
+            .then_with(|| a.doc_id.cmp(&b.doc_id))
+    });
+}
+
+/// Reorder the cascade window and reassign every rank to the final order.
+fn reorder_cascade_window(
+    cascade_hits: &mut [CascadeHit],
+    window: usize,
+    scores: &HashMap<u64, f64>,
+    weights: BoostWeights,
+) {
+    let BoostWeights { base_w, boost_w } = weights;
+    let window = window.min(cascade_hits.len());
+    for h in &mut cascade_hits[..window] {
+        h.boost_score = scores.get(&h.doc_id).copied().unwrap_or(0.0) as f32;
+    }
+    cascade_hits[..window].sort_by(|a, b| {
+        let fa = base_w * f64::from(a.bm25_score) + boost_w * f64::from(a.boost_score);
+        let fb = base_w * f64::from(b.bm25_score) + boost_w * f64::from(b.boost_score);
+        fb.total_cmp(&fa)
+            .then_with(|| b.vector_score.total_cmp(&a.vector_score))
+            .then_with(|| a.doc_id.cmp(&b.doc_id))
+    });
+    for (i, hit) in cascade_hits.iter_mut().enumerate() {
+        hit.rank = i as u32 + 1;
     }
 }

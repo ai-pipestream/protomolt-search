@@ -147,6 +147,40 @@ fn assert_invalid_contexts(
     assert_eq!(flat.message(), fused.message());
 }
 
+/// Requests that name an option only the flat route serves.
+fn flat_only_requests() -> Vec<Bm25SearchRequest> {
+    vec![
+        Bm25SearchRequest {
+            analysis: Some(Default::default()),
+            ..Default::default()
+        },
+        Bm25SearchRequest {
+            phrase: Some(Default::default()),
+            ..Default::default()
+        },
+        Bm25SearchRequest {
+            prefixes: vec![Default::default()],
+            ..Default::default()
+        },
+        Bm25SearchRequest {
+            score_stages: vec![Default::default()],
+            ..Default::default()
+        },
+        Bm25SearchRequest {
+            projections: vec![Default::default()],
+            ..Default::default()
+        },
+        Bm25SearchRequest {
+            stats_fields: vec!["price".into()],
+            ..Default::default()
+        },
+        Bm25SearchRequest {
+            cardinality_fields: vec!["price".into()],
+            ..Default::default()
+        },
+    ]
+}
+
 #[tokio::test]
 async fn public_contexts_refuse_options_their_route_cannot_serve() {
     let coordinator = CoordinatorServiceImpl::new(Vec::new());
@@ -191,36 +225,7 @@ async fn public_contexts_refuse_options_their_route_cannot_serve() {
             tonic::Code::InvalidArgument
         );
     }
-    for request in [
-        Bm25SearchRequest {
-            analysis: Some(Default::default()),
-            ..Default::default()
-        },
-        Bm25SearchRequest {
-            phrase: Some(Default::default()),
-            ..Default::default()
-        },
-        Bm25SearchRequest {
-            prefixes: vec![Default::default()],
-            ..Default::default()
-        },
-        Bm25SearchRequest {
-            score_stages: vec![Default::default()],
-            ..Default::default()
-        },
-        Bm25SearchRequest {
-            projections: vec![Default::default()],
-            ..Default::default()
-        },
-        Bm25SearchRequest {
-            stats_fields: vec!["price".into()],
-            ..Default::default()
-        },
-        Bm25SearchRequest {
-            cardinality_fields: vec!["price".into()],
-            ..Default::default()
-        },
-    ] {
+    for request in flat_only_requests() {
         assert_eq!(
             FusedLexicalQuery::new(&request, 0, None)
                 .err()

@@ -259,30 +259,43 @@ impl FusedProbe {
                     }),
                 }
             }
-            crate::proximity::PhraseRoute::Positions => ResolvedField {
-                field: field.clone(),
-                terms: analysis.terms.clone(),
-                source: index,
-                phrase: Some(crate::pb::PhraseLeg {
-                    sequence: phrase.sequence.iter().map(|&index| index as u32).collect(),
-                    slop: phrase.slop,
-                    alternatives: phrase
-                        .alternatives
-                        .iter()
-                        .map(|path| crate::pb::PhraseSequence {
-                            terms: path.iter().map(|&index| index as u32).collect(),
-                        })
-                        .collect(),
-                }),
-                fingerprint,
-                routing: Some(crate::pb::PhraseRouting {
-                    field: field.field.clone(),
-                    served_field: field.field.clone(),
-                    bigram_column: false,
-                    slop: phrase.slop,
-                }),
-            },
+            crate::proximity::PhraseRoute::Positions => {
+                positions_field(index, field, analysis, phrase, fingerprint)
+            }
         })
+    }
+}
+
+/// A phrase leg verified against token positions on the field itself.
+fn positions_field(
+    index: usize,
+    field: &crate::pb::QueryField,
+    analysis: &AnalyzedField,
+    phrase: &PhraseConstraint,
+    fingerprint: u64,
+) -> ResolvedField {
+    ResolvedField {
+        field: field.clone(),
+        terms: analysis.terms.clone(),
+        source: index,
+        phrase: Some(crate::pb::PhraseLeg {
+            sequence: phrase.sequence.iter().map(|&index| index as u32).collect(),
+            slop: phrase.slop,
+            alternatives: phrase
+                .alternatives
+                .iter()
+                .map(|path| crate::pb::PhraseSequence {
+                    terms: path.iter().map(|&index| index as u32).collect(),
+                })
+                .collect(),
+        }),
+        fingerprint,
+        routing: Some(crate::pb::PhraseRouting {
+            field: field.field.clone(),
+            served_field: field.field.clone(),
+            bigram_column: false,
+            slop: phrase.slop,
+        }),
     }
 }
 

@@ -270,18 +270,18 @@ fn empty_stream_fleets_fail_without_creating_a_zero_capacity_channel() {
 fn stream_open_rejects_nan_before_channels_or_network_setup() {
     let coordinator = CoordinatorServiceImpl::new(vec!["not a valid node URI".into()]);
     let filters = RequestFilters::default();
-    let error = coordinator
-        .open_stream_fanout_with_identities(
-            "invalid",
-            &[1.0],
-            Some(f32::NAN),
-            Some(1),
-            false,
-            &filters,
-            None,
-        )
-        .err()
-        .expect("NaN must fail without a Tokio runtime or a network connection");
+    let error = StreamOpen::new(
+        "invalid",
+        &[1.0],
+        Some(f32::NAN),
+        Some(1),
+        false,
+        &filters,
+        None,
+    )
+    .and_then(|open| coordinator.open_stream_context(open))
+    .err()
+    .expect("NaN must fail without a Tokio runtime or a network connection");
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
     assert_eq!(error.message(), "initial_floor must not be NaN");
     assert!(coordinator.links.lock().unwrap().is_empty());
@@ -323,18 +323,18 @@ fn stream_open_refuses_invalid_identity_budgets_before_network_setup() {
             ..valid
         },
     ] {
-        let error = coordinator
-            .open_stream_fanout_with_identities(
-                "invalid",
-                &[1.0],
-                None,
-                Some(1),
-                false,
-                &filters,
-                Some(limits),
-            )
-            .err()
-            .expect("invalid identity limits must fail before opening a channel");
+        let error = StreamOpen::new(
+            "invalid",
+            &[1.0],
+            None,
+            Some(1),
+            false,
+            &filters,
+            Some(limits),
+        )
+        .and_then(|open| coordinator.open_stream_context(open))
+        .err()
+        .expect("invalid identity limits must fail before opening a channel");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
         assert!(error.message().starts_with("identity limits require"));
     }
@@ -345,18 +345,18 @@ fn stream_open_refuses_invalid_identity_budgets_before_network_setup() {
 fn stream_open_refuses_identity_exchange_on_collapsed_streams() {
     let coordinator = CoordinatorServiceImpl::new(vec!["not a valid node URI".into()]);
     let filters = RequestFilters::default();
-    let error = coordinator
-        .open_stream_fanout_with_identities(
-            "invalid",
-            &[1.0],
-            None,
-            Some(1),
-            true,
-            &filters,
-            Some(valid_identity_limits()),
-        )
-        .err()
-        .expect("collapse cannot opt into the row identity protocol");
+    let error = StreamOpen::new(
+        "invalid",
+        &[1.0],
+        None,
+        Some(1),
+        true,
+        &filters,
+        Some(valid_identity_limits()),
+    )
+    .and_then(|open| coordinator.open_stream_context(open))
+    .err()
+    .expect("collapse cannot opt into the row identity protocol");
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
     assert_eq!(
         error.message(),
