@@ -920,6 +920,7 @@ fn an_empty_store_keeps_its_declaration_through_save_and_no_catalog_admits_it() 
             bm25_path: &path,
             live_docs_path: &live_path,
             partition_column: None,
+            parents_colocated: false,
         })
         .unwrap_err();
     assert!(err.contains("not aligned"), "{err}");

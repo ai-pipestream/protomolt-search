@@ -219,6 +219,7 @@ impl<'a> CatalogPlacer<'a> {
                 bm25_path,
                 live_docs_path: live_path,
                 partition_column: self.cut_column(),
+                parents_colocated: false,
             })
             .map_err(|error| {
                 format!(

@@ -88,6 +88,7 @@ async fn cutover(
                     bm25_path: &paths[ordinal][2],
                     live_docs_path: &paths[ordinal][3],
                     partition_column: None,
+                    parents_colocated: false,
                 };
                 base += m.rows;
                 source

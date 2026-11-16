@@ -70,6 +70,7 @@ async fn document_only_segment_is_a_gap_in_bitmap_and_boolean_membership() {
                 bm25_path: &bm25,
                 live_docs_path: &live,
                 partition_column: None,
+                parents_colocated: false,
             })
             .unwrap();
     }

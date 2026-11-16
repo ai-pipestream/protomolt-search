@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use super::child_build::{finish_child, ChildSlot};
 use super::child_catalog::sealed;
 use super::merge_inputs::load_merge_manifests;
+use super::parent_routing::{
+    clear_scattered, logs_hold_foreign_parents, parent_routes, route_of, scattered_parents,
+};
 use super::replay::{read_gens_binding, replay_buckets, Replay};
 use super::split_inputs::{
     create_out_dir, distribute, hash_range, replay_clocked, require_stable_keys, SplitInputs,
@@ -112,12 +115,16 @@ pub fn split_logs_with(
     create_out_dir(request.out_dir)?;
     let n = request.n;
     let bucket_count = inputs.manifest.bucket_count as usize;
-    let children = if n <= bucket_count && bucket_count.is_multiple_of(n) {
+    let cheap = n <= bucket_count && bucket_count.is_multiple_of(n);
+    let children = if cheap
+        && !logs_hold_foreign_parents(request.gens, &inputs.manifest, request.vectors_only)?
+    {
         split_bucket_ranges(request, &inputs, analyze)?
     } else {
         eprintln!(
-            "reshard: WAL bucket count {bucket_count} caps cheap splits at {bucket_count} \
-             children; re-partitioning every record for split={n}"
+            "reshard: whole WAL buckets route by row id, which would scatter a lineage \
+             parent's rows or cap the split at {bucket_count} children; re-partitioning \
+             every record by parent for split={n}"
         );
         split_rehashed(request, &inputs, analyze)?
     };
@@ -172,8 +179,10 @@ fn split_bucket_ranges(
     Ok(children)
 }
 
-/// A finer split than the bucket count: every record is re-partitioned
-/// by [`bucket_of`]`(id, n)`.
+/// A split finer than the bucket count, or over logs that hold lineage
+/// parents: every record is re-partitioned by [`bucket_of`] of its lineage
+/// parent (its own id when it has none), so a parent's chunks share a
+/// child.
 fn split_rehashed(
     request: &SplitRequest<'_>,
     inputs: &SplitInputs,
@@ -196,7 +205,8 @@ fn split_rehashed(
         )?;
     }
     replay.compact();
-    let partitions = distribute(replay, n, |id, _| Ok(bucket_of(id, n)))?;
+    let routes = parent_routes(&replay);
+    let partitions = distribute(replay, n, |id, _| Ok(bucket_of(route_of(&routes, id), n)))?;
     build_children(request, inputs, partitions, analyze)
 }
 
@@ -210,6 +220,7 @@ fn build_children(
 ) -> Result<Vec<ChildImage>, String> {
     let schema = inputs.schema(request.bm25_fields);
     let n = partitions.len();
+    let scattered = scattered_parents(&partitions);
     let mut children = Vec::with_capacity(n);
     for (i, replay) in partitions.into_iter().enumerate() {
         let (hash_lo, hash_hi) = hash_range(i, n);
@@ -228,6 +239,7 @@ fn build_children(
             analyze,
         )?);
     }
+    clear_scattered(&mut children, &scattered);
     Ok(children)
 }
 
@@ -295,6 +307,7 @@ pub fn split_stable_logs_ranged(
             })
     })?;
     let schema = inputs.schema(bm25_fields);
+    let scattered = scattered_parents(&partitions);
     let mut children = Vec::with_capacity(ranges.len());
     for (shard, replay) in partitions.into_iter().enumerate() {
         let (hash_lo, hash_hi) = ranges[shard];
@@ -313,6 +326,7 @@ pub fn split_stable_logs_ranged(
             analyze,
         )?);
     }
+    clear_scattered(&mut children, &scattered);
     Ok(StableReshardOutput {
         images: sealed(&inputs.manifest, inputs.next_generation()?, children)?,
         source_cutoffs,

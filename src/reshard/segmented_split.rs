@@ -6,6 +6,7 @@ use super::child_build::{finish_child, ChildSlot};
 #[cfg(doc)]
 use super::hash_split::split_logs_with;
 use super::hash_split::SplitRequest;
+use super::parent_routing::{parent_routes, route_of};
 use super::replay::{replay_buckets, Replay};
 use super::split_inputs::{create_out_dir, distribute, hash_range, SplitInputs};
 use super::{bucket_of, Analyzer, SegmentedChildImage, SegmentedReshardOutput};
@@ -106,7 +107,8 @@ impl<'a> SegmentSealer<'a> {
             return Ok(());
         }
         let n = self.request.n;
-        let partitions = distribute(replay, n, |id, _| Ok(bucket_of(id, n)))?;
+        let routes = parent_routes(&replay);
+        let partitions = distribute(replay, n, |id, _| Ok(bucket_of(route_of(&routes, id), n)))?;
         for (logical_shard, partition) in partitions.into_iter().enumerate() {
             self.seal_partition(logical_shard, partition, analyze)?;
         }

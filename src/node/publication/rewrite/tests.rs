@@ -133,6 +133,7 @@ impl Inputs<'_> {
                 bm25_path: &path.join("documents.bm25"),
                 live_docs_path: &path.join("live-docs.bin"),
                 partition_column: None,
+                parents_colocated: false,
             })
             .unwrap();
     }
@@ -184,6 +185,7 @@ fn output_sources<'a>(
             bm25_path: &p[2],
             live_docs_path: &p[3],
             partition_column: None,
+            parents_colocated: false,
         })
         .collect()
 }

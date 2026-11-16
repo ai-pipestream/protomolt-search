@@ -83,6 +83,7 @@ impl Fixture {
                     bm25_path: &bm25,
                     live_docs_path: &live,
                     partition_column: None,
+                    parents_colocated: false,
                 })
                 .unwrap();
         }
@@ -321,6 +322,7 @@ fn mismatched_exact_dimensions_cannot_enter_a_catalog() {
             bm25_path: &stage.join("documents.bm25"),
             live_docs_path: &stage.join("live.bin"),
             partition_column: None,
+            parents_colocated: false,
         })
         .unwrap_err();
     assert!(error.contains("exact-vector dimension"), "{error}");
@@ -452,6 +454,7 @@ fn publication_switches_sealed_rows_and_read_version_together() {
                 bm25_path: &stage.join("documents.bm25"),
                 live_docs_path: &stage.join("live.bin"),
                 partition_column: None,
+                parents_colocated: false,
             }],
         )
         .unwrap();

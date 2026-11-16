@@ -58,6 +58,7 @@ impl NodeServiceImpl {
             bm25_path: &bm25_path,
             live_docs_path: &live_path,
             partition_column: None,
+            parents_colocated: plan.parents_colocated,
         };
         plan.catalog
             .append(source)

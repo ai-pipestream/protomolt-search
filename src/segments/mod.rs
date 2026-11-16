@@ -81,6 +81,10 @@ pub struct SegmentSource<'a> {
     /// its partition.
     /// `None` for a tail seal and for the bucket layout.
     pub partition_column: Option<&'a str>,
+    /// Whether every lineage parent with a row in this segment holds all
+    /// of its live rows on this shard. Reshard and routed ingest prove it;
+    /// anything that cannot passes `false`.
+    pub parents_colocated: bool,
 }
 
 /// The scoring contracts a sealed segment's provider may carry: the
