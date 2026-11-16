@@ -71,12 +71,25 @@ const LOCK_STRIPES: usize = 1 << 14;
 pub trait LinkCells: Sync {
     fn get(&self, i: usize) -> u32;
     fn cell_count(&self) -> usize;
+    /// Hint the cache that cells `start..start + cells` are about to be read.
+    fn prefetch(&self, start: usize, cells: usize);
+}
+
+/// Prefetch `cells` link cells (4 bytes each) from `tail`'s start.
+#[inline]
+fn prefetch_cells<T>(tail: &[T], cells: usize) {
+    let bytes = cells.min(tail.len()) * 4;
+    super::distance::prefetch_bytes(tail.as_ptr() as *const u8, bytes, bytes.div_ceil(64));
 }
 
 impl LinkCells for [AtomicU32] {
     #[inline]
     fn get(&self, i: usize) -> u32 {
         self[i].load(Atomic::Relaxed)
+    }
+    #[inline]
+    fn prefetch(&self, start: usize, cells: usize) {
+        prefetch_cells(&self[start.min(self.len())..], cells);
     }
     fn cell_count(&self) -> usize {
         <[AtomicU32]>::len(self)
@@ -87,6 +100,10 @@ impl LinkCells for [u32] {
     #[inline]
     fn get(&self, i: usize) -> u32 {
         self[i]
+    }
+    #[inline]
+    fn prefetch(&self, start: usize, cells: usize) {
+        prefetch_cells(&self[start.min(self.len())..], cells);
     }
     fn cell_count(&self) -> usize {
         <[u32]>::len(self)

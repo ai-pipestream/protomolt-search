@@ -140,11 +140,17 @@ pub fn dot_batch4_scalar(q: &[f32], rows: [&[f32]; 4]) -> [f32; 4] {
 /// lines of it. A no-op on targets without a prefetch instruction.
 #[inline]
 pub fn prefetch(row: &[f32], lines: usize) {
+    prefetch_bytes(row.as_ptr() as *const u8, row.len() * 4, lines);
+}
+
+/// Hint the cache that the first `lines` cache lines of the `available`
+/// bytes at `bytes` are about to be read.
+#[inline]
+pub fn prefetch_bytes(bytes: *const u8, available: usize, lines: usize) {
     #[cfg(target_arch = "x86_64")]
     {
         use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-        let bytes = row.as_ptr() as *const i8;
-        let available = row.len() * 4;
+        let bytes = bytes as *const i8;
         let mut at = 0usize;
         for _ in 0..lines {
             if at >= available {
@@ -152,15 +158,13 @@ pub fn prefetch(row: &[f32], lines: usize) {
             }
             // SAFETY: prefetch is a hint and has no effect on memory
             // safety, whatever the address; the pointer stays within the
-            // row's bytes here anyway.
+            // `available` bytes here anyway.
             unsafe { _mm_prefetch::<_MM_HINT_T0>(bytes.add(at)) };
             at += 64;
         }
     }
     #[cfg(target_arch = "aarch64")]
     {
-        let bytes = row.as_ptr() as *const u8;
-        let available = row.len() * 4;
         let mut at = 0usize;
         for _ in 0..lines {
             if at >= available {
@@ -168,7 +172,7 @@ pub fn prefetch(row: &[f32], lines: usize) {
             }
             // SAFETY: `prfm pldl2keep` is a read-only architectural cache
             // hint into per-core L2 that never faults and has no effect on
-            // memory safety; `p` stays within `row`'s bytes here as well.
+            // memory safety; `p` stays within the `available` bytes as well.
             unsafe {
                 let p = bytes.add(at);
                 core::arch::asm!(
@@ -182,6 +186,6 @@ pub fn prefetch(row: &[f32], lines: usize) {
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
-        let _ = (row, lines);
+        let _ = (bytes, available, lines);
     }
 }

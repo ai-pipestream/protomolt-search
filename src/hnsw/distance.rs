@@ -252,7 +252,7 @@ mod scalar;
 mod slack;
 
 use scalar::score_nodes_scalar;
-pub use scalar::{dot_batch4_scalar, dot_scalar, prefetch};
+pub use scalar::{dot_batch4_scalar, dot_scalar, prefetch, prefetch_bytes};
 #[cfg(any(feature = "net", test))]
 pub(crate) use slack::simd_score_floor;
 pub(crate) use slack::{dot_underflow_slack, kernel_dot_slack_per_norm, kernel_row_slack};
