@@ -54,6 +54,9 @@ struct Inner {
     // crash target, `tests/control_raft_crash_faults.rs`).
     #[cfg(any(test, feature = "fault-injection"))]
     fault: Mutex<Option<crate::source_authority::ExitFault>>,
+    // Dropped last after `database` and `_file_lock` close their file
+    // descriptors and release the exclusive OS lock.
+    released: tokio::sync::watch::Sender<()>,
 }
 
 /// The purge state of a raft log on disk, for crash-recovery harnesses.
@@ -80,12 +83,14 @@ enum Settle {
 /// Cloneable handle; clones share the store and the write order.
 #[derive(Clone)]
 pub struct RaftLogStore {
-    inner: Arc<Inner>,
     // The state machine's store, once hosted: a purge never passes its
     // applied position, so a snapshot install the state machine refuses
     // leaves the log consistent with the store it kept (the library purges
     // for an incoming snapshot before the state machine has installed it).
+    // Declared before `inner` so replication readers drop their hosted
+    // store handle before `inner` signals log release.
     floor: Option<super::state_machine::SharedStore>,
+    inner: Arc<Inner>,
 }
 
 fn io<E: std::fmt::Display>(

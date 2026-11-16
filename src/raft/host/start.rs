@@ -202,6 +202,7 @@ impl RaftHost {
         let machine =
             ControlStateMachine::new(store, &dir.join(SNAPSHOT_DIR), config.max_snapshot_bytes)?;
         let shared = machine.shared_store();
+        let machine_released = machine.subscribe_release();
         let staging = machine.staging();
         let last_build = machine.last_build();
         let published = machine.published_image();
@@ -226,6 +227,7 @@ impl RaftHost {
             raft,
             store: shared,
             log_store,
+            machine_released,
             node_id,
             dir: dir.to_path_buf(),
             lease: Duration::from_millis(config.admission_lease_ms),

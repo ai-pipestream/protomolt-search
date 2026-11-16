@@ -196,6 +196,7 @@ struct Shared {
     isolation: Isolation,
     timing: tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
     rejections: PeerRejections,
+    closed: tokio::sync::watch::Sender<bool>,
 }
 
 /// A rejection a peer answered to one of this node's RPCs: a definite

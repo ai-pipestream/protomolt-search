@@ -332,3 +332,26 @@ async fn capacity_retries_advance(
         assert_eq!(applied_index(host), last_index(host));
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_releases_log_and_store_locks_with_external_store_handle_held() {
+    let dir = Directory::new("shutdown-locks");
+    let group = identity(7);
+    let host = RaftHost::bootstrap_single(
+        &dir.0,
+        &group,
+        1,
+        "https://node-1:19291",
+        &policy(),
+        &limits(),
+        &config(),
+    )
+    .await
+    .unwrap();
+    let retained_handle = host.store_handle();
+    assert!(retained_handle().is_ok());
+    host.shutdown().await.unwrap();
+    assert_eq!(retained_handle().err().unwrap().code(), Code::Unavailable);
+    let inspected = crate::raft::host::inspect_node(&dir.0, &group, 1).unwrap();
+    assert!(inspected.applied.is_some());
+}

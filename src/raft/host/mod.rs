@@ -138,6 +138,7 @@ pub struct RaftHost {
     raft: Raft<ControlRaft>,
     store: SharedStore,
     log_store: RaftLogStore,
+    machine_released: watch::Receiver<()>,
     node_id: NodeId,
     dir: PathBuf,
     lease: Duration,
