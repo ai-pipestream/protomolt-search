@@ -85,6 +85,7 @@ impl PreparedSource {
             req,
             vector: Some(row.vector),
             stable_routing_key: Some(self.key.clone()),
+            logged: false,
         }))
     }
 }

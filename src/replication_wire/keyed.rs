@@ -21,9 +21,14 @@ pub const MAX_STREAM_KEY_BYTES: usize = 8 << 10;
 
 const LENGTH_BYTES: usize = std::mem::size_of::<u32>();
 
+/// Bytes `keys` take in a metadata value.
+pub(crate) fn encoded_key_bytes(keys: &[Vec<u8>]) -> usize {
+    keys.iter().map(|key| LENGTH_BYTES + key.len()).sum()
+}
+
 /// The metadata value for `keys`, one per row in row order.
 pub fn encode_stable_keys(keys: &[Vec<u8>]) -> Result<Vec<u8>, String> {
-    let mut value = Vec::with_capacity(keys.iter().map(|key| LENGTH_BYTES + key.len()).sum());
+    let mut value = Vec::with_capacity(encoded_key_bytes(keys));
     for key in keys {
         let length = u32::try_from(key.len())
             .map_err(|_| "stable routing key exceeds the 4 GiB frame limit".to_string())?;

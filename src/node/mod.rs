@@ -87,7 +87,8 @@ pub(in crate::node) use self::config::{
     resolved_rerank_parallel, source_tables, validate_column_tables,
 };
 pub(in crate::node) use self::ingest::{
-    geography_wanted, quality_wanted, CompiledMaterialize, IngestDoc, IngestSource, MappedSource,
+    geography_wanted, quality_wanted, replay_first_id, CompiledMaterialize, IngestDoc,
+    IngestSource, MappedSource, StreamKeys,
 };
 pub(in crate::node) use self::lexical::{
     bm25_scoring_fingerprint, cut_snippets, explain_terms, highlight_plan, params_from, LegFilters,
