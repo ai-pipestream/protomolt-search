@@ -161,6 +161,7 @@ impl<'a> TreeBuild<'a> {
             num_documents: documents,
             parent_ids: Vec::new(),
             row_parent_ids: Vec::new(),
+            parents_colocated: false,
         }
     }
 }

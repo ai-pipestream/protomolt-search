@@ -315,3 +315,47 @@ fn compaction_can_publish_multiple_dense_outputs_atomically() {
         vec!["out-a", "out-b"]
     );
 }
+
+#[test]
+fn a_segment_records_its_colocation_proof_and_a_retry_cannot_change_it() {
+    let fixture = fixture(
+        "colocated",
+        &[
+            1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.8, 0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ],
+        &["one", "two"],
+    );
+    let root = fixture.root.join("catalog");
+    let catalog = SegmentCatalog::open(&root).unwrap();
+    assert!(
+        catalog.snapshot().parents_colocated(),
+        "an empty set proves it"
+    );
+    let proven = SegmentSource {
+        parents_colocated: true,
+        ..source(&fixture, "proven", 0)
+    };
+    catalog.append(proven).unwrap();
+    assert!(catalog.snapshot().metadata(0).parents_colocated);
+    assert!(catalog.snapshot().parents_colocated());
+    let retry = SegmentSource {
+        parents_colocated: false,
+        ..source(&fixture, "proven", 0)
+    };
+    assert!(catalog
+        .append(retry)
+        .unwrap_err()
+        .contains("differs from the published"));
+    catalog.append(source(&fixture, "unproven", 2)).unwrap();
+    let reopened = SegmentCatalog::open(&root).unwrap().snapshot();
+    assert_eq!(
+        (0..reopened.len())
+            .map(|i| reopened.metadata(i).parents_colocated)
+            .collect::<Vec<_>>(),
+        vec![true, false]
+    );
+    assert!(
+        !reopened.parents_colocated(),
+        "one unproven segment clears the set"
+    );
+}

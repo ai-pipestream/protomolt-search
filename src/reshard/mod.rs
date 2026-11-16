@@ -36,6 +36,7 @@ mod hash_split;
 mod hnsw_sources;
 mod merge_inputs;
 mod parallel_build;
+mod parent_routing;
 mod partitioned;
 mod placement_split;
 mod reconstruct;
@@ -157,6 +158,10 @@ pub struct ChildImage {
     /// parent-id order — the complete old-to-new id map of the child,
     /// which compaction extends as the tail applies.
     pub row_parent_ids: Vec<u64>,
+    /// Whether every lineage parent with a row in this image holds all of
+    /// its live input rows here, and every row proves its parent's rows
+    /// shared one source shard (see `segments::SegmentSource`).
+    pub parents_colocated: bool,
 }
 
 /// The result of one split or merge: the images plus the NEW generation

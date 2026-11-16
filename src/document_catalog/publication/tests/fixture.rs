@@ -205,6 +205,7 @@ impl Fixture {
                     bm25_path: &paths[2],
                     live_docs_path: &paths[3],
                     partition_column: None,
+                    parents_colocated: meta.parents_colocated,
                 };
                 base += meta.rows;
                 source
@@ -316,6 +317,7 @@ impl Fixture {
                     bm25_path: &directory.join(&selected.bm25.file),
                     live_docs_path: &directory.join(&selected.live_docs.file),
                     partition_column: None,
+                    parents_colocated: false,
                 }],
                 &scratch,
                 1,

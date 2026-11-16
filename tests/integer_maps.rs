@@ -336,6 +336,7 @@ fn integer_maps_translate_keys_across_sealed_frozen_and_mutable_parts() {
                 bm25_path: &image,
                 live_docs_path: &live,
                 partition_column: None,
+                parents_colocated: false,
             })
             .unwrap();
         shard.republish(published).unwrap();

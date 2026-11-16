@@ -186,6 +186,30 @@ the old generation and losing a tail.
    means rebuilding from source (or, later, an image-aware reshard
    that partitions the base image plus the log).
 
+## Parent colocation
+
+A split routes a row by its lineage `parent_id` when the row names a parent
+other than itself, and by its row id otherwise, so every chunk of a document
+lands on one child while unparented rows still spread by id. Whole WAL
+buckets route by row id, so logs that hold any foreign parent take the
+re-partitioning path; a segmented split routes each bucket's rows the same
+way. Stable-key splits keep routing by key (the live topology does), and
+placement splits by code; both verify the result instead of assuming it.
+
+Every sealed segment records `parents_colocated`: true when every lineage
+parent with a row in the segment holds all of its live rows on this shard.
+A row proves it when it is its own parent or arrived under a stable routing
+key (routed ingest places every chunk of a source document by that
+document's key); a raw lineage row proves nothing, and the tail it joins
+seals into a segment that carries `false`. A reshard child carries `true`
+only when all of its rows prove it and no other child holds rows of its
+parents; compaction keeps the proof (from the replayed rows, or the input
+set's when it rebuilds from sealed segments); a snapshot restore keeps every
+segment's bit. `NodeServiceImpl::parents_colocated` reports whether every
+sealed segment, the frozen part and the tail of a shard carry it. Correctness
+never depends on the bit: a coordinator may skip parent completion only when
+every consulted shard reports it.
+
 ## Compaction
 
 Classic WAL truncation does not apply — the log is full history, kept

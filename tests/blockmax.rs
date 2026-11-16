@@ -590,6 +590,7 @@ fn score_candidates_plain_walks_are_bitwise_equal() {
                 bm25_path: &bm25_path,
                 live_docs_path: &live,
                 partition_column: None,
+                parents_colocated: false,
             })
             .unwrap();
         base += rows;

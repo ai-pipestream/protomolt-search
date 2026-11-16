@@ -475,6 +475,7 @@ fn the_union_index_equals_one_image_over_the_same_rows() {
                 bm25_path: &stage.join("documents.bm25"),
                 live_docs_path: &stage.join("live-docs.bin"),
                 partition_column: None,
+                parents_colocated: false,
             })
             .unwrap();
         union.republish(published).unwrap();
@@ -799,6 +800,7 @@ fn a_mapped_sealed_image_opens_without_the_heap_load() {
             bm25_path: &bm25_path,
             live_docs_path: &live_path,
             partition_column: None,
+            parents_colocated: false,
         })
         .unwrap();
     drop(catalog);

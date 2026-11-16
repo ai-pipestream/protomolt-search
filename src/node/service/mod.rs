@@ -342,6 +342,15 @@ impl NodeServiceImpl {
         Self::adopt_layout(bm25, created)
     }
 
+    /// Whether every row this shard serves proves its lineage parent's
+    /// rows share this shard: a persisted shard whose sealed segments,
+    /// frozen part and tail all carry the proof. A shard without an index
+    /// path proves nothing.
+    pub fn parents_colocated(&self) -> bool {
+        matches!(read_shard(&self.state).bm25.as_ref(),
+            Some(Bm25Shard::Segmented(shard)) if shard.parents_colocated())
+    }
+
     /// Create an empty exact-vector store: disk-spilling at the tail's exact
     /// sidecar path on persisted shards, or heap-backed for in-memory shards.
     pub(in crate::node) fn fresh_exact_store(

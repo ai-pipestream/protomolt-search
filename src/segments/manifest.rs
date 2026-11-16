@@ -91,6 +91,9 @@ pub struct SegmentMetadata {
     /// segment is never pruned.
     #[serde(default)]
     pub summary: Option<SegmentSummary>,
+    /// Whether every lineage parent with a row in this segment holds all
+    /// of its live rows on this shard (see [`super::SegmentSource`]).
+    pub parents_colocated: bool,
 }
 
 impl SegmentMetadata {

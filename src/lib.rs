@@ -131,6 +131,7 @@ pub mod test_support;
 pub mod values;
 
 // Crate-private implementation details.
+mod colocation;
 mod column_stats;
 pub(crate) mod facet_rows;
 mod field_permissions;

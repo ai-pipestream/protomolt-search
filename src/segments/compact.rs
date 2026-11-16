@@ -142,6 +142,7 @@ impl SegmentCatalog {
                 bm25_path: segment.image.bm25_path.as_deref().expect("validated above"),
                 live_docs_path,
                 partition_column: partition_col,
+                parents_colocated: segment.image.parents_colocated,
             })
             .collect();
         let snapshot = self.replace_many_for_compaction(

@@ -36,6 +36,7 @@ pub(in crate::node) struct SealPlan {
     pub(in crate::node) stage: PathBuf,
     pub(in crate::node) segment_id: String,
     pub(in crate::node) generation: u64,
+    pub(in crate::node) parents_colocated: bool,
 }
 
 /// Freeze the vector tail over the same `rows` as the documents (or pick
@@ -228,6 +229,9 @@ impl NodeServiceImpl {
             stage: shard.stage_dir(&format!("{generation:08}")),
             segment_id: format!("seg-{generation:08}"),
             generation,
+            parents_colocated: shard
+                .frozen_parents_colocated()
+                .expect("the seal froze the tail above"),
         }))
     }
 

@@ -80,6 +80,7 @@ pub(super) fn verify_retry_source(
     if source.generation != held.generation
         || source.base_label != held.base_label
         || backend != held.backend_kind
+        || source.parents_colocated != held.parents_colocated
     {
         return Err("segment retry differs from the published generation, range or backend".into());
     }
@@ -348,6 +349,7 @@ fn staged_metadata(
         analysis_fingerprints: (0..bm25.field_count())
             .map(|field| bm25.analysis_fingerprint(field))
             .collect(),
+        parents_colocated: source.parents_colocated,
         document_count: Bm25Index::doc_count(bm25),
         total_document_length: Bm25Index::total_doc_length(bm25),
         vector: artifacts.vector,

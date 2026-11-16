@@ -805,6 +805,7 @@ fn verify_segmented_wal_compaction_tombstones(
             bm25_path: &sealed_dir.join(&sealed.bm25.file),
             live_docs_path: &pipestream_search::node::live_docs_sidecar_path(index_path),
             partition_column: None,
+            parents_colocated: false,
         })
         .unwrap();
     let input_ids = ["parent".to_string()];

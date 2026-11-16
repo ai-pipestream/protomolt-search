@@ -24,6 +24,10 @@ pub(in crate::compaction) struct StageImagesSpec<'a> {
     pub source_generation: u64,
     pub backend_kind: &'a str,
     pub partition_column: Option<&'a str>,
+    /// The colocation proof every output carries when the inputs decide it
+    /// (a rebuild from sealed segments keeps the set's); `None` takes each
+    /// image's own, proven from the replayed rows.
+    pub parents_colocated: Option<bool>,
 }
 
 pub(in crate::compaction) fn stage_compacted_images(
@@ -71,6 +75,7 @@ pub(in crate::compaction) fn stage_compacted_images(
             bm25_path: image.bm25_path.as_deref().expect("checked above"),
             live_docs_path: live,
             partition_column: spec.partition_column,
+            parents_colocated: spec.parents_colocated.unwrap_or(image.parents_colocated),
         })
         .collect();
     crate::segments::stage_segments(spec.root, sources)
@@ -140,6 +145,7 @@ impl NodeServiceImpl {
             source_generation: epoch_at_open + 1,
             backend_kind: &pre.backend_kind,
             partition_column: pre.partition.as_deref(),
+            parents_colocated: None,
         })?;
         match self.open_staged_segmented_shadow(pre, &root, &staged, epoch_at_open, new_wal) {
             Ok(shadow) => Ok(shadow),

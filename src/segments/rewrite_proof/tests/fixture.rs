@@ -130,6 +130,7 @@ impl Fixture {
                 bm25_path: &bp,
                 live_docs_path: &lp,
                 partition_column: None,
+                parents_colocated: false,
             })
             .unwrap();
     }

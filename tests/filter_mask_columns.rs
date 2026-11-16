@@ -237,6 +237,7 @@ fn the_mask_from_the_columns_is_the_row_by_row_mask_across_every_part() {
                 bm25_path: &image,
                 live_docs_path: &live,
                 partition_column: None,
+                parents_colocated: false,
             })
             .unwrap();
         shard.republish(published).unwrap();
@@ -314,6 +315,7 @@ fn measure_the_mask_from_the_columns() {
                 bm25_path: &image,
                 live_docs_path: &live,
                 partition_column: None,
+                parents_colocated: false,
             })
             .unwrap();
         shard.republish(published).unwrap();

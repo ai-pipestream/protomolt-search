@@ -1134,6 +1134,7 @@ fn an_interrupted_walless_cutover_rolls_back_at_open() {
             bm25_path: &bm25_path,
             live_docs_path: &live_path,
             partition_column: None,
+            parents_colocated: false,
         })
         .unwrap();
     let manifest = catalog.snapshot().manifest().clone();
@@ -1311,6 +1312,7 @@ fn partitioned_compaction_preserves_lattice_and_per_document_sparse_scales() {
                 bm25_path: &bp,
                 live_docs_path: &lp,
                 partition_column: None,
+                parents_colocated: false,
             })
             .unwrap();
     }

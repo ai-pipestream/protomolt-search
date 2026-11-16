@@ -187,6 +187,7 @@ impl NodeServiceImpl {
                 bm25_path: &paths[2],
                 live_docs_path: &paths[3],
                 partition_column: before.manifest().partition_key.as_deref(),
+                parents_colocated: false,
             })
             .collect();
         let result = self.publish_document_maintenance_blocking(

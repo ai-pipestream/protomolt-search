@@ -92,6 +92,7 @@ fn source_generation<'a>(
         bm25_path: &fixture.bm25,
         live_docs_path: &fixture.live_docs,
         partition_column: None,
+        parents_colocated: false,
     }
 }
 

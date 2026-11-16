@@ -83,6 +83,12 @@ impl NodeServiceImpl {
             }
             let shard = guard.bm25.as_mut().expect("builder just ensured");
             store::apply_bm25_row(shard, doc_id, &req.doc, req.analyzed, &columns)?;
+            let keyed = req.stable_routing_key.is_some();
+            if let Bm25Shard::Segmented(shard) = shard {
+                if !crate::colocation::row_proves_parent_colocated(&req.doc, global_id, keyed) {
+                    shard.note_scattered_parent();
+                }
+            }
         }
 
         let logged_vector = vector::apply_and_lock_mapped_vector(guard, doc_id, prepared_vector)?;

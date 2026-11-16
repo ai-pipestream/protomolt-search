@@ -125,6 +125,7 @@ fn build_segmented_hnsw_fixture(dir: &TempDir) -> (VectorIndex, Vec<f32>, Bits) 
                 bm25_path: &bm25_path,
                 live_docs_path: &live_path,
                 partition_column: None,
+                parents_colocated: false,
             })
             .expect("append segment");
     }
