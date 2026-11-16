@@ -1,0 +1,23 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "packageRules": [
+    {
+      "matchManagers": ["cargo"],
+      "matchFileNames": ["Cargo.toml"],
+      "matchPackageNames": ["openraft"],
+      "allowedVersions": "=0.9.25"
+    },
+    {
+      "matchManagers": ["cargo"],
+      "matchFileNames": ["benchmarks/ann/Cargo.toml"],
+      "matchPackageNames": ["space"],
+      "allowedVersions": ">=0.17.0 <0.18.0"
+    },
+    {
+      "matchManagers": ["cargo"],
+      "matchFileNames": ["benchmarks/ann/Cargo.toml"],
+      "matchPackageNames": ["rand_pcg"],
+      "allowedVersions": ">=0.3.0 <0.4.0"
+    }
+  ]
+}
