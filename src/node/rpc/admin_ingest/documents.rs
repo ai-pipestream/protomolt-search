@@ -1,9 +1,26 @@
 //! Document write RPCs: plain and mapped ingest, deletion, and replacement.
 
-use super::replication_stable_key;
 use crate::node::*;
 
 impl NodeServiceImpl {
+    /// Refuse a WAL replay stream that does not start at this shard's
+    /// document tip. The caller holds the single-writer ingest slot, so the
+    /// tip cannot move before the stream's first row applies.
+    fn require_document_tip(&self, claimed: u64) -> Result<(), Status> {
+        let guard = read_shard(&self.state);
+        let tip = self.config.slot_offset
+            + guard
+                .bm25
+                .as_ref()
+                .map_or(0, |shard| u64::from(shard.next_doc_id()));
+        if claimed != tip {
+            return Err(Status::failed_precondition(format!(
+                "WAL replay starts at document {claimed}, but this shard's next document is {tip}"
+            )));
+        }
+        Ok(())
+    }
+
     async fn open_analysis_stream_or_refuse(
         &self,
         addr: &str,
@@ -62,12 +79,16 @@ impl NodeServiceImpl {
             let addr = self.config.analysis_addr.clone().ok_or_else(|| {
                 Status::unavailable("no analysis backend configured for this shard (analysis_addr)")
             })?;
-            let stable_routing_key = replication_stable_key(&request)?;
+            let keys = StreamKeys::from_metadata(request.metadata())?;
+            let replay = replay_first_id(request.metadata())?;
+            if let Some(claimed) = replay {
+                self.require_document_tip(claimed)?;
+            }
             let mut inbound = request.into_inner();
             let mut source = IngestSource::Plain {
                 stream: &mut inbound,
-                stable_routing_key,
-                consumed: false,
+                keys,
+                logged: replay.is_some(),
             };
             let (added, first_id, total, wal_generation) =
                 self.run_ingest_source(&addr, &mut source).await?;

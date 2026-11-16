@@ -6,25 +6,6 @@ mod wal_feed;
 
 use crate::node::*;
 
-const STABLE_ROUTING_KEY_METADATA: &str = "x-protomolt-stable-key-bin";
-
-fn replication_stable_key<T>(request: &Request<T>) -> Result<Option<Vec<u8>>, Status> {
-    request
-        .metadata()
-        .get_bin(STABLE_ROUTING_KEY_METADATA)
-        .map(|value| {
-            value
-                .to_bytes()
-                .map(|bytes| bytes.to_vec())
-                .map_err(|error| {
-                    Status::invalid_argument(format!(
-                        "invalid replication stable-key metadata: {error}"
-                    ))
-                })
-        })
-        .transpose()
-}
-
 /// Whether the exact-vector sidecar covers every row the shard serves.
 fn exact_vectors_available(guard: &ShardState) -> bool {
     guard.exact_vectors.as_ref().is_some_and(|exact| {
@@ -100,6 +81,7 @@ impl NodeServiceImpl {
             });
         Ok(Response::new(HealthResponse {
             multi_res_vector_version: 1,
+            replication_version: crate::replication_wire::RECEIVER_VERSION,
             document_contract_version: crate::document_contract::VERSION,
             collection: self.config.collection.clone(),
             num_vectors,
@@ -164,20 +146,13 @@ impl NodeServiceImpl {
     ) -> Result<Response<AddVectorsResponse>, Status> {
         crate::metrics::timed(Route::AddVectors, request, |request| async move {
             let _ingest = self.claim_ingest()?;
-            let stable_routing_key = replication_stable_key(&request)?;
+            let mut keys = StreamKeys::from_metadata(request.metadata())?;
             let mut inbound = request.into_inner();
             let mut added = 0u64;
             let mut first_id = 0u64;
-            let mut batches = 0usize;
             while let Some(batch) = inbound.message().await? {
-                batches += 1;
-                if stable_routing_key.is_some() && batches > 1 {
-                    return Err(Status::invalid_argument(
-                    "a replication stable-key metadata value may carry exactly one vector batch",
-                ));
-                }
                 let service = self.clone();
-                let key = stable_routing_key.clone();
+                let key = keys.next_row("vector")?;
                 let mutation = self.mutation_gate.clone().read_owned().await;
                 let (batch_added, batch_first_id) = tokio::task::spawn_blocking(move || {
                     let _mutation = mutation;
@@ -191,6 +166,7 @@ impl NodeServiceImpl {
                 added += batch_added;
                 self.seal_if_due().await?;
             }
+            keys.finish("vector")?;
             let (total, wal_generation) = {
                 let guard = read_shard(&self.state);
                 (

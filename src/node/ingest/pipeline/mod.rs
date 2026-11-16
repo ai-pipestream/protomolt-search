@@ -9,6 +9,16 @@ mod streamed;
 pub(in crate::node) use self::field_streams::{FieldEvent, FieldStreams};
 pub(in crate::node) use self::source::{IngestDoc, IngestSource, MappedSource, PendingDoc};
 
+/// One document whose analysis has landed, ready to apply.
+pub(in crate::node) struct AnalyzedRow {
+    pub(in crate::node) doc: AddDocumentsRequest,
+    pub(in crate::node) analyzed: crate::postings::AnalyzedDoc,
+    pub(in crate::node) vector: Option<Vec<f32>>,
+    pub(in crate::node) stable_routing_key: Option<Vec<u8>>,
+    /// The document came from a WAL replay stream.
+    pub(in crate::node) logged: bool,
+}
+
 impl NodeServiceImpl {
     pub(in crate::node) fn doc_session_layers(
         &self,
@@ -154,16 +164,22 @@ impl NodeServiceImpl {
     /// guarantee it.
     pub(in crate::node) async fn apply_analyzed_document(
         &self,
-        doc: AddDocumentsRequest,
-        analyzed: crate::postings::AnalyzedDoc,
-        vector: Option<Vec<f32>>,
-        stable_routing_key: Option<Vec<u8>>,
+        row: AnalyzedRow,
         added: &mut u64,
         first_id: &mut u64,
     ) -> Result<(), Status> {
+        let AnalyzedRow {
+            doc,
+            analyzed,
+            vector,
+            stable_routing_key,
+            logged,
+        } = row;
         // Refuse live requests carrying forged derived column values or
-        // fingerprints before placement checks and column materialization run.
-        if let Some(declaration) = self.config.derived.as_deref() {
+        // fingerprints before placement checks and column materialization
+        // run. A logged row keeps its values; materialization holds its
+        // fingerprint to this index's declaration.
+        if let Some(declaration) = self.config.derived.as_deref().filter(|_| !logged) {
             declaration.refuse_carried(&doc)?;
         }
         self.check_placement(&doc, stable_routing_key.as_deref())?;
@@ -203,15 +219,14 @@ impl NodeServiceImpl {
             let held = pending.remove(next_apply).expect("readiness just checked");
             let cased = cased_field_index(&self.config, self.phrase_index.as_deref(), &held.doc)?;
             let analyzed = join_fields(analyzed, held.extras, cased)?;
-            self.apply_analyzed_document(
-                held.doc,
+            let row = AnalyzedRow {
+                doc: held.doc,
                 analyzed,
-                held.vector,
-                held.stable_routing_key,
-                added,
-                first_id,
-            )
-            .await?;
+                vector: held.vector,
+                stable_routing_key: held.stable_routing_key,
+                logged: held.logged,
+            };
+            self.apply_analyzed_document(row, added, first_id).await?;
             *next_apply += 1;
         }
     }

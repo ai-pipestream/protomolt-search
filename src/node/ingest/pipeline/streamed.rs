@@ -136,6 +136,7 @@ impl<'a> StreamedIngest<'a> {
             req: first,
             vector: first_vector,
             stable_routing_key: first_stable_routing_key,
+            logged: first_logged,
         } = first;
         let mut run = Self {
             node,
@@ -165,6 +166,7 @@ impl<'a> StreamedIngest<'a> {
                 doc: first,
                 vector: first_vector,
                 stable_routing_key: first_stable_routing_key,
+                logged: first_logged,
                 outstanding: first_extras.len(),
                 extras: first_extras,
             },
@@ -256,6 +258,7 @@ impl<'a> StreamedIngest<'a> {
             req: doc,
             vector: doc_vector,
             stable_routing_key,
+            logged,
         } = doc;
         // Extra-field analyses are queued on arrival
         // (validated now, so a bad field fails before the
@@ -278,6 +281,7 @@ impl<'a> StreamedIngest<'a> {
                 doc,
                 vector: doc_vector,
                 stable_routing_key,
+                logged,
                 outstanding: extras.len(),
                 extras,
             },
