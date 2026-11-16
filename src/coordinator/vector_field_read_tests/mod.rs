@@ -38,7 +38,8 @@ fn node_rows_with_private_terms(
     if fingerprint_override {
         binding.plan_fingerprint = "b".repeat(64);
     }
-    let mut store = crate::postings::Bm25Store::new().with_facets(&["audience"]);
+    let mut store = crate::postings::Bm25Store::new()
+        .with_columns(crate::postings::ColumnKind::Facet, &["audience"]);
     store.set_binding(Some(crate::postings::StoredBinding {
         plan_fingerprint: binding.plan_fingerprint.clone(),
         body_path: "body".into(),

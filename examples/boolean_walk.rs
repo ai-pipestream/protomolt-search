@@ -62,16 +62,17 @@ fn tail_of(root: &Path, set: &OpenedSegmentSet) -> Result<Bm25Store, String> {
         "tables: fields {fields:?} (positions {positions:?}, sentences {sentences:?}) facets \
          {facets:?} integers {integers:?} numerics {numerics:?}"
     );
-    let mut tail = Bm25Store::with_fields(&strs(&fields))
+    use pipestream_search::postings::ColumnKind::*;
+    let mut tail = Bm25Store::with_text_fields(&strs(&fields))
         .with_positions(&strs(&positions))
         .with_sentences(&strs(&sentences))
-        .with_facets(&strs(&facets))
-        .with_numerics(&strs(&numerics))
-        .with_integers(&strs(&integers))
-        .with_unsigned_integers(&strs(&unsigned))
-        .with_geos(&strs(&geo))
-        .with_map_facets(&strs(&map_facets))
-        .with_map_numerics(&strs(&map_numerics));
+        .with_columns(Facet, &strs(&facets))
+        .with_columns(Numeric, &strs(&numerics))
+        .with_columns(Integer, &strs(&integers))
+        .with_columns(UnsignedInteger, &strs(&unsigned))
+        .with_columns(Geo, &strs(&geo))
+        .with_columns(MapFacet, &strs(&map_facets))
+        .with_columns(MapNumeric, &strs(&map_numerics));
     // The segments' derived-column declaration, if any, is the tail's.
     tail.set_derived(r.derived().cloned());
     Ok(tail)

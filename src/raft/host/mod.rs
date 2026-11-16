@@ -47,7 +47,7 @@ use tonic::Status;
 
 #[cfg(feature = "tls")]
 use super::transport::{
-    Isolation, PeerDirectory, PeerRejection, PeerRejections, RaftTransportService,
+    Isolation, ListenerHost, PeerDirectory, PeerRejection, PeerRejections, RaftTransportService,
     SnapshotRejections, TonicNetworkFactory, TransportLimits,
 };
 #[cfg(feature = "tls")]

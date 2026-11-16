@@ -163,9 +163,9 @@ impl Bm25Store {
 
     /// An empty store with the given field table, in field-id order.
     /// Field 0 is the body (the stored text); `new()` is
-    /// `with_fields(&["body"])`. Names must be non-empty and unique
+    /// `with_text_fields(&["body"])`. Names must be non-empty and unique
     /// (the v6 reader validates the same on open).
-    pub fn with_fields(names: &[&str]) -> Self {
+    pub fn with_text_fields(names: &[&str]) -> Self {
         validate_text_field_names(names, "store");
         Self {
             fields: names.iter().map(|n| FieldStore::new(n)).collect(),
@@ -174,11 +174,6 @@ impl Bm25Store {
             columns: ColumnSet::default(),
             sources: Default::default(),
         }
-    }
-
-    /// Unified text-field table constructor matching [`Self::with_fields`].
-    pub fn with_text_fields(names: &[&str]) -> Self {
-        Self::with_fields(names)
     }
 
     /// Declare a typed column table for `kind` before any documents are added.

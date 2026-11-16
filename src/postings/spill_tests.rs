@@ -66,10 +66,11 @@ fn spill_builder_v6_multi_field_byte_identical() {
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
 
-    let mut store = Bm25Store::with_fields(&["body", "case_name"]);
-    let mut builder = SpillBuilder::create_with_fields(&base.join("build"), &["body", "case_name"])
-        .unwrap()
-        .with_buffer_bytes(128);
+    let mut store = Bm25Store::with_text_fields(&["body", "case_name"]);
+    let mut builder =
+        SpillBuilder::create_with_text_fields(&base.join("build"), &["body", "case_name"])
+            .unwrap()
+            .with_buffer_bytes(128);
     for (id, text, doc, lineage) in two_field_corpus() {
         store.add_document_with_lineage(id, text.clone(), doc.clone(), lineage);
         builder

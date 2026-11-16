@@ -225,9 +225,7 @@ fn bulk_walk_and_enumerate_visit_identical_nodes_and_scores_to_single_row_dot() 
                         view.walk(
                             q,
                             24,
-                            filter,
-                            super::super::graph::Patience::OFF,
-                            super::super::graph::FloorPrune::OFF,
+                            super::super::graph::Steering::filtered(filter),
                             scratch,
                             &mut trace,
                         )

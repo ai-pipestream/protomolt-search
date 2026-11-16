@@ -32,7 +32,10 @@ fn lexical(term: &str, df: u32) -> BooleanPlanLeaf {
     }
 }
 fn fixture() -> (NodeServiceImpl, Vec<BooleanPlanLeaf>) {
-    let mut store = Bm25Store::with_fields(&["body"]).with_facets(&["audience"]);
+    let mut store = Bm25Store::with_text_fields(&["body"]).with_columns(
+        pipestream_search::postings::ColumnKind::Facet,
+        &["audience"],
+    );
     for (id, text, audience) in [
         (0, "alpha all", "public"),
         (1, "beta all", "public"),

@@ -57,13 +57,7 @@ impl DocumentCatalog {
     ) -> Result<Option<Written>, Status> {
         let read = self.database.begin_read().map_err(storage)?;
         let meta = read.open_table(META).map_err(storage)?;
-        let header: DocumentCatalogHeader = decode_header(
-            meta.get("header")
-                .map_err(storage)?
-                .ok_or_else(|| Status::data_loss("catalog header missing"))?
-                .value(),
-        )?;
-        validate_current_header(&header)?;
+        let header = current_header(&meta)?;
         self.validate_resource_binding(&header)?;
         check_history(&header, request)?;
         operation_key.check_header(&header)?;

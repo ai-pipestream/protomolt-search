@@ -17,7 +17,9 @@ use pipestream_search::pb::{
     AddDocumentsRequest, Bm25Hit, Bm25SearchRequest, GeoBbox, GeoFilter, GeoPointValue, GeoRadius,
     QueryField, ScoreOp, ScoreStage,
 };
-use pipestream_search::postings::{AnalyzedDoc, Bm25Reader, Bm25Store, SpillBuilder};
+use pipestream_search::postings::{
+    AnalyzedDoc, Bm25Reader, Bm25Store, ColumnKind::*, SpillBuilder,
+};
 use pipestream_search::scorefn::{ColumnRef, NumericRead, ScoreChain, Stage, StageOp};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -234,13 +236,13 @@ fn geo_columns_roundtrip_and_dual_writers_agree() {
 
     // A store carrying all six column kinds at once, to pin the kinded
     // table's ordering with kind 5 appended last.
-    let mut store = Bm25Store::with_fields(&["body"])
-        .with_facets(&["court"])
-        .with_numerics(&["date"])
-        .with_map_facets(&["meta"])
-        .with_map_numerics(&["attrs"])
-        .with_integers(&["citations"])
-        .with_geos(&["courthouse"]);
+    let mut store = Bm25Store::with_text_fields(&["body"])
+        .with_columns(Facet, &["court"])
+        .with_columns(Numeric, &["date"])
+        .with_columns(MapFacet, &["meta"])
+        .with_columns(MapNumeric, &["attrs"])
+        .with_columns(Integer, &["citations"])
+        .with_columns(Geo, &["courthouse"]);
     for (i, terms) in [
         &[("rust", 1u32), ("search", 1)][..],
         &[("vector", 1)][..],
@@ -268,14 +270,14 @@ fn geo_columns_roundtrip_and_dual_writers_agree() {
         "geo columns opt into the v7-shaped v8 payload"
     );
 
-    let mut builder = SpillBuilder::create_with_fields(&dir.join("spill.build"), &["body"])
+    let mut builder = SpillBuilder::create_with_text_fields(&dir.join("spill.build"), &["body"])
         .unwrap()
-        .with_facet_fields(&["court"])
-        .with_numeric_fields(&["date"])
-        .with_map_facet_fields(&["meta"])
-        .with_map_numeric_fields(&["attrs"])
-        .with_integer_fields(&["citations"])
-        .with_geo_fields(&["courthouse"]);
+        .with_columns(Facet, &["court"])
+        .with_columns(Numeric, &["date"])
+        .with_columns(MapFacet, &["meta"])
+        .with_columns(MapNumeric, &["attrs"])
+        .with_columns(Integer, &["citations"])
+        .with_columns(Geo, &["courthouse"]);
     for (i, terms) in [
         &[("rust", 1u32), ("search", 1)][..],
         &[("vector", 1)][..],
@@ -338,7 +340,7 @@ fn geo_columns_roundtrip_and_dual_writers_agree() {
 
     // A column no document valued folds to four NaNs, the kind-1 empty
     // convention.
-    let mut empty = Bm25Store::with_fields(&["body"]).with_geos(&["courthouse"]);
+    let mut empty = Bm25Store::with_text_fields(&["body"]).with_columns(Geo, &["courthouse"]);
     empty.add_document(0, "doc".to_string(), analyzed(&[("rust", 1)]));
     let empty_path = dir.join("empty.bm25");
     empty.save(&empty_path).unwrap();
@@ -365,7 +367,7 @@ fn corrupt_geo_sections_refuse_at_open() {
         .join(format!("geo_corrupt_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
-    let mut store = Bm25Store::with_fields(&["body"]).with_geos(&["courthouse"]);
+    let mut store = Bm25Store::with_text_fields(&["body"]).with_columns(Geo, &["courthouse"]);
     for i in 0..2u32 {
         store.add_document(
             i,
@@ -464,23 +466,23 @@ fn partial_kind_stores_tile_into_the_geo_section() {
         ("mapnumerics_geo", false, false, false, true, false),
         ("integers_geo", false, false, false, false, true),
     ] {
-        let mut store = Bm25Store::with_fields(&["body"]);
+        let mut store = Bm25Store::with_text_fields(&["body"]);
         if facets {
-            store = store.with_facets(&["court"]);
+            store = store.with_columns(Facet, &["court"]);
         }
         if numerics {
-            store = store.with_numerics(&["date"]);
+            store = store.with_columns(Numeric, &["date"]);
         }
         if map_facets {
-            store = store.with_map_facets(&["meta"]);
+            store = store.with_columns(MapFacet, &["meta"]);
         }
         if map_numerics {
-            store = store.with_map_numerics(&["attrs"]);
+            store = store.with_columns(MapNumeric, &["attrs"]);
         }
         if integers {
-            store = store.with_integers(&["citations"]);
+            store = store.with_columns(Integer, &["citations"]);
         }
-        let mut store = store.with_geos(&["courthouse"]);
+        let mut store = store.with_columns(Geo, &["courthouse"]);
         store.add_document(0, "doc".to_string(), analyzed());
         if facets {
             store.set_facet(0, 0, "scotus");
@@ -502,24 +504,24 @@ fn partial_kind_stores_tile_into_the_geo_section() {
         store.save(&path).unwrap();
 
         let mut builder =
-            SpillBuilder::create_with_fields(&dir.join(format!("{case}.build")), &["body"])
+            SpillBuilder::create_with_text_fields(&dir.join(format!("{case}.build")), &["body"])
                 .unwrap();
         if facets {
-            builder = builder.with_facet_fields(&["court"]);
+            builder = builder.with_columns(Facet, &["court"]);
         }
         if numerics {
-            builder = builder.with_numeric_fields(&["date"]);
+            builder = builder.with_columns(Numeric, &["date"]);
         }
         if map_facets {
-            builder = builder.with_map_facet_fields(&["meta"]);
+            builder = builder.with_columns(MapFacet, &["meta"]);
         }
         if map_numerics {
-            builder = builder.with_map_numeric_fields(&["attrs"]);
+            builder = builder.with_columns(MapNumeric, &["attrs"]);
         }
         if integers {
-            builder = builder.with_integer_fields(&["citations"]);
+            builder = builder.with_columns(Integer, &["citations"]);
         }
-        let mut builder = builder.with_geo_fields(&["courthouse"]);
+        let mut builder = builder.with_columns(Geo, &["courthouse"]);
         builder
             .add_document_with_lineage(0, "doc".to_string(), analyzed(), None)
             .unwrap();
@@ -574,21 +576,15 @@ async fn distributed_geo_filters_are_exact_and_boundary_correct() {
     // d3 and d6 are outside, d5 has no point, and d7 lives on a shard
     // with no geo column — the last two fail for the same reason, and
     // it is exact: no location is inside no region.
-    let (hits, _, _) = coordinator
-        .fanout_bm25_faceted(
-            "rust",
-            10,
-            None,
-            0.0,
-            &[],
-            &[],
-            &[],
-            &[],
-            &[bbox_filter("courthouse", 0.0, 1.0, 0.0, 1.0)],
-            None,
-        )
-        .await
-        .unwrap();
+    let (hits, _, _) = common::fanout::bm25_geo(
+        &coordinator,
+        "rust",
+        10,
+        &[bbox_filter("courthouse", 0.0, 1.0, 0.0, 1.0)],
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         ids(&hits),
         vec![0, 1, 2],
@@ -620,8 +616,7 @@ async fn distributed_geo_filters_are_exact_and_boundary_correct() {
             bbox_filter("courthouse", 0.0, 1.0, 0.0, 1.0 - 1e-9),
         ),
     ] {
-        let (hits, _, _) = coordinator
-            .fanout_bm25_faceted("rust", 10, None, 0.0, &[], &[], &[], &[], &[f], None)
+        let (hits, _, _) = common::fanout::bm25_geo(&coordinator, "rust", 10, &[f], None)
             .await
             .unwrap();
         assert_eq!(ids(&hits), want, "{case} edge moved past its corner");
@@ -631,79 +626,61 @@ async fn distributed_geo_filters_are_exact_and_boundary_correct() {
     // equator one degree of longitude is one degree of latitude, so d1
     // and d2 are BOTH exactly at the boundary.
     let one_degree = geo::haversine_meters(0.0, 0.0, 0.0, 1.0);
-    let (hits, _, _) = coordinator
-        .fanout_bm25_faceted(
-            "rust",
-            10,
-            None,
+    let (hits, _, _) = common::fanout::bm25_geo(
+        &coordinator,
+        "rust",
+        10,
+        &[radius_filter(
+            "courthouse",
             0.0,
-            &[],
-            &[],
-            &[],
-            &[],
-            &[radius_filter(
-                "courthouse",
-                0.0,
-                0.0,
-                one_degree,
-                GeoMetric::Haversine,
-            )],
-            None,
-        )
-        .await
-        .unwrap();
+            0.0,
+            one_degree,
+            GeoMetric::Haversine,
+        )],
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         ids(&hits),
         vec![0, 1, 2],
         "distance exactly == meters is in"
     );
-    let (hits, _, _) = coordinator
-        .fanout_bm25_faceted(
-            "rust",
-            10,
-            None,
+    let (hits, _, _) = common::fanout::bm25_geo(
+        &coordinator,
+        "rust",
+        10,
+        &[radius_filter(
+            "courthouse",
             0.0,
-            &[],
-            &[],
-            &[],
-            &[],
-            &[radius_filter(
-                "courthouse",
-                0.0,
-                0.0,
-                one_degree.next_down(),
-                GeoMetric::Haversine,
-            )],
-            None,
-        )
-        .await
-        .unwrap();
+            0.0,
+            one_degree.next_down(),
+            GeoMetric::Haversine,
+        )],
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         ids(&hits),
         vec![0],
         "one ULP tighter and the boundary drops"
     );
-    let (hits, _, _) = coordinator
-        .fanout_bm25_faceted(
-            "rust",
-            10,
-            None,
+    let (hits, _, _) = common::fanout::bm25_geo(
+        &coordinator,
+        "rust",
+        10,
+        &[radius_filter(
+            "courthouse",
             0.0,
-            &[],
-            &[],
-            &[],
-            &[],
-            &[radius_filter(
-                "courthouse",
-                0.0,
-                0.0,
-                geo::M_PER_DEG_LAT,
-                GeoMetric::Manhattan,
-            )],
-            None,
-        )
-        .await
-        .unwrap();
+            0.0,
+            geo::M_PER_DEG_LAT,
+            GeoMetric::Manhattan,
+        )],
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         ids(&hits),
         vec![0, 1, 2],
@@ -712,62 +689,44 @@ async fn distributed_geo_filters_are_exact_and_boundary_correct() {
 
     // The pole, where cos(lat) is zero: a box whose northern edge IS 90
     // contains it. ("vector" matches d1 and d4.)
-    let (hits, _, _) = coordinator
-        .fanout_bm25_faceted(
-            "vector",
-            10,
-            None,
-            0.0,
-            &[],
-            &[],
-            &[],
-            &[],
-            &[bbox_filter("courthouse", 89.0, 90.0, -180.0, 180.0)],
-            None,
-        )
-        .await
-        .unwrap();
+    let (hits, _, _) = common::fanout::bm25_geo(
+        &coordinator,
+        "vector",
+        10,
+        &[bbox_filter("courthouse", 89.0, 90.0, -180.0, 180.0)],
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(ids(&hits), vec![4], "lat exactly 90 is inside the box");
 
     // Just west of the antimeridian, reached by an ORDINARY box whose
     // eastern edge is 180. The wraparound box that would also reach it
     // is refused (see the refusal matrix).
-    let (hits, _, _) = coordinator
-        .fanout_bm25_faceted(
-            "rust",
-            10,
-            None,
-            0.0,
-            &[],
-            &[],
-            &[],
-            &[],
-            &[bbox_filter("courthouse", -46.0, -44.0, 179.0, 180.0)],
-            None,
-        )
-        .await
-        .unwrap();
+    let (hits, _, _) = common::fanout::bm25_geo(
+        &coordinator,
+        "rust",
+        10,
+        &[bbox_filter("courthouse", -46.0, -44.0, 179.0, 180.0)],
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(ids(&hits), vec![6], "lon 179.9 needs no wraparound");
 
     // ALL filters must pass: the intersection, not the union.
-    let (hits, _, _) = coordinator
-        .fanout_bm25_faceted(
-            "rust",
-            10,
-            None,
-            0.0,
-            &[],
-            &[],
-            &[],
-            &[],
-            &[
-                bbox_filter("courthouse", 0.0, 1.0, 0.0, 1.0),
-                bbox_filter("courthouse", 0.5, 90.0, -180.0, 180.0),
-            ],
-            None,
-        )
-        .await
-        .unwrap();
+    let (hits, _, _) = common::fanout::bm25_geo(
+        &coordinator,
+        "rust",
+        10,
+        &[
+            bbox_filter("courthouse", 0.0, 1.0, 0.0, 1.0),
+            bbox_filter("courthouse", 0.5, 90.0, -180.0, 180.0),
+        ],
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(ids(&hits), vec![2], "AND semantics, not OR");
 
     // Distributed == monolith, bitwise, with a filter applied.
@@ -797,12 +756,10 @@ async fn distributed_geo_filters_are_exact_and_boundary_correct() {
                 GeoMetric::Haversine,
             )],
         ] {
-            let (got, _, _) = coordinator
-                .fanout_bm25_faceted(text, 10, None, 0.0, &[], &[], &[], &[], &filters, None)
+            let (got, _, _) = common::fanout::bm25_geo(&coordinator, text, 10, &filters, None)
                 .await
                 .unwrap();
-            let (want, _, _) = monolithic
-                .fanout_bm25_faceted(text, 10, None, 0.0, &[], &[], &[], &[], &filters, None)
+            let (want, _, _) = common::fanout::bm25_geo(&monolithic, text, 10, &filters, None)
                 .await
                 .unwrap();
             assert_eq!(
@@ -817,26 +774,20 @@ async fn distributed_geo_filters_are_exact_and_boundary_correct() {
     // counts are over the match set as already defined, and the doc
     // says so loudly. Pinned here so a future CEL layer changing it is
     // a deliberate, visible change.
-    let (hits, facets, _) = coordinator
-        .fanout_bm25_faceted(
-            "rust",
-            10,
-            None,
-            0.0,
-            &[],
-            &[],
-            &[],
-            &[],
-            &[bbox_filter("courthouse", 0.0, 1.0, 0.0, 1.0)],
-            None,
-        )
-        .await
-        .unwrap();
+    let (hits, facets, _) = common::fanout::bm25_geo(
+        &coordinator,
+        "rust",
+        10,
+        &[bbox_filter("courthouse", 0.0, 1.0, 0.0, 1.0)],
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(ids(&hits), vec![0, 1, 2]);
     assert!(facets.is_empty(), "none were requested");
 
     // The fused route carries filters too, forwarded like range facets.
-    let fields = vec![QueryField {
+    let fields = [QueryField {
         field: "body".to_string(),
         analysis: None,
         weight: 1.0,
@@ -847,20 +798,19 @@ async fn distributed_geo_filters_are_exact_and_boundary_correct() {
         synonyms: Vec::new(),
         synonyms_off: false,
     }];
-    let (hits, _, _) = coordinator
-        .fanout_bm25_fused_faceted(
-            "rust",
-            10,
-            &fields,
-            0.0,
-            &[],
-            &[],
-            &[],
-            &[bbox_filter("courthouse", 0.0, 1.0, 0.0, 1.0)],
-            None,
-        )
-        .await
-        .unwrap();
+    let (hits, _, _) = common::fanout::bm25_fused_req(
+        &coordinator,
+        pipestream_search::pb::Bm25SearchRequest {
+            text: "rust".into(),
+            fields: fields.to_vec(),
+            geo_filters: vec![bbox_filter("courthouse", 0.0, 1.0, 0.0, 1.0)],
+            ..Default::default()
+        },
+        10,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(ids(&hits), vec![0, 1, 2], "the fused route filters too");
 
     // The public RPC carries filters end to end.
@@ -915,21 +865,15 @@ async fn geo_filter_refusals_are_loud() {
         .with_bm25(Some(analysis.clone()), Default::default());
 
     // A column NO shard knows is a typo, not an empty result set.
-    let err = coordinator
-        .fanout_bm25_faceted(
-            "rust",
-            10,
-            None,
-            0.0,
-            &[],
-            &[],
-            &[],
-            &[],
-            &[bbox_filter("courthosue", 0.0, 1.0, 0.0, 1.0)],
-            None,
-        )
-        .await
-        .unwrap_err();
+    let err = common::fanout::bm25_geo(
+        &coordinator,
+        "rust",
+        10,
+        &[bbox_filter("courthosue", 0.0, 1.0, 0.0, 1.0)],
+        None,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     assert!(
         err.message().contains("courthosue") && err.message().contains("--geo-fields"),
@@ -939,21 +883,15 @@ async fn geo_filter_refusals_are_loud() {
 
     // A column only SOME shards know is the heterogeneous fleet, and is
     // fine — shard 2 has no geo column and contributes nothing.
-    coordinator
-        .fanout_bm25_faceted(
-            "rust",
-            10,
-            None,
-            0.0,
-            &[],
-            &[],
-            &[],
-            &[],
-            &[bbox_filter("courthouse", 0.0, 1.0, 0.0, 1.0)],
-            None,
-        )
-        .await
-        .expect("a partially known column is exact, not an error");
+    common::fanout::bm25_geo(
+        &coordinator,
+        "rust",
+        10,
+        &[bbox_filter("courthouse", 0.0, 1.0, 0.0, 1.0)],
+        None,
+    )
+    .await
+    .expect("a partially known column is exact, not an error");
 
     let antimeridian = GeoFilter {
         column: "courthouse".to_string(),
@@ -1010,8 +948,7 @@ async fn geo_filter_refusals_are_loud() {
         (unspecified_metric, "unknown geo metric"),
         (bbox_filter("", 0.0, 1.0, 0.0, 1.0), "names the geo column"),
     ] {
-        let err = coordinator
-            .fanout_bm25_faceted("rust", 10, None, 0.0, &[], &[], &[], &[], &[bad], None)
+        let err = common::fanout::bm25_geo(&coordinator, "rust", 10, &[bad], None)
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument, "{needle}");
@@ -1028,8 +965,7 @@ async fn geo_filter_refusals_are_loud() {
     let bad = bbox_filter("courthouse", 0.0, 1.0, 179.0, -179.0);
     let bad_one = std::slice::from_ref(&bad);
     for (text, k) in [("", 10u32), ("rust", 0)] {
-        let err = coordinator
-            .fanout_bm25_faceted(text, k, None, 0.0, &[], &[], &[], &[], bad_one, None)
+        let err = common::fanout::bm25_geo(&coordinator, text, k, bad_one, None)
             .await
             .unwrap_err();
         assert_eq!(
@@ -1038,7 +974,7 @@ async fn geo_filter_refusals_are_loud() {
             "text {text:?}, k {k}: the early return must not hide the refusal"
         );
     }
-    let fields = vec![QueryField {
+    let fields = [QueryField {
         field: "body".to_string(),
         analysis: None,
         weight: 1.0,
@@ -1049,10 +985,18 @@ async fn geo_filter_refusals_are_loud() {
         synonyms: Vec::new(),
         synonyms_off: false,
     }];
-    let err = coordinator
-        .fanout_bm25_fused_faceted("", 10, &fields, 0.0, &[], &[], &[], bad_one, None)
-        .await
-        .unwrap_err();
+    let err = common::fanout::bm25_fused_req(
+        &coordinator,
+        pipestream_search::pb::Bm25SearchRequest {
+            fields: fields.to_vec(),
+            geo_filters: bad_one.to_vec(),
+            ..Default::default()
+        },
+        10,
+        None,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(
         err.code(),
         tonic::Code::InvalidArgument,
@@ -1172,7 +1116,7 @@ fn build_geo_pruned_corpus(n: u32, path: &std::path::Path) -> u64 {
     let tf_a = |d: u32| 1 + (u64::from(d) * 2654435761 % 7) as u32;
     let lat = |d: u32| -60.0 + f64::from(d % 121);
     let lon = |d: u32| -179.0 + f64::from(d % 359);
-    let mut store = Bm25Store::with_fields(&["body"]).with_geos(&["courthouse"]);
+    let mut store = Bm25Store::with_text_fields(&["body"]).with_columns(Geo, &["courthouse"]);
     let mut total = 0u64;
     for doc in 0..n {
         let mut terms = vec![("a".to_string(), tf_a(doc), Vec::new())];
@@ -1379,14 +1323,12 @@ async fn distributed_geo_decay_matches_monolith() {
     ] {
         // Origin at (1, 0): d2 sits ON it (factor 1), d0 and d1 are one
         // degree away, d3 and d6 are far.
-        let stages = vec![geo_stage("courthouse", op, 1.0, 0.0, 100_000.0)];
+        let stages = [geo_stage("courthouse", op, 1.0, 0.0, 100_000.0)];
         for text in ["rust", "search rust", "vector"] {
-            let (got, _, _) = distributed
-                .fanout_bm25_faceted(text, 10, None, 0.0, &[], &[], &[], &stages, &[], None)
+            let (got, _, _) = common::fanout::bm25_stages(&distributed, text, 10, &stages, None)
                 .await
                 .unwrap();
-            let (want, _, _) = monolithic
-                .fanout_bm25_faceted(text, 10, None, 0.0, &[], &[], &[], &stages, &[], None)
+            let (want, _, _) = common::fanout::bm25_stages(&monolithic, text, 10, &stages, None)
                 .await
                 .unwrap();
             assert_eq!(
@@ -1400,8 +1342,7 @@ async fn distributed_geo_decay_matches_monolith() {
         // d2 (distance 0, factor 1) climbing over documents that beat it
         // unchained.
         let unchained = distributed.fanout_bm25("rust", 10, None).await.unwrap();
-        let (chained, _, _) = distributed
-            .fanout_bm25_faceted("rust", 10, None, 0.0, &[], &[], &[], &stages, &[], None)
+        let (chained, _, _) = common::fanout::bm25_stages(&distributed, "rust", 10, &stages, None)
             .await
             .unwrap();
         assert_eq!(ids(&unchained), ids(&chained), "a decay removes nothing");
@@ -1452,8 +1393,7 @@ async fn distributed_geo_decay_matches_monolith() {
             "[-180, 180]",
         ),
     ] {
-        let err = distributed
-            .fanout_bm25_faceted("rust", 10, None, 0.0, &[], &[], &[], &[bad], &[], None)
+        let err = common::fanout::bm25_stages(&distributed, "rust", 10, &[bad], None)
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument, "{needle}");
@@ -1464,27 +1404,21 @@ async fn distributed_geo_decay_matches_monolith() {
         );
     }
     // A geo column NO shard knows is refused by the chain's typo rule.
-    let err = distributed
-        .fanout_bm25_faceted(
-            "rust",
-            10,
-            None,
+    let err = common::fanout::bm25_stages(
+        &distributed,
+        "rust",
+        10,
+        &[geo_stage(
+            "courthosue",
+            ScoreOp::MultGeoDecayHaversine,
             0.0,
-            &[],
-            &[],
-            &[],
-            &[geo_stage(
-                "courthosue",
-                ScoreOp::MultGeoDecayHaversine,
-                0.0,
-                0.0,
-                10.0,
-            )],
-            &[],
-            None,
-        )
-        .await
-        .unwrap_err();
+            0.0,
+            10.0,
+        )],
+        None,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     assert!(err.message().contains("courthosue"), "{}", err.message());
 

@@ -21,6 +21,7 @@ pub(crate) use self::facets::{
 pub(in crate::node) use self::facets::{unknown_range_counts, validate_lat_lon, FacetCountRequest};
 pub(in crate::node) use self::filters::{
     filter_known_flags, prune_segments, resolve_shard_filters, ResolvedShardFilters, SegmentPrune,
+    ShardFilterInputs,
 };
 pub(in crate::node) use self::state::{
     active_artifact_rows, live_document_count, live_field_stats, IngestGuard,

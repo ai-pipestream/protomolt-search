@@ -1,26 +1,112 @@
 //! A document's column values written into the child's BM25 store.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::pb::AddDocumentsRequest;
 use crate::postings::SpillBuilder;
 
 use super::ColumnTables;
 
-fn index_of(table: &[String], name: &str) -> Option<usize> {
-    table.iter().position(|n| n == name)
+/// One column family's name-to-slot index, built once per child.
+struct Slots {
+    label: &'static str,
+    index: HashMap<String, usize>,
+}
+
+impl Slots {
+    fn new(label: &'static str, table: &[String]) -> Result<Self, String> {
+        let mut index = HashMap::with_capacity(table.len());
+        for (slot, name) in table.iter().enumerate() {
+            if index.insert(name.clone(), slot).is_some() {
+                return Err(format!("duplicate {label} column {name:?} in child table"));
+            }
+        }
+        Ok(Self { label, index })
+    }
+
+    fn get(&self, local: u32, name: &str) -> Result<usize, String> {
+        self.index.get(name).copied().ok_or_else(|| {
+            format!(
+                "record at child slot {local}: {} column {name:?} is absent from the replay table",
+                self.label
+            )
+        })
+    }
+}
+
+/// Pre-indexed slot lookup for all nine column families of one child.
+pub(super) struct ColumnSlots {
+    facets: Slots,
+    numerics: Slots,
+    map_facets: Slots,
+    map_numerics: Slots,
+    map_integers: Slots,
+    map_unsigned_integers: Slots,
+    integers: Slots,
+    unsigned_integers: Slots,
+    geo: Slots,
+}
+
+impl ColumnSlots {
+    pub(super) fn new(tables: &ColumnTables) -> Result<Self, String> {
+        Ok(Self {
+            facets: Slots::new("facet", &tables.facets)?,
+            numerics: Slots::new("numeric", &tables.numerics)?,
+            map_facets: Slots::new("map-facet", &tables.map_facets)?,
+            map_numerics: Slots::new("map-numeric", &tables.map_numerics)?,
+            map_integers: Slots::new("integer map", &tables.map_integers)?,
+            map_unsigned_integers: Slots::new(
+                "unsigned integer map",
+                &tables.map_unsigned_integers,
+            )?,
+            integers: Slots::new("integer", &tables.integers)?,
+            unsigned_integers: Slots::new("unsigned", &tables.unsigned_integers)?,
+            geo: Slots::new("geo", &tables.geo)?,
+        })
+    }
+}
+
+/// Refuses a second value for one scalar slot, or one map slot and key.
+struct Seen<'a> {
+    local: u32,
+    label: &'static str,
+    keys: HashSet<(usize, &'a str)>,
+}
+
+impl<'a> Seen<'a> {
+    fn new(local: u32, label: &'static str) -> Self {
+        Self {
+            local,
+            label,
+            keys: HashSet::new(),
+        }
+    }
+
+    fn insert(&mut self, slot: usize, key: &'a str) -> Result<(), String> {
+        if self.keys.insert((slot, key)) {
+            return Ok(());
+        }
+        Err(format!(
+            "record at child slot {}: {} column slot {slot} key {key:?} repeats",
+            self.local, self.label
+        ))
+    }
 }
 
 /// Write every column value the document carries at `local`.
 pub(super) fn set_columns(
     builder: &mut SpillBuilder,
-    tables: &ColumnTables,
+    slots: &ColumnSlots,
     local: u32,
     doc: &AddDocumentsRequest,
 ) -> Result<(), String> {
-    set_keyword_columns(builder, tables, local, doc);
-    set_map_integer_columns(builder, tables, local, doc)?;
-    set_integer_columns(builder, tables, local, doc)?;
+    set_keyword_columns(builder, slots, local, doc)?;
+    set_map_integer_columns(builder, slots, local, doc)?;
+    set_integer_columns(builder, slots, local, doc)?;
+    let mut seen = Seen::new(local, "geo");
     for e in &doc.geo_points {
-        let gi = index_of(&tables.geo, &e.field).expect("geo table was derived from these records");
+        let gi = slots.geo.get(local, &e.field)?;
+        seen.insert(gi, "")?;
         builder.set_geo(gi, local, e.lat, e.lon);
     }
     Ok(())
@@ -28,49 +114,51 @@ pub(super) fn set_columns(
 
 fn set_keyword_columns(
     builder: &mut SpillBuilder,
-    tables: &ColumnTables,
+    slots: &ColumnSlots,
     local: u32,
     doc: &AddDocumentsRequest,
-) {
+) -> Result<(), String> {
+    let mut seen = Seen::new(local, "facet");
     for fv in &doc.facets {
-        let fi = index_of(&tables.facets, &fv.field)
-            .expect("facet table was derived from these records");
+        let fi = slots.facets.get(local, &fv.field)?;
+        seen.insert(fi, "")?;
         builder.set_facet(fi, local, &fv.value);
     }
+    let mut seen = Seen::new(local, "numeric");
     for nv in &doc.numerics {
-        let ni = index_of(&tables.numerics, &nv.field)
-            .expect("numeric table was derived from these records");
+        let ni = slots.numerics.get(local, &nv.field)?;
+        seen.insert(ni, "")?;
         builder.set_numeric(ni, local, nv.value);
     }
+    let mut seen = Seen::new(local, "map-facet");
     for e in &doc.map_facets {
-        let ci = index_of(&tables.map_facets, &e.field)
-            .expect("map-facet table was derived from these records");
+        let ci = slots.map_facets.get(local, &e.field)?;
+        seen.insert(ci, &e.key)?;
         builder.set_map_facet(ci, local, &e.key, &e.value);
     }
+    let mut seen = Seen::new(local, "map-numeric");
     for e in &doc.map_numerics {
-        let ci = index_of(&tables.map_numerics, &e.field)
-            .expect("map-numeric table was derived from these records");
+        let ci = slots.map_numerics.get(local, &e.field)?;
+        seen.insert(ci, &e.key)?;
         builder.set_map_numeric(ci, local, &e.key, e.value);
     }
+    Ok(())
 }
 
 fn set_map_integer_columns(
     builder: &mut SpillBuilder,
-    tables: &ColumnTables,
+    slots: &ColumnSlots,
     local: u32,
     doc: &AddDocumentsRequest,
 ) -> Result<(), String> {
-    let absent =
-        |field: &str| format!("integer map column {field:?} is absent from the replay table");
     for e in &doc.map_integers {
-        let ci = index_of(&tables.map_integers, &e.field).ok_or_else(|| absent(&e.field))?;
+        let ci = slots.map_integers.get(local, &e.field)?;
         builder
             .set_map_integer(ci, local, &e.key, e.value)
             .map_err(|e| format!("integer map replay: {e}"))?;
     }
     for e in &doc.map_unsigned_integers {
-        let ci =
-            index_of(&tables.map_unsigned_integers, &e.field).ok_or_else(|| absent(&e.field))?;
+        let ci = slots.map_unsigned_integers.get(local, &e.field)?;
         builder
             .set_map_unsigned_integer(ci, local, &e.key, e.value)
             .map_err(|e| format!("integer map replay: {e}"))?;
@@ -80,37 +168,29 @@ fn set_map_integer_columns(
 
 /// Integers, unsigned integers, and timestamps. Timestamps re-run the
 /// node's conversion from the instant the WAL kept: the child gets the
-/// same epoch micros the parent stored, not a copy of a copy.
+/// same epoch micros the parent stored, not a copy of a copy. Integers and
+/// timestamps share one slot table, so one value per slot across both.
 fn set_integer_columns(
     builder: &mut SpillBuilder,
-    tables: &ColumnTables,
+    slots: &ColumnSlots,
     local: u32,
     doc: &AddDocumentsRequest,
 ) -> Result<(), String> {
+    let mut seen = Seen::new(local, "integer");
     for e in &doc.integers {
-        let ii = index_of(&tables.integers, &e.field)
-            .expect("integer table was derived from these records");
+        let ii = slots.integers.get(local, &e.field)?;
+        seen.insert(ii, "")?;
         builder.set_integer(ii, local, e.value);
     }
-    let mut unsigned_seen = std::collections::HashSet::new();
+    let mut unsigned_seen = Seen::new(local, "unsigned");
     for value in &doc.unsigned_integers {
-        if !unsigned_seen.insert(&value.field) {
-            return Err(format!(
-                "record at child slot {local}: unsigned field {:?} repeats",
-                value.field
-            ));
-        }
-        let column = index_of(&tables.unsigned_integers, &value.field).ok_or_else(|| {
-            format!(
-                "record at child slot {local}: undeclared unsigned field {:?}",
-                value.field
-            )
-        })?;
+        let column = slots.unsigned_integers.get(local, &value.field)?;
+        unsigned_seen.insert(column, "")?;
         builder.set_unsigned_integer(column, local, value.value);
     }
     for e in &doc.timestamps {
-        let ii = index_of(&tables.integers, &e.field)
-            .expect("integer table was derived from these records");
+        let ii = slots.integers.get(local, &e.field)?;
+        seen.insert(ii, "")?;
         let ts = e.value.as_ref().ok_or_else(|| {
             format!(
                 "record at child slot {local}: timestamp field {:?} carries no instant",

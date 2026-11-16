@@ -69,7 +69,7 @@ fn deterministic_unit_vectors(rows: usize, dim: usize, seed: u64) -> Vec<f32> {
 }
 
 fn build_empty_bm25(rows: usize) -> Bm25Store {
-    let mut store = Bm25Store::with_fields(&["body"]);
+    let mut store = Bm25Store::with_text_fields(&["body"]);
     let doc = analyze_document_native("token", Some(&body_spec())).expect("analyze doc");
     for slot in 0..rows as u32 {
         store.add_document(slot, "token".to_string(), doc.clone());

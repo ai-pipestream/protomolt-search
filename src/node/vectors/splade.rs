@@ -116,9 +116,11 @@ impl NodeServiceImpl {
             Some(store),
             None,
             rows,
-            &[],
-            &[],
-            filter,
+            ShardFilterInputs {
+                geo: &[],
+                regions: &[],
+                tree: filter,
+            },
             self.knobs.segment_pruning(),
             None,
         )?;

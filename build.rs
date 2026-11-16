@@ -13,12 +13,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The console's JSON facade transcodes from this descriptor set at
     // run time (src/console.rs), so a new RPC needs no facade change.
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
+    // These vendored comments spell placeholders as `<name>`, which rustdoc
+    // reads as unclosed HTML tags; the protos themselves cannot be edited.
+    let mut prost = tonic_prost_build::Config::new();
+    prost.disable_comments([
+        ".ai.protomolt.proto.index.hints.v1.ChunkingPolicy.vector_field",
+        ".ai.protomolt.proto.index.hints.v1.BlockRole.BLOCK_ROLE_CHUNK_ID",
+    ]);
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
         .build_transport(net)
         .file_descriptor_set_path(out_dir.join("search_descriptor.bin"))
-        .compile_protos(
+        .compile_with_config(
+            prost,
             &[
                 "proto/ai/protomolt/search/v1/search.proto",
                 "proto/google/rpc/status.proto",

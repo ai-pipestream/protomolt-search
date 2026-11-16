@@ -39,7 +39,7 @@ fn new_column_payloads_are_crc_covered_and_roundtrip() {
     let dir = std::env::temp_dir().join(format!("review125-crc-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("columns.bm25");
-    let mut store = Bm25Store::with_fields(&["body"]).with_positions(&["body"]);
+    let mut store = Bm25Store::with_text_fields(&["body"]).with_positions(&["body"]);
     store.add_document(
         0,
         "joined word".into(),
@@ -105,7 +105,7 @@ fn single_term_ties_and_admission_use_lower_live_doc_id() {
 fn lattice_slop_rejects_overlap_and_counts_only_gaps() {
     use pipestream_search::postings::{AnalyzedDoc, AnalyzedField, Bm25Store};
     use pipestream_search::proximity::phrase_matches;
-    let mut store = Bm25Store::with_fields(&["body"]).with_positions(&["body"]);
+    let mut store = Bm25Store::with_text_fields(&["body"]).with_positions(&["body"]);
     for (doc, court_pos) in [3, 4, 2].into_iter().enumerate() {
         store.add_document(
             doc as u32,
@@ -229,7 +229,7 @@ fn canonical_splade_v2_bytes_reject_v1_magic_and_mixed_scales_survive_transpose(
 
     let dir = std::env::temp_dir().join(format!("splade-scales-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let mut store = Bm25Store::with_fields(&["body"]);
+    let mut store = Bm25Store::with_text_fields(&["body"]);
     let scales = [0.00001_f32, 0.00002, 0.5];
     for (row, scale) in scales.iter().enumerate() {
         store.add_document(

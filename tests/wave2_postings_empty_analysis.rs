@@ -81,10 +81,10 @@ fn assert_transpose_case(dir: &Path, name: &str, docs: &[RowSpec]) {
     let any_lattice = docs.iter().any(|(_, b, _)| b.pos_lengths.is_some());
     let sp = dir.join(format!("{name}_s.bm25"));
     let bp = dir.join(format!("{name}_b.bm25"));
-    let mut store = Bm25Store::with_fields(&["body", "title"])
+    let mut store = Bm25Store::with_text_fields(&["body", "title"])
         .with_positions(&["body"])
         .with_sentences(&["body"]);
-    let mut spill = SpillBuilder::create_with_fields(&dir.join(name), &["body", "title"])
+    let mut spill = SpillBuilder::create_with_text_fields(&dir.join(name), &["body", "title"])
         .unwrap()
         .with_position_fields(&["body"])
         .with_sentence_fields(&["body"]);

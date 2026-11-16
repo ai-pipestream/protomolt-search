@@ -42,7 +42,6 @@ fn final_segment_can_be_reclaimed_only_with_identical_generation_metadata() {
         .verify_source_rewrite(&before, &fixture.0.join("self-proof"), 1)
         .unwrap();
     let mut manifest = before.published_manifest();
-    manifest.format = 4;
     manifest.generation_declaration =
         Some(SegmentGenerationDeclaration::encode(&declaration).unwrap());
     manifest.segments.clear();

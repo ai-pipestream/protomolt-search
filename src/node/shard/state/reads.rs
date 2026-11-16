@@ -94,9 +94,11 @@ impl ShardState {
             self.bm25.as_ref(),
             self.live_docs.words(),
             rows,
-            geo_filters,
-            geo_regions,
-            combined.as_ref(),
+            ShardFilterInputs {
+                geo: geo_filters,
+                regions: geo_regions,
+                tree: combined.as_ref(),
+            },
             prune,
             None,
         )?;

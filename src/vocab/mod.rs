@@ -16,10 +16,9 @@
 //!
 //! A window rolls over at [`DEFAULT_WINDOW_DOCS`] documents (or on an
 //! explicit snapshot) and is sealed as a protobuf `VocabSnapshot` at
-//! `<index path>.vocab/snapshot-<seq>-<millis>.pb` — the shared on-disk
-//! contract with the Java listener, so snapshots are interchangeable
-//! between the two implementations (same hashes, same parameters, same
-//! byte layouts; pinned by the cross-language vector tests).
+//! `<index path>.vocab/snapshot-<seq>-<millis>.pb`, a stable on-disk
+//! contract (hashes, parameters and byte layouts are pinned by the
+//! cross-language vector tests).
 //!
 //! The listener is analytics, not a ledger: [`VocabularyListener::feed`]
 //! never fails — a sketch or persistence failure loses one document's

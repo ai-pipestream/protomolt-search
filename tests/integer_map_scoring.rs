@@ -349,7 +349,7 @@ mod pruning {
     use super::*;
     use pipestream_search::{
         bm25::{self, Bm25Params, CorpusStats},
-        postings::{AnalyzedDoc, Bm25Reader, Bm25Store},
+        postings::{AnalyzedDoc, Bm25Reader, Bm25Store, ColumnKind::*},
         scorefn::{ColumnRef, NumericRead, ScoreChain, Stage, StageOp},
     };
     struct Columns<'a>(&'a Bm25Reader);
@@ -383,9 +383,9 @@ mod pruning {
         }
     }
     fn build_integer_map_store(path: &std::path::Path) -> CorpusStats {
-        let mut store = Bm25Store::with_fields(&["body"])
-            .with_map_integers(&["signed"])
-            .with_map_unsigned_integers(&["unsigned"]);
+        let mut store = Bm25Store::with_text_fields(&["body"])
+            .with_columns(MapInteger, &["signed"])
+            .with_columns(MapUnsignedInteger, &["unsigned"]);
         let n = 3000u32;
         let mut total = 0;
         for row in 0..n {

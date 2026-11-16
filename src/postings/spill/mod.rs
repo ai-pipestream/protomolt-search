@@ -124,12 +124,12 @@ impl SpillBuilder {
 
     /// Create a single-field ("body") builder spilling into `dir`.
     pub fn create(dir: &Path) -> io::Result<Self> {
-        Self::create_with_fields(dir, &["body"])
+        Self::create_with_text_fields(dir, &["body"])
     }
 
     /// Create a builder with the given field table; same contract as
-    /// [`Bm25Store::with_fields`].
-    pub fn create_with_fields(dir: &Path, names: &[&str]) -> io::Result<Self> {
+    /// [`Bm25Store::with_text_fields`].
+    pub fn create_with_text_fields(dir: &Path, names: &[&str]) -> io::Result<Self> {
         validate_text_field_names(names, "builder");
         std::fs::create_dir_all(dir)?;
         let texts = io::BufWriter::new(std::fs::File::create(dir.join("texts.spill"))?);
@@ -146,11 +146,6 @@ impl SpillBuilder {
             columns: ColumnSet::default(),
             sources: crate::source_archive::SourceArchive::spilling(&dir.join("sources.spill"))?,
         })
-    }
-
-    /// Unified text-field table constructor matching [`Bm25Store::with_text_fields`].
-    pub fn create_with_text_fields(dir: &Path, names: &[&str]) -> io::Result<Self> {
-        Self::create_with_fields(dir, names)
     }
 
     /// Override the sort-buffer capacity (tests force multi-run merges with tiny caps).

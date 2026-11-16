@@ -194,7 +194,7 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
     let config =
         VectorIndex::fit_backend_config(EMBEDDED_TURBOVEC, DIM, BITS, &corpus[..sample_rows * DIM])
             .unwrap();
-    let calibration = pipestream_search::vector::legacy_calibration_config(&config)
+    let calibration = pipestream_search::vector::embedded_turbovec_calibration(&config)
         .unwrap()
         .unwrap();
 

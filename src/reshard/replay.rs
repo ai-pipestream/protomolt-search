@@ -113,10 +113,9 @@ pub(super) fn require_backend_config(manifest: &WalManifest, what: &Path) -> Res
     let dim = manifest.dim as usize;
     let config = manifest.backend_config();
     let configured = config.as_ref().is_ok_and(|config| {
-        crate::vector::legacy_calibration_config(config)
-            .ok()
-            .flatten()
-            .is_none_or(|legacy| legacy.shift.len() == dim && legacy.scale.len() == dim)
+        crate::vector::embedded_turbovec_calibration(config).is_ok_and(|calibration| {
+            calibration.is_none_or(|pair| pair.shift.len() == dim && pair.scale.len() == dim)
+        })
     });
     if dim == 0 || !configured {
         return Err(format!(

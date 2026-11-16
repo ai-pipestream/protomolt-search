@@ -10,6 +10,25 @@ pub(in crate::source_authority) struct Committed {
     pub(in crate::source_authority) replicas: Vec<ControlReplica>,
 }
 
+/// The topology row the control state names as current; its absence is corruption.
+pub(in crate::source_authority) fn current_topology(
+    topologies: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    key: &LogicalSourceOwner,
+    generation: u64,
+) -> Result<ControlTopology, Status> {
+    let row_key = ControlTopologyKey {
+        key: Some(key.clone()),
+        generation,
+    };
+    contract::decode(
+        topologies
+            .get(row_key.encode_to_vec().as_slice())
+            .map_err(storage)?
+            .ok_or_else(|| corrupt("current topology row is missing"))?
+            .value(),
+    )
+}
+
 pub(in crate::source_authority) fn load_committed(
     control: &impl ReadableTable<&'static [u8], &'static [u8]>,
     topologies: &impl ReadableTable<&'static [u8], &'static [u8]>,
@@ -24,20 +43,7 @@ pub(in crate::source_authority) fn load_committed(
         return Ok(None);
     };
     let state: ControlCollectionState = contract::decode(state.value())?;
-    let topology: ControlTopology = contract::decode(
-        topologies
-            .get(
-                ControlTopologyKey {
-                    key: Some(key.clone()),
-                    generation: state.topology_generation,
-                }
-                .encode_to_vec()
-                .as_slice(),
-            )
-            .map_err(storage)?
-            .ok_or_else(|| corrupt("current topology row is missing"))?
-            .value(),
-    )?;
+    let topology = current_topology(topologies, key, state.topology_generation)?;
     let prefix = resource_prefix(key);
     let end = prefix_end(&prefix).ok_or_else(|| corrupt("resource prefix overflow"))?;
     let mut node_rows = BTreeMap::new();

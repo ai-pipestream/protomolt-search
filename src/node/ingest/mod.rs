@@ -5,6 +5,7 @@ mod materialize;
 mod mutations;
 mod pipeline;
 
+pub(crate) use self::commit::MaterializedDocument;
 pub(crate) use self::materialize::{
     apply_materialize, cased_field_index, compile_materialize_spec, join_fields, materialize_sha,
 };

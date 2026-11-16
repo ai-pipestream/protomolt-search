@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use std::process::Child;
 use std::time::Instant;
 
-use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::coordinator::{CascadeQuery, CoordinatorServiceImpl};
 use pipestream_search::demo::dataset;
 use pipestream_search::harness::{self, mock_analysis};
 use pipestream_search::node::NodeConfig;
@@ -277,19 +277,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         let global_probe_id = (part * counts[0] + index) as u64;
         println!("\n=== query (doc {global_probe_id}): {text:?}");
-        let hits = coordinator
-            .fanout_cascade(
-                "shakedown",
-                text,
-                &vector,
-                5,
-                Some(&spec),
-                0.0,
-                false,
-                &Default::default(),
-            )
-            .await?
-            .0;
+        let req = pipestream_search::pb::HybridSearchRequest {
+            text: text.into(),
+            vector: vector.to_vec(),
+            analysis: Some(spec.clone()),
+            ..Default::default()
+        };
+        let filters = Default::default();
+        let query = CascadeQuery::from_request("shakedown", &req, 5, 0.0, &filters)?;
+        let hits = coordinator.fanout_cascade_context(query).await?.0;
         for hit in &hits {
             println!(
                 "  #{} doc {:>7} (shard {}) vector {:.4}  bm25 {:.4}",

@@ -159,16 +159,12 @@ impl RaftHost {
         )));
         host.peer_rejections = Some(peer_rejections);
         let service = RaftTransportService::new(
-            host.raft.clone(),
+            host.listener_host(),
             node_id,
             Arc::clone(&transport.directory),
             isolation.clone(),
             timing,
-            host.hold.clone(),
-            Arc::clone(&host.staging),
-            Arc::clone(&host.snapshot_rejections),
             &transport.limits,
-            host.read_timeout,
         );
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let server = tonic::transport::Server::builder()
@@ -188,6 +184,18 @@ impl RaftHost {
         host.directory = Some(transport.directory);
         host.isolation = isolation;
         Ok(host)
+    }
+
+    /// The host state the transport listener serves from.
+    #[cfg(feature = "tls")]
+    fn listener_host(&self) -> ListenerHost {
+        ListenerHost {
+            raft: self.raft.clone(),
+            hold: self.hold.clone(),
+            staging: Arc::clone(&self.staging),
+            rejections: Arc::clone(&self.snapshot_rejections),
+            read_timeout: self.read_timeout,
+        }
     }
 
     pub(super) async fn start_with<N: RaftNetworkFactory<ControlRaft>>(

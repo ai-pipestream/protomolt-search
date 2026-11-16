@@ -142,6 +142,12 @@ impl Inner {
     }
 }
 
+/// A cheaply cloned handle to one node's durable source-authority database:
+/// the committed access policy, logical source-owner preparations and
+/// control state of every managed resource. Each operation authorizes the
+/// caller's stable principal against the committed policy inside one redb
+/// transaction; a storage failure closes the handle for good. Admitted
+/// source work holds a shared guard that every control command waits on.
 #[derive(Clone)]
 pub struct SourceAuthorityStore {
     inner: Arc<Inner>,
@@ -274,6 +280,13 @@ impl SourceAuthorityStore {
         key: &LogicalSourceOwner,
     ) -> Result<AccessPolicy, Status> {
         contract::key(key, false)?;
+        let policy = self.committed_policy(tx)?;
+        contract::authorize(&policy, principal, key)?;
+        Ok(policy)
+    }
+
+    /// The committed policy, after checking the header binds this store.
+    fn committed_policy(&self, tx: &redb::ReadTransaction) -> Result<AccessPolicy, Status> {
         let meta = tx.open_table(META).map_err(storage)?;
         let header: SourceAuthorityHeader = contract::decode(
             meta.get("header")
@@ -289,7 +302,6 @@ impl SourceAuthorityStore {
                 .value(),
         )?;
         contract::policy(&policy).map_err(corrupt)?;
-        contract::authorize(&policy, principal, key)?;
         Ok(policy)
     }
 }

@@ -137,8 +137,14 @@ async fn integer_map_ranges_keep_adjacent_large_values_in_distinct_buckets() {
         .join(format!("map-ranges-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut store = Bm25Store::new()
-        .with_map_integers(&["signed"])
-        .with_map_unsigned_integers(&["unsigned"]);
+        .with_columns(
+            pipestream_search::postings::ColumnKind::MapInteger,
+            &["signed"],
+        )
+        .with_columns(
+            pipestream_search::postings::ColumnKind::MapUnsignedInteger,
+            &["unsigned"],
+        );
     for row in 0..10 {
         store.add_document(
             row as u32,

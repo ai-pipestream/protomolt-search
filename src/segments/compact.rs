@@ -48,7 +48,6 @@ impl SegmentCatalog {
         manifest.segments.extend(outputs.iter().cloned());
         manifest.segments.sort_by_key(|segment| segment.base_label);
         manifest.partition_key = partition_key;
-        manifest.update_retained_format();
         let published = self.publish(manifest);
         if published.is_err() {
             cleanup_staged(&self.root, &outputs);

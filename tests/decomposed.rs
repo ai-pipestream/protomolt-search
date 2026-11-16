@@ -252,21 +252,17 @@ async fn decomposed_matches_exhaustive_fused_oracle() {
                     .into_iter()
                     .take(k as usize)
                     .collect();
-            let got = fx
-                .coordinator
-                .fanout_hybrid(
-                    &format!("dec-{w_v}-{w_b}-{leg_k}"),
-                    "zebra crossing",
-                    &query,
-                    k,
-                    None,
-                    legs_decomposed(w_v, w_b, leg_k),
-                    false,
-                    &Default::default(),
-                )
-                .await
-                .expect("decomposed fan-out")
-                .0;
+            let got = common::fanout::hybrid(
+                &fx.coordinator,
+                &format!("dec-{w_v}-{w_b}-{leg_k}"),
+                "zebra crossing",
+                &query,
+                k,
+                legs_decomposed(w_v, w_b, leg_k),
+            )
+            .await
+            .expect("decomposed fan-out")
+            .0;
             assert_eq!(
                 signature(&got),
                 want,
@@ -282,33 +278,11 @@ async fn decomposed_is_deterministic_across_racy_floor_timing() {
     let fx = start_fixture().await;
     let query = fx.corpus[DIM..2 * DIM].to_vec();
     let legs = || legs_decomposed(1.0, 0.5, 12);
-    let first = fx
-        .coordinator
-        .fanout_hybrid(
-            "det-1",
-            "zebra",
-            &query,
-            12,
-            None,
-            legs(),
-            false,
-            &Default::default(),
-        )
+    let first = common::fanout::hybrid(&fx.coordinator, "det-1", "zebra", &query, 12, legs())
         .await
         .unwrap()
         .0;
-    let second = fx
-        .coordinator
-        .fanout_hybrid(
-            "det-2",
-            "zebra",
-            &query,
-            12,
-            None,
-            legs(),
-            false,
-            &Default::default(),
-        )
+    let second = common::fanout::hybrid(&fx.coordinator, "det-2", "zebra", &query, 12, legs())
         .await
         .unwrap()
         .0;
@@ -336,21 +310,17 @@ async fn decomposed_empty_bm25_leg_degenerates_to_scaled_vector_ranking() {
     let k = 8u32;
     // No document contains this term: b(d) = 0 everywhere, fused is
     // w_v * v(d), and the ranking must be the plain streaming top-k.
-    let got = fx
-        .coordinator
-        .fanout_hybrid(
-            "deg-1",
-            "xyzzyplugh",
-            &query,
-            k,
-            None,
-            legs_decomposed(2.5, 1.0, 20),
-            false,
-            &Default::default(),
-        )
-        .await
-        .unwrap()
-        .0;
+    let got = common::fanout::hybrid(
+        &fx.coordinator,
+        "deg-1",
+        "xyzzyplugh",
+        &query,
+        k,
+        legs_decomposed(2.5, 1.0, 20),
+    )
+    .await
+    .unwrap()
+    .0;
     let want = oracle_fused(&fx.coordinator, "xyzzyplugh", &query, 2.5, 1.0, 0.0).await;
     assert_eq!(signature(&got), want[..k as usize].to_vec());
     for h in &got {
@@ -382,18 +352,7 @@ async fn decomposed_min_vector_score_gates_the_result_set_exactly() {
     let min_v = deep_v.hits[19].score;
     let mut legs = legs_decomposed(1.0, 1.0, k);
     legs.min_vector_score = min_v;
-    let got = fx
-        .coordinator
-        .fanout_hybrid(
-            "gate-1",
-            "zebra crossing",
-            &query,
-            k,
-            None,
-            legs,
-            false,
-            &Default::default(),
-        )
+    let got = common::fanout::hybrid(&fx.coordinator, "gate-1", "zebra crossing", &query, k, legs)
         .await
         .unwrap()
         .0;
@@ -535,21 +494,17 @@ async fn decomposed_serves_through_hybrid_search_with_debug() {
         .await
         .unwrap()
         .into_inner();
-    let direct = fx
-        .coordinator
-        .fanout_hybrid(
-            "dbg-direct",
-            "zebra crossing",
-            &query,
-            6,
-            None,
-            legs_decomposed(1.0, 1.0, 60),
-            false,
-            &Default::default(),
-        )
-        .await
-        .unwrap()
-        .0;
+    let direct = common::fanout::hybrid(
+        &fx.coordinator,
+        "dbg-direct",
+        "zebra crossing",
+        &query,
+        6,
+        legs_decomposed(1.0, 1.0, 60),
+    )
+    .await
+    .unwrap()
+    .0;
     assert_eq!(signature(&response.hits), signature(&direct));
     let debug = response.debug.expect("debug requested");
     assert_eq!(debug.fusion_mode, FusionMode::Decomposed as i32);

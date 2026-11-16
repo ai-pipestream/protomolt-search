@@ -89,8 +89,8 @@ fn main() {
     let mut builders: Vec<SpillBuilder> = names
         .iter()
         .map(|(tag, fields)| {
-            let b = SpillBuilder::create_with_fields(&out.join(format!("build-{tag}")), fields)
-                .expect("spill dir");
+            let dir = out.join(format!("build-{tag}"));
+            let b = SpillBuilder::create_with_text_fields(&dir, fields).expect("spill dir");
             match *tag {
                 "positions" => b.with_position_fields(&["body"]),
                 "sentences" => b.with_sentence_fields(&["body"]),

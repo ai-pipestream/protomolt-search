@@ -189,15 +189,16 @@ impl NodeServiceImpl {
                 partition_column: before.manifest().partition_key.as_deref(),
             })
             .collect();
-        let result = self.publish_document_maintenance_blocking(
-            source,
-            &request.index_key,
-            claim,
-            before.epoch(),
-            sources,
-            &builder.directory.0.join("proof"),
-            proof_batch_rows,
-        );
+        let result =
+            self.publish_document_maintenance_blocking(crate::node::DocumentMaintenanceRequest {
+                source,
+                index_key: &request.index_key,
+                expected: claim,
+                catalog_epoch: before.epoch(),
+                sources,
+                proof_scratch: &builder.directory.0.join("proof"),
+                proof_batch_rows,
+            });
         drop(builder);
         #[cfg(test)]
         hooks::run(before.root(), true);

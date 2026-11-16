@@ -4,7 +4,7 @@
 //! generation cutover, and public quality claims. A vector backend owns its
 //! encoding, native score, query execution, and persisted image. Runtime code
 //! outside this module talks only to [`VectorIndex`]; the concrete TurboVec
-//! dependency is contained in [`embedded_turbovec`].
+//! dependency is contained in the private `embedded_turbovec` module.
 
 mod backend;
 mod embedded_turbovec;

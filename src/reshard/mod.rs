@@ -271,6 +271,19 @@ impl ColumnTables {
             geo: table.geo.clone(),
         }
     }
+
+    /// The tables a value expression may read.
+    pub(crate) fn numeric_types(&self) -> crate::values::NumericTypes<'_> {
+        crate::values::NumericTypes {
+            numerics: &self.numerics,
+            integers: &self.integers,
+            unsigned_integers: &self.unsigned_integers,
+            map_numerics: &self.map_numerics,
+            map_integers: &self.map_integers,
+            map_unsigned_integers: &self.map_unsigned_integers,
+            facets: &self.facets,
+        }
+    }
 }
 
 /// Render the coordinator shard map for a reshard result (see

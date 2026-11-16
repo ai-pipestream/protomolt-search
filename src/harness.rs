@@ -23,7 +23,7 @@ use crate::pb::{
     VectorBackendConfig as WireVectorBackendConfig,
 };
 use crate::vector::{
-    embedded_turbovec_config, legacy_calibration_config, VectorBackendConfig, VectorIndex,
+    embedded_turbovec_calibration, embedded_turbovec_config, VectorBackendConfig, VectorIndex,
     EMBEDDED_TURBOVEC,
 };
 use crate::MAX_MESSAGE_BYTES;
@@ -63,10 +63,10 @@ pub fn unit_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
 pub fn fit_calibration(dim: usize, bit_width: usize, sample: &[f32]) -> (Vec<f32>, Vec<f32>) {
     let config = VectorIndex::fit_backend_config(EMBEDDED_TURBOVEC, dim, bit_width, sample)
         .expect("calibration sample must be non-empty finite rows");
-    let legacy = legacy_calibration_config(&config)
+    let calibration = embedded_turbovec_calibration(&config)
         .expect("fitted backend config must decode")
-        .expect("embedded backend exposes the legacy calibration view");
-    (legacy.shift, legacy.scale)
+        .expect("embedded backend exposes its calibration");
+    (calibration.shift, calibration.scale)
 }
 
 /// An empty index committed to an externally fitted calibration pair:
@@ -113,7 +113,7 @@ pub fn reported_calibration(response: &GetVectorBackendResponse) -> (Vec<f32>, V
         config_format: config.config_format.clone(),
         payload: config.payload.clone(),
     };
-    legacy_calibration_config(&config)
+    embedded_turbovec_calibration(&config)
         .expect("reported backend config must decode")
         .map_or_else(|| (Vec::new(), Vec::new()), |view| (view.shift, view.scale))
 }

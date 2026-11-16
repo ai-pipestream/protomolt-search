@@ -1,7 +1,8 @@
-use pipestream_search::postings::{AnalyzedDoc, Bm25Store};
+use pipestream_search::postings::{AnalyzedDoc, Bm25Store, ColumnKind};
 #[test]
 fn generate() {
-    let mut store = Bm25Store::with_fields(&["body"]).with_integers(&["value"]);
+    let mut store =
+        Bm25Store::with_text_fields(&["body"]).with_columns(ColumnKind::Integer, &["value"]);
     for row in 0..4 {
         store.add_document(row, "word".into(), AnalyzedDoc::body(vec![("word".into(), 1, vec![(0, 4)])], 1));
     }

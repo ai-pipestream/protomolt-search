@@ -17,7 +17,7 @@ impl Fixture {
     fn owned_catalog(&self, root: &Path) {
         std::fs::create_dir_all(root).unwrap();
         let manifest = SegmentSetManifest {
-            format: 3,
+            format: 5,
             source_owner: Some(
                 SegmentSourceOwner::encode(&crate::pb::storage::SourceIndexOwner {
                     format_version: 1,
@@ -80,10 +80,12 @@ fn every_row_commit_boundary_refuses_an_owned_empty_index() {
         ));
         refused(node.apply_document_locked(
             &mut state,
-            AddDocumentsRequest::default(),
-            crate::postings::AnalyzedDoc::default(),
-            None,
-            None,
+            crate::node::MaterializedDocument {
+                doc: AddDocumentsRequest::default(),
+                analyzed: crate::postings::AnalyzedDoc::default(),
+                vector: None,
+                stable_routing_key: None,
+            },
             &mut added,
             &mut first,
         ));

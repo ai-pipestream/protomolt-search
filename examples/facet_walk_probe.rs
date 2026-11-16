@@ -36,8 +36,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprint!("building {n_docs} docs ... ");
     std::io::stderr().flush()?;
     let t_build = Instant::now();
-    let mut builder = SpillBuilder::create_with_fields(&dir.join("build"), &["body"])?
-        .with_facet_fields(&["court"]);
+    let mut builder = SpillBuilder::create_with_text_fields(&dir.join("build"), &["body"])?
+        .with_columns(pipestream_search::postings::ColumnKind::Facet, &["court"]);
     for doc in 0..n_docs {
         let mut terms = vec![("common".to_string(), 1u32, Vec::new())];
         if doc % 2 == 0 {

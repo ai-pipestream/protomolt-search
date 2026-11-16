@@ -84,8 +84,8 @@ fn positioned_corpus() -> Vec<(u32, String, AnalyzedDoc)> {
 /// asserting the two files are byte-identical; returns the heap store
 /// and the two file paths.
 fn write_positioned(base: &std::path::Path) -> (Bm25Store, PathBuf, PathBuf) {
-    let mut store = Bm25Store::with_fields(&["body", "name"]).with_positions(&["body"]);
-    let mut builder = SpillBuilder::create_with_fields(&base.join("build"), &["body", "name"])
+    let mut store = Bm25Store::with_text_fields(&["body", "name"]).with_positions(&["body"]);
+    let mut builder = SpillBuilder::create_with_text_fields(&base.join("build"), &["body", "name"])
         .unwrap()
         .with_position_fields(&["body"])
         .with_buffer_bytes(64);
@@ -203,7 +203,7 @@ fn files_without_positions_open_and_report_none() {
     let base = std::env::temp_dir().join(format!("positions-old-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
-    let mut store = Bm25Store::with_fields(&["body", "name"]);
+    let mut store = Bm25Store::with_text_fields(&["body", "name"]);
     for (id, text, mut doc) in positioned_corpus() {
         // The analysis carried positions, but the field never asked.
         doc.fields[0].positions = None;
@@ -233,7 +233,7 @@ fn positions_validation_refuses_a_lying_base_table_and_an_orphan_entry() {
     let base = std::env::temp_dir().join(format!("positions-val-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
-    let mut store = Bm25Store::with_fields(&["body"]).with_positions(&["body"]);
+    let mut store = Bm25Store::with_text_fields(&["body"]).with_positions(&["body"]);
     for (id, text, mut doc) in positioned_corpus() {
         doc.fields.truncate(1);
         store.add_document(id, text, doc);

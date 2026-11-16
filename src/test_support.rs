@@ -17,7 +17,7 @@
 //!   does not mean the child has finished its close-on-exec sweep: with
 //!   the `clone(CLONE_VFORK)` spawn glibc uses, the kernel resumes the
 //!   parent when the child gives up the shared address space, which is
-//!   before the sweep. On 2026-09-09 (kernel 7.0, glibc 2.43) a probe in
+//!   before the sweep. On kernel 7.0 with glibc 2.43 a probe in
 //!   the shape of a test (hold, spawn under the guard, drop, re-take
 //!   through a fresh open) saw the re-take rejected 6 times in 120,000
 //!   rounds, with the parent's file still in the child's table after

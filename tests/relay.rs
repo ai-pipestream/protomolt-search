@@ -1101,29 +1101,17 @@ async fn lexical_and_hybrid_queries_through_relays_equal_the_flat_fanout() {
     let flat = with_bm25(l.clone(), true);
     for (qi, text) in ["court", "zebra court"].into_iter().enumerate() {
         let query = leaves.corpus[qi * DIM..(qi + 1) * DIM].to_vec();
-        let filters = Default::default();
-        let (want_rrf, _) = flat
-            .fanout_hybrid("h", text, &query, LEX_K, None, rrf_legs(), false, &filters)
+        let (want_rrf, _) = common::fanout::hybrid(&flat, "h", text, &query, LEX_K, rrf_legs())
             .await
             .expect("flat rrf");
-        let (want_weighted, _) = flat
-            .fanout_hybrid(
-                "w",
-                text,
-                &query,
-                LEX_K,
-                None,
-                weighted_legs(),
-                false,
-                &filters,
-            )
-            .await
-            .expect("flat weighted");
+        let (want_weighted, _) =
+            common::fanout::hybrid(&flat, "w", text, &query, LEX_K, weighted_legs())
+                .await
+                .expect("flat weighted");
         assert!(!want_rrf.is_empty(), "{text}: hybrid matched");
         for (name, roots) in &trees {
             let relayed = with_bm25(roots.clone(), true);
-            let (rrf, _) = relayed
-                .fanout_hybrid("h", text, &query, LEX_K, None, rrf_legs(), false, &filters)
+            let (rrf, _) = common::fanout::hybrid(&relayed, "h", text, &query, LEX_K, rrf_legs())
                 .await
                 .expect("relayed rrf");
             assert_eq!(
@@ -1131,19 +1119,10 @@ async fn lexical_and_hybrid_queries_through_relays_equal_the_flat_fanout() {
                 hybrid_bits(&want_rrf),
                 "{name} {text:?}: rrf"
             );
-            let (weighted, _) = relayed
-                .fanout_hybrid(
-                    "w",
-                    text,
-                    &query,
-                    LEX_K,
-                    None,
-                    weighted_legs(),
-                    false,
-                    &filters,
-                )
-                .await
-                .expect("relayed weighted");
+            let (weighted, _) =
+                common::fanout::hybrid(&relayed, "w", text, &query, LEX_K, weighted_legs())
+                    .await
+                    .expect("relayed weighted");
             assert_eq!(
                 hybrid_bits(&weighted),
                 hybrid_bits(&want_weighted),
@@ -1572,49 +1551,45 @@ async fn cascade_and_decomposed_fusion_through_relays_equal_the_flat_fanout() {
     let filters = Default::default();
     for (qi, text) in ["court", "zebra court", "opinion"].into_iter().enumerate() {
         let query = leaves.corpus[qi * DIM..(qi + 1) * DIM].to_vec();
-        let (want_cascade, _) = flat
-            .fanout_cascade("c", text, &query, LEX_K, None, 0.0, false, &filters)
-            .await
-            .expect("flat cascade");
+        let (want_cascade, _) =
+            common::fanout::cascade(&flat, "c", text, &query, LEX_K, 0.0, &filters)
+                .await
+                .expect("flat cascade");
         assert!(!want_cascade.is_empty(), "{text}: the cascade matched");
-        let (want_decomposed, _) = flat
-            .fanout_hybrid(
-                "d",
-                text,
-                &query,
-                LEX_K,
-                None,
-                decomposed_legs(),
-                false,
-                &filters,
-            )
-            .await
-            .expect("flat decomposed");
+        let (want_decomposed, _) = common::fanout::hybrid_filtered(
+            &flat,
+            "d",
+            text,
+            &query,
+            LEX_K,
+            decomposed_legs(),
+            &filters,
+        )
+        .await
+        .expect("flat decomposed");
         assert!(!want_decomposed.is_empty(), "{text}: decomposed matched");
         for (name, roots) in &trees {
             let relayed = with_bm25(roots.clone());
-            let (cascade, _) = relayed
-                .fanout_cascade("c", text, &query, LEX_K, None, 0.0, false, &filters)
-                .await
-                .unwrap_or_else(|e| panic!("{name} {text:?}: cascade: {e}"));
+            let (cascade, _) =
+                common::fanout::cascade(&relayed, "c", text, &query, LEX_K, 0.0, &filters)
+                    .await
+                    .unwrap_or_else(|e| panic!("{name} {text:?}: cascade: {e}"));
             assert_eq!(
                 cascade_bits(&cascade),
                 cascade_bits(&want_cascade),
                 "{name} {text:?}: cascade"
             );
-            let (decomposed, _) = relayed
-                .fanout_hybrid(
-                    "d",
-                    text,
-                    &query,
-                    LEX_K,
-                    None,
-                    decomposed_legs(),
-                    false,
-                    &filters,
-                )
-                .await
-                .unwrap_or_else(|e| panic!("{name} {text:?}: decomposed: {e}"));
+            let (decomposed, _) = common::fanout::hybrid_filtered(
+                &relayed,
+                "d",
+                text,
+                &query,
+                LEX_K,
+                decomposed_legs(),
+                &filters,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{name} {text:?}: decomposed: {e}"));
             assert_eq!(
                 hybrid_bits(&decomposed),
                 hybrid_bits(&want_decomposed),

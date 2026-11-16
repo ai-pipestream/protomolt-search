@@ -125,35 +125,14 @@ impl Store {
         }
     }
 
-    /// Reassemble a store from decoded arrays (an image loaded onto the
+    /// Fill an empty store with decoded arrays (an image loaded onto the
     /// heap). The caller has validated them; an unlinked image (`entry ==
     /// NO_NODE`) leaves `links` absent.
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_parts(
-        dim: usize,
-        m: usize,
-        ef_construction: usize,
-        seed: u64,
-        kernel: Kernel,
-        rows: Vec<f32>,
-        inv_norm: Vec<f32>,
-        level: Vec<u8>,
-        upper_slot: Vec<u32>,
-        upper_base: Vec<u32>,
-        links0: Vec<AtomicU32>,
-        upper: Vec<AtomicU32>,
-        entry: u32,
-        top: u8,
-    ) -> Self {
-        let mut store = Self::new(dim, m, ef_construction, seed, kernel);
-        store.rows = OwnedRows::from_values(dim, rows);
-        store.inv_norm = inv_norm;
-        if entry != NO_NODE {
-            store.links = Some(GraphLinks::from_parts(
-                level, upper_slot, upper_base, links0, upper, entry, top,
-            ));
-        }
-        store
+    pub fn with_parts(mut self, rows: Vec<f32>, inv_norm: Vec<f32>, links: GraphLinks) -> Self {
+        self.rows = OwnedRows::from_values(self.dim, rows);
+        self.inv_norm = inv_norm;
+        self.links = (links.entry_state().0 != NO_NODE).then_some(links);
+        self
     }
 
     #[inline]

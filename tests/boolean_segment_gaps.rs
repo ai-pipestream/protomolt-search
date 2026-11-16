@@ -13,7 +13,7 @@ use pipestream_search::vector::{VectorIndex, EMBEDDED_TURBOVEC};
 use tonic::Request;
 
 fn documents() -> Bm25Store {
-    let mut store = Bm25Store::with_fields(&["body"]);
+    let mut store = Bm25Store::with_text_fields(&["body"]);
     for slot in 0..2 {
         store.add_document(
             slot,
@@ -77,7 +77,7 @@ async fn document_only_segment_is_a_gap_in_bitmap_and_boolean_membership() {
     assert_eq!(index.len(), 8);
     assert_eq!(index.vector_rows(), vec![(0, 2), (4, 2), (6, 2)]);
     let mut bm25 =
-        SegmentedShard::open(root.join("catalog"), Bm25Store::with_fields(&["body"])).unwrap();
+        SegmentedShard::open(root.join("catalog"), Bm25Store::with_text_fields(&["body"])).unwrap();
     for slot in 6..8 {
         bm25.add_document(
             slot,

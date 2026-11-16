@@ -176,7 +176,7 @@ impl<'a> Mask<'a> {
     pub fn bools(&self) -> Cow<'a, [bool]> {
         match self {
             Mask::Bools(allow) => Cow::Borrowed(allow),
-            Mask::Bits(bits) => Cow::Owned(bits.to_bools()),
+            Mask::Bits(bits) => Cow::Owned((0..bits.len()).map(|slot| bits.test(slot)).collect()),
             Mask::All(len) => Cow::Owned(vec![true; *len]),
         }
     }

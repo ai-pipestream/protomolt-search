@@ -137,7 +137,7 @@ async fn empty_key_ranges_and_prefixes_survive_node_and_relay_wire() {
         coordinator::CoordinatorServiceImpl,
         harness::start_relay,
         node::{Bm25Shard, NodeConfig, NodeServiceImpl},
-        postings::{AnalyzedDoc, Bm25Store},
+        postings::{AnalyzedDoc, Bm25Store, ColumnKind::MapFacet},
     };
     let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("map-selector-rpc-{}", std::process::id()));
@@ -148,7 +148,7 @@ async fn empty_key_ranges_and_prefixes_survive_node_and_relay_wire() {
         for leaf in 0..2 {
             // Exercise prepared heap and mapped dictionaries here; the
             // ingestion and rewrite lifecycle is covered in map_value_presence.
-            let mut store = Bm25Store::new().with_map_facets(&["meta"]);
+            let mut store = Bm25Store::new().with_columns(MapFacet, &["meta"]);
             for (row, value) in [Some("map"), Some("a"), Some(""), None].iter().enumerate() {
                 store.add_document(
                     row as u32,
@@ -165,7 +165,7 @@ async fn empty_key_ranges_and_prefixes_survive_node_and_relay_wire() {
                 common::catalog::sealed_shard(
                     &path.with_extension("tv"),
                     &path,
-                    Bm25Store::new().with_map_facets(&["meta"]),
+                    Bm25Store::new().with_columns(MapFacet, &["meta"]),
                 )
             } else {
                 Bm25Shard::Building(store)

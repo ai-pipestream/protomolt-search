@@ -1,7 +1,7 @@
 //! Exact integer maps retain their types, presence and bounds across both writers/readers.
 mod common;
 use pipestream_search::postings::{
-    AnalyzedDoc, Bm25Reader, Bm25Store, SpillBuilder, StoredDerived,
+    AnalyzedDoc, Bm25Reader, Bm25Store, ColumnKind::*, SpillBuilder, StoredDerived,
 };
 
 fn directory(tag: &str) -> std::path::PathBuf {
@@ -34,19 +34,19 @@ fn populate_integer_map_pair(
     long_key: &str,
     source: &pipestream_search::pb::ProtobufSource,
 ) -> (Bm25Store, SpillBuilder) {
-    let mut heap = Bm25Store::with_fields(&["body"])
-        .with_map_numerics(&["float"])
-        .with_integers(&["signed"])
-        .with_unsigned_integers(&["unsigned"])
-        .with_map_integers(&["signed_map", "empty_signed"])
-        .with_map_unsigned_integers(&["unsigned_map", "empty_unsigned"]);
-    let mut spill = SpillBuilder::create_with_fields(&dir.join("build"), &["body"])
+    let mut heap = Bm25Store::with_text_fields(&["body"])
+        .with_columns(MapNumeric, &["float"])
+        .with_columns(Integer, &["signed"])
+        .with_columns(UnsignedInteger, &["unsigned"])
+        .with_columns(MapInteger, &["signed_map", "empty_signed"])
+        .with_columns(MapUnsignedInteger, &["unsigned_map", "empty_unsigned"]);
+    let mut spill = SpillBuilder::create_with_text_fields(&dir.join("build"), &["body"])
         .unwrap()
-        .with_map_numeric_fields(&["float"])
-        .with_integer_fields(&["signed"])
-        .with_unsigned_integer_fields(&["unsigned"])
-        .with_map_integer_fields(&["signed_map", "empty_signed"])
-        .with_map_unsigned_integer_fields(&["unsigned_map", "empty_unsigned"])
+        .with_columns(MapNumeric, &["float"])
+        .with_columns(Integer, &["signed"])
+        .with_columns(UnsignedInteger, &["unsigned"])
+        .with_columns(MapInteger, &["signed_map", "empty_signed"])
+        .with_columns(MapUnsignedInteger, &["unsigned_map", "empty_unsigned"])
         .with_buffer_bytes(1);
     let derived = derived_decl();
     heap.set_derived(Some(derived.clone()));
@@ -208,9 +208,9 @@ fn integer_map_only_and_empty_files_have_valid_section_boundaries() {
         for unsigned in [false, true] {
             let mut heap = Bm25Store::new();
             heap = if unsigned {
-                heap.with_map_unsigned_integers(&["m"])
+                heap.with_columns(MapUnsignedInteger, &["m"])
             } else {
-                heap.with_map_integers(&["m"])
+                heap.with_columns(MapInteger, &["m"])
             };
             if rows == 1 {
                 heap.add_document(0, "map".into(), document());
@@ -237,8 +237,8 @@ fn integer_maps_translate_keys_across_sealed_frozen_and_mutable_parts() {
     let root = dir.join("catalog");
     let tail = || {
         Bm25Store::new()
-            .with_map_integers(&["signed"])
-            .with_map_unsigned_integers(&["unsigned"])
+            .with_columns(MapInteger, &["signed"])
+            .with_columns(MapUnsignedInteger, &["unsigned"])
     };
     let mut shard = SegmentedShard::open(&root, tail()).unwrap();
     let rows = [

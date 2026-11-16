@@ -383,8 +383,8 @@ fn the_union_index_equals_one_image_over_the_same_rows() {
     let dir = tempdir("union");
     let root = dir.join("catalog");
     let tail = || {
-        Bm25Store::with_fields(&["body"])
-            .with_facets(&["court"])
+        Bm25Store::with_text_fields(&["body"])
+            .with_columns(pipestream_search::postings::ColumnKind::Facet, &["court"])
             .with_positions(&["body"])
             .with_sentences(&["body"])
     };
@@ -774,7 +774,7 @@ fn a_mapped_sealed_image_opens_without_the_heap_load() {
         .unwrap();
     let bm25_path = stage.join("documents.bm25");
     {
-        let mut store = Bm25Store::with_fields(&["body"]);
+        let mut store = Bm25Store::with_text_fields(&["body"]);
         for i in 0..ROWS as u32 {
             store.add_document(
                 i,

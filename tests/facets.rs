@@ -14,12 +14,18 @@ use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     AddDocumentsRequest, Bm25QueryRequest, Bm25SearchRequest, FacetValue, FlushRequest,
 };
-use pipestream_search::postings::{AnalyzedDoc, Bm25Reader, Bm25Store, SpillBuilder};
+use pipestream_search::postings::{
+    AnalyzedDoc, Bm25Reader, Bm25Store, ColumnKind::*, SpillBuilder,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 
-use common::{mock::start_mock_analysis, start_empty_node};
+use common::{
+    fanout::{bm25_facets, bm25_fused_req},
+    mock::start_mock_analysis,
+    start_empty_node,
+};
 
 /// A document's facet values at ingest: (field, value) pairs.
 type Facets = &'static [(&'static str, &'static str)];
@@ -178,7 +184,7 @@ fn facet_columns_roundtrip_and_dual_writers_agree() {
         )
     };
 
-    let mut store = Bm25Store::with_fields(&["body"]).with_facets(&["court", "year"]);
+    let mut store = Bm25Store::with_text_fields(&["body"]).with_columns(Facet, &["court", "year"]);
     for (i, (text, terms, facets)) in docs.iter().enumerate() {
         store.add_document(i as u32, text.to_string(), analyzed(terms));
         for (field, value) in *facets {
@@ -196,9 +202,9 @@ fn facet_columns_roundtrip_and_dual_writers_agree() {
     );
 
     // The spill builder produces the same bytes.
-    let mut builder = SpillBuilder::create_with_fields(&dir.join("spill.build"), &["body"])
+    let mut builder = SpillBuilder::create_with_text_fields(&dir.join("spill.build"), &["body"])
         .unwrap()
-        .with_facet_fields(&["court", "year"])
+        .with_columns(Facet, &["court", "year"])
         .with_buffer_bytes(32); // force multi-run merges
     for (i, (text, terms, facets)) in docs.iter().enumerate() {
         builder
@@ -246,7 +252,7 @@ fn facet_columns_roundtrip_and_dual_writers_agree() {
     );
 
     // A facet-less store still writes v6, byte for byte the old format.
-    let mut plain = Bm25Store::with_fields(&["body"]);
+    let mut plain = Bm25Store::with_text_fields(&["body"]);
     plain.add_document(0, "rust".to_string(), analyzed(&[("rust", 1)]));
     let plain_path = dir.join("plain.bm25");
     plain.save(&plain_path).unwrap();
@@ -270,13 +276,12 @@ async fn facet_counts_are_exact_additive_and_floor_independent() {
     let (addrs, handles) = start_faceted_shards(&analysis).await;
     let coordinator = CoordinatorServiceImpl::new(addrs.clone())
         .with_bm25(Some(analysis.clone()), Default::default());
-    let want = vec!["court".to_string(), "year".to_string()];
+    let want = ["court".to_string(), "year".to_string()];
 
     // "rust" matches d0, d1, d2, d4. Courts: ca9 (d1, d2), scotus (d0);
     // d4 sits on the facet-less shard. Years: 1990 (d0), 1991 (d1) —
     // d2 has no year value.
-    let (hits, facets, _) = coordinator
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &want, &[], &[], &[], &[], None)
+    let (hits, facets, _) = bm25_facets(&coordinator, "rust", 6, 0.0, &want, None)
         .await
         .unwrap();
     assert_eq!(hits.len(), 4);
@@ -292,8 +297,7 @@ async fn facet_counts_are_exact_additive_and_floor_independent() {
     );
 
     // Counts cover the whole match set even when k surfaces one hit.
-    let (hits_k1, facets_k1, _) = coordinator
-        .fanout_bm25_faceted("rust", 1, None, 0.0, &want, &[], &[], &[], &[], None)
+    let (hits_k1, facets_k1, _) = bm25_facets(&coordinator, "rust", 1, 0.0, &want, None)
         .await
         .unwrap();
     assert_eq!(hits_k1.len(), 1);
@@ -301,8 +305,7 @@ async fn facet_counts_are_exact_additive_and_floor_independent() {
 
     // A seeded floor narrows the surfaced hits, never the counts.
     let seed = pipestream_search::bm25::floor_seed(hits[0].score);
-    let (seeded_hits, seeded_facets, _) = coordinator
-        .fanout_bm25_faceted("rust", 6, None, seed, &want, &[], &[], &[], &[], None)
+    let (seeded_hits, seeded_facets, _) = bm25_facets(&coordinator, "rust", 6, seed, &want, None)
         .await
         .unwrap();
     assert!(seeded_hits.len() < hits.len(), "the floor trimmed hits");
@@ -313,8 +316,7 @@ async fn facet_counts_are_exact_additive_and_floor_independent() {
     assert_eq!(counts_of(&seeded_facets[1]), vec![("1990", 1), ("1991", 1)]);
 
     // "vector" matches d1, d3: all courts tie, value order decides.
-    let (_, vector_facets, _) = coordinator
-        .fanout_bm25_faceted("vector", 6, None, 0.0, &want, &[], &[], &[], &[], None)
+    let (_, vector_facets, _) = bm25_facets(&coordinator, "vector", 6, 0.0, &want, None)
         .await
         .unwrap();
     assert_eq!(
@@ -323,19 +325,17 @@ async fn facet_counts_are_exact_additive_and_floor_independent() {
     );
 
     // The fused route counts the same match set (one body leg).
-    let fields = vec![pipestream_search::pb::QueryField {
-        field: "body".to_string(),
-        analysis: None,
-        weight: 1.0,
-        k1: 0.0,
-        b: 0.0,
-        phrase: None,
-        prefixes: Vec::new(),
-        synonyms: Vec::new(),
-        synonyms_off: false,
-    }];
-    let (fused_hits, fused_facets, _) = coordinator
-        .fanout_bm25_fused_faceted("rust", 6, &fields, 0.0, &want, &[], &[], &[], None)
+    let fused_req = Bm25SearchRequest {
+        text: "rust".into(),
+        fields: vec![pipestream_search::pb::QueryField {
+            field: "body".into(),
+            weight: 1.0,
+            ..Default::default()
+        }],
+        facet_fields: want.to_vec(),
+        ..Default::default()
+    };
+    let (fused_hits, fused_facets, _) = bm25_fused_req(&coordinator, fused_req, 6, None)
         .await
         .unwrap();
     assert_eq!(fused_hits.len(), 4);

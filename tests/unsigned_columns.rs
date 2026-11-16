@@ -1,7 +1,7 @@
 mod common;
 
 use pipestream_search::postings::{
-    AnalyzedDoc, Bm25Reader, Bm25Store, SpillBuilder, StoredBinding,
+    AnalyzedDoc, Bm25Reader, Bm25Store, ColumnKind::*, SpillBuilder, StoredBinding,
 };
 
 fn directory(name: &str) -> std::path::PathBuf {
@@ -20,28 +20,28 @@ fn analyzed(positional: bool) -> AnalyzedDoc {
 }
 
 fn build_unsigned_pair(dir: &std::path::Path, tag: &str, mixed: bool) -> (Bm25Store, SpillBuilder) {
-    let mut heap = Bm25Store::new().with_unsigned_integers(&["unsigned", "missing"]);
+    let mut heap = Bm25Store::new().with_columns(UnsignedInteger, &["unsigned", "missing"]);
     let mut spill = SpillBuilder::create(&dir.join(format!("{tag}.build")))
         .unwrap()
-        .with_unsigned_integer_fields(&["unsigned", "missing"])
+        .with_columns(UnsignedInteger, &["unsigned", "missing"])
         .with_buffer_bytes(32);
     if mixed {
         heap = heap
-            .with_facets(&["facet"])
-            .with_numerics(&["float"])
-            .with_map_facets(&["map_facet"])
-            .with_map_numerics(&["map_float"])
-            .with_integers(&["signed"])
-            .with_geos(&["geo"])
+            .with_columns(Facet, &["facet"])
+            .with_columns(Numeric, &["float"])
+            .with_columns(MapFacet, &["map_facet"])
+            .with_columns(MapNumeric, &["map_float"])
+            .with_columns(Integer, &["signed"])
+            .with_columns(Geo, &["geo"])
             .with_positions(&["body"])
             .with_sentences(&["body"]);
         spill = spill
-            .with_facet_fields(&["facet"])
-            .with_numeric_fields(&["float"])
-            .with_map_facet_fields(&["map_facet"])
-            .with_map_numeric_fields(&["map_float"])
-            .with_integer_fields(&["signed"])
-            .with_geo_fields(&["geo"])
+            .with_columns(Facet, &["facet"])
+            .with_columns(Numeric, &["float"])
+            .with_columns(MapFacet, &["map_facet"])
+            .with_columns(MapNumeric, &["map_float"])
+            .with_columns(Integer, &["signed"])
+            .with_columns(Geo, &["geo"])
             .with_position_fields(&["body"])
             .with_sentence_fields(&["body"]);
         let binding = StoredBinding {
@@ -185,8 +185,11 @@ fn full_unsigned_domain_survives_both_writers_readers_and_other_column_kinds() {
 fn signed_and_unsigned_column_names_cannot_alias() {
     let dir = directory("names");
     let heap = Bm25Store::new()
-        .with_integers(&["value"])
-        .with_unsigned_integers(&["value"]);
+        .with_columns(pipestream_search::postings::ColumnKind::Integer, &["value"])
+        .with_columns(
+            pipestream_search::postings::ColumnKind::UnsignedInteger,
+            &["value"],
+        );
     assert!(heap.save(&dir.join("duplicate.bm25")).is_err());
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -194,7 +197,10 @@ fn signed_and_unsigned_column_names_cannot_alias() {
 #[test]
 fn unsigned_presence_metadata_and_truncation_are_checked() {
     let dir = directory("corruption");
-    let mut store = Bm25Store::new().with_unsigned_integers(&["value"]);
+    let mut store = Bm25Store::new().with_columns(
+        pipestream_search::postings::ColumnKind::UnsignedInteger,
+        &["value"],
+    );
     for row in 0..9 {
         store.add_document(row, "word".into(), analyzed(false));
         if row != 1 {
@@ -248,7 +254,7 @@ fn unsigned_values_survive_sealing_publication_and_reopen() {
     use pipestream_search::segments::SegmentSource;
 
     fn tail() -> Bm25Store {
-        Bm25Store::new().with_unsigned_integers(&["unsigned", "missing"])
+        Bm25Store::new().with_columns(UnsignedInteger, &["unsigned", "missing"])
     }
     fn append(shard: &mut SegmentedShard, values: &[Option<u64>]) {
         for value in values {
@@ -296,9 +302,9 @@ fn unsigned_values_survive_sealing_publication_and_reopen() {
         // Refusal leaves the existing schema and values untouched.
         for wrong in [
             Bm25Store::new(),
-            Bm25Store::new().with_unsigned_integers(&["missing", "unsigned"]),
-            Bm25Store::new().with_integers(&["unsigned", "missing"]),
-            tail().with_facets(&["extra"]),
+            Bm25Store::new().with_columns(UnsignedInteger, &["missing", "unsigned"]),
+            Bm25Store::new().with_columns(Integer, &["unsigned", "missing"]),
+            tail().with_columns(Facet, &["extra"]),
         ] {
             let rows = shard.tail().next_doc_id();
             assert!(shard
@@ -369,9 +375,9 @@ fn unsigned_values_survive_sealing_publication_and_reopen() {
     verify(&reopened, &expected[..sealed_rows]);
     for wrong in [
         Bm25Store::new(),
-        Bm25Store::new().with_unsigned_integers(&["unsigned"]),
-        Bm25Store::new().with_unsigned_integers(&["missing", "unsigned"]),
-        Bm25Store::new().with_integers(&["unsigned", "missing"]),
+        Bm25Store::new().with_columns(UnsignedInteger, &["unsigned"]),
+        Bm25Store::new().with_columns(UnsignedInteger, &["missing", "unsigned"]),
+        Bm25Store::new().with_columns(Integer, &["unsigned", "missing"]),
     ] {
         assert!(SegmentedShard::open(&root, wrong)
             .err()

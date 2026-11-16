@@ -108,8 +108,8 @@ fn int_range_impossible(summary: &SegmentSummary, name: &str, lo: i64, hi: i64) 
         return true;
     }
     let Some(column) = summary.int_columns.iter().find(|c| c.name == name) else {
-        // The summary does not know the column: written before the
-        // column existed on this shard, or a different table. Maybe.
+        // Unlisted columns carry no range bound in this summary, so the
+        // segment cannot be ruled out.
         return false;
     };
     if column.present == 0 {

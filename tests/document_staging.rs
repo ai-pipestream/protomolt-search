@@ -1062,7 +1062,7 @@ async fn source_owner_survives_reopen_and_fences_legacy_storage_and_snapshots() 
         assert_eq!(owner.history_id, receipt.history_id);
         assert_eq!(owner.index_key, b"books-index");
         assert_eq!(owner.collection, "books");
-        assert_eq!(set.manifest().format, 4);
+        assert_eq!(set.manifest().format, 5);
         assert!(set.generation_declaration().is_some());
         let before = fixture.manifest();
         let catalog = SegmentCatalog::open(&root).unwrap();

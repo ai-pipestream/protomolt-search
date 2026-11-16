@@ -60,7 +60,7 @@ fn doc_for_global_id(g: u32) -> AnalyzedDoc {
 }
 
 fn build_shard(range: std::ops::Range<u32>, offset: u32) -> Bm25Store {
-    let mut store = Bm25Store::with_fields(&["body", "name"]);
+    let mut store = Bm25Store::with_text_fields(&["body", "name"]);
     for g in range {
         store.add_document(g - offset, format!("doc {g}"), doc_for_global_id(g));
     }
@@ -189,7 +189,7 @@ fn fused_pruned_distributed_equals_monolithic() {
 }
 
 fn build_absent_term_shard() -> Bm25Store {
-    let mut store = Bm25Store::with_fields(&["body", "name"]);
+    let mut store = Bm25Store::with_text_fields(&["body", "name"]);
     for i in 0..2000u32 {
         let tf = if i % 97 == 0 { 5 } else { 1 };
         store.add_document(

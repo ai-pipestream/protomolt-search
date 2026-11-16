@@ -52,15 +52,12 @@ impl SegmentCatalog {
 
     /// Source versions may produce zero rows. Still commit their epoch and
     /// reviewed binding, with the source journal prepared under this fence.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_projection_prepared<T>(
         &self,
         expected_epoch: u64,
         retirements: &[SegmentRowRetirement],
         sources: Vec<SegmentSource<'_>>,
-        binding: Option<&StoredBinding>,
-        owner: &crate::pb::storage::SourceIndexOwner,
-        declaration: &crate::pb::storage::IndexGenerationDeclaration,
+        generation: SourceGeneration<'_>,
         prepare: impl FnOnce(&Arc<OpenedSegmentSet>) -> Result<T, String>,
     ) -> Result<(Arc<OpenedSegmentSet>, T), String> {
         self.commit_row_transaction(
@@ -68,9 +65,9 @@ impl SegmentCatalog {
                 expected_epoch,
                 retirements,
                 sources,
-                binding,
-                owner: Some(owner),
-                declaration: Some(declaration),
+                binding: generation.binding,
+                owner: Some(generation.owner),
+                declaration: Some(generation.declaration),
             },
             prepare,
         )
@@ -113,7 +110,6 @@ impl SegmentCatalog {
             }
             manifest.segments.extend(outputs.iter().cloned());
             manifest.segments.sort_by_key(|segment| segment.base_label);
-            manifest.update_retained_format();
             let opened = Arc::new(OpenedSegmentSet::open_manifest_reusing(
                 self.root.clone(),
                 manifest,
@@ -159,6 +155,13 @@ impl SegmentCatalog {
         }
         Ok(())
     }
+}
+
+/// The generation metadata a source publication commits with its rows.
+pub(crate) struct SourceGeneration<'a> {
+    pub(crate) binding: Option<&'a StoredBinding>,
+    pub(crate) owner: &'a crate::pb::storage::SourceIndexOwner,
+    pub(crate) declaration: &'a crate::pb::storage::IndexGenerationDeclaration,
 }
 
 /// One row update: the epoch it expects, the rows it retires, the segments

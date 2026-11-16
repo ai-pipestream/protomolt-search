@@ -77,8 +77,8 @@ pub struct TreeSplitOptions {
     /// Build only this child (by index in leaf order) and leave the
     /// others' catalogs unwritten: the routing pass still spills every
     /// child, so the rows and the map are the full split's, but a
-    /// child whose build failed (an out-of-memory kill on the archive,
-    /// 2026-09-06) is redone without the five that finished.
+    /// child whose build failed (an out-of-memory kill, say) is redone
+    /// without the five that finished.
     pub only_child: Option<usize>,
     /// The open-files limit the spill pass is checked against; `None`
     /// reads the process's own soft limit. A test sets a small number

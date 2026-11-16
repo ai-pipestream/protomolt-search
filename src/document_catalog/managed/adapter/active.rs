@@ -150,14 +150,7 @@ impl ActiveManagedCatalog {
         let key = self.key();
         let transaction = self.inner.database.begin_read().map_err(storage)?;
         let metadata = transaction.open_table(META).map_err(storage)?;
-        let header: DocumentCatalogHeader = decode_header(
-            metadata
-                .get("header")
-                .map_err(storage)?
-                .ok_or_else(|| Status::data_loss("catalog header missing"))?
-                .value(),
-        )?;
-        validate_current_header(&header)?;
+        let header = current_header(&metadata)?;
         self.inner.validate_resource_binding(&header)?;
         Ok(crate::pb::DocumentWriteTarget {
             workspace: key.workspace.clone(),

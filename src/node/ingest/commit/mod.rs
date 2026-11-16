@@ -9,6 +9,14 @@ use self::columns::ValidatedColumns;
 use crate::node::*;
 use crate::postings::AnalyzedDoc;
 
+/// One materialized document ready for a locked commit.
+pub(crate) struct MaterializedDocument {
+    pub(crate) doc: AddDocumentsRequest,
+    pub(crate) analyzed: AnalyzedDoc,
+    pub(crate) vector: Option<Vec<f32>>,
+    pub(crate) stable_routing_key: Option<Vec<u8>>,
+}
+
 /// Inputs and output counters for one locked single-document commit.
 struct DocumentCommit<'a> {
     doc: AddDocumentsRequest,
@@ -20,20 +28,20 @@ struct DocumentCommit<'a> {
 }
 
 impl<'a> DocumentCommit<'a> {
-    fn new(
-        doc: AddDocumentsRequest,
-        analyzed: AnalyzedDoc,
-        vector: Option<Vec<f32>>,
-        stable_routing_key: Option<Vec<u8>>,
-        counters: (&'a mut u64, &'a mut u64),
-    ) -> Self {
+    fn new(document: MaterializedDocument, added: &'a mut u64, first_id: &'a mut u64) -> Self {
+        let MaterializedDocument {
+            doc,
+            analyzed,
+            vector,
+            stable_routing_key,
+        } = document;
         Self {
             doc,
             analyzed,
             vector,
             stable_routing_key,
-            added: counters.0,
-            first_id: counters.1,
+            added,
+            first_id,
         }
     }
 }
@@ -42,18 +50,14 @@ impl NodeServiceImpl {
     /// Apply a materialized document against a caller-held [`ShardState`]:
     /// id assignment, BM25 store insert, mapped vector commit, WAL manifest
     /// lock, and WAL record appends in lockstep.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_document_locked(
         &self,
         guard: &mut ShardState,
-        doc: AddDocumentsRequest,
-        analyzed: AnalyzedDoc,
-        vector: Option<Vec<f32>>,
-        stable_routing_key: Option<Vec<u8>>,
+        document: MaterializedDocument,
         added: &mut u64,
         first_id: &mut u64,
     ) -> Result<(), Status> {
-        let req = DocumentCommit::new(doc, analyzed, vector, stable_routing_key, (added, first_id));
+        let req = DocumentCommit::new(document, added, first_id);
         self.commit_document(guard, req)
     }
 

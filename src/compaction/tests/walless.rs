@@ -22,18 +22,20 @@ async fn walless_compaction_catches_up_writes_and_deletes_made_after_the_build()
         let mut guard = crate::node::write_shard(&node.state);
         node.apply_document_locked(
             &mut guard,
-            AddDocumentsRequest {
-                text,
-                analysis: Some(spec),
-                integers: vec![crate::pb::IntegerValue {
-                    field: "num".into(),
-                    value: 10_000,
-                }],
-                ..Default::default()
+            crate::node::MaterializedDocument {
+                doc: AddDocumentsRequest {
+                    text,
+                    analysis: Some(spec),
+                    integers: vec![crate::pb::IntegerValue {
+                        field: "num".into(),
+                        value: 10_000,
+                    }],
+                    ..Default::default()
+                },
+                analyzed,
+                vector: Some(crate::harness::unit_vectors(1, 64, 99)),
+                stable_routing_key: None,
             },
-            analyzed,
-            Some(crate::harness::unit_vectors(1, 64, 99)),
-            None,
             &mut 0,
             &mut 0,
         )
@@ -141,18 +143,20 @@ fn append_numbered_rows(node: &NodeServiceImpl) {
         let mut guard = crate::node::write_shard(&node.state);
         node.apply_document_locked(
             &mut guard,
-            AddDocumentsRequest {
-                text,
-                analysis: Some(spec.clone()),
-                integers: vec![crate::pb::IntegerValue {
-                    field: "num".into(),
-                    value: i as i64,
-                }],
-                ..Default::default()
+            crate::node::MaterializedDocument {
+                doc: AddDocumentsRequest {
+                    text,
+                    analysis: Some(spec.clone()),
+                    integers: vec![crate::pb::IntegerValue {
+                        field: "num".into(),
+                        value: i as i64,
+                    }],
+                    ..Default::default()
+                },
+                analyzed,
+                vector: None,
+                stable_routing_key: None,
             },
-            analyzed,
-            None,
-            None,
             &mut 0,
             &mut 0,
         )

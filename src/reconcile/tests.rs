@@ -103,8 +103,14 @@ fn reconstructed_rows_and_tables_retain_both_integer_map_families() {
         std::process::id()
     ));
     let mut store = Bm25Store::new()
-        .with_map_integers(&["signed", "empty"])
-        .with_map_unsigned_integers(&["unsigned"]);
+        .with_columns(
+            crate::postings::ColumnKind::MapInteger,
+            &["signed", "empty"],
+        )
+        .with_columns(
+            crate::postings::ColumnKind::MapUnsignedInteger,
+            &["unsigned"],
+        );
     store.add_document(
         0,
         "map".into(),

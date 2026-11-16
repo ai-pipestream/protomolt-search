@@ -97,11 +97,10 @@ pub struct VectorBackendConfig {
     pub payload: Vec<u8>,
 }
 
-/// Compatibility view of the embedded backend's former public calibration
-/// fields. New product metadata transports [`VectorBackendConfig`] opaquely;
-/// this view exists only while the legacy calibration RPC is served.
+/// The embedded turbovec provider's calibration, decoded from its opaque
+/// [`VectorBackendConfig`]: the inverse of [`embedded_turbovec_config`].
 #[derive(Debug, Clone, PartialEq)]
-pub struct LegacyCalibrationConfig {
+pub struct EmbeddedTurbovecCalibration {
     pub bits_per_dimension: usize,
     pub shift: Vec<f32>,
     pub scale: Vec<f32>,
@@ -115,9 +114,10 @@ pub fn embedded_turbovec_config(
     embedded_turbovec::config(bits_per_dimension, shift, scale)
 }
 
-pub fn legacy_calibration_config(
+/// Decode the embedded provider's calibration; `None` for any other backend.
+pub fn embedded_turbovec_calibration(
     config: &VectorBackendConfig,
-) -> Result<Option<LegacyCalibrationConfig>, VectorError> {
+) -> Result<Option<EmbeddedTurbovecCalibration>, VectorError> {
     if config.backend_kind != EMBEDDED_TURBOVEC {
         return Ok(None);
     }

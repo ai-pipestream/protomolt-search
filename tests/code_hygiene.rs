@@ -10,7 +10,8 @@
 //! 3. Zero new unconditional `#[allow(clippy::too_many_arguments)]` or
 //!    unconditional `#[allow(dead_code)]` attributes.
 //! 4. Zero new `docs/*.md` inline comment breadcrumbs, diff-narration or
-//!    war-story comment phrases, or retired research-dump references.
+//!    war-story comment phrases, or retired research-dump references, and
+//!    zero `#<digits>` issue breadcrumbs.
 //!
 //! Modules above the default ceilings on the stabilization baseline are listed
 //! in `code_hygiene/ratchet.rs` keyed by top-level module path (`src/foo.rs`
@@ -225,6 +226,13 @@ fn comment_breadcrumbs_and_slop_do_not_grow() {
                 sum.slop_comments.len(),
                 allow.slop_comments,
                 preview(&sum.slop_comments)
+            ));
+        }
+        if !sum.issue_breadcrumbs.is_empty() {
+            failures.push(format!(
+                "{module}: {} `#<digits>` issue breadcrumb comment(s) [{}]",
+                sum.issue_breadcrumbs.len(),
+                preview(&sum.issue_breadcrumbs)
             ));
         }
     }

@@ -1113,7 +1113,7 @@ fn an_interrupted_walless_cutover_rolls_back_at_open() {
     std::fs::create_dir_all(&work).unwrap();
     let bm25_path = work.join("documents.bm25");
     let live_path = work.join("live.bin");
-    let mut store = pipestream_search::postings::Bm25Store::with_fields(&["body"]);
+    let mut store = pipestream_search::postings::Bm25Store::with_text_fields(&["body"]);
     store.add_document(
         0,
         "document".into(),
@@ -1252,9 +1252,9 @@ fn partitioned_compaction_preserves_lattice_and_per_document_sparse_scales() {
     for segment in 0..2 {
         let source = dir.join(format!("source-{segment}"));
         std::fs::create_dir(&source).unwrap();
-        let mut store = Bm25Store::with_fields(&["body"])
+        let mut store = Bm25Store::with_text_fields(&["body"])
             .with_positions(&["body"])
-            .with_integers(&["num"]);
+            .with_columns(pipestream_search::postings::ColumnKind::Integer, &["num"]);
         store.set_binding(Some(binding.clone()));
         let mut vectors = Vec::new();
         let mut live = LiveDocs::default();

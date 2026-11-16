@@ -22,7 +22,7 @@ use pipestream_search::pb::{
     Bm25SearchResponse, ExpandTermPrefixRequest, FacetValue, FlushRequest, LexicalQuery,
     QueryField, QueryRequest, SearchQuery, SelectionQuery, TermPrefix,
 };
-use pipestream_search::postings::{AnalyzedDoc, Bm25Index, Bm25Reader, Bm25Store};
+use pipestream_search::postings::{AnalyzedDoc, Bm25Index, Bm25Reader, Bm25Store, ColumnKind};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request};
@@ -517,7 +517,7 @@ async fn string_ranges_resolve_over_sorted_dictionaries_and_old_files_refuse() {
     let dir = tempdir("ranges");
     let courts = ["scotus", "ca9", "ca5", "dcc", "ca11", "ca1", "nysd", "ca10"];
     // Heap store in scrambled first-seen order.
-    let mut store = Bm25Store::with_fields(&["body"]).with_facets(&["court"]);
+    let mut store = Bm25Store::new().with_columns(ColumnKind::Facet, &["court"]);
     for (i, court) in courts.iter().enumerate() {
         let text = format!("opinion {court}");
         let doc = analyze_document_native(&text, Some(&body_spec())).unwrap();

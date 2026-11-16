@@ -1014,7 +1014,7 @@ async fn snippets_survive_flush_reopen_and_wal_replay() {
 async fn a_catalog_without_the_section_serves_and_refuses_sentence_mode_by_name() {
     let dir = tempdir("old");
     // A pre-sentence file: the heap store without the declaration.
-    let mut store = Bm25Store::with_fields(&["body"]);
+    let mut store = Bm25Store::with_text_fields(&["body"]);
     for (i, text) in CORPUS.iter().enumerate() {
         let mut doc = analyze_document_native(text, Some(&body_spec())).unwrap();
         doc.fields[0].sentences = None;
@@ -1108,8 +1108,8 @@ fn sentence_spans_are_priced_exactly_and_both_writers_agree() {
     let dir = tempdir("price");
     let (docs, lines) = (50u32, 3usize);
     let corpus = synthetic(docs, lines);
-    let mut heap = Bm25Store::with_fields(&["body"]).with_sentences(&["body"]);
-    let mut spill = SpillBuilder::create_with_fields(&dir.join("build"), &["body"])
+    let mut heap = Bm25Store::with_text_fields(&["body"]).with_sentences(&["body"]);
+    let mut spill = SpillBuilder::create_with_text_fields(&dir.join("build"), &["body"])
         .unwrap()
         .with_sentence_fields(&["body"]);
     // A gap slot (id 3 skipped) exercises the base table's sparse entry.
@@ -1162,7 +1162,7 @@ fn sentence_spans_are_priced_exactly_and_both_writers_agree() {
         assert_eq!(heap.field_doc_sentences(0, slot), Some(want.as_slice()));
     }
     // A shard without the declaration carries no section, at no cost.
-    let mut plain = Bm25Store::with_fields(&["body"]);
+    let mut plain = Bm25Store::with_text_fields(&["body"]);
     for (i, text) in corpus.iter().enumerate() {
         let doc = analyze_document_native(text, Some(&body_spec())).unwrap();
         plain.add_document(i as u32, text.clone(), doc);

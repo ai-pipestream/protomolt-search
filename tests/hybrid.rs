@@ -201,31 +201,11 @@ async fn hybrid_is_deterministic_and_carries_provenance() {
     // Query vector: doc 0's own vector — doc 0 tops its vector leg.
     let query = corpus[..DIM].to_vec();
 
-    let first = coordinator
-        .fanout_hybrid(
-            "h1",
-            "zebra",
-            &query,
-            8,
-            None,
-            legs_default(),
-            false,
-            &Default::default(),
-        )
+    let first = common::fanout::hybrid(&coordinator, "h1", "zebra", &query, 8, legs_default())
         .await
         .unwrap()
         .0;
-    let second = coordinator
-        .fanout_hybrid(
-            "h2",
-            "zebra",
-            &query,
-            8,
-            None,
-            legs_default(),
-            false,
-            &Default::default(),
-        )
+    let second = common::fanout::hybrid(&coordinator, "h2", "zebra", &query, 8, legs_default())
         .await
         .unwrap()
         .0;
@@ -326,34 +306,28 @@ async fn distributed_hybrid_matches_monolithic_on_partition_stable_corpus() {
     let monolithic =
         CoordinatorServiceImpl::new(vec![mono_addr]).with_bm25(Some(analysis), Default::default());
 
-    let got = distributed
-        .fanout_hybrid(
-            "d",
-            "zebra",
-            &query,
-            N_DOCS as u32,
-            None,
-            legs_default(),
-            false,
-            &Default::default(),
-        )
-        .await
-        .unwrap()
-        .0;
-    let want = monolithic
-        .fanout_hybrid(
-            "m",
-            "zebra",
-            &query,
-            N_DOCS as u32,
-            None,
-            legs_default(),
-            false,
-            &Default::default(),
-        )
-        .await
-        .unwrap()
-        .0;
+    let got = common::fanout::hybrid(
+        &distributed,
+        "d",
+        "zebra",
+        &query,
+        N_DOCS as u32,
+        legs_default(),
+    )
+    .await
+    .unwrap()
+    .0;
+    let want = common::fanout::hybrid(
+        &monolithic,
+        "m",
+        "zebra",
+        &query,
+        N_DOCS as u32,
+        legs_default(),
+    )
+    .await
+    .unwrap()
+    .0;
 
     // Monolithic sanity: doc 0 (both legs) first, then the vector order.
     let want_originals: Vec<usize> = want
@@ -474,34 +448,15 @@ async fn global_rank_fusion_is_exact_on_adversarial_partition() {
         legs_blend(Normalization::MinMax, Combination::Geometric),
         legs_blend(Normalization::None, Combination::Harmonic),
     ] {
-        let got = distributed
-            .fanout_hybrid(
-                "adv",
-                "zebra",
-                &query,
-                N_DOCS as u32,
-                None,
-                legs,
-                false,
-                &Default::default(),
-            )
+        let got = common::fanout::hybrid(&distributed, "adv", "zebra", &query, N_DOCS as u32, legs)
             .await
             .unwrap()
             .0;
-        let want = monolithic
-            .fanout_hybrid(
-                "adv-m",
-                "zebra",
-                &query,
-                N_DOCS as u32,
-                None,
-                legs,
-                false,
-                &Default::default(),
-            )
-            .await
-            .unwrap()
-            .0;
+        let want =
+            common::fanout::hybrid(&monolithic, "adv-m", "zebra", &query, N_DOCS as u32, legs)
+                .await
+                .unwrap()
+                .0;
 
         let mode = legs.fusion_mode;
         assert_eq!(got.len(), want.len(), "{mode:?}");
@@ -585,31 +540,11 @@ async fn score_blend_follows_documented_arithmetic() {
     let query = corpus[..DIM].to_vec();
     let blend = legs_blend(Normalization::MinMax, Combination::Arithmetic);
 
-    let first = coordinator
-        .fanout_hybrid(
-            "b1",
-            "zebra",
-            &query,
-            8,
-            None,
-            blend,
-            false,
-            &Default::default(),
-        )
+    let first = common::fanout::hybrid(&coordinator, "b1", "zebra", &query, 8, blend)
         .await
         .unwrap()
         .0;
-    let second = coordinator
-        .fanout_hybrid(
-            "b2",
-            "zebra",
-            &query,
-            8,
-            None,
-            blend,
-            false,
-            &Default::default(),
-        )
+    let second = common::fanout::hybrid(&coordinator, "b2", "zebra", &query, 8, blend)
         .await
         .unwrap()
         .0;
@@ -650,17 +585,7 @@ async fn score_blend_follows_documented_arithmetic() {
         bm25_weight: 4.0,
         ..blend
     };
-    let boosted = coordinator
-        .fanout_hybrid(
-            "b3",
-            "zebra",
-            &query,
-            8,
-            None,
-            weighted,
-            false,
-            &Default::default(),
-        )
+    let boosted = common::fanout::hybrid(&coordinator, "b3", "zebra", &query, 8, weighted)
         .await
         .unwrap()
         .0;
@@ -678,31 +603,11 @@ async fn score_blend_follows_documented_arithmetic() {
         legs_blend(Normalization::MinMax, Combination::Geometric),
         legs_blend(Normalization::MinMax, Combination::Harmonic),
     ] {
-        let hits = coordinator
-            .fanout_hybrid(
-                "bx",
-                "zebra",
-                &query,
-                8,
-                None,
-                legs,
-                false,
-                &Default::default(),
-            )
+        let hits = common::fanout::hybrid(&coordinator, "bx", "zebra", &query, 8, legs)
             .await
             .unwrap()
             .0;
-        let again = coordinator
-            .fanout_hybrid(
-                "by",
-                "zebra",
-                &query,
-                8,
-                None,
-                legs,
-                false,
-                &Default::default(),
-            )
+        let again = common::fanout::hybrid(&coordinator, "by", "zebra", &query, 8, legs)
             .await
             .unwrap()
             .0;
@@ -1094,31 +999,11 @@ async fn two_level_fallback_is_reachable_and_deterministic() {
         CoordinatorServiceImpl::new(addrs).with_bm25(Some(analysis), Default::default());
     let query = corpus[..DIM].to_vec();
 
-    let first = coordinator
-        .fanout_hybrid(
-            "t1",
-            "zebra",
-            &query,
-            8,
-            None,
-            legs_two_level(),
-            false,
-            &Default::default(),
-        )
+    let first = common::fanout::hybrid(&coordinator, "t1", "zebra", &query, 8, legs_two_level())
         .await
         .unwrap()
         .0;
-    let second = coordinator
-        .fanout_hybrid(
-            "t2",
-            "zebra",
-            &query,
-            8,
-            None,
-            legs_two_level(),
-            false,
-            &Default::default(),
-        )
+    let second = common::fanout::hybrid(&coordinator, "t2", "zebra", &query, 8, legs_two_level())
         .await
         .unwrap()
         .0;
@@ -1246,17 +1131,7 @@ async fn hybrid_lexical_leg_matches_between_heap_and_v5_resident() {
         let coordinator = CoordinatorServiceImpl::new(vec![addr])
             .with_bm25(Some(analysis.clone()), Default::default());
         runs.push(
-            coordinator
-                .fanout_hybrid(
-                    "h",
-                    "zebra",
-                    &query,
-                    8,
-                    None,
-                    legs_default(),
-                    false,
-                    &Default::default(),
-                )
+            common::fanout::hybrid(&coordinator, "h", "zebra", &query, 8, legs_default())
                 .await
                 .unwrap()
                 .0,
@@ -1331,33 +1206,14 @@ async fn debug_block_profiles_every_fusion_mode() {
         legs_two_level(),
         legs_blend(Normalization::MinMax, Combination::Arithmetic),
     ] {
-        let (plain, no_debug) = coordinator
-            .fanout_hybrid(
-                "p",
-                "zebra",
-                &query,
-                8,
-                None,
-                legs,
-                false,
-                &Default::default(),
-            )
+        let (plain, no_debug) = common::fanout::hybrid(&coordinator, "p", "zebra", &query, 8, legs)
             .await
             .unwrap();
         assert!(no_debug.is_none(), "debug=false must not build a profile");
-        let (hits, debug) = coordinator
-            .fanout_hybrid(
-                "d",
-                "zebra",
-                &query,
-                8,
-                None,
-                legs,
-                true,
-                &Default::default(),
-            )
-            .await
-            .unwrap();
+        let (hits, debug) =
+            common::fanout::hybrid_debug(&coordinator, "d", "zebra", &query, 8, legs)
+                .await
+                .unwrap();
         assert_eq!(ids(&plain), ids(&hits), "debug changed the results");
         let debug = debug.unwrap();
         assert_eq!(debug.fusion_mode, legs.fusion_mode as i32);
@@ -1378,31 +1234,19 @@ async fn debug_block_profiles_every_fusion_mode() {
         assert!(debug.total_ms >= debug.legs_ms);
     }
 
-    let (plain, no_debug) = coordinator
-        .fanout_cascade(
-            "cp",
-            "zebra",
-            &query,
-            4,
-            None,
-            0.0,
-            false,
-            &Default::default(),
-        )
-        .await
-        .unwrap();
+    let (plain, no_debug) = common::fanout::cascade(
+        &coordinator,
+        "cp",
+        "zebra",
+        &query,
+        4,
+        0.0,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
     assert!(no_debug.is_none());
-    let (hits, debug) = coordinator
-        .fanout_cascade(
-            "cd",
-            "zebra",
-            &query,
-            4,
-            None,
-            0.0,
-            true,
-            &Default::default(),
-        )
+    let (hits, debug) = common::fanout::cascade_debug(&coordinator, "cd", "zebra", &query, 4, 0.0)
         .await
         .unwrap();
     let cascade_sig = |hits: &[pipestream_search::pb::CascadeHit]| {
@@ -1479,19 +1323,10 @@ async fn a_zero_weight_leg_is_not_scanned_by_the_shard() {
     let query = corpus[..DIM].to_vec();
 
     // Control: both legs on, both legs report work.
-    let (_, debug) = coordinator
-        .fanout_hybrid(
-            "both",
-            "zebra",
-            &query,
-            8,
-            None,
-            legs_default(),
-            true,
-            &Default::default(),
-        )
-        .await
-        .unwrap();
+    let (_, debug) =
+        common::fanout::hybrid_debug(&coordinator, "both", "zebra", &query, 8, legs_default())
+            .await
+            .unwrap();
     let debug = debug.unwrap();
     assert!(
         debug.shards.iter().all(|s| s.vector_hits > 0),
@@ -1503,22 +1338,19 @@ async fn a_zero_weight_leg_is_not_scanned_by_the_shard() {
     );
 
     // Vector leg off: no shard may report a single vector hit.
-    let (_, debug) = coordinator
-        .fanout_hybrid(
-            "novec",
-            "zebra",
-            &query,
-            8,
-            None,
-            HybridLegs {
-                vector_weight: 0.0,
-                ..legs_default()
-            },
-            true,
-            &Default::default(),
-        )
-        .await
-        .unwrap();
+    let (_, debug) = common::fanout::hybrid_debug(
+        &coordinator,
+        "novec",
+        "zebra",
+        &query,
+        8,
+        HybridLegs {
+            vector_weight: 0.0,
+            ..legs_default()
+        },
+    )
+    .await
+    .unwrap();
     let debug = debug.unwrap();
     assert!(
         debug.shards.iter().all(|s| s.vector_hits == 0),
@@ -1535,22 +1367,19 @@ async fn a_zero_weight_leg_is_not_scanned_by_the_shard() {
     );
 
     // BM25 leg off: the mirror image.
-    let (_, debug) = coordinator
-        .fanout_hybrid(
-            "nobm25",
-            "zebra",
-            &query,
-            8,
-            None,
-            HybridLegs {
-                bm25_weight: 0.0,
-                ..legs_default()
-            },
-            true,
-            &Default::default(),
-        )
-        .await
-        .unwrap();
+    let (_, debug) = common::fanout::hybrid_debug(
+        &coordinator,
+        "nobm25",
+        "zebra",
+        &query,
+        8,
+        HybridLegs {
+            bm25_weight: 0.0,
+            ..legs_default()
+        },
+    )
+    .await
+    .unwrap();
     let debug = debug.unwrap();
     assert!(
         debug.shards.iter().all(|s| s.bm25_hits == 0),

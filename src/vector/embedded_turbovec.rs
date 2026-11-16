@@ -37,7 +37,7 @@ pub(super) fn config(
 
 pub(super) fn decode_config(
     config: &VectorBackendConfig,
-) -> Result<LegacyCalibrationConfig, VectorError> {
+) -> Result<EmbeddedTurbovecCalibration, VectorError> {
     if config.config_format != CONFIG_FORMAT {
         return Err(VectorError::new(format!(
             "unsupported {EMBEDDED_TURBOVEC} config format {:?}",
@@ -46,7 +46,7 @@ pub(super) fn decode_config(
     }
     let payload: ConfigPayload = serde_json::from_slice(&config.payload)
         .map_err(|e| VectorError::new(format!("invalid backend config: {e}")))?;
-    Ok(LegacyCalibrationConfig {
+    Ok(EmbeddedTurbovecCalibration {
         bits_per_dimension: payload.bits_per_dimension,
         shift: payload.shift,
         scale: payload.scale,

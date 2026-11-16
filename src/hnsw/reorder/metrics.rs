@@ -73,7 +73,7 @@ pub(in crate::hnsw) fn walk_row_4k_pages<L: LinkCells + ?Sized>(
     query: &[f32],
     ef: usize,
 ) -> usize {
-    use super::super::graph::{with_scratch, Filter, FloorPrune, Hook, Patience};
+    use super::super::graph::{with_scratch, Filter, Hook, Steering};
 
     if view.n() == 0 || !view.is_linked() {
         return 0;
@@ -106,9 +106,7 @@ pub(in crate::hnsw) fn walk_row_4k_pages<L: LinkCells + ?Sized>(
         let _ = view.walk(
             query,
             ef.max(1),
-            Filter::None,
-            Patience::OFF,
-            FloorPrune::OFF,
+            Steering::filtered(Filter::None),
             scratch,
             &mut hook,
         );

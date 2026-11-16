@@ -237,13 +237,15 @@ impl NodeServiceImpl {
                 catalog_epoch,
                 retirements,
                 sources,
-                s.candidate.segments().and_then(OpenedSegmentSet::binding),
-                source_owner
-                    .as_ref()
-                    .expect("source publication has an owner"),
-                declaration
-                    .as_ref()
-                    .expect("source publication has a declaration"),
+                crate::segments::SourceGeneration {
+                    binding: s.candidate.segments().and_then(OpenedSegmentSet::binding),
+                    owner: source_owner
+                        .as_ref()
+                        .expect("source publication has an owner"),
+                    declaration: declaration
+                        .as_ref()
+                        .expect("source publication has a declaration"),
+                },
                 prepare,
             ),
             None => catalog.commit_rows_prepared(catalog_epoch, retirements, sources, prepare),

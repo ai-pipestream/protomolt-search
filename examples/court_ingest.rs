@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::coordinator::{CascadeQuery, CoordinatorServiceImpl};
 use pipestream_search::demo::court::{self, Chunk};
 use pipestream_search::harness::{self, mock_analysis, start_sidecar};
 use pipestream_search::node::NodeConfig;
@@ -30,7 +30,7 @@ use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, AnalysisSpec, BroadcastVectorBackendRequest,
     DocLineage, DocumentField, FacetValue, FlushRequest, GetDocumentsRequest, HealthRequest,
-    IntegerValue, TimestampValue,
+    HybridSearchRequest, IntegerValue, TimestampValue,
 };
 use pipestream_search::security::ToolClient;
 use tokio::sync::mpsc;
@@ -652,19 +652,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             chunk.cluster_id,
             &chunk.text[..chunk.text.len().min(120)]
         );
-        let hits = coordinator
-            .fanout_cascade(
-                "court",
-                &chunk.text,
-                vector,
-                5,
-                Some(&spec),
-                0.0,
-                false,
-                &Default::default(),
-            )
-            .await?
-            .0;
+        let req = HybridSearchRequest {
+            text: chunk.text.clone(),
+            vector: vector.to_vec(),
+            analysis: Some(spec.clone()),
+            ..Default::default()
+        };
+        let filters = Default::default();
+        let query = CascadeQuery::from_request("court", &req, 5, 0.0, &filters)?;
+        let hits = coordinator.fanout_cascade_context(query).await?.0;
         for hit in &hits {
             println!(
                 "  #{} doc {:>7} (shard {}) vector {:.4}  bm25 {:.4}",

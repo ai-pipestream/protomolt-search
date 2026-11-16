@@ -98,9 +98,11 @@ impl NodeServiceImpl {
                 guard.bm25.as_ref(),
                 None,
                 slots,
-                &[],
-                &[],
-                visibility_filter,
+                ShardFilterInputs {
+                    geo: &[],
+                    regions: &[],
+                    tree: visibility_filter,
+                },
                 self.knobs.segment_pruning(),
                 None,
             )?;

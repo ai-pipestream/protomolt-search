@@ -10,7 +10,7 @@
 //!   read from the inverted column ([`ColumnSets`]), so it costs the rows it
 //!   admits, not the rows of the shard;
 //! - a number range is a run of the column sorted by value
-//!   ([`crate::number_rows`]), or a read of the rows still in question when
+//!   (the crate-private `number_rows` index), or a read of the rows still in question when
 //!   those are the fewer ([`range_part`]);
 //! - every other leaf is asked row by row, but only over the rows still in
 //!   question when its turn comes;

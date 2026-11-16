@@ -94,7 +94,7 @@ fn new_column_payloads_are_crc_covered_and_roundtrip() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("columns.bm25");
-    let mut store = Bm25Store::with_fields(&["body"]).with_positions(&["body"]);
+    let mut store = Bm25Store::with_text_fields(&["body"]).with_positions(&["body"]);
     store.add_document(
         0,
         "joined word".into(),
@@ -158,7 +158,7 @@ fn single_term_ties_and_admission_use_lower_live_doc_id() {
 
 #[test]
 fn lattice_slop_rejects_overlap_and_counts_only_gaps() {
-    let mut store = Bm25Store::with_fields(&["body"]).with_positions(&["body"]);
+    let mut store = Bm25Store::with_text_fields(&["body"]).with_positions(&["body"]);
     for (doc, court_pos) in [3, 4, 2].into_iter().enumerate() {
         store.add_document(
             doc as u32,
@@ -245,7 +245,7 @@ async fn remote_shard_splade_over_tcp_propagates_running_floor_and_filter() {
     {
         let idx_path = dir.join(format!("shard_{shard_idx}.idx"));
         let bm25_path = dir.join(format!("shard_{shard_idx}.bm25"));
-        let mut store = Bm25Store::with_fields(&["body"]);
+        let mut store = Bm25Store::with_text_fields(&["body"]);
         store.add_document(
             0,
             format!("shard {shard_idx} doc"),

@@ -51,18 +51,6 @@ impl ModuleAllowance {
         }
     }
 
-    pub(crate) const fn params(mut self, max_params: usize, over_count: usize) -> Self {
-        self.max_params = max_params;
-        self.over_7_params = over_count;
-        self
-    }
-
-    pub(crate) const fn allows(mut self, too_many_args: usize, dead_code: usize) -> Self {
-        self.too_many_args_allows = too_many_args;
-        self.dead_code_allows = dead_code;
-        self
-    }
-
     pub(crate) fn has_any_allowance(&self) -> bool {
         *self != Self::base(self.module)
     }
@@ -74,16 +62,6 @@ pub(crate) fn lookup_allowance(module: &str) -> ModuleAllowance {
         .map_or_else(|_| ModuleAllowance::base(""), |idx| RATCHET[idx])
 }
 
-const fn base(module: &'static str) -> ModuleAllowance {
-    ModuleAllowance::base(module)
-}
-
-/// Non-increasing per-module allowances on the stabilization baseline.
-/// Modules already within every default ceiling are omitted.
-pub(crate) const RATCHET: &[ModuleAllowance] = &[
-    base("src/coordinator").params(11, 4).allows(4, 0),
-    base("src/hnsw").params(14, 2).allows(2, 0),
-    base("src/node").params(14, 4).allows(4, 0),
-    base("src/raft").params(10, 1).allows(1, 0),
-    base("src/segments").params(8, 1).allows(1, 0),
-];
+/// Per-module allowances. Every module sits at the default ceilings, so the
+/// table is empty and any new exception fails the gate.
+pub(crate) const RATCHET: &[ModuleAllowance] = &[];

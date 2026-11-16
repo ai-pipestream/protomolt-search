@@ -8,10 +8,10 @@
 //!     --probe-id=12345 --docs-per-shard=340000
 //! ```
 
-use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::coordinator::{CascadeQuery, CoordinatorServiceImpl};
 use pipestream_search::demo::court;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
-use pipestream_search::pb::{AnalysisSpec, GetDocumentsRequest};
+use pipestream_search::pb::{AnalysisSpec, GetDocumentsRequest, HybridSearchRequest};
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");
@@ -98,19 +98,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             lineage.parent_id, lineage.group_id, lineage.span_start, lineage.span_end
         );
         println!("text: {:?}", prefix(&doc.text, 140));
-        let hits = coordinator
-            .fanout_cascade(
-                "court-query",
-                &doc.text,
-                &vector,
-                k,
-                Some(&spec),
-                0.0,
-                false,
-                &Default::default(),
-            )
-            .await?
-            .0;
+        let req = HybridSearchRequest {
+            text: doc.text.clone(),
+            vector: vector.to_vec(),
+            analysis: Some(spec.clone()),
+            ..Default::default()
+        };
+        let filters = Default::default();
+        let query = CascadeQuery::from_request("court-query", &req, k, 0.0, &filters)?;
+        let hits = coordinator.fanout_cascade_context(query).await?.0;
         for hit in &hits {
             println!(
                 "  #{} doc {:>8} (shard {}) vector {:.4}  bm25 {:.4}",

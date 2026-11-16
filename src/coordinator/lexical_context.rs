@@ -3,13 +3,15 @@
 use super::*;
 use std::borrow::Cow;
 
+/// A validated single-field lexical search with its projections.
 #[derive(Clone, Copy)]
-pub(crate) struct FlatLexicalQuery<'a> {
+pub struct FlatLexicalQuery<'a> {
     options: ValidatedLexicalQuery<'a>,
     projections: &'a [crate::pb::CompiledProjection],
 }
 
-pub(crate) struct FusedLexicalQuery<'a> {
+/// A validated multi-field lexical search.
+pub struct FusedLexicalQuery<'a> {
     options: ValidatedLexicalQuery<'a>,
     fields: Cow<'a, [crate::pb::QueryField]>,
 }
@@ -23,7 +25,7 @@ pub(super) struct ValidatedLexicalQuery<'a> {
 }
 
 impl<'a> FlatLexicalQuery<'a> {
-    pub(crate) fn new(
+    pub fn new(
         request: &'a Bm25SearchRequest,
         k: u32,
         projections: &'a [crate::pb::CompiledProjection],
@@ -61,7 +63,7 @@ impl<'a> FlatLexicalQuery<'a> {
 }
 
 impl<'a> FusedLexicalQuery<'a> {
-    pub(crate) fn new(
+    pub fn new(
         request: &'a Bm25SearchRequest,
         k: u32,
         filter: Option<&'a crate::pb::FilterExpr>,

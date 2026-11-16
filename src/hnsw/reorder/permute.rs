@@ -148,14 +148,7 @@ pub(in crate::hnsw) fn permute_store_with_links(
     } else {
         old_to_new[old_entry as usize]
     };
-    let mut out = Store::from_parts(
-        store.dim,
-        store.m,
-        store.ef_construction,
-        store.seed,
-        store.kernel,
-        nodes.rows,
-        nodes.inv_norm,
+    let links = GraphLinks::from_parts(
         nodes.level,
         nodes.upper_slot,
         nodes.upper_base,
@@ -164,6 +157,14 @@ pub(in crate::hnsw) fn permute_store_with_links(
         new_entry,
         top,
     );
+    let mut out = Store::new(
+        store.dim,
+        store.m,
+        store.ef_construction,
+        store.seed,
+        store.kernel,
+    )
+    .with_parts(nodes.rows, nodes.inv_norm, links);
     let map = attach_node_map.then(|| composed_node_map(store, new_to_old));
     out.set_reorder_state(true, map);
     out

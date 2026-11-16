@@ -41,9 +41,11 @@ impl NodeServiceImpl {
                 Some(store),
                 None,
                 store.next_doc_id() as usize,
-                &[],
-                &[],
-                filter,
+                ShardFilterInputs {
+                    geo: &[],
+                    regions: &[],
+                    tree: filter,
+                },
                 self.knobs.segment_pruning(),
                 None,
             )?;

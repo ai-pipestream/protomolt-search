@@ -96,10 +96,12 @@ impl NodeServiceImpl {
             let mut first = 0u64;
             self.apply_document_locked(
                 &mut shadow.state,
-                doc,
-                analyzed_doc,
-                None,
-                key,
+                crate::node::MaterializedDocument {
+                    doc,
+                    analyzed: analyzed_doc,
+                    vector: None,
+                    stable_routing_key: key,
+                },
                 &mut added,
                 &mut first,
             )?;

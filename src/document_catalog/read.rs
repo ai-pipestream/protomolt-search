@@ -124,13 +124,7 @@ impl DocumentCatalog {
         }
         let transaction = self.database.begin_read().map_err(storage)?;
         let meta = transaction.open_table(META).map_err(storage)?;
-        let header: DocumentCatalogHeader = decode_header(
-            meta.get("header")
-                .map_err(storage)?
-                .ok_or_else(|| Status::data_loss("catalog header missing"))?
-                .value(),
-        )?;
-        validate_current_header(&header)?;
+        let header = current_header(&meta)?;
         let fence = accepted_fence(request, &header)?;
         let mut response = ReadAcceptedDocumentsResponse {
             through_sequence: fence,

@@ -3,7 +3,7 @@ mod common;
 use pipestream_search::{
     node::{Bm25Shard, NodeConfig, NodeServiceImpl},
     pb::{self, node_service_server::NodeService},
-    postings::{AnalyzedDoc, Bm25Store},
+    postings::{AnalyzedDoc, Bm25Store, ColumnKind::*},
 };
 use prost::Message;
 
@@ -37,7 +37,7 @@ fn map_stage(key: &str) -> pb::ScoreStage {
     pb::ScoreStage::decode(wire.encode_to_vec().as_slice()).unwrap()
 }
 fn store() -> Bm25Store {
-    let mut store = Bm25Store::new().with_map_numerics(&["metrics"]);
+    let mut store = Bm25Store::new().with_columns(MapNumeric, &["metrics"]);
     for row in 0..3 {
         store.add_document(
             row,
@@ -221,7 +221,7 @@ async fn map_score_bounds_explanations_and_fetches_agree_through_relays() {
     let mut handles = Vec::new();
     let mut addresses = Vec::new();
     for leaf in 0..2 {
-        let mut data = Bm25Store::new().with_map_numerics(&["metrics"]);
+        let mut data = Bm25Store::new().with_columns(MapNumeric, &["metrics"]);
         for row in 0..ROWS {
             data.add_document(
                 row as u32,
@@ -240,7 +240,7 @@ async fn map_score_bounds_explanations_and_fetches_agree_through_relays() {
             common::catalog::sealed_shard(
                 &root.join("mapped.tv"),
                 &path,
-                Bm25Store::new().with_map_numerics(&["metrics"]),
+                Bm25Store::new().with_columns(MapNumeric, &["metrics"]),
             )
         };
         let node = NodeServiceImpl::new(

@@ -144,7 +144,6 @@ impl Drop for Fixture {
 /// The catalog's published set, reopened as a source-owned generation.
 fn owned_set(catalog: &SegmentCatalog, root: PathBuf) -> OpenedSegmentSet {
     let mut manifest = catalog.snapshot().published_manifest();
-    manifest.format = 3;
     manifest.source_owner = Some(
         SegmentSourceOwner::encode(&crate::pb::storage::SourceIndexOwner {
             format_version: 1,
@@ -158,22 +157,28 @@ fn owned_set(catalog: &SegmentCatalog, root: PathBuf) -> OpenedSegmentSet {
 }
 
 fn declared_store(change: &str) -> Bm25Store {
-    let mut store = Bm25Store::with_fields(&["body", "name"])
+    let mut store = Bm25Store::with_text_fields(&["body", "name"])
         .with_positions(&["body"])
         .with_sentences(&["body"])
-        .with_facets(if change == "schema" {
-            &["facet"][..]
-        } else {
-            &["facet", "empty_facet"][..]
-        })
-        .with_numerics(&["double"])
-        .with_integers(&["signed"])
-        .with_unsigned_integers(&["unsigned"])
-        .with_geos(&["point"])
-        .with_map_facets(&["labels"])
-        .with_map_numerics(&["double_map"])
-        .with_map_integers(&["signed_map"])
-        .with_map_unsigned_integers(&["unsigned_map"]);
+        .with_columns(
+            crate::postings::ColumnKind::Facet,
+            if change == "schema" {
+                &["facet"][..]
+            } else {
+                &["facet", "empty_facet"][..]
+            },
+        )
+        .with_columns(crate::postings::ColumnKind::Numeric, &["double"])
+        .with_columns(crate::postings::ColumnKind::Integer, &["signed"])
+        .with_columns(crate::postings::ColumnKind::UnsignedInteger, &["unsigned"])
+        .with_columns(crate::postings::ColumnKind::Geo, &["point"])
+        .with_columns(crate::postings::ColumnKind::MapFacet, &["labels"])
+        .with_columns(crate::postings::ColumnKind::MapNumeric, &["double_map"])
+        .with_columns(crate::postings::ColumnKind::MapInteger, &["signed_map"])
+        .with_columns(
+            crate::postings::ColumnKind::MapUnsignedInteger,
+            &["unsigned_map"],
+        );
     store
         .set_analysis_fingerprint(0, if change == "analyzer" { 12 } else { 11 })
         .unwrap();

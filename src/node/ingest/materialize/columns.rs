@@ -33,7 +33,7 @@ impl NodeServiceImpl {
             }
         }
         let sources = source_tables(&self.config);
-        let types = sources.types();
+        let types = sources.numeric_types();
         for ((name, expr, kind), source) in columns.iter().zip(&spec.columns) {
             let (_, vt) = crate::values::resolve(expr, &types).map_err(|e| {
                 Status::invalid_argument(format!("materialize: column {name:?}: {}", e.message()))

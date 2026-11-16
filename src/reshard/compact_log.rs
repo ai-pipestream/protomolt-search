@@ -107,7 +107,7 @@ pub(super) fn replay_counts(replay: &Replay) -> (u64, u64) {
 /// When `manifest`'s backend is `hnsw` with a non-`None` `locality_order` and
 /// `replay` holds at least `MIN_GRAPH_ROWS` vectors, build/merge the HNSW
 /// graph up front, permute it globally in-place (`0 B/row` overhead, no node
-/// map), and return the matching segment-wide slot order (`#98`).
+/// map), and return the matching segment-wide slot order.
 fn prepare_compacted_replay_order(
     manifest: &WalManifest,
     replay: &Replay,

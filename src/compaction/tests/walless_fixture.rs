@@ -61,19 +61,21 @@ pub(super) fn walless_fixture(label: &str, rows: usize) -> (PathBuf, NodeService
         let mut guard = crate::node::write_shard(&node.state);
         node.apply_document_locked(
             &mut guard,
-            AddDocumentsRequest {
-                text,
-                analysis: Some(spec.clone()),
-                integers: vec![crate::pb::IntegerValue {
-                    field: "num".into(),
-                    value: (i / 3) as i64,
-                }],
-                position_fields: Vec::new(),
-                ..Default::default()
+            crate::node::MaterializedDocument {
+                doc: AddDocumentsRequest {
+                    text,
+                    analysis: Some(spec.clone()),
+                    integers: vec![crate::pb::IntegerValue {
+                        field: "num".into(),
+                        value: (i / 3) as i64,
+                    }],
+                    position_fields: Vec::new(),
+                    ..Default::default()
+                },
+                analyzed,
+                vector: Some(sample[i * 64..(i + 1) * 64].to_vec()),
+                stable_routing_key: None,
             },
-            analyzed,
-            Some(sample[i * 64..(i + 1) * 64].to_vec()),
-            None,
             &mut 0,
             &mut 0,
         )

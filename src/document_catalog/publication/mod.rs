@@ -248,13 +248,7 @@ impl DocumentCatalog {
         }
         let tx = self.database.begin_read().map_err(storage)?;
         let meta = tx.open_table(META).map_err(storage)?;
-        let header: DocumentCatalogHeader = decode_header(
-            meta.get("header")
-                .map_err(storage)?
-                .ok_or_else(|| Status::data_loss("catalog header missing"))?
-                .value(),
-        )?;
-        validate_current_header(&header)?;
+        let header = current_header(&meta)?;
         Ok(crate::pb::storage::SourceIndexOwner {
             format_version: 1,
             history_id: header.history_id,
@@ -277,13 +271,7 @@ impl DocumentCatalog {
         catalog.with_durable_snapshot(|snapshot| {
             let tx = self.database.begin_read().map_err(storage)?;
             let meta = tx.open_table(META).map_err(storage)?;
-            let header: DocumentCatalogHeader = decode_header(
-                meta.get("header")
-                    .map_err(storage)?
-                    .ok_or_else(|| Status::data_loss("catalog header missing"))?
-                    .value(),
-            )?;
-            validate_current_header(&header)?;
+            let header = current_header(&meta)?;
             let states = tx.open_table(STATES).map_err(storage)?;
             let Some(bytes) = states.get(key).map_err(storage)? else {
                 return Ok(None);
@@ -309,13 +297,7 @@ impl DocumentCatalog {
     pub(super) fn validate_projection_journal(&self) -> Result<bool, Status> {
         let tx = self.database.begin_read().map_err(storage)?;
         let meta = tx.open_table(META).map_err(storage)?;
-        let header: DocumentCatalogHeader = decode_header(
-            meta.get("header")
-                .map_err(storage)?
-                .ok_or_else(|| Status::data_loss("catalog header missing"))?
-                .value(),
-        )?;
-        validate_current_header(&header)?;
+        let header = current_header(&meta)?;
         let names = tx
             .list_tables()
             .map_err(storage)?

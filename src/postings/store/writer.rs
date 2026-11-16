@@ -23,8 +23,7 @@ impl Bm25Store {
     }
 
     /// Persist with first-seen dictionaries under the ordinary v8
-    /// envelope: the exact file a pre-2026-09 build wrote. Legacy oracle
-    /// for the tests only (see [`Self::write_v6_first_seen_dictionaries`]).
+    /// envelope. A test-only oracle (see [`Self::write_v6_first_seen_dictionaries`]).
     pub fn save_first_seen_dictionaries(&self, path: &Path) -> io::Result<()> {
         save_v8_atomic(path, |w| self.write_v6_first_seen_dictionaries(w))
     }
@@ -157,8 +156,8 @@ impl Bm25Store {
         self.write_v6_ordered(w, true)
     }
 
-    /// [`Self::write_v6_to`] with dictionaries in first-seen order — a legacy
-    /// oracle for tests verifying pre-2026-09-02 files.
+    /// [`Self::write_v6_to`] with dictionaries in first-seen order: a test
+    /// oracle for files whose dictionaries are not byte-ordered.
     pub fn write_v6_first_seen_dictionaries<W: Write>(&self, w: &mut W) -> io::Result<()> {
         self.write_v6_ordered(w, false)
     }

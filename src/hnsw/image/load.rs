@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicU32;
 
 use super::super::config::{HnswConfig, LocalityOrder};
 use super::super::distance::Kernel;
-use super::super::graph::{Store, View, NO_NODE};
+use super::super::graph::{GraphLinks, Store, View, NO_NODE};
 use super::super::reorder::NodeMap;
 use super::super::rows::MappedRows;
 use super::super::HNSW;
@@ -108,14 +108,7 @@ pub fn load_heap(path: &Path, kernel: Kernel) -> Result<(Store, HnswConfig), Vec
     };
     validate_structure(&view, &header)
         .map_err(|e| VectorError::new(format!("load {}: {e}", path.display())))?;
-    let mut store = Store::from_parts(
-        header.dim,
-        m,
-        header.config.ef_construction as usize,
-        header.config.seed,
-        kernel,
-        rows,
-        inv_norm,
+    let links = GraphLinks::from_parts(
         level,
         upper_slot,
         upper_base,
@@ -124,6 +117,14 @@ pub fn load_heap(path: &Path, kernel: Kernel) -> Result<(Store, HnswConfig), Vec
         header.entry,
         header.top,
     );
+    let mut store = Store::new(
+        header.dim,
+        m,
+        header.config.ef_construction as usize,
+        header.config.seed,
+        kernel,
+    )
+    .with_parts(rows, inv_norm, links);
     store.set_reorder_state(
         header.entry != NO_NODE && header.config.locality_order != LocalityOrder::None,
         node_map,

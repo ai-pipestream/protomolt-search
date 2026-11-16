@@ -173,10 +173,12 @@ impl NodeServiceImpl {
         let mut guard = write_shard(&self.state);
         self.apply_document_locked(
             &mut guard,
-            doc,
-            analyzed,
-            vector,
-            stable_routing_key,
+            crate::node::MaterializedDocument {
+                doc,
+                analyzed,
+                vector,
+                stable_routing_key,
+            },
             added,
             first_id,
         )

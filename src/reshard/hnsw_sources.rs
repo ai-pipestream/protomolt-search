@@ -2,8 +2,8 @@
 
 use crate::vector::{VectorIndex, VectorProvider};
 
-/// Sealed HNSW segment images available for donor transplant and `#99`
-/// join-set graph merge during shard compaction (`#76`, `#99`).
+/// Sealed HNSW segment images available for donor transplant and join-set
+/// graph merge during shard compaction.
 pub(crate) struct HnswCompactionSources {
     slot_offset: u64,
     ranges: Vec<HnswSourceRange>,

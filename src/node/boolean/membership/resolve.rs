@@ -61,9 +61,11 @@ impl BooleanMembership<'_> {
             bm25,
             self.deleted.clone(),
             self.n,
-            &filter.geo_filters,
-            &geo_regions,
-            filter.filter.as_ref(),
+            ShardFilterInputs {
+                geo: &filter.geo_filters,
+                regions: &geo_regions,
+                tree: filter.filter.as_ref(),
+            },
             self.prune_enabled,
             domain,
         )?;

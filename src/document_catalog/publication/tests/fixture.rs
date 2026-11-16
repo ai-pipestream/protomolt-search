@@ -300,12 +300,12 @@ impl Fixture {
         let output = rewrite.output;
         tokio::task::spawn_blocking(move || {
             arm();
-            node.publish_document_maintenance_blocking(
-                &source,
-                INDEX,
-                StatsClaim::required(stats_epoch, &stats_incarnation).unwrap(),
-                epoch,
-                vec![SegmentSource {
+            node.publish_document_maintenance_blocking(crate::node::DocumentMaintenanceRequest {
+                source: &source,
+                index_key: INDEX,
+                expected: StatsClaim::required(stats_epoch, &stats_incarnation).unwrap(),
+                catalog_epoch: epoch,
+                sources: vec![SegmentSource {
                     multi_res_path: None,
                     segment_id: output,
                     generation: epoch + 1,
@@ -317,9 +317,9 @@ impl Fixture {
                     live_docs_path: &directory.join(&selected.live_docs.file),
                     partition_column: None,
                 }],
-                &scratch,
-                1,
-            )
+                proof_scratch: &scratch,
+                proof_batch_rows: 1,
+            })
         })
         .await
         .unwrap()

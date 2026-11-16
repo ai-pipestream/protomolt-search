@@ -28,7 +28,7 @@ fn two_fields(body: AnalyzedField, name: AnalyzedField) -> AnalyzedDoc {
 /// doc0: body "rust rust search", name "smith"; doc1: body "rust vector
 /// vector", no name; doc2: body "search", name "rust smith".
 fn hand_computed_store() -> Bm25Store {
-    let mut store = Bm25Store::with_fields(&["body", "name"]);
+    let mut store = Bm25Store::with_text_fields(&["body", "name"]);
     let doc0 = two_fields(
         field(vec![("rust", 2, vec![(0, 4)]), ("search", 1, vec![])], 3),
         field(vec![("smith", 1, vec![(0, 5)])], 1),
@@ -151,7 +151,7 @@ fn doc_for(g: u32) -> AnalyzedDoc {
 
 /// A two-field store holding global ids `range`, renumbered from `offset`.
 fn build(range: std::ops::Range<u32>, offset: u32) -> Bm25Store {
-    let mut store = Bm25Store::with_fields(&["body", "name"]);
+    let mut store = Bm25Store::with_text_fields(&["body", "name"]);
     for g in range {
         store.add_document(g - offset, format!("doc {g}"), doc_for(g));
     }
@@ -262,7 +262,7 @@ fn fused_distributed_equals_monolithic() {
 
 #[test]
 fn phrase_group_uses_strongest_nested_concept_without_stacking() {
-    let mut store = Bm25Store::with_fields(&["body", "phrases"]);
+    let mut store = Bm25Store::with_text_fields(&["body", "phrases"]);
     let doc = two_fields(
         field(
             vec![

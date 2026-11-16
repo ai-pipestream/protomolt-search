@@ -20,6 +20,7 @@ mod wire;
 
 pub use self::directory::certificate_sha256;
 pub(crate) use self::network::classify;
+pub(crate) use self::stage::ListenerHost;
 use self::wire::*;
 
 use super::reasons;

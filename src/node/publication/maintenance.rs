@@ -28,14 +28,17 @@ fn observation(intent: &MaintenanceIntent, claim: StatsClaim) -> DocumentMainten
     }
 }
 
-struct MaintenanceRequest<'a> {
-    source: &'a DocumentCatalog,
-    index_key: &'a [u8],
-    expected: StatsClaim,
-    catalog_epoch: u64,
-    sources: Vec<SegmentSource<'a>>,
-    proof_scratch: &'a Path,
-    proof_batch_rows: usize,
+/// One maintenance publication: the source catalog and index it rewrites,
+/// the stats claim and catalog epoch its build read, the rebuilt segments,
+/// and where and in what batches their preservation proof runs.
+pub struct DocumentMaintenanceRequest<'a> {
+    pub source: &'a DocumentCatalog,
+    pub index_key: &'a [u8],
+    pub expected: StatsClaim,
+    pub catalog_epoch: u64,
+    pub sources: Vec<SegmentSource<'a>>,
+    pub proof_scratch: &'a Path,
+    pub proof_batch_rows: usize,
 }
 
 struct MaintenanceSnapshot {
@@ -47,39 +50,10 @@ struct MaintenanceSnapshot {
 }
 
 impl NodeServiceImpl {
-    /// Publish rebuilt, immutable segments through the source owner's journal
-    /// and one serving-state fence. All live source identities and stored query
-    /// content must survive. The owner calls this on a blocking worker; this is
-    /// not a public ingest/administration RPC or a source write receipt.
-    ///
-    /// Source writes may continue during the caller's private build. Its captured
-    /// read version must still hold here. Copying and preservation verification
-    /// run without mutation fences; both reads and source writes can continue.
-    /// This operation explicitly enables journal format 2, refusing migration
-    /// while another index in the source catalog has a pending source intent.
-    #[allow(clippy::too_many_arguments)]
-    pub fn publish_document_maintenance_blocking(
+    fn validate_maintenance_request(
         &self,
-        source: &DocumentCatalog,
-        index_key: &[u8],
-        expected: StatsClaim,
-        catalog_epoch: u64,
-        sources: Vec<SegmentSource<'_>>,
-        proof_scratch: &Path,
-        proof_batch_rows: usize,
-    ) -> Result<DocumentMaintenanceActivation, Status> {
-        self.run_document_maintenance(MaintenanceRequest {
-            source,
-            index_key,
-            expected,
-            catalog_epoch,
-            sources,
-            proof_scratch,
-            proof_batch_rows,
-        })
-    }
-
-    fn validate_maintenance_request(&self, req: &MaintenanceRequest<'_>) -> Result<(), Status> {
+        req: &DocumentMaintenanceRequest<'_>,
+    ) -> Result<(), Status> {
         if !(1..=1_048_576).contains(&req.proof_batch_rows) {
             return Err(Status::invalid_argument(
                 "maintenance proof_batch_rows must be 1..=1048576",
@@ -94,9 +68,19 @@ impl NodeServiceImpl {
         Ok(())
     }
 
-    fn run_document_maintenance(
+    /// Publish rebuilt, immutable segments through the source owner's journal
+    /// and one serving-state fence. All live source identities and stored query
+    /// content must survive. The owner calls this on a blocking worker; this is
+    /// not a public ingest/administration RPC or a source write receipt.
+    ///
+    /// Source writes may continue during the caller's private build. Its captured
+    /// read version must still hold here. Copying and preservation verification
+    /// run without mutation fences; both reads and source writes can continue.
+    /// This operation explicitly enables journal format 2, refusing migration
+    /// while another index in the source catalog has a pending source intent.
+    pub fn publish_document_maintenance_blocking(
         &self,
-        req: MaintenanceRequest<'_>,
+        req: DocumentMaintenanceRequest<'_>,
     ) -> Result<DocumentMaintenanceActivation, Status> {
         self.validate_maintenance_request(&req)?;
         let owner = req.source.index_owner(req.index_key)?;

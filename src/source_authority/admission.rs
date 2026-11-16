@@ -186,24 +186,7 @@ impl SourceAdmission<'_> {
             if disclose {
                 self.store.read_policy(&tx, &self.principal, key)?;
             }
-            let table = tx.open_table(OWNERS).map_err(storage)?;
-            let bytes = key.encode_to_vec();
-            let held: PreparedSourceOwner = contract::decode(
-                table
-                    .get(bytes.as_slice())
-                    .map_err(storage)?
-                    .ok_or_else(|| {
-                        crate::raft::reasons::reason(
-                            Status::failed_precondition(
-                                "source owner has no committed preparation",
-                            ),
-                            crate::raft::reasons::ADMISSION_UNRECORDED_ACTIVATION,
-                        )
-                    })?
-                    .value(),
-            )?;
-            contract::owner(&held).map_err(corrupt)?;
-            Ok(held)
+            committed_preparation(&tx, key)
         })
     }
 
@@ -285,23 +268,7 @@ impl SourceAdmission<'_> {
                 .ok_or_else(|| missing("prepared owner key"))?;
             let tx = self.store.inner.database().begin_read().map_err(storage)?;
             self.store.read_policy(&tx, &self.principal, key)?;
-            let table = tx.open_table(OWNERS).map_err(storage)?;
-            let bytes = key.encode_to_vec();
-            let held: PreparedSourceOwner = contract::decode(
-                table
-                    .get(bytes.as_slice())
-                    .map_err(storage)?
-                    .ok_or_else(|| {
-                        crate::raft::reasons::reason(
-                            Status::failed_precondition(
-                                "source owner has no committed preparation",
-                            ),
-                            crate::raft::reasons::ADMISSION_UNRECORDED_ACTIVATION,
-                        )
-                    })?
-                    .value(),
-            )?;
-            contract::owner(&held).map_err(corrupt)?;
+            let held = committed_preparation(&tx, key)?;
             if &held != expected || held.phase != PreparedSourceOwnerPhase::Prepared as i32 {
                 return Err(Status::failed_precondition(
                     "source owner preparation changed or is no longer pending",
@@ -383,4 +350,27 @@ impl SourceAuthorityStore {
         admission.recovery = true;
         Ok(admission)
     }
+}
+
+/// The committed, valid preparation recorded for `key`.
+fn committed_preparation(
+    tx: &redb::ReadTransaction,
+    key: &LogicalSourceOwner,
+) -> Result<PreparedSourceOwner, Status> {
+    let table = tx.open_table(OWNERS).map_err(storage)?;
+    let bytes = key.encode_to_vec();
+    let held: PreparedSourceOwner = contract::decode(
+        table
+            .get(bytes.as_slice())
+            .map_err(storage)?
+            .ok_or_else(|| {
+                crate::raft::reasons::reason(
+                    Status::failed_precondition("source owner has no committed preparation"),
+                    crate::raft::reasons::ADMISSION_UNRECORDED_ACTIVATION,
+                )
+            })?
+            .value(),
+    )?;
+    contract::owner(&held).map_err(corrupt)?;
+    Ok(held)
 }

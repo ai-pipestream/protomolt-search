@@ -10,7 +10,7 @@ use pipestream_search::{
     mapping::{derive_plan, derive_plan_with_definition, Extractor, MappingError},
     node::{self, NodeConfig},
     pb,
-    postings::Bm25Reader,
+    postings::{Bm25Reader, Bm25Store, ColumnKind::*},
     reshard,
     segments::OpenedSegmentSet,
     wal,
@@ -966,10 +966,10 @@ async fn mapped_maps_cross_rpc_binding_reopen_and_compaction() {
         pipestream_search::node::Bm25Shard::Segmented(
             pipestream_search::segmented::SegmentedShard::open(
                 pipestream_search::node::segments_root(config.index_path.as_ref().unwrap()),
-                pipestream_search::postings::Bm25Store::new()
-                    .with_unsigned_integers(&["id"])
-                    .with_map_facets(&["attrs"])
-                    .with_map_numerics(&["weights"]),
+                Bm25Store::new()
+                    .with_columns(UnsignedInteger, &["id"])
+                    .with_columns(MapFacet, &["attrs"])
+                    .with_columns(MapNumeric, &["weights"]),
             )
             .unwrap(),
         )

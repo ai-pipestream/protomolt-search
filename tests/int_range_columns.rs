@@ -16,7 +16,9 @@ use pipestream_search::pb::{
     AddDocumentsRequest, Bm25Hit, Bm25SearchRequest, IntegerValue, RangeFacetField, ScoreOp,
     ScoreStage, TimestampValue,
 };
-use pipestream_search::postings::{AnalyzedDoc, Bm25Reader, Bm25Store, SpillBuilder};
+use pipestream_search::postings::{
+    AnalyzedDoc, Bm25Reader, Bm25Store, ColumnKind::*, SpillBuilder,
+};
 use pipestream_search::scorefn::{ColumnRef, NumericRead, ScoreChain, Stage, StageOp};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -187,12 +189,12 @@ fn integer_columns_roundtrip_and_dual_writers_agree() {
 
     // A store carrying all five column kinds at once, to pin the
     // kinded table's ordering with kind 4 appended last.
-    let mut store = Bm25Store::with_fields(&["body"])
-        .with_facets(&["court"])
-        .with_numerics(&["date"])
-        .with_map_facets(&["meta"])
-        .with_map_numerics(&["attrs"])
-        .with_integers(&["citations"]);
+    let mut store = Bm25Store::with_text_fields(&["body"])
+        .with_columns(Facet, &["court"])
+        .with_columns(Numeric, &["date"])
+        .with_columns(MapFacet, &["meta"])
+        .with_columns(MapNumeric, &["attrs"])
+        .with_columns(Integer, &["citations"]);
     for (i, terms) in [
         &[("rust", 1u32), ("search", 1)][..],
         &[("vector", 1)][..],
@@ -219,13 +221,13 @@ fn integer_columns_roundtrip_and_dual_writers_agree() {
         "integer columns opt into the v7-shaped v8 payload"
     );
 
-    let mut builder = SpillBuilder::create_with_fields(&dir.join("spill.build"), &["body"])
+    let mut builder = SpillBuilder::create_with_text_fields(&dir.join("spill.build"), &["body"])
         .unwrap()
-        .with_facet_fields(&["court"])
-        .with_numeric_fields(&["date"])
-        .with_map_facet_fields(&["meta"])
-        .with_map_numeric_fields(&["attrs"])
-        .with_integer_fields(&["citations"])
+        .with_columns(Facet, &["court"])
+        .with_columns(Numeric, &["date"])
+        .with_columns(MapFacet, &["meta"])
+        .with_columns(MapNumeric, &["attrs"])
+        .with_columns(Integer, &["citations"])
         .with_buffer_bytes(32);
     for (i, terms) in [
         &[("rust", 1u32), ("search", 1)][..],
@@ -293,7 +295,7 @@ fn integer_columns_roundtrip_and_dual_writers_agree() {
 
     // Integers alone still opt the shard into v7, and a column no
     // document valued folds to the empty range rather than to a value.
-    let mut only_integer = Bm25Store::with_fields(&["body"]).with_integers(&["a", "b"]);
+    let mut only_integer = Bm25Store::new().with_columns(Integer, &["a", "b"]);
     only_integer.add_document(0, "rust".to_string(), analyzed(&[("rust", 1)]));
     only_integer.set_integer(0, 0, 42);
     let integer_path = dir.join("integer.bm25");
@@ -339,17 +341,17 @@ fn partial_kind_stores_tile_and_validate() {
         ("numerics_int", false, true, false),
         ("mapfacets_int", false, false, true),
     ] {
-        let mut store = Bm25Store::with_fields(&["body"]);
+        let mut store = Bm25Store::with_text_fields(&["body"]);
         if facets {
-            store = store.with_facets(&["court"]);
+            store = store.with_columns(Facet, &["court"]);
         }
         if numerics {
-            store = store.with_numerics(&["date"]);
+            store = store.with_columns(Numeric, &["date"]);
         }
         if map_facets {
-            store = store.with_map_facets(&["meta"]);
+            store = store.with_columns(MapFacet, &["meta"]);
         }
-        let mut store = store.with_integers(&["citations"]);
+        let mut store = store.with_columns(Integer, &["citations"]);
         store.add_document(0, "doc".to_string(), analyzed());
         if facets {
             store.set_facet(0, 0, "scotus");
@@ -365,18 +367,18 @@ fn partial_kind_stores_tile_and_validate() {
         store.save(&path).unwrap();
 
         let mut builder =
-            SpillBuilder::create_with_fields(&dir.join(format!("{case}.build")), &["body"])
+            SpillBuilder::create_with_text_fields(&dir.join(format!("{case}.build")), &["body"])
                 .unwrap();
         if facets {
-            builder = builder.with_facet_fields(&["court"]);
+            builder = builder.with_columns(Facet, &["court"]);
         }
         if numerics {
-            builder = builder.with_numeric_fields(&["date"]);
+            builder = builder.with_columns(Numeric, &["date"]);
         }
         if map_facets {
-            builder = builder.with_map_facet_fields(&["meta"]);
+            builder = builder.with_columns(MapFacet, &["meta"]);
         }
-        let mut builder = builder.with_integer_fields(&["citations"]);
+        let mut builder = builder.with_columns(Integer, &["citations"]);
         builder
             .add_document_with_lineage(0, "doc".to_string(), analyzed(), None)
             .unwrap();
@@ -441,10 +443,10 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
     // UPPER bucket; [20, 30) holds d3. d5 is below the first edge and
     // d6 has no value, so neither is counted anywhere.
     let want = vec![range_field("citations", &EDGES)];
-    let (hits, _, ranges) = coordinator
-        .fanout_bm25_faceted("rust", 10, None, 0.0, &[], &[], &want, &[], &[], None)
-        .await
-        .unwrap();
+    let (hits, _, ranges) =
+        common::fanout::bm25_range_facets(&coordinator, "rust", 10, &want, None)
+            .await
+            .unwrap();
     assert_eq!(hits.len(), 6);
     assert_eq!(ranges.len(), 1);
     assert_eq!(ranges[0].column, "citations");
@@ -461,19 +463,19 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
 
     // Counts cover the whole match set at k = 1 too: the floor bounds
     // what is surfaced, never what matched.
-    let (hits_k1, _, ranges_k1) = coordinator
-        .fanout_bm25_faceted("rust", 1, None, 0.0, &[], &[], &want, &[], &[], None)
-        .await
-        .unwrap();
+    let (hits_k1, _, ranges_k1) =
+        common::fanout::bm25_range_facets(&coordinator, "rust", 1, &want, None)
+            .await
+            .unwrap();
     assert_eq!(hits_k1.len(), 1);
     assert_eq!(buckets_of(&ranges_k1[0]), buckets_of(&ranges[0]));
 
     // A value sitting exactly on the LAST edge lands in no bucket:
     // "vector" matches d1 (10) and d4 (30).
-    let (_, _, vector_ranges) = coordinator
-        .fanout_bm25_faceted("vector", 10, None, 0.0, &[], &[], &want, &[], &[], None)
-        .await
-        .unwrap();
+    let (_, _, vector_ranges) =
+        common::fanout::bm25_range_facets(&coordinator, "vector", 10, &want, None)
+            .await
+            .unwrap();
     assert_eq!(
         buckets_of(&vector_ranges[0]),
         vec![(0.0, 10.0, 0), (10.0, 20.0, 1), (20.0, 30.0, 0)],
@@ -514,7 +516,7 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
     assert_eq!(buckets_of(&resp.range_facets[0]), buckets_of(&ranges[0]));
 
     // The fused route counts over the union of every leg's terms.
-    let fields = vec![pipestream_search::pb::QueryField {
+    let fields = [pipestream_search::pb::QueryField {
         field: "body".to_string(),
         analysis: None,
         weight: 1.0,
@@ -525,28 +527,31 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
         synonyms: Vec::new(),
         synonyms_off: false,
     }];
-    let (_, _, fused_ranges) = coordinator
-        .fanout_bm25_fused_faceted("rust", 10, &fields, 0.0, &[], &[], &want, &[], None)
-        .await
-        .unwrap();
+    let (_, _, fused_ranges) = common::fanout::bm25_fused_req(
+        &coordinator,
+        pipestream_search::pb::Bm25SearchRequest {
+            text: "rust".into(),
+            fields: fields.to_vec(),
+            range_facet_fields: want.to_vec(),
+            ..Default::default()
+        },
+        10,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(buckets_of(&fused_ranges[0]), buckets_of(&ranges[0]));
 
     // A column NO shard knows is a typo, not an empty histogram.
-    let err = coordinator
-        .fanout_bm25_faceted(
-            "rust",
-            10,
-            None,
-            0.0,
-            &[],
-            &[],
-            &[range_field("citation", &EDGES)],
-            &[],
-            &[],
-            None,
-        )
-        .await
-        .unwrap_err();
+    let err = common::fanout::bm25_range_facets(
+        &coordinator,
+        "rust",
+        10,
+        &[range_field("citation", &EDGES)],
+        None,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     assert!(
         err.message().contains("citation") && err.message().contains("--integer-fields"),
@@ -564,21 +569,15 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
         (vec![0.0, f64::INFINITY], "not finite"),
         (vec![f64::NAN, 1.0], "not finite"),
     ] {
-        let err = coordinator
-            .fanout_bm25_faceted(
-                "rust",
-                10,
-                None,
-                0.0,
-                &[],
-                &[],
-                &[range_field("citations", &edges)],
-                &[],
-                &[],
-                None,
-            )
-            .await
-            .unwrap_err();
+        let err = common::fanout::bm25_range_facets(
+            &coordinator,
+            "rust",
+            10,
+            &[range_field("citations", &edges)],
+            None,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument, "{needle}");
         assert!(
             err.message().contains(needle) && err.message().contains("citations"),
@@ -591,41 +590,33 @@ async fn distributed_range_facets_are_exact_and_boundary_correct() {
     // terms or asks for k = 0: edge validation needs no shard, so the
     // coordinator's early return must not swallow it into an empty Ok.
     for (text, k) in [("", 10u32), ("rust", 0)] {
-        let err = coordinator
-            .fanout_bm25_faceted(
-                text,
-                k,
-                None,
-                0.0,
-                &[],
-                &[],
-                &[range_field("citations", &[5.0])],
-                &[],
-                &[],
-                None,
-            )
-            .await
-            .unwrap_err();
+        let err = common::fanout::bm25_range_facets(
+            &coordinator,
+            text,
+            k,
+            &[range_field("citations", &[5.0])],
+            None,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
             err.code(),
             tonic::Code::InvalidArgument,
             "text {text:?}, k {k}: the early return must not hide the refusal"
         );
     }
-    let err = coordinator
-        .fanout_bm25_fused_faceted(
-            "",
-            10,
-            &fields,
-            0.0,
-            &[],
-            &[],
-            &[range_field("citations", &[5.0])],
-            &[],
-            None,
-        )
-        .await
-        .unwrap_err();
+    let err = common::fanout::bm25_fused_req(
+        &coordinator,
+        pipestream_search::pb::Bm25SearchRequest {
+            fields: fields.to_vec(),
+            range_facet_fields: vec![range_field("citations", &[5.0])],
+            ..Default::default()
+        },
+        10,
+        None,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(
         err.code(),
         tonic::Code::InvalidArgument,
@@ -738,7 +729,8 @@ fn integer_chain_pruned_matches_exhaustive_bitwise() {
 fn build_integer_chain_store(path: &std::path::Path) -> CorpusStats {
     let n = 3000u32;
     let mut total = 0u64;
-    let mut store = Bm25Store::with_fields(&["body"]).with_integers(&["citations", "filed"]);
+    let mut store =
+        Bm25Store::with_text_fields(&["body"]).with_columns(Integer, &["citations", "filed"]);
     for doc in 0..n {
         let tf_a = 1 + (u64::from(doc) * 2654435761 % 7) as u32;
         let mut terms = vec![("a".to_string(), tf_a, Vec::new())];
@@ -787,7 +779,7 @@ async fn distributed_integer_chain_matches_monolith() {
     let monolithic = CoordinatorServiceImpl::new(vec![mono_addr])
         .with_bm25(Some(analysis.clone()), Default::default());
 
-    let stages = vec![ScoreStage {
+    let stages = [ScoreStage {
         operation: Some(pipestream_search::pb::score_stage::Operation::Op(
             ScoreOp::MultLog as i32,
         )),
@@ -800,12 +792,10 @@ async fn distributed_integer_chain_matches_monolith() {
         origin_lon: 0.0,
     }];
     for text in ["rust", "search rust", "vector"] {
-        let (got, _, _) = distributed
-            .fanout_bm25_faceted(text, 10, None, 0.0, &[], &[], &[], &stages, &[], None)
+        let (got, _, _) = common::fanout::bm25_stages(&distributed, text, 10, &stages, None)
             .await
             .unwrap();
-        let (want, _, _) = monolithic
-            .fanout_bm25_faceted(text, 10, None, 0.0, &[], &[], &[], &stages, &[], None)
+        let (want, _, _) = common::fanout::bm25_stages(&monolithic, text, 10, &stages, None)
             .await
             .unwrap();
         assert_eq!(
@@ -818,8 +808,7 @@ async fn distributed_integer_chain_matches_monolith() {
     // The chain does something, and d6 (on the column-less shard) keeps
     // its base score bit for bit.
     let unchained = distributed.fanout_bm25("rust", 10, None).await.unwrap();
-    let (chained, _, _) = distributed
-        .fanout_bm25_faceted("rust", 10, None, 0.0, &[], &[], &[], &stages, &[], None)
+    let (chained, _, _) = common::fanout::bm25_stages(&distributed, "rust", 10, &stages, None)
         .await
         .unwrap();
     assert_eq!(unchained.len(), chained.len(), "same match set");
@@ -928,21 +917,15 @@ async fn timestamps_land_as_epoch_micros_in_the_integer_column() {
     // document sits exactly on the last edge and also lands nowhere;
     // only January falls in the single bucket.
     let edges = vec![(JAN_2024 * 1_000_000) as f64, (JUL_2024 * 1_000_000) as f64];
-    let (hits, _, ranges) = coordinator
-        .fanout_bm25_faceted(
-            "rust",
-            10,
-            None,
-            0.0,
-            &[],
-            &[],
-            &[range_field("filed_at", &edges)],
-            &[],
-            &[],
-            None,
-        )
-        .await
-        .unwrap();
+    let (hits, _, ranges) = common::fanout::bm25_range_facets(
+        &coordinator,
+        "rust",
+        10,
+        &[range_field("filed_at", &edges)],
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(hits.len(), 3);
     assert_eq!(
         buckets_of(&ranges[0]),
@@ -954,21 +937,15 @@ async fn timestamps_land_as_epoch_micros_in_the_integer_column() {
     // 500_999 ns remainder truncated to 500 micros, so the stored value
     // is JUL * 1e6 + 500, above the old edge and below the new one.
     let wider = vec![edges[0], edges[1] + 1_000.0];
-    let (_, _, wide_ranges) = coordinator
-        .fanout_bm25_faceted(
-            "rust",
-            10,
-            None,
-            0.0,
-            &[],
-            &[],
-            &[range_field("filed_at", &wider)],
-            &[],
-            &[],
-            None,
-        )
-        .await
-        .unwrap();
+    let (_, _, wide_ranges) = common::fanout::bm25_range_facets(
+        &coordinator,
+        "rust",
+        10,
+        &[range_field("filed_at", &wider)],
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(buckets_of(&wide_ranges[0]), vec![(wider[0], wider[1], 2)]);
 
     // Refusals: an unknown field, an overflowing instant, and a field
@@ -1061,21 +1038,15 @@ async fn integer_ingest_refusals_are_loud() {
     // the same range counts it did before.
     let coordinator = CoordinatorServiceImpl::new(addrs.clone())
         .with_bm25(Some(analysis.clone()), Default::default());
-    let (_, _, ranges) = coordinator
-        .fanout_bm25_faceted(
-            "rust",
-            10,
-            None,
-            0.0,
-            &[],
-            &[],
-            &[range_field("citations", &EDGES)],
-            &[],
-            &[],
-            None,
-        )
-        .await
-        .unwrap();
+    let (_, _, ranges) = common::fanout::bm25_range_facets(
+        &coordinator,
+        "rust",
+        10,
+        &[range_field("citations", &EDGES)],
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         buckets_of(&ranges[0]),
         vec![(0.0, 10.0, 2), (10.0, 20.0, 1), (20.0, 30.0, 1)]

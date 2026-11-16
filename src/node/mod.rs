@@ -51,8 +51,9 @@ pub(crate) use self::boolean::{evaluate_boolean_membership, EvaluatedBoolean};
 pub(crate) use self::config::{check_attached_derived, stored_derived};
 pub(crate) use self::ingest::{
     apply_materialize, cased_field_index, compile_materialize_spec, join_fields, materialize_sha,
-    session_layers,
+    session_layers, MaterializedDocument,
 };
+pub use self::publication::DocumentMaintenanceRequest;
 #[cfg(test)]
 pub(crate) use self::publication::{
     set_rewrite_test_hooks, AFTER_MAINTENANCE_VERIFIED, FAIL_PROJECTION_DECISION,
@@ -100,7 +101,7 @@ pub(in crate::node) use self::shard::{
     live_field_stats, projected_value, prune_segments, resolve_shard_filters,
     score_exact_slots_checked, uint_min_max_as_f64, unknown_range_counts, validate_lat_lon,
     AdmittedDocPass, DocPassSpec, EmptyColumns, IngestGuard, ResolvedShardFilters, SegmentPrune,
-    ShardNumericRead,
+    ShardFilterInputs, ShardNumericRead,
 };
 pub(in crate::node) use self::snapshot::stream_file;
 pub(in crate::node) use self::storage::{
