@@ -802,7 +802,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         security: ToolClient::from_args(Vec::<String>::new())?,
         allow_remote: false,
     })
-    .await?;
+    .await?
+    .with_raw_explorer()?;
     eprintln!(
         "demo cluster: {SHARDS} shards, {} documents, {DIM}-dim hashed embedding",
         docs.len()

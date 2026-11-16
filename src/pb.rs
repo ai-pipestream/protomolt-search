@@ -46,8 +46,8 @@ pub mod tei {
 /// (`proto/ai/protomolt/proto/schema/registry/v1/descriptor_exchange.proto`,
 /// byte-identical to protomolt — `scripts/check-vendored-protos.sh`).
 /// This engine consumes the exchange service as one gRPC client among
-/// any; descriptor bytes stay opaque until the mapping layer derives a
-/// plan from them (`docs/descriptor-mappings.md`).
+/// any; descriptor bytes stay opaque until [`crate::mapping`] derives an
+/// extraction plan from them.
 pub mod exchange {
     tonic::include_proto!("ai.protomolt.proto.schema.registry.v1");
 }
