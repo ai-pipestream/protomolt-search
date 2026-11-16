@@ -115,6 +115,8 @@ pub mod geo;
 #[doc(hidden)]
 pub mod replay_journal;
 #[doc(hidden)]
+pub mod segment_prune;
+#[doc(hidden)]
 pub mod segmented_vectors;
 #[doc(hidden)]
 pub mod sortkeys;
@@ -151,7 +153,6 @@ mod query_disclosure;
 mod query_identity;
 mod rangefacet;
 pub(crate) mod rankdiff;
-pub(crate) mod segment_prune;
 pub(crate) mod source_archive;
 mod source_owner;
 mod stream_signal;
