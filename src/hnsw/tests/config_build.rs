@@ -215,6 +215,56 @@ fn fixed_order_build_is_reproducible_bit_for_bit() {
 }
 
 #[test]
+fn small_m_fixed_order_build_repairs_islands_reproducibly_bit_for_bit() {
+    let dim = 24;
+    let vectors = crate::harness::unit_vectors(1_200, dim, 0x4A5E_7711);
+    let small_m_cfg = HnswConfig {
+        m: 4,
+        ef_construction: 24,
+        seed: 100,
+        build_mode: BuildMode::FixedOrder,
+        locality_order: super::super::config::LocalityOrder::None,
+    };
+    let dir = temp_dir("fixed-order-small-m");
+    let image = |tag: &str, batches: &[usize]| {
+        let mut index = HnswIndex::new(dim, small_m_cfg).unwrap();
+        let mut at = 0;
+        for &rows in batches {
+            index
+                .add(&vectors[at * dim..(at + rows) * dim], dim)
+                .unwrap();
+            at += rows;
+        }
+        let path = dir.join(tag);
+        index.write(&path).unwrap();
+        std::fs::read(&path).unwrap()
+    };
+    let once = image("a", &[1_200]);
+    assert_eq!(
+        once,
+        image("b", &[1_200]),
+        "two small-M FixedOrder builds differ"
+    );
+    assert_eq!(
+        once,
+        image("c", &[800, 300, 100]),
+        "batched small-M FixedOrder build differs"
+    );
+    let path_a = dir.join("a");
+    assert_eq!(
+        HnswIndex::load(&path_a).unwrap().unreachable_from_entry(),
+        0
+    );
+    assert_eq!(
+        HnswIndex::load_mapped(&path_a)
+            .unwrap()
+            .unreachable_from_entry(),
+        0
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn levels_are_geometric_capped_and_order_independent() {
     let mult = 1.0 / 16f64.ln();
     let mut counts = [0usize; 8];

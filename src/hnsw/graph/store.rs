@@ -325,10 +325,10 @@ impl Store {
         let range = 0..n as u32;
         if parallel {
             builder.insert_parallel(range);
-            super::super::repair::repair_connectivity(&builder);
         } else {
             builder.insert_sequential(range);
         }
+        super::super::repair::repair_connectivity(&builder);
         Ok(links)
     }
 
