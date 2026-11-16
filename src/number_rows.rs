@@ -1,5 +1,4 @@
-//! A number column sorted: the rows that hold a value, in value order
-//! (`docs/vector-filters.md`, "The mask from the columns").
+//! A number column sorted: the rows that hold a value, in value order.
 //!
 //! A number column stores one value per row, which answers "what does this
 //! row hold". A range filter asks "which rows hold a value in this range",

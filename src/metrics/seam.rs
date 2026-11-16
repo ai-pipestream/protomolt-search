@@ -28,7 +28,7 @@ pub fn inc_request(route: Route) {
 #[derive(Debug, Clone, Copy)]
 struct Nested;
 
-/// Mark `request` as already counted (see [`Nested`]).
+/// Mark `request` as already counted (see `Nested`).
 pub fn nested<T>(mut request: Request<T>) -> Request<T> {
     request.extensions_mut().insert(Nested);
     request
@@ -158,7 +158,7 @@ where
     }
 }
 
-/// A response stream carrying its request's [`Ticket`]; see
+/// A response stream carrying its request's `Ticket`; see
 /// [`timed_stream`]. A nested request's stream carries none.
 pub struct Timed<S> {
     inner: S,

@@ -47,7 +47,7 @@ fn encode(token: u64, opcode: u8, value: f32) -> [u8; FRAME_LEN] {
     frame
 }
 
-/// A signed datagram (docs/security.md): the plain frame, a 4-byte
+/// A signed datagram: the plain frame, a 4-byte
 /// sequence number, and a 16-byte HMAC-SHA256 tag over both. The
 /// receiver ignores a tag that does not verify and a sequence at or
 /// behind the newest it accepted for the stream, so a forged, damaged,

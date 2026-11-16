@@ -1,4 +1,4 @@
-//! The placement dry run (`docs/placement.md`, "The dry run"): what a
+//! The placement dry run: what a
 //! proposed tree would do to the rows a cluster holds, computed from
 //! filtered counts the shards already know how to answer.
 //!

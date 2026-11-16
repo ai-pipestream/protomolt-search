@@ -1,19 +1,17 @@
-//! Geo-point primitives: distances, regions, and resolved filters
-//! (`docs/geo-columns.md`).
+//! Geo-point primitives: distances, regions, and resolved filters.
 //!
 //! The engine owns geo PRIMITIVES — a coordinate is a column value, a
 //! region is a predicate over it, a distance is a monotone score
 //! transform. It does not own road networks: travel time and energy are
 //! an enrichment sidecar's job, and their outputs arrive back here as
-//! ordinary map-numeric columns keyed by anchor
-//! (`docs/plans/routing-enrichment.md`).
+//! ordinary map-numeric columns keyed by anchor.
 //!
 //! Two rules hold everywhere in this module and are pinned in tests:
 //!
 //! - **Edges belong to the region.** A point exactly on a bbox edge is
 //!   inside; a distance exactly equal to a radius is inside. Half-open
 //!   is the right rule for BUCKETS, which must partition without
-//!   double-counting (`docs/range-facets.md`); a filter partitions
+//!   double-counting; a filter partitions
 //!   nothing, so the surprising rule would be the exclusive one.
 //! - **Absence fails every filter.** A document with no point is not
 //!   inside any region. That is exact, not degradation.

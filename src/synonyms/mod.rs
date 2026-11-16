@@ -1,4 +1,4 @@
-//! Query-time synonyms and did-you-mean (`docs/synonyms.md`).
+//! Query-time synonyms and did-you-mean.
 //!
 //! A synonym rule is a line of words: symmetric (every word expands to
 //! every other) or one-way (`terms` expand to `to`). Rules are written
@@ -183,25 +183,7 @@ where
     let mut analyzed: Vec<AnalyzedRule> = Vec::new();
     if let (Some(table), false) = (table, table_off) {
         if !table.is_empty() {
-            let key = spec_key(spec);
-            let cached = table
-                .analyzed
-                .lock()
-                .expect("synonym cache lock")
-                .get(&key)
-                .cloned();
-            let rules = match cached {
-                Some(rules) => rules,
-                None => {
-                    let rules = analyze_rules(&table.rules, spec, analyze.clone()).await?;
-                    table
-                        .analyzed
-                        .lock()
-                        .expect("synonym cache lock")
-                        .insert(key, rules.clone());
-                    rules
-                }
-            };
+            let rules = table_rules(table, spec, analyze.clone()).await?;
             analyzed.extend(rules);
         }
     }
@@ -214,44 +196,7 @@ where
     let query: Vec<String> = terms.clone();
     let mut expansions = Vec::new();
     for (q_idx, term) in query.iter().enumerate() {
-        let mut added: Vec<String> = Vec::new();
-        for rule in &analyzed {
-            let single_matched = rule
-                .terms
-                .iter()
-                .any(|entry| entry.len() == 1 && entry[0] == *term);
-            let phrase_matched: Option<&[String]> = rule
-                .terms
-                .iter()
-                .find(|entry| {
-                    entry.len() >= 2
-                        && q_idx + entry.len() <= query.len()
-                        && query[q_idx..q_idx + entry.len()] == **entry
-                })
-                .map(|v| v.as_slice());
-
-            if !single_matched && phrase_matched.is_none() {
-                continue;
-            }
-            let sources: Vec<&Vec<String>> = if rule.to.is_empty() {
-                rule.terms
-                    .iter()
-                    .filter(|entry| {
-                        !(single_matched && entry.len() == 1 && entry[0] == *term)
-                            && phrase_matched.is_none_or(|pm| entry.as_slice() != pm)
-                    })
-                    .collect()
-            } else {
-                rule.to.iter().collect()
-            };
-            for entry in sources {
-                for t in entry {
-                    if t != term && !added.contains(t) {
-                        added.push(t.clone());
-                    }
-                }
-            }
-        }
+        let added = added_terms(&analyzed, &query, q_idx);
         if added.is_empty() {
             continue;
         }
@@ -269,6 +214,82 @@ where
         });
     }
     Ok(expansions)
+}
+
+/// The table's rules analyzed under `spec`, cached per analysis spec.
+async fn table_rules<F, Fut>(
+    table: &SynonymTable,
+    spec: Option<&AnalysisSpec>,
+    analyze: F,
+) -> Result<Vec<AnalyzedRule>, Status>
+where
+    F: Fn(String, Option<AnalysisSpec>) -> Fut + Clone,
+    Fut: std::future::Future<Output = Result<Vec<String>, Status>>,
+{
+    let key = spec_key(spec);
+    let cached = table
+        .analyzed
+        .lock()
+        .expect("synonym cache lock")
+        .get(&key)
+        .cloned();
+    let rules = match cached {
+        Some(rules) => rules,
+        None => {
+            let rules = analyze_rules(&table.rules, spec, analyze).await?;
+            table
+                .analyzed
+                .lock()
+                .expect("synonym cache lock")
+                .insert(key, rules.clone());
+            rules
+        }
+    };
+    Ok(rules)
+}
+
+/// The terms every matching rule adds for the query term at `q_idx`, each once.
+fn added_terms(analyzed: &[AnalyzedRule], query: &[String], q_idx: usize) -> Vec<String> {
+    let term = &query[q_idx];
+    let mut added: Vec<String> = Vec::new();
+    for rule in analyzed {
+        let single_matched = rule
+            .terms
+            .iter()
+            .any(|entry| entry.len() == 1 && entry[0] == *term);
+        let phrase_matched: Option<&[String]> = rule
+            .terms
+            .iter()
+            .find(|entry| {
+                entry.len() >= 2
+                    && q_idx + entry.len() <= query.len()
+                    && query[q_idx..q_idx + entry.len()] == **entry
+            })
+            .map(|v| v.as_slice());
+
+        if !single_matched && phrase_matched.is_none() {
+            continue;
+        }
+        let sources: Vec<&Vec<String>> = if rule.to.is_empty() {
+            rule.terms
+                .iter()
+                .filter(|entry| {
+                    !(single_matched && entry.len() == 1 && entry[0] == *term)
+                        && phrase_matched.is_none_or(|pm| entry.as_slice() != pm)
+                })
+                .collect()
+        } else {
+            rule.to.iter().collect()
+        };
+        for entry in sources {
+            for t in entry {
+                if t != term && !added.contains(t) {
+                    added.push(t.clone());
+                }
+            }
+        }
+    }
+    added
 }
 
 fn rule_phrase_label(analyzed: &[AnalyzedRule], query: &[String], q_idx: usize) -> Option<String> {
@@ -362,73 +383,4 @@ pub fn rank_candidates(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn edit_distance_counts_transpositions_as_one_and_respects_the_bound() {
-        assert_eq!(edit_distance("court", "court", 2), 0);
-        assert_eq!(edit_distance("court", "cuort", 2), 1, "a transposition");
-        assert_eq!(edit_distance("court", "cort", 2), 1, "a deletion");
-        assert_eq!(edit_distance("court", "courts", 2), 1, "an insertion");
-        assert_eq!(edit_distance("court", "coart", 2), 1, "a substitution");
-        assert_eq!(edit_distance("court", "cuorts", 2), 2);
-        assert_eq!(
-            edit_distance("court", "xxxxx", 2),
-            3,
-            "past the bound: bound + 1"
-        );
-        assert_eq!(edit_distance("", "ab", 1), 2);
-        assert_eq!(edit_distance("naïve", "naive", 1), 1, "chars, not bytes");
-    }
-
-    #[test]
-    fn candidates_rank_by_distance_then_df_then_term() {
-        let mut entries = BTreeMap::new();
-        entries.insert("court".to_string(), (50, 2));
-        entries.insert("courts".to_string(), (7, 1));
-        entries.insert("cort".to_string(), (7, 1));
-        entries.insert("coupon".to_string(), (90, 2));
-        entries.insert("cour".to_string(), (1, 1));
-        let ranked = rank_candidates("cuort", &entries, 2, 10);
-        let got: Vec<(&str, u32)> = ranked
-            .iter()
-            .map(|c| (c.term.as_str(), c.distance))
-            .collect();
-        // "cort" is one deletion away, like the transposition "court";
-        // "courts" (a transposition and an insertion) and "cour" (two
-        // deletions) are two, and df orders them.
-        assert_eq!(
-            got,
-            vec![("court", 1), ("cort", 1), ("courts", 2), ("cour", 2)],
-            "distance first, then df, then the term"
-        );
-        assert!(rank_candidates("court", &entries, 1, 10)
-            .iter()
-            .all(|c| c.term != "court"));
-    }
-
-    #[test]
-    fn rules_validate_by_shape() {
-        assert!(validate_rule(&SynonymRule {
-            terms: vec!["car".into()],
-            to: vec![],
-        })
-        .is_err());
-        assert!(validate_rule(&SynonymRule {
-            terms: vec![],
-            to: vec!["x".into()],
-        })
-        .is_err());
-        assert!(validate_rule(&SynonymRule {
-            terms: vec!["a".into(), " ".into()],
-            to: vec![],
-        })
-        .is_err());
-        assert!(validate_rule(&SynonymRule {
-            terms: vec!["car".into(), "automobile".into()],
-            to: vec![],
-        })
-        .is_ok());
-    }
-}
+mod tests;

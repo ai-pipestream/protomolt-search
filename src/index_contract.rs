@@ -6,36 +6,28 @@ use prost::Message;
 use tonic::Status;
 
 use crate::pb::{
-    IndexDefinition, MappedIndexContract, MappedKind as K, MappedPlan, MappedRole as R,
+    IndexDefinition, IndexProjection, MappedIndexContract, MappedKind as K, MappedPlan,
+    MappedRole as R,
 };
 
 fn invalid(message: &str) -> Status {
     Status::invalid_argument(format!("index contract: {message}"))
 }
 
-/// Check policy structure without claiming descriptor/type compatibility.
-/// The planner additionally resolves every path and validates its declared type.
-pub(crate) fn validate_definition(definition: &IndexDefinition) -> Result<(), Status> {
-    let mut previous: Option<&[u32]> = None;
-    let mut names = HashSet::new();
-    let mut ids = Vec::new();
-    let mut vectors = Vec::new();
-    let mut chunks = Vec::new();
-    let mut chunk_ids = Vec::new();
-    for projection in &definition.projections {
+/// Role-bearing paths and column names gathered while walking projections.
+#[derive(Default)]
+struct RolePaths<'a> {
+    names: HashSet<&'a str>,
+    ids: Vec<&'a [u32]>,
+    vectors: Vec<&'a [u32]>,
+    chunks: Vec<&'a [u32]>,
+    chunk_ids: Vec<&'a [u32]>,
+}
+
+impl<'a> RolePaths<'a> {
+    /// Check one projection's kind and role, recording its path under each role it holds.
+    fn admit(&mut self, projection: &'a IndexProjection) -> Result<(), Status> {
         let path = projection.field_numbers.as_slice();
-        if path.is_empty()
-            || path.len() > 9
-            || path
-                .iter()
-                .any(|&n| n == 0 || n > 536_870_911 || (19_000..20_000).contains(&n))
-            || previous.is_some_and(|p| p >= path)
-        {
-            return Err(invalid(
-                "field-number paths must be valid, unique and sorted",
-            ));
-        }
-        previous = Some(path);
         let kind = K::try_from(projection.kind).map_err(|_| invalid("unknown projection kind"))?;
         let role = R::try_from(projection.role).map_err(|_| invalid("unknown projection role"))?;
         if kind == K::Unspecified || (kind == K::Vector) != (projection.vector_dims > 0) {
@@ -47,11 +39,11 @@ pub(crate) fn validate_definition(definition: &IndexDefinition) -> Result<(), St
             if kind != K::Nested || !projection.column_name.is_empty() {
                 return Err(invalid("CHUNKS requires NESTED and no column name"));
             }
-            chunks.push(path);
+            self.chunks.push(path);
         } else {
             if matches!(kind, K::Object | K::Nested | K::Binary)
                 || projection.column_name.trim().is_empty()
-                || !names.insert(projection.column_name.as_str())
+                || !self.names.insert(projection.column_name.as_str())
             {
                 return Err(invalid(
                     "value projections require supported kinds and unique nonempty column names",
@@ -68,9 +60,9 @@ pub(crate) fn validate_definition(definition: &IndexDefinition) -> Result<(), St
                 ));
             }
             if role == R::DocId {
-                ids.push(path);
+                self.ids.push(path);
             } else {
-                chunk_ids.push(path);
+                self.chunk_ids.push(path);
             }
         }
         if kind == K::Vector {
@@ -84,24 +76,61 @@ pub(crate) fn validate_definition(definition: &IndexDefinition) -> Result<(), St
                     "vector projection conflicts with a structural role or built-in column",
                 ));
             }
-            vectors.push(path);
+            self.vectors.push(path);
         }
+        Ok(())
     }
-    if ids.len() != 1 || vectors.len() != 1 || chunks.len() > 1 || chunk_ids.len() > 1 {
-        return Err(invalid(
-            "one DOC_ID, one VECTOR and at most one CHUNKS/CHUNK_ID are required",
-        ));
+
+    /// Check role cardinalities and that identity/vector paths agree with the chunk scope.
+    fn check_scope(&self) -> Result<(), Status> {
+        let Self {
+            ids,
+            vectors,
+            chunks,
+            chunk_ids,
+            ..
+        } = self;
+        if ids.len() != 1 || vectors.len() != 1 || chunks.len() > 1 || chunk_ids.len() > 1 {
+            return Err(invalid(
+                "one DOC_ID, one VECTOR and at most one CHUNKS/CHUNK_ID are required",
+            ));
+        }
+        if let Some(chunks) = chunks.first() {
+            if ids[0].starts_with(chunks)
+                || !vectors[0].starts_with(chunks)
+                || chunk_ids.iter().any(|path| !path.starts_with(chunks))
+            {
+                return Err(invalid("identity/vector paths contradict the chunk scope"));
+            }
+        } else if !chunk_ids.is_empty() {
+            return Err(invalid("CHUNK_ID requires a CHUNKS scope"));
+        }
+        Ok(())
     }
-    if let Some(chunks) = chunks.first() {
-        if ids[0].starts_with(chunks)
-            || !vectors[0].starts_with(chunks)
-            || chunk_ids.iter().any(|path| !path.starts_with(chunks))
+}
+
+/// Check policy structure without claiming descriptor/type compatibility.
+/// The planner additionally resolves every path and validates its declared type.
+pub(crate) fn validate_definition(definition: &IndexDefinition) -> Result<(), Status> {
+    let mut previous: Option<&[u32]> = None;
+    let mut roles = RolePaths::default();
+    for projection in &definition.projections {
+        let path = projection.field_numbers.as_slice();
+        if path.is_empty()
+            || path.len() > 9
+            || path
+                .iter()
+                .any(|&n| n == 0 || n > 536_870_911 || (19_000..20_000).contains(&n))
+            || previous.is_some_and(|p| p >= path)
         {
-            return Err(invalid("identity/vector paths contradict the chunk scope"));
+            return Err(invalid(
+                "field-number paths must be valid, unique and sorted",
+            ));
         }
-    } else if !chunk_ids.is_empty() {
-        return Err(invalid("CHUNK_ID requires a CHUNKS scope"));
+        previous = Some(path);
+        roles.admit(projection)?;
     }
+    roles.check_scope()?;
     for pair in definition.projections.windows(2) {
         if pair[1].field_numbers.starts_with(&pair[0].field_numbers)
             && pair[0].role != R::Chunks as i32

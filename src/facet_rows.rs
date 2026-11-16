@@ -1,5 +1,4 @@
-//! A facet column inverted: for each value ordinal, the rows that hold it
-//! (`docs/vector-filters.md`, "The mask from the columns").
+//! A facet column inverted: for each value ordinal, the rows that hold it.
 //!
 //! A facet column stores one ordinal per row, which answers "what does this
 //! row hold". A filter asks the other question, "which rows hold this
@@ -9,7 +8,7 @@
 //! kept, since a sealed part never changes.
 //!
 //! A value held by few rows keeps them as a sorted list; a value held by at
-//! least one row in [`DENSE_ONE_IN`] keeps a bitmap, so a union over a
+//! least one row in `DENSE_ONE_IN` keeps a bitmap, so a union over a
 //! popular value is a pass over words, not over rows. At most
 //! `DENSE_ONE_IN` values can be that popular, which bounds the whole
 //! structure at 4 bytes per row for the lists, plus `rows / 8` bytes per
