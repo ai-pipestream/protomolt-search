@@ -101,7 +101,6 @@ const fn base(module: &'static str) -> ModuleAllowance {
 pub(crate) const RATCHET: &[ModuleAllowance] = &[
     base("crates/protomolt-search-embedded/tests/dependency_gate").comments(1, 0),
     base("crates/protomolt-search-embedded/tests/document_grants").test_fn_lines(126, 1),
-    base("src/bin/console").comments(1, 0),
     base("src/boolean_bits").comments(3, 0),
     base("src/calendar").comments(1, 0),
     base("src/capacity_tiers").comments(1, 1),
@@ -115,29 +114,20 @@ pub(crate) const RATCHET: &[ModuleAllowance] = &[
         .test_fn_lines(130, 1)
         .comments(8, 0),
     base("src/coordinator")
-        .fn_lines(455, 37)
-        .test_fn_lines(177, 4)
+        .fn_lines(273, 28)
+        .test_fn_lines(177, 2)
         .params(11, 5)
         .allows(5, 0),
     base("src/demo").comments(1, 0),
-    base("src/document_catalog")
-        .fn_lines(275, 6)
-        .test_fn_lines(253, 3)
-        .comments(3, 0),
     base("src/facet_rows").comments(1, 0),
     base("src/geo").comments(3, 0),
-    base("src/hnsw")
-        .fn_lines(409, 11)
-        .params(14, 7)
-        .allows(7, 1)
-        .comments(9, 0),
+    base("src/hnsw").params(14, 2).allows(2, 0),
     base("src/index_contract").fn_lines(98, 1),
     base("src/index_definition").fn_lines(128, 1),
     base("src/link").comments(1, 0),
     base("src/live_docs").comments(1, 0),
-    base("src/main").fn_lines(602, 3).comments(10, 0),
     base("src/node")
-        .fn_lines(854, 35)
+        .fn_lines(389, 34)
         .test_fn_lines(230, 1)
         .params(14, 5)
         .allows(5, 0)
@@ -148,30 +138,13 @@ pub(crate) const RATCHET: &[ModuleAllowance] = &[
     base("src/query_disclosure")
         .fn_lines(115, 1)
         .test_fn_lines(151, 1),
-    base("src/raft")
-        .test_fn_lines(206, 4)
-        .params(10, 1)
-        .allows(1, 0)
-        .comments(2, 0),
+    base("src/raft").params(10, 1).allows(1, 0),
     base("src/schema_report").fn_lines(118, 3),
-    base("src/segmented").fn_lines(125, 2).comments(6, 0),
-    base("src/segmented_vectors").comments(1, 0),
-    base("src/segments")
-        .fn_lines(248, 7)
-        .test_fn_lines(260, 1)
-        .params(8, 2)
-        .allows(2, 0)
-        .comments(12, 0),
+    base("src/segments").params(8, 1).allows(1, 0),
     base("src/sha256").comments(1, 0),
     base("src/sortkeys").comments(1, 0),
-    base("src/source_authority")
-        .fn_lines(233, 15)
-        .test_fn_lines(197, 6)
-        .allows(1, 0)
-        .comments(12, 0),
     base("src/source_owner").fn_lines(83, 1),
     base("src/stats_cache").comments(1, 0),
     base("src/stream_signal").comments(1, 0),
     base("src/synonyms").fn_lines(107, 1).comments(1, 0),
-    base("src/turbo_bridge").fn_lines(184, 1),
 ];

@@ -314,8 +314,9 @@ analysis service on real chunks, relative to a term-vectors-only pass:
 - roughly fourteen times: coreference resolution
 
 So the cheap layers can ride the rebuild without changing its shape,
-while the expensive ones are their own decision and probably their own
-pass. TODO: which set the rebuild actually enables.
+while the expensive ones remain an explicit per-corpus choice and
+typically warrant a separate pass; which subset a given rebuild enables
+is left to corpus policy rather than fixed by the engine.
 
 Two constraints on the design, both learned rather than assumed. First,
 annotations must be keyed by stable document identity (source document
@@ -325,11 +326,11 @@ a failed annotation write must not fail the index build, but it also
 must not vanish: coverage belongs in the ledger so that "which chunks
 lack annotations" is a question with an answer.
 
-TODO: the integration is planned but not wired, the proto shape is
-expected to change, and the bulk-analytics access pattern (counting
-across the corpus rather than fetching one document) is unsolved. A
-per-document object store answers the second question well and the
-first one badly.
+Repo-side annotation persistence is not wired into the serving pipeline,
+its wire schema remains open to revision, and the bulk-analytics access
+pattern (counting across the corpus rather than fetching one document)
+remains an open storage tradeoff: a per-document object store serves
+point fetches well and corpus-wide scans poorly.
 
 ## 9. Protocols, briefly
 
