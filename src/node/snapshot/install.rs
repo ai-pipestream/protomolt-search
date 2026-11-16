@@ -12,6 +12,16 @@ mod segment_prepare;
 use image_prepare::{check_pending_compaction, PreparedImage};
 use segment_prepare::{PreparedSegments, SegmentPaths};
 
+/// Write and sync the retained-vector declaration beside its payload file.
+async fn write_retained_declaration(declaration: &[u8], payload: &Path) -> Result<(), Status> {
+    use tokio::io::AsyncWriteExt;
+    let io_err = |e: std::io::Error| Status::internal(format!("snapshot receive: {e}"));
+    let path = crate::multi_res_storage::declaration_path(payload);
+    let mut file = tokio::fs::File::create(path).await.map_err(io_err)?;
+    file.write_all(declaration).await.map_err(io_err)?;
+    file.sync_all().await.map_err(io_err)
+}
+
 impl NodeServiceImpl {
     /// Receive one snapshot image into the staging generation directory
     /// (`vector.index`, `vectors.f32`, `documents.bm25`, and `live-docs.bin`
@@ -92,12 +102,7 @@ impl NodeServiceImpl {
             file.sync_all().await.map_err(io_err)?;
         }
         if manifest.multi_res_vector_bytes > 0 {
-            let path = crate::multi_res_storage::declaration_path(&paths[4]);
-            let mut file = tokio::fs::File::create(path).await.map_err(io_err)?;
-            file.write_all(&manifest.multi_res_declaration)
-                .await
-                .map_err(io_err)?;
-            file.sync_all().await.map_err(io_err)?;
+            write_retained_declaration(&manifest.multi_res_declaration, &paths[4]).await?;
         }
         Ok(())
     }

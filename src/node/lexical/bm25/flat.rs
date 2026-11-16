@@ -134,15 +134,16 @@ impl FlatRun<'_> {
             return Ok(self.empty_facets());
         };
         let columns = ShardNumericRead(store);
-        let (facets, range_facets, stats, distinct) = store.count_facets(
-            &[(flat_index(store, masked)?, &req.terms)],
-            &req.facet_fields,
-            &req.map_facet_fields,
-            &req.range_facet_fields,
-            &req.stats_fields,
-            &req.cardinality_fields,
-            filter.map(|filter| (filter, &columns as &dyn NumericRead)),
-        )?;
+        let (facets, range_facets, stats, distinct) =
+            store.count_facets(crate::node::shard::FacetCountRequest {
+                views: &[(flat_index(store, masked)?, &req.terms)],
+                facet_fields: &req.facet_fields,
+                map_facet_fields: &req.map_facet_fields,
+                range_facet_fields: &req.range_facet_fields,
+                stats_fields: &req.stats_fields,
+                cardinality_fields: &req.cardinality_fields,
+                filter: filter.map(|filter| (filter, &columns as &dyn NumericRead)),
+            })?;
         Ok(Bm25QueryResponse {
             facets,
             range_facets,

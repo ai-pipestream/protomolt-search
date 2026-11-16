@@ -1,13 +1,17 @@
 use super::*;
 use crate::pb::{DocumentIdentity, ProtobufSource};
 use crate::segments::{SegmentCatalog, SegmentGenerationDeclaration, SegmentSourceOwner};
+use crate::vector::VectorBackendConfig;
 
-#[tokio::test]
-async fn mixed_vectors_typed_values_and_lattice_splade_survive_bounded_rebuilding() {
-    let directory = Directory::create(&std::env::temp_dir()).unwrap();
-    let root = directory.0.join("catalog");
-    let catalog = SegmentCatalog::open(&root).unwrap();
-    let config = NodeConfig {
+struct Inputs<'a> {
+    directory: &'a Path,
+    catalog: &'a SegmentCatalog,
+    config: &'a NodeConfig,
+    backend: &'a VectorBackendConfig,
+}
+
+fn config() -> NodeConfig {
+    NodeConfig {
         collection: "books".into(),
         wal: false,
         bm25_fields: vec!["body".into(), "empty".into()],
@@ -23,77 +27,82 @@ async fn mixed_vectors_typed_values_and_lattice_splade_survive_bounded_rebuildin
         map_integer_fields: vec!["signed_map".into()],
         map_unsigned_integer_fields: vec!["unsigned_map".into()],
         ..Default::default()
+    }
+}
+
+fn analyzed(id: u32) -> AnalyzedDoc {
+    AnalyzedDoc {
+        fields: vec![
+            AnalyzedField {
+                terms: vec![("red".into(), 2, vec![(0, 3), (4, 7)])],
+                length: 2,
+                splade: vec![("neural".into(), 200)],
+                splade_scale_bits: (0.01_f32 * (id + 1) as f32).to_bits(),
+                positions: Some(vec![vec![0, 2]]),
+                pos_lengths: Some(vec![vec![2, 1]]),
+                sentences: Some(vec![(0, 7)]),
+            },
+            AnalyzedField::default(),
+        ],
+        ..Default::default()
+    }
+}
+
+/// Row `row` of a source segment: document `id` with a value in every typed
+/// column kind, so each kind crosses the rebuild.
+fn add_row(store: &mut Bm25Store, row: u32, id: u32) {
+    store.add_document(row, "red red".into(), analyzed(id));
+    let identity = DocumentIdentity {
+        document_key: format!("key-{id}").into_bytes(),
+        version: 7,
+        chunk_ordinal: Some(0),
     };
-    let sample: Vec<f32> = (0..64).map(|i| (i as f32 * 0.3).sin()).collect();
-    let backend = VectorIndex::fit_backend_config(&config.vector_backend, 8, 4, &sample).unwrap();
-    let mut base = 0;
-    for (segment, (count, has_vectors)) in [(3, true), (2, false), (2, true), (2, true)]
-        .into_iter()
-        .enumerate()
-    {
-        let path = directory.0.join(format!("source-{segment}"));
+    let source = ProtobufSource {
+        descriptor_set: include_bytes!(
+            "../../../../tests/fixtures/unsigned-mapping/descriptor.bin"
+        )
+        .to_vec(),
+        message_type: "unsigned_mapping.Parent".into(),
+        payload: [
+            vec![9],
+            (id as u64).to_le_bytes().to_vec(),
+            vec![0xa0, 6, 0x81, 0],
+        ]
+        .concat(),
+    };
+    store
+        .source_archive_mut()
+        .attach_source_with_identity(row, &source, Some(0), Some(&identity))
+        .unwrap();
+    store.set_facet(0, row, "");
+    store.set_numeric(0, row, -0.0);
+    store.set_integer(0, row, i64::MIN);
+    if id != 4 {
+        store.set_unsigned_integer(0, row, if id == 3 { 0 } else { u64::MAX });
+    }
+    store.set_geo(0, row, -0.0, 2.0);
+    store.set_map_facet(0, row, "", "");
+    store.set_map_numeric(0, row, "", -0.0);
+    store.set_map_integer(0, row, "", i64::MIN).unwrap();
+    store
+        .set_map_unsigned_integer(0, row, "", u64::MAX)
+        .unwrap();
+}
+
+impl Inputs<'_> {
+    /// Write and append source segment `segment`, rows `base..base + count`.
+    fn write_segment(&self, segment: usize, count: u32, has_vectors: bool, base: u32) {
+        let (config, backend) = (self.config, self.backend);
+        let path = self.directory.join(format!("source-{segment}"));
         std::fs::create_dir(&path).unwrap();
-        let mut store = heap_store(&config).unwrap();
+        let mut store = heap_store(config).unwrap();
         store.set_analysis_fingerprint(0, 11).unwrap();
         store.set_analysis_fingerprint(1, 22).unwrap();
         let mut vectors = Vec::new();
         let mut live = LiveDocs::default();
         for row in 0..count {
             let id = base + row;
-            store.add_document(
-                row,
-                "red red".into(),
-                AnalyzedDoc {
-                    fields: vec![
-                        AnalyzedField {
-                            terms: vec![("red".into(), 2, vec![(0, 3), (4, 7)])],
-                            length: 2,
-                            splade: vec![("neural".into(), 200)],
-                            splade_scale_bits: (0.01_f32 * (id + 1) as f32).to_bits(),
-                            positions: Some(vec![vec![0, 2]]),
-                            pos_lengths: Some(vec![vec![2, 1]]),
-                            sentences: Some(vec![(0, 7)]),
-                        },
-                        AnalyzedField::default(),
-                    ],
-                    ..Default::default()
-                },
-            );
-            let identity = DocumentIdentity {
-                document_key: format!("key-{id}").into_bytes(),
-                version: 7,
-                chunk_ordinal: Some(0),
-            };
-            let source = ProtobufSource {
-                descriptor_set: include_bytes!(
-                    "../../../../tests/fixtures/unsigned-mapping/descriptor.bin"
-                )
-                .to_vec(),
-                message_type: "unsigned_mapping.Parent".into(),
-                payload: [
-                    vec![9],
-                    (id as u64).to_le_bytes().to_vec(),
-                    vec![0xa0, 6, 0x81, 0],
-                ]
-                .concat(),
-            };
-            store
-                .source_archive_mut()
-                .attach_source_with_identity(row, &source, Some(0), Some(&identity))
-                .unwrap();
-            store.set_facet(0, row, "");
-            store.set_numeric(0, row, -0.0);
-            store.set_integer(0, row, i64::MIN);
-            if id != 4 {
-                store.set_unsigned_integer(0, row, if id == 3 { 0 } else { u64::MAX });
-            }
-            store.set_geo(0, row, -0.0, 2.0);
-            store.set_map_facet(0, row, "", "");
-            store.set_map_numeric(0, row, "", -0.0);
-            store.set_map_integer(0, row, "", i64::MIN).unwrap();
-            store
-                .set_map_unsigned_integer(0, row, "", u64::MAX)
-                .unwrap();
+            add_row(&mut store, row, id);
             vectors.extend((0..8).map(|d| (id as f32 + d as f32) / 8.0));
             if id == 1 {
                 live.delete(row as usize);
@@ -103,7 +112,7 @@ async fn mixed_vectors_typed_values_and_lattice_splade_survive_bounded_rebuildin
         live.write(&path.join("live-docs.bin"), count as u64)
             .unwrap();
         if has_vectors {
-            let mut provider = VectorIndex::from_backend_config(8, &backend).unwrap();
+            let mut provider = VectorIndex::from_backend_config(8, backend).unwrap();
             provider.add(&vectors, 8).unwrap();
             provider.prepare().unwrap();
             provider.write(&path.join("vector.index")).unwrap();
@@ -112,7 +121,7 @@ async fn mixed_vectors_typed_values_and_lattice_splade_survive_bounded_rebuildin
                 .write(&path.join("vectors.f32"))
                 .unwrap();
         }
-        catalog
+        self.catalog
             .append(SegmentSource {
                 multi_res_path: None,
                 segment_id: &format!("input-{segment}"),
@@ -126,8 +135,11 @@ async fn mixed_vectors_typed_values_and_lattice_splade_survive_bounded_rebuildin
                 partition_column: None,
             })
             .unwrap();
-        base += count;
     }
+}
+
+/// Mark the catalog as the owned, declared generation a rewrite requires.
+fn declare_owned_generation(catalog: &SegmentCatalog, root: &Path, backend: VectorBackendConfig) {
     let mut manifest = catalog.snapshot().published_manifest();
     manifest.format = 4;
     manifest.source_owner = Some(
@@ -150,6 +162,75 @@ async fn mixed_vectors_typed_values_and_lattice_splade_survive_bounded_rebuildin
         serde_json::to_vec(&manifest).unwrap(),
     )
     .unwrap();
+}
+
+fn output_sources<'a>(
+    builder: &'a Builder<'_>,
+    paths: &'a [[PathBuf; 4]],
+    node: &'a NodeServiceImpl,
+    generation: u64,
+) -> Vec<SegmentSource<'a>> {
+    builder
+        .outputs
+        .iter()
+        .zip(paths)
+        .map(|(o, p)| SegmentSource {
+            multi_res_path: None,
+            segment_id: &o.id,
+            generation,
+            base_label: o.base,
+            backend_kind: &node.config.vector_backend,
+            vector_path: o.vector.then_some(p[0].as_path()),
+            exact_vector_path: o.vector.then_some(p[1].as_path()),
+            bm25_path: &p[2],
+            live_docs_path: &p[3],
+            partition_column: None,
+        })
+        .collect()
+}
+
+fn assert_rebuilt(before: &OpenedSegmentSet, after: &OpenedSegmentSet) {
+    assert_eq!(after.bm25(1).unsigned_integer_value(0, 0), Some(0));
+    assert_eq!(after.bm25(1).unsigned_integer_value(0, 1), None);
+    assert_eq!(
+        after.bm25(0).numeric_value(0, 0).unwrap().to_bits(),
+        (-0.0f64).to_bits()
+    );
+    assert_eq!(
+        after.bm25(2).document_identity(3).unwrap().document_key,
+        b"key-8"
+    );
+    assert!(after.exact_vectors(1).is_none());
+    assert!(before.bm25(0).field(0).has_splade());
+    assert!(
+        after.bm25(0).field(0).has_splade(),
+        "online rebuild erased SPLADE column"
+    );
+}
+
+#[tokio::test]
+async fn mixed_vectors_typed_values_and_lattice_splade_survive_bounded_rebuilding() {
+    let directory = Directory::create(&std::env::temp_dir()).unwrap();
+    let root = directory.0.join("catalog");
+    let catalog = SegmentCatalog::open(&root).unwrap();
+    let config = config();
+    let sample: Vec<f32> = (0..64).map(|i| (i as f32 * 0.3).sin()).collect();
+    let backend = VectorIndex::fit_backend_config(&config.vector_backend, 8, 4, &sample).unwrap();
+    let inputs = Inputs {
+        directory: &directory.0,
+        catalog: &catalog,
+        config: &config,
+        backend: &backend,
+    };
+    let mut base = 0;
+    for (segment, (count, has_vectors)) in [(3, true), (2, false), (2, true), (2, true)]
+        .into_iter()
+        .enumerate()
+    {
+        inputs.write_segment(segment, count, has_vectors, base);
+        base += count;
+    }
+    declare_owned_generation(&catalog, &root, backend);
     let before = Arc::new(OpenedSegmentSet::open(root).unwrap());
     let node = NodeServiceImpl::new(None, config);
     let request = CompactDocumentIndexRequest {
@@ -192,44 +273,12 @@ async fn mixed_vectors_typed_values_and_lattice_splade_survive_bounded_rebuildin
     let staged = catalog
         .stage_maintenance(
             before.clone(),
-            builder
-                .outputs
-                .iter()
-                .zip(&paths)
-                .map(|(o, p)| SegmentSource {
-                    multi_res_path: None,
-                    segment_id: &o.id,
-                    generation: before.epoch() + 1,
-                    base_label: o.base,
-                    backend_kind: &node.config.vector_backend,
-                    vector_path: o.vector.then_some(p[0].as_path()),
-                    exact_vector_path: o.vector.then_some(p[1].as_path()),
-                    bm25_path: &p[2],
-                    live_docs_path: &p[3],
-                    partition_column: None,
-                })
-                .collect(),
+            output_sources(&builder, &paths, &node, before.epoch() + 1),
         )
         .unwrap();
     let proof = before
         .verify_source_rewrite(staged.snapshot(), &directory.0.join("proof"), 2)
         .unwrap();
     assert_eq!(proof.live_rows, 8);
-    let after = staged.snapshot();
-    assert_eq!(after.bm25(1).unsigned_integer_value(0, 0), Some(0));
-    assert_eq!(after.bm25(1).unsigned_integer_value(0, 1), None);
-    assert_eq!(
-        after.bm25(0).numeric_value(0, 0).unwrap().to_bits(),
-        (-0.0f64).to_bits()
-    );
-    assert_eq!(
-        after.bm25(2).document_identity(3).unwrap().document_key,
-        b"key-8"
-    );
-    assert!(after.exact_vectors(1).is_none());
-    assert!(before.bm25(0).field(0).has_splade());
-    assert!(
-        after.bm25(0).field(0).has_splade(),
-        "online rebuild erased SPLADE column"
-    );
+    assert_rebuilt(&before, staged.snapshot());
 }

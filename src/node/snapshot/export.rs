@@ -51,6 +51,120 @@ pub(in crate::node) async fn stream_file(
 /// [`crate::MAX_MESSAGE_BYTES`] while amortizing per-message overhead.
 pub const SNAPSHOT_STREAM_CHUNK: usize = 1024 * 1024;
 
+/// The serving catalog's published artifacts and the standalone images
+/// that still belong to a segmented generation, as `(snapshot name, path)`.
+fn segment_sources(
+    guard: &ShardState,
+    index_path: &Path,
+) -> Result<Vec<(String, PathBuf)>, Status> {
+    let mut sources: Vec<(String, PathBuf)> = Vec::new();
+    let root = segments_root(index_path);
+    let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
+        return Err(Status::internal("segment snapshot has no serving catalog"));
+    };
+    sources.push((
+        format!("{CATALOG_DIR}/segments.json"),
+        root.join("segments.json"),
+    ));
+    // Compaction can stage new segments while the serving catalog is
+    // pinned. Copy only its published artifacts, never staging files or
+    // retired segments discovered by walking the directory tree.
+    for metadata in &shard.snapshot().manifest().segments {
+        let directory = format!("segments/{}", metadata.segment_id);
+        sources.push((
+            format!("{CATALOG_DIR}/{directory}/segment.json"),
+            root.join(&directory).join("segment.json"),
+        ));
+        for artifact in [
+            Some(&metadata.vector),
+            Some(&metadata.exact_vectors),
+            Some(&metadata.bm25),
+            Some(&metadata.live_docs),
+            metadata.multi_res.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !artifact.file.is_empty() {
+                let name = format!("{directory}/{}", artifact.file);
+                sources.push((format!("{CATALOG_DIR}/{name}"), root.join(name)));
+            }
+        }
+    }
+    for (name, path) in [
+        ("vector.index", index_path.to_path_buf()),
+        ("vectors.f32", exact_vector_sidecar_path(index_path)),
+        ("live-docs.bin", live_docs_sidecar_path(index_path)),
+    ] {
+        if name == "vectors.f32" && guard.index.as_ref().is_some_and(VectorIndex::is_empty) {
+            continue;
+        }
+        // A standalone image from before the first seal is obsolete
+        // once sealed vector images define the serving generation.
+        if (name == "vector.index" || name == "vectors.f32")
+            && matches!(guard.bm25.as_ref(), Some(Bm25Shard::Segmented(shard))
+                if (0..shard.snapshot().len()).any(|i| shard.snapshot().vector(i).is_some()))
+        {
+            continue;
+        }
+        if path.is_file() {
+            sources.push((name.to_string(), path));
+        }
+    }
+    Ok(sources)
+}
+
+/// The single-image generation's files that exist, as `(snapshot name, path)`.
+fn image_sources(guard: &ShardState, index_path: &Path) -> Vec<(String, PathBuf)> {
+    let mut sources: Vec<(String, PathBuf)> = Vec::new();
+    let (vector, exact, bm25) = storage_paths(index_path, guard.generation.as_ref());
+    let live = live_docs_storage_path(index_path, guard.generation.as_ref());
+    let retained = crate::multi_res::storage_path(index_path, guard.generation.as_ref());
+    for (name, path) in [
+        ("vector.index", vector),
+        ("vectors.f32", exact),
+        ("documents.bm25", bm25),
+        ("live-docs.bin", live),
+        (
+            "vectors.multi.json",
+            crate::multi_res_storage::declaration_path(&retained),
+        ),
+        ("vectors.multi", retained),
+    ] {
+        if path.is_file() {
+            sources.push((name.to_string(), path));
+        }
+    }
+    sources
+}
+
+/// Copy and hash every source into `directory`, then fsync each directory
+/// written. Returns the artifacts and their total bytes.
+fn copy_sources(
+    sources: &[(String, PathBuf)],
+    directory: &Path,
+) -> Result<(Vec<repo::Artifact>, u64), Status> {
+    let mut artifacts = Vec::with_capacity(sources.len());
+    let mut bytes = 0u64;
+    for (name, source) in sources {
+        let artifact = repo::copy_and_hash(source, &directory.join(name), name)
+            .map_err(|e| Status::internal(format!("copy {}: {e}", source.display())))?;
+        bytes += artifact.bytes;
+        artifacts.push(artifact);
+    }
+    let mut synced = std::collections::BTreeSet::new();
+    for artifact in &artifacts {
+        let path = directory.join(&artifact.file);
+        if let Some(parent) = path.parent() {
+            if synced.insert(parent.to_path_buf()) {
+                crate::postings::fsync_parent(&path)
+                    .map_err(|e| Status::internal(format!("fsync {}: {e}", parent.display())))?;
+            }
+        }
+    }
+    Ok((artifacts, bytes))
+}
+
 impl NodeServiceImpl {
     /// The layout the shard's files form: the segment catalog, or one
     /// image plus sidecars (an installed generation is always the latter).
@@ -179,101 +293,12 @@ impl NodeServiceImpl {
     ) -> Result<(RepositoryManifest, u64), Status> {
         guard.check_legacy_mutation()?;
         let layout = Self::served_layout(guard);
-        let mut sources: Vec<(String, PathBuf)> = Vec::new();
-        if layout == LAYOUT_SEGMENTS {
-            let root = segments_root(index_path);
-            let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
-                return Err(Status::internal("segment snapshot has no serving catalog"));
-            };
-            sources.push((
-                format!("{CATALOG_DIR}/segments.json"),
-                root.join("segments.json"),
-            ));
-            // Compaction can stage new segments while the serving catalog is
-            // pinned. Copy only its published artifacts, never staging files or
-            // retired segments discovered by walking the directory tree.
-            for metadata in &shard.snapshot().manifest().segments {
-                let directory = format!("segments/{}", metadata.segment_id);
-                sources.push((
-                    format!("{CATALOG_DIR}/{directory}/segment.json"),
-                    root.join(&directory).join("segment.json"),
-                ));
-                for artifact in [
-                    Some(&metadata.vector),
-                    Some(&metadata.exact_vectors),
-                    Some(&metadata.bm25),
-                    Some(&metadata.live_docs),
-                    metadata.multi_res.as_ref(),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    if !artifact.file.is_empty() {
-                        let name = format!("{directory}/{}", artifact.file);
-                        sources.push((format!("{CATALOG_DIR}/{name}"), root.join(name)));
-                    }
-                }
-            }
-            for (name, path) in [
-                ("vector.index", index_path.to_path_buf()),
-                ("vectors.f32", exact_vector_sidecar_path(index_path)),
-                ("live-docs.bin", live_docs_sidecar_path(index_path)),
-            ] {
-                if name == "vectors.f32" && guard.index.as_ref().is_some_and(VectorIndex::is_empty)
-                {
-                    continue;
-                }
-                // A standalone image from before the first seal is obsolete
-                // once sealed vector images define the serving generation.
-                if (name == "vector.index" || name == "vectors.f32")
-                    && matches!(guard.bm25.as_ref(), Some(Bm25Shard::Segmented(shard))
-                        if (0..shard.snapshot().len()).any(|i| shard.snapshot().vector(i).is_some()))
-                {
-                    continue;
-                }
-                if path.is_file() {
-                    sources.push((name.to_string(), path));
-                }
-            }
+        let sources = if layout == LAYOUT_SEGMENTS {
+            segment_sources(guard, index_path)?
         } else {
-            let (vector, exact, bm25) = storage_paths(index_path, guard.generation.as_ref());
-            let live = live_docs_storage_path(index_path, guard.generation.as_ref());
-            let retained = crate::multi_res::storage_path(index_path, guard.generation.as_ref());
-            for (name, path) in [
-                ("vector.index", vector),
-                ("vectors.f32", exact),
-                ("documents.bm25", bm25),
-                ("live-docs.bin", live),
-                (
-                    "vectors.multi.json",
-                    crate::multi_res_storage::declaration_path(&retained),
-                ),
-                ("vectors.multi", retained),
-            ] {
-                if path.is_file() {
-                    sources.push((name.to_string(), path));
-                }
-            }
-        }
-        let mut artifacts = Vec::with_capacity(sources.len());
-        let mut bytes = 0u64;
-        for (name, source) in &sources {
-            let artifact = repo::copy_and_hash(source, &directory.join(name), name)
-                .map_err(|e| Status::internal(format!("copy {}: {e}", source.display())))?;
-            bytes += artifact.bytes;
-            artifacts.push(artifact);
-        }
-        let mut synced = std::collections::BTreeSet::new();
-        for artifact in &artifacts {
-            let path = directory.join(&artifact.file);
-            if let Some(parent) = path.parent() {
-                if synced.insert(parent.to_path_buf()) {
-                    crate::postings::fsync_parent(&path).map_err(|e| {
-                        Status::internal(format!("fsync {}: {e}", parent.display()))
-                    })?;
-                }
-            }
-        }
+            image_sources(guard, index_path)
+        };
+        let (artifacts, bytes) = copy_sources(&sources, directory)?;
         let (backend_kind, scoring_fingerprint, dim) = match guard.index.as_ref() {
             Some(index) => {
                 let descriptor = index.descriptor();
@@ -293,7 +318,7 @@ impl NodeServiceImpl {
             });
         Ok((
             RepositoryManifest {
-                format_version: if artifacts.iter().any(|artifact: &repo::Artifact| {
+                format_version: if artifacts.iter().any(|artifact| {
                     artifact.file == "vectors.multi" || artifact.file.ends_with("/vectors.multi")
                 }) {
                     repo::RETAINED_FORMAT_VERSION
