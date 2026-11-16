@@ -49,10 +49,9 @@ pub struct ScanStats {
     /// the caller does with them.
     pub floors_offered: u64,
     /// Floors the caller actually put on the wire, which is what
-    /// `--floor-warmup-chunks` and `--floor-min-interval-ms` move. It was
-    /// once the same counter as `floors_offered`, so a knob that
-    /// suppressed nine tenths of the broadcasts read as having done
-    /// nothing at all.
+    /// `--floor-warmup-chunks` and `--floor-min-interval-ms` move. Kept
+    /// apart from `floors_offered` so a knob that suppresses nine tenths
+    /// of the broadcasts shows up as having done so.
     pub floors_published: u64,
     /// Chunks that ran with an external (coordinator-pushed) floor in effect.
     pub floor_updates_applied: u64,
@@ -131,6 +130,48 @@ fn masked_rows(allow: &[bool], start: usize, end: usize) -> usize {
     rows
 }
 
+/// Mark the chunk's allowed slots in `mask`, returning how many rows the
+/// kernel streams. A chunk in which the filters allow nothing is skipped
+/// outright (`None`): no kernel call, no candidates, and nothing to
+/// publish. This is where a selective filter pays for itself, above the
+/// kernel's own all-masked block short-circuit.
+///
+/// `mask[start..end]` must be all false on entry: a bitmap sets only its
+/// allowed slots, read a word at a time, so the allowlist is never
+/// expanded beyond the chunk being scanned.
+fn fill_mask(
+    mask: &mut [bool],
+    allow: Option<Mask<'_>>,
+    start: usize,
+    end: usize,
+) -> Option<usize> {
+    match allow {
+        None | Some(Mask::All(_)) => {
+            mask[start..end].fill(true);
+            Some(end - start)
+        }
+        Some(allow) if !allow.any_in(start, end) => None,
+        Some(Mask::Bools(a)) => {
+            mask[start..end].copy_from_slice(&a[start..end]);
+            Some(masked_rows(a, start, end))
+        }
+        Some(allow) => {
+            let mut rows = 0;
+            let mut counted = None;
+            allow.for_each_in(start, end, |slot| {
+                mask[slot] = true;
+                let block = (slot - start) / BLOCK_VECTORS;
+                if counted != Some(block) {
+                    counted = Some(block);
+                    let block_start = start + block * BLOCK_VECTORS;
+                    rows += (block_start + BLOCK_VECTORS).min(end) - block_start;
+                }
+            });
+            Some(rows)
+        }
+    }
+}
+
 /// `true` when `a` ranks ahead of `b` in top-k order: score descending,
 /// ties broken by ascending slot (deterministic, matches the coordinator's
 /// merge tie-break).
@@ -140,7 +181,9 @@ fn ranks_before(a: ChunkHit, b: ChunkHit) -> bool {
 
 /// Merge one chunk's hits into the running top-k `heap` (score desc, slot
 /// asc, capped at `k` — or at `k` plus the boundary tie group when
-/// `keep_ties` is set).
+/// `keep_ties` is set). The merge writes into `spare` and swaps it with
+/// `heap`, so a heap and its spare are the only two buffers a query's scan
+/// ever holds, however many chunks compete.
 ///
 /// turbovec returns each row score-descending, so instead of inserting hit
 /// by hit — O(k) per insert, which hurts at k=10000 — this sorts the (small)
@@ -155,7 +198,13 @@ fn ranks_before(a: ChunkHit, b: ChunkHit) -> bool {
 /// retention is bounded by k plus the largest tie group at the CURRENT
 /// boundary — worst case a shard of identical scores, same as any
 /// tie-complete contract.
-fn merge_chunk_hits(heap: &mut Vec<ChunkHit>, chunk: &mut [ChunkHit], k: usize, keep_ties: bool) {
+fn merge_chunk_hits(
+    heap: &mut Vec<ChunkHit>,
+    spare: &mut Vec<ChunkHit>,
+    chunk: &mut [ChunkHit],
+    k: usize,
+    keep_ties: bool,
+) {
     if chunk.is_empty() {
         return;
     }
@@ -180,7 +229,10 @@ fn merge_chunk_hits(heap: &mut Vec<ChunkHit>, chunk: &mut [ChunkHit], k: usize, 
             return;
         }
     }
-    let mut merged = Vec::with_capacity(heap.len() + chunk.len());
+    let merged = spare;
+    merged.clear();
+    let bound = heap.len() + chunk.len();
+    merged.reserve(if keep_ties { bound } else { bound.min(k) });
     let (mut i, mut j) = (0, 0);
     while merged.len() < k && (i < heap.len() || j < chunk.len()) {
         let take_heap = match (heap.get(i), chunk.get(j)) {
@@ -214,7 +266,29 @@ fn merge_chunk_hits(heap: &mut Vec<ChunkHit>, chunk: &mut [ChunkHit], k: usize, 
         // ties and chunk ties interleave by slot.
         merged[k..].sort_by_key(|h| h.slot);
     }
-    *heap = merged;
+    std::mem::swap(heap, merged);
+}
+
+/// One query's scan of one index: what the plain ([`chunked_topk`]) and
+/// collapse-by-parent ([`chunked_topk_collapsed`]) chunked scans are asked
+/// for.
+#[derive(Debug, Clone, Copy)]
+pub struct ChunkedScan<'a> {
+    pub index: &'a VectorIndex,
+    /// A single query vector of the index's dimension.
+    pub query: &'a [f32],
+    /// Result count.
+    pub k: usize,
+    /// Chunk size in SIMD blocks (values < 1 behave as 1).
+    pub chunk_blocks: usize,
+    /// The request's filters as a slot allowlist covering every slot of
+    /// the index, in the shape the caller holds, or `None` for an
+    /// unfiltered scan. A filter only REMOVES documents, so every floor
+    /// stays a valid lower bound on the filtered k-th best and no pruning
+    /// math changes; what changes is that the kernel never scores a
+    /// removed slot, so the result is the exact top-k OF THE SURVIVORS
+    /// rather than the top-k narrowed afterwards.
+    pub allow: Option<Mask<'a>>,
 }
 
 /// One query of a batched chunked scan.
@@ -231,8 +305,8 @@ pub struct BatchQuery<'a> {
     /// every slot of the index. `None` is an unfiltered query, which
     /// is not the same thing as an all-true allowlist: `None` batches
     /// with every other unfiltered query, an allowlist batches only
-    /// with itself (see [`chunked_topk_batch`]). The chunk scan masks
-    /// with a byte per row and converts a bitmap once per query; a
+    /// with itself (see [`chunked_topk_batch`]). The chunk scan reads
+    /// the mask one chunk at a time in the shape it is held in; a
     /// provider searched whole takes the mask as it is.
     pub allow: Option<Mask<'a>>,
     /// The enumerate threshold for a provider that chooses a filter

@@ -158,18 +158,16 @@ fn run_collapsed_blocking(mut exec: SearchShardExec) -> Result<DonePayload, Stat
     }
     let filters = prepare_exec_filters(&guard, index.len(), &exec)?;
     let (hits, mut stats) = chunked_topk_collapsed(
-        index,
-        &exec.start.vector,
-        exec.start.k as usize,
-        exec.chunk_blocks,
+        crate::chunked::ChunkedScan {
+            index,
+            query: &exec.start.vector,
+            k: exec.start.k as usize,
+            chunk_blocks: exec.chunk_blocks,
+            allow: filters.allow.as_ref().map(crate::vector::Mask::Bits),
+        },
         &parents.rows,
         &mut *exec.external,
         &mut *exec.publish,
-        filters
-            .allow
-            .as_ref()
-            .map(|bits| bits.to_bools())
-            .as_deref(),
     );
     stats.segments_total = filters.prune.segments_total;
     stats.segments_skipped = filters.prune.segments_skipped;

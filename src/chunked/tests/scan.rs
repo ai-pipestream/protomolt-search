@@ -19,14 +19,16 @@ fn scan_bytes_follow_the_geometry() {
     // One query, unfiltered: every row streamed exactly once.
     let query = unit_vectors(1, dim, 0x0E50_0002);
     let (_, stats) = chunked_topk(
-        &index,
-        &query,
-        10,
-        4,
+        ChunkedScan {
+            index: &index,
+            query: &query,
+            k: 10,
+            chunk_blocks: 4,
+            allow: None,
+        },
+        false,
         &mut || None,
         &mut |_| false,
-        false,
-        None,
     );
     assert_eq!(stats.bytes_scanned, n as u64 * row_bytes);
     assert!(stats.scan_nanos > 0, "active time is observed");
@@ -93,14 +95,16 @@ fn filtered_scans_stream_only_blocks_with_an_allowed_slot() {
     allow[0] = true; // block 0 of chunk 0
     allow[4 * BLOCK_VECTORS + 3] = true; // block 0 of chunk 1 (chunk = 4 blocks)
     let (_, stats) = chunked_topk(
-        &index,
-        &query,
-        10,
-        4,
+        ChunkedScan {
+            index: &index,
+            query: &query,
+            k: 10,
+            chunk_blocks: 4,
+            allow: Some(Mask::Bools(&allow)),
+        },
+        false,
         &mut || None,
         &mut |_| false,
-        false,
-        Some(&allow),
     );
     assert_eq!(
         stats.bytes_scanned,
@@ -110,14 +114,16 @@ fn filtered_scans_stream_only_blocks_with_an_allowed_slot() {
     assert_eq!(stats.chunk_calls, 2);
     let empty = vec![false; n];
     let (_, stats) = chunked_topk(
-        &index,
-        &query,
-        10,
-        4,
+        ChunkedScan {
+            index: &index,
+            query: &query,
+            k: 10,
+            chunk_blocks: 4,
+            allow: Some(Mask::Bools(&empty)),
+        },
+        false,
         &mut || None,
         &mut |_| false,
-        false,
-        Some(&empty),
     );
     assert_eq!(stats.bytes_scanned, 0);
     assert_eq!(stats.scan_nanos, 0);
@@ -134,14 +140,16 @@ fn chunked_matches_unchunked_for_all_chunk_sizes() {
 
     for chunk_blocks in [1, 2, 7, 64, 10_000] {
         let (hits, stats) = chunked_topk(
-            &index,
-            &query,
-            k,
-            chunk_blocks,
+            ChunkedScan {
+                index: &index,
+                query: &query,
+                k,
+                chunk_blocks,
+                allow: None,
+            },
+            false,
             &mut || None,
             &mut |_| false,
-            false,
-            None,
         );
         let got: Vec<(i64, u32)> = hits
             .iter()
@@ -175,14 +183,16 @@ fn chunked_matches_unchunked_at_large_k() {
 
     for chunk_blocks in [1, 8] {
         let (hits, _) = chunked_topk(
-            &index,
-            &query,
-            k,
-            chunk_blocks,
+            ChunkedScan {
+                index: &index,
+                query: &query,
+                k,
+                chunk_blocks,
+                allow: None,
+            },
+            false,
             &mut || None,
             &mut |_| false,
-            false,
-            None,
         );
         assert_eq!(hits.len(), k);
         let got: Vec<(i64, u32)> = hits
@@ -211,31 +221,35 @@ fn mid_scan_floor_injection_is_lossless_and_prunes() {
     let true_kth = index.search_unfiltered(&query, k).scores_for_query(0)[k - 1];
 
     let (baseline, base_stats) = chunked_topk(
-        &index,
-        &query,
-        k,
-        2,
+        ChunkedScan {
+            index: &index,
+            query: &query,
+            k,
+            chunk_blocks: 2,
+            allow: None,
+        },
+        false,
         &mut || None,
         &mut |_| false,
-        false,
-        None,
     );
 
     // Floor becomes visible after the first chunk, like a coordinator
     // update arriving mid-scan.
     let mut polls = 0usize;
     let (floored, floored_stats) = chunked_topk(
-        &index,
-        &query,
-        k,
-        2,
+        ChunkedScan {
+            index: &index,
+            query: &query,
+            k,
+            chunk_blocks: 2,
+            allow: None,
+        },
+        false,
         &mut || {
             polls += 1;
             (polls > 1).then_some(true_kth)
         },
         &mut |_| false,
-        false,
-        None,
     );
 
     assert_eq!(baseline, floored);
@@ -258,17 +272,19 @@ fn publishes_kth_best_once_heap_fills() {
 
     let mut published = Vec::new();
     let (hits, stats) = chunked_topk(
-        &index,
-        &query,
-        k,
-        1,
+        ChunkedScan {
+            index: &index,
+            query: &query,
+            k,
+            chunk_blocks: 1,
+            allow: None,
+        },
+        false,
         &mut || None,
         &mut |f| {
             published.push(f);
             true
         },
-        false,
-        None,
     );
 
     assert_eq!(hits.len(), k);
@@ -296,26 +312,30 @@ fn tie_complete_keeps_boundary_tie_group() {
     }
 
     let (capped, _) = chunked_topk(
-        &index,
-        &query,
-        k,
-        1,
+        ChunkedScan {
+            index: &index,
+            query: &query,
+            k,
+            chunk_blocks: 1,
+            allow: None,
+        },
+        false,
         &mut || None,
         &mut |_| false,
-        false,
-        None,
     );
     assert_eq!(capped.len(), k, "without keep_ties the heap caps at k");
 
     let (tied, _) = chunked_topk(
-        &index,
-        &query,
-        k,
-        1,
+        ChunkedScan {
+            index: &index,
+            query: &query,
+            k,
+            chunk_blocks: 1,
+            allow: None,
+        },
+        true,
         &mut || None,
         &mut |_| false,
-        true,
-        None,
     );
     assert_eq!(tied.len(), 6, "whole boundary tie group must survive");
     assert!(tied.iter().all(|h| h.score == tied[0].score));

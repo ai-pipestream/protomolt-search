@@ -4,13 +4,14 @@ use prost::Message;
 use tonic::transport::Channel;
 
 use crate::pb::node_service_client::NodeServiceClient;
-use crate::pb::wal::{wal_record, LoggedAddDocuments, LoggedAddVectors, LoggedBinding, WalRecord};
+use crate::pb::wal::{wal_record, LoggedBinding, WalRecord};
 use crate::pb::{
     ApplyWalBindingRequest, CommitReplacementsRequest, DeleteDocumentsRequest, FlushRequest,
     HealthRequest, HealthResponse, ReadWalRequest, ReadWalResponse,
 };
 
-use super::{client, keyed_request, require_fresh_ingest_replay, vector_row, ReplicaCursor};
+use super::batch::Held;
+use super::{client, ReplicaCursor};
 
 /// The primary's counts at the end of the exported prefix.
 struct PrefixHealth {
@@ -36,13 +37,16 @@ impl PrefixHealth {
 }
 
 /// The replica a catch-up writes to, with its append tips as they move.
-struct ReplicaWriter {
-    client: NodeServiceClient<Channel>,
-    target: HealthResponse,
+/// The tips count every admitted row, held or sent.
+pub(super) struct ReplicaWriter {
+    pub(super) client: NodeServiceClient<Channel>,
+    pub(super) target: HealthResponse,
     /// An earlier attempt may have applied a record but failed before
     /// flushing or acknowledging it. In-memory tips and already_bound do
     /// not prove durability, so retries must cross the flush boundary too.
     requires_flush: bool,
+    /// Admitted append records waiting to share one stream.
+    pub(super) held: Held,
 }
 
 /// Bring one replica to the primary's current durable WAL high watermark.
@@ -95,6 +99,7 @@ pub async fn sync_once(cursor: &ReplicaCursor) -> Result<ReplicaCursor, String> 
         client: replica,
         target,
         requires_flush: false,
+        held: Held::Nothing,
     };
     let (high_watermark, prefix) = writer
         .apply_stream(stream, generation, cursor.clock)
@@ -147,6 +152,7 @@ impl ReplicaWriter {
         let Some(prefix) = prefix else {
             return Err("primary WAL stream ended without completion".to_string());
         };
+        self.send_held().await?;
         Ok((high_watermark, prefix))
     }
 
@@ -161,6 +167,18 @@ impl ReplicaWriter {
                     | wal_record::Op::Bind(_)
             )
         );
+        // A held append run must land before any record that is not an
+        // append, so the replica applies the source's order.
+        if matches!(
+            record.op.as_ref(),
+            Some(
+                wal_record::Op::DeleteDocument(_)
+                    | wal_record::Op::Replacement(_)
+                    | wal_record::Op::Bind(_)
+            )
+        ) {
+            self.send_held().await?;
+        }
         match record.op {
             Some(wal_record::Op::AddVectors(add)) => self.apply_vectors(add).await,
             Some(wal_record::Op::AddDocuments(add)) => self.apply_documents(add).await,
@@ -196,146 +214,6 @@ impl ReplicaWriter {
             Some(wal_record::Op::Bind(binding)) => self.apply_binding(binding).await,
             Some(wal_record::Op::Flush(_)) | None => Ok(()),
         }
-    }
-
-    /// Where a record of `rows` rows from `first_id` stands against the
-    /// replica's tip: `Ok(true)` to append, `Ok(false)` when it is already
-    /// present, an error for a partial batch or a gap.
-    fn admit(first_id: u64, rows: u64, tip: u64, what: &str) -> Result<bool, String> {
-        if first_id < tip {
-            if first_id + rows > tip {
-                return Err(format!("replica contains a partial WAL {what} batch"));
-            }
-            return Ok(false);
-        }
-        if first_id == tip {
-            return Ok(true);
-        }
-        Err(format!(
-            "replica {what} gap: next id is {tip}, WAL starts at {first_id}"
-        ))
-    }
-
-    async fn apply_vectors(&mut self, add: LoggedAddVectors) -> Result<(), String> {
-        let batch = add
-            .batch
-            .ok_or_else(|| "WAL vector record has no batch".to_string())?;
-        crate::multi_res_wal::require_supported(self.target.multi_res_vector_version, &batch)?;
-        crate::multi_res_wal::decode_batch(&batch)?;
-        let dim = usize::try_from(batch.dim).unwrap_or(0);
-        if dim == 0 || !batch.vectors.len().is_multiple_of(dim) {
-            return Err("WAL vector record has invalid dimensions".to_string());
-        }
-        let rows = (batch.vectors.len() / dim) as u64;
-        if rows == 0 {
-            return Err("WAL vector record is empty".to_string());
-        }
-        let keys = add.stable_routing_keys;
-        if !keys.is_empty() && keys.len() != rows as usize {
-            return Err("WAL vector stable-key count does not match rows".to_string());
-        }
-        let tip = self.target.slot_offset + self.target.num_vectors;
-        if !Self::admit(add.first_id, rows, tip, "vector")? {
-            return Ok(());
-        }
-        let different = || "replica assigned different vector ids".to_string();
-        if keys.is_empty() {
-            let request = tonic::Request::new(tokio_stream::iter([batch]));
-            let response = self.add_vectors(request).await?;
-            if response.first_id != add.first_id || response.added != rows {
-                return Err(different());
-            }
-        } else {
-            for (offset, (vector, key)) in batch.vectors.chunks_exact(dim).zip(&keys).enumerate() {
-                let row = vector_row(&batch, offset, vector);
-                let response = self.add_vectors(keyed_request(row, key)).await?;
-                if response.first_id != add.first_id + offset as u64 || response.added != 1 {
-                    return Err(different());
-                }
-            }
-        }
-        self.target.num_vectors += rows;
-        Ok(())
-    }
-
-    async fn add_vectors(
-        &mut self,
-        request: tonic::Request<
-            impl tokio_stream::Stream<Item = crate::pb::AddVectorsRequest> + Send + 'static,
-        >,
-    ) -> Result<crate::pb::AddVectorsResponse, String> {
-        Ok(self
-            .client
-            .add_vectors(request)
-            .await
-            .map_err(|error| format!("replicate vectors: {error}"))?
-            .into_inner())
-    }
-
-    async fn apply_documents(&mut self, add: LoggedAddDocuments) -> Result<(), String> {
-        let required = add
-            .documents
-            .iter()
-            .map(crate::document_contract::required_version)
-            .max()
-            .unwrap_or(0);
-        crate::document_contract::require_supported(
-            self.target.document_contract_version,
-            required,
-        )?;
-        for document in &add.documents {
-            require_fresh_ingest_replay(document)?;
-        }
-        let rows = add.documents.len() as u64;
-        if rows == 0 {
-            return Err("WAL document record is empty".to_string());
-        }
-        let keys = add.stable_routing_keys;
-        if !keys.is_empty() && keys.len() != rows as usize {
-            return Err("WAL document stable-key count does not match rows".to_string());
-        }
-        let tip = self.target.slot_offset + self.target.document_slots;
-        if !Self::admit(add.first_id, rows, tip, "document")? {
-            return Ok(());
-        }
-        if keys.is_empty() {
-            let request = tonic::Request::new(tokio_stream::iter(add.documents));
-            self.add_documents(request, required, add.first_id, rows)
-                .await?;
-        } else {
-            for (offset, (document, key)) in add.documents.into_iter().zip(&keys).enumerate() {
-                let required = crate::document_contract::required_version(&document);
-                let first_id = add.first_id + offset as u64;
-                self.add_documents(keyed_request(document, key), required, first_id, 1)
-                    .await?;
-            }
-        }
-        self.target.document_slots += rows;
-        Ok(())
-    }
-
-    /// Append documents and check the replica assigned `(first_id, rows)`
-    /// under a contract version of at least `required`.
-    async fn add_documents(
-        &mut self,
-        request: tonic::Request<
-            impl tokio_stream::Stream<Item = crate::pb::AddDocumentsRequest> + Send + 'static,
-        >,
-        required: u32,
-        first_id: u64,
-        rows: u64,
-    ) -> Result<(), String> {
-        let response = self
-            .client
-            .add_documents(request)
-            .await
-            .map_err(|error| format!("replicate documents: {error}"))?
-            .into_inner();
-        crate::document_contract::require_supported(response.document_contract_version, required)?;
-        if response.first_id != first_id || response.added != rows {
-            return Err("replica assigned different document ids".to_string());
-        }
-        Ok(())
     }
 
     async fn apply_binding(&mut self, binding: LoggedBinding) -> Result<(), String> {
