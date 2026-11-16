@@ -24,6 +24,10 @@ impl ActiveManagedCatalog {
         admission: &SourceAdmission<'_>,
         request: &crate::pb::AcceptDocumentRequest,
     ) -> Result<Acceptance, Status> {
+        let _judging = self
+            .judging
+            .read()
+            .map_err(|_| Status::internal("write judgement barrier poisoned"))?;
         // A retry of an operation awaiting its decision, or already
         // fenced, is answered from the record before the entry check:
         // the decision is what the retry asks for, and for an actor

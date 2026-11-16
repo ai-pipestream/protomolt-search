@@ -103,7 +103,7 @@ impl NodeServiceImpl {
             generation::check_upgrade(&declared, &previous).map_err(Status::failed_precondition)?;
             declared = previous;
         }
-        if let Some(staged) = source.candidate.segments().filter(|set| !set.is_empty()) {
+        if let Some(staged) = source.segments().filter(|set| !set.is_empty()) {
             let mut selected = generation::backend(&declared);
             if selected.is_none() {
                 if let Some(vector) = (0..staged.len()).find_map(|i| staged.vector(i)) {
@@ -225,8 +225,7 @@ impl NodeServiceImpl {
             prepared_commit = true;
             let intent = projection
                 .map(|s| {
-                    s.catalog
-                        .prepare_index_publication(s.index_key, s.candidate, &old_set, set)
+                    s.prepare(&old_set, set)
                         .map_err(|status| status.to_string())
                 })
                 .transpose()?;
@@ -237,7 +236,7 @@ impl NodeServiceImpl {
                 catalog_epoch,
                 retirements,
                 sources,
-                s.candidate.segments().and_then(OpenedSegmentSet::binding),
+                s.segments().and_then(OpenedSegmentSet::binding),
                 source_owner
                     .as_ref()
                     .expect("source publication has an owner"),

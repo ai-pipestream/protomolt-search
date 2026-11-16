@@ -7,11 +7,15 @@ use crate::pb::storage::{
 };
 use crate::pb::AccessAction;
 use crate::source_authority::{SourceAdmission, SourceAuthorityStore, VerifiedOwnerCompletion};
+use std::sync::Arc;
 
 mod accept;
 mod active;
 mod bind;
 mod prepared;
+mod publication;
+
+pub use publication::{PendingOperation, Reconciled};
 
 /// A locally bound source retained under its committed preparation. It has
 /// no acceptance, journal mutation, export or inner-catalog accessor. Open
@@ -64,10 +68,15 @@ pub enum Settlement {
 /// exactly this epoch and the actor permitted, and the admission is held
 /// through the source commit.
 pub struct ActiveManagedCatalog {
-    pub(super) inner: DocumentCatalog,
+    pub(super) inner: Arc<DocumentCatalog>,
     binding: SourceManagedBinding,
     activation: SourceManagedActivation,
     authority: SourceAuthorityStore,
+    /// Held shared by every write from before its commit until its
+    /// outcome is judged, and exclusively by a publisher reading an
+    /// outcome, so a version read ACCEPTED can no longer become
+    /// UNCONFIRMED.
+    judging: std::sync::RwLock<()>,
     #[cfg(any(test, feature = "fault-injection"))]
     settle_pause: std::sync::Mutex<Option<std::time::Duration>>,
 }

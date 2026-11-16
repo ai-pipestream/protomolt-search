@@ -152,6 +152,15 @@ pub(super) struct Fixture {
 }
 
 pub(super) fn fixture(name: &str, bob_has_local_admin: bool) -> Fixture {
+    fixture_writing(name, bob_has_local_admin, &write())
+}
+
+/// The fixture with `first` as the catalog's write at sequence 1.
+pub(super) fn fixture_writing(
+    name: &str,
+    bob_has_local_admin: bool,
+    first: &AcceptDocumentRequest,
+) -> Fixture {
     let dir = Directory::new(name);
     let local_authorizer: Arc<dyn Authorizer> =
         Arc::new(PolicyAuthority::new(access_policy(bob_has_local_admin)).unwrap());
@@ -165,7 +174,7 @@ pub(super) fn fixture(name: &str, bob_has_local_admin: bool) -> Fixture {
     let ingest =
         AccessPermit::acquire(local_authorizer, "alice", "books", AccessAction::Ingest).unwrap();
     let catalog = AccessControlledCatalog::create(&dir.catalog(), &resource(), &admin).unwrap();
-    let receipt = catalog.accept(&ingest, &write()).unwrap();
+    let receipt = catalog.accept(&ingest, first).unwrap();
 
     let identity = authority_identity(7);
     let authority = SourceAuthorityStore::create(

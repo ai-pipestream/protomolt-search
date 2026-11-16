@@ -159,6 +159,9 @@ pub(super) fn validate_header(header: &DocumentCatalogHeader) -> Result<(), Stat
 mod adapter;
 
 #[cfg(feature = "net")]
-pub use adapter::{Acceptance, ActiveManagedCatalog, PreparedManagedCatalog, Settlement};
+pub use adapter::{
+    Acceptance, ActiveManagedCatalog, PendingOperation, PreparedManagedCatalog, Reconciled,
+    Settlement,
+};
 #[cfg(all(test, feature = "net"))]
 mod tests;

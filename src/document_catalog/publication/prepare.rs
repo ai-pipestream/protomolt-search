@@ -95,13 +95,26 @@ impl DocumentCatalog {
         };
         intent.intent_id = intent_hash(&intent);
         validate_intent(&intent, key, &info.history_id)?;
-        let tx = self.writable_transaction()?;
-        ensure_journal(&tx, &info.history_id)?;
-        if !self.stage_intent(&tx, key, candidate, &intent, before.is_empty())? {
-            return Ok(intent);
-        }
-        tx.commit().map_err(storage)?;
+        self.record_intent(key, &info.history_id, &intent, before.is_empty())?;
         Ok(intent)
+    }
+
+    /// Record `intent` as the index's pending transition in a transaction
+    /// of its own; an exact retry of a pending or decided intent writes
+    /// nothing.
+    pub(super) fn record_intent(
+        &self,
+        key: &[u8],
+        history_id: &[u8],
+        intent: &ProjectionIntent,
+        before_is_empty: bool,
+    ) -> Result<(), Status> {
+        let tx = self.writable_transaction()?;
+        ensure_journal(&tx, history_id)?;
+        if self.stage_intent(&tx, key, history_id, intent, before_is_empty)? {
+            tx.commit().map_err(storage)?;
+        }
+        Ok(())
     }
 
     /// The accepted version the candidate was staged from, checked against
@@ -114,6 +127,7 @@ impl DocumentCatalog {
         let read = self.database.begin_read().map_err(storage)?;
         let (source, bytes) = Self::get_from(&read, &info.document_key, Some(info.version))?
             .ok_or_else(|| Status::not_found("projection accepted version missing"))?;
+        super::fenced::require_publishable(&source)?;
         if source.accepted_sequence != info.accepted_sequence
             || source.deleted != info.deleted
             || bytes.as_ref() != candidate.source()
@@ -141,17 +155,17 @@ impl DocumentCatalog {
         Ok(source)
     }
 
-    /// Record `intent` as the index's pending transition. Returns false,
+    /// Stage `intent` as the index's pending transition. Returns false,
     /// writing nothing, when the same intent is already pending or decided.
     fn stage_intent(
         &self,
         tx: &redb::WriteTransaction,
         key: &[u8],
-        candidate: &StagedDocumentCandidate,
+        history_id: &[u8],
         intent: &ProjectionIntent,
         before_is_empty: bool,
     ) -> Result<bool, Status> {
-        let info = candidate.info();
+        let sequence = intent.source.as_ref().map_or(0, |s| s.accepted_sequence);
         let mut states = tx.open_table(STATES).map_err(storage)?;
         let decisions = tx.open_table(DECISIONS).map_err(storage)?;
         let existing = states
@@ -163,7 +177,7 @@ impl DocumentCatalog {
             Some(state) => state,
             None if before_is_empty => ProjectionJournalState {
                 index_key: key.to_vec(),
-                history_id: info.history_id.clone(),
+                history_id: history_id.to_vec(),
                 committed_sequence: 0,
                 committed_manifest_sha256: intent.before_manifest_sha256.clone(),
                 pending: None,
@@ -176,7 +190,7 @@ impl DocumentCatalog {
                 ))
             }
         };
-        validate_state(&state, key, &info.history_id)?;
+        validate_state(&state, key, history_id)?;
         let maintenance = maintenance_table!(tx);
         let collection = self.collection()?;
         validate_tip(&state, &decisions, maintenance.as_ref(), &collection)?;
@@ -195,12 +209,12 @@ impl DocumentCatalog {
         }
         let decision_key = ProjectionDecisionKey {
             index_key: key.to_vec(),
-            accepted_sequence: info.accepted_sequence,
+            accepted_sequence: sequence,
         }
         .encode_to_vec();
         if let Some(record) = decisions.get(decision_key.as_slice()).map_err(storage)? {
             let committed: ProjectionIntent = decode(record.value())?;
-            validate_intent(&committed, key, &info.history_id)?;
+            validate_intent(&committed, key, history_id)?;
             if &committed == intent {
                 return Ok(false);
             }
@@ -208,7 +222,7 @@ impl DocumentCatalog {
                 "accepted sequence already has a different projection decision",
             ));
         }
-        if state.committed_sequence.checked_add(1) != Some(info.accepted_sequence)
+        if state.committed_sequence.checked_add(1) != Some(sequence)
             || state.committed_manifest_sha256 != intent.before_manifest_sha256
         {
             return Err(Status::failed_precondition(

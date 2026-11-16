@@ -35,6 +35,10 @@ mod vectors;
 pub use self::boolean::BOOLEAN_MUST_SHORT_CIRCUIT_SKIPS;
 pub use self::config::{Layout, NodeConfig, MAX_RERANK_PARALLEL};
 pub use self::projection::StagedDocumentCandidate;
+#[cfg(feature = "net")]
+pub use self::publication::{
+    next_publication, publication_status, publish_next, ManagedTarget, NextPublication,
+};
 pub use self::scan::{
     observe_scan, scan_batch_counters, scan_rate, ScanRate, ScanWindow, SCAN_WINDOW_MIN_SAMPLES,
     SCAN_WINDOW_MS, SCAN_WINDOW_SAMPLES,

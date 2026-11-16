@@ -158,7 +158,15 @@ pub(super) fn recorded(active: &ActiveManagedCatalog, operation_id: &[u8]) -> (W
 }
 
 pub(super) fn activated(name: &str) -> (Fixture, ActiveManagedCatalog) {
-    let fixture = fixture(name, false);
+    activated_writing(name, &write())
+}
+
+/// [`activated`] with `first` as the write at sequence 1.
+pub(super) fn activated_writing(
+    name: &str,
+    first: &AcceptDocumentRequest,
+) -> (Fixture, ActiveManagedCatalog) {
+    let fixture = fixture_writing(name, false, first);
     let identity = authority_identity(7);
     let (fixture, managed) = ready(fixture);
     assert_eq!(

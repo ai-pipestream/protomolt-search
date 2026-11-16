@@ -66,6 +66,7 @@ impl DocumentCatalog {
             .map_err(storage)?
             .ok_or_else(|| Status::not_found("accepted document version is missing"))?;
         let metadata: DocumentVersion = decode(stored.value())?;
+        publication::require_publishable(&metadata)?;
         if !metadata.deleted && !Self::source_fits(&transaction, &metadata, request.max_bytes)? {
             return Err(Status::resource_exhausted(
                 "projection source exceeds max_bytes",

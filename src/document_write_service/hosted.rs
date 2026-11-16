@@ -7,7 +7,7 @@
 //! through unchanged without retry or leader forwarding.
 
 use super::{admit_ingest, extract_network_document, WorkPermit, WriteBudget};
-use crate::document_catalog::{Acceptance, ActiveManagedCatalog, Settlement};
+use crate::document_catalog::{Acceptance, ActiveManagedCatalog, Reconciled, Settlement};
 use crate::metrics::{self, Route};
 use crate::pb::document_write_service_server::{DocumentWriteService, DocumentWriteServiceServer};
 use crate::pb::{
@@ -265,6 +265,56 @@ impl HostedDocumentWriteService {
             }
         })?;
         result.map(Response::new)
+    }
+
+    /// The pending-actor reconciler, run after a restart or a leader
+    /// failover: list up to `limit` UNCONFIRMED writes of `collection`
+    /// under `admin`'s leased Admin admission, then settle each under a
+    /// fresh lease of its own actor, the one whose Ingest right is judged.
+    /// A write no fresh lease can decide now stays unconfirmed and is
+    /// reported, for the next pass.
+    pub async fn reconcile_unconfirmed(
+        &self,
+        admin: &str,
+        collection: &str,
+        limit: usize,
+    ) -> Result<Reconciled, Status> {
+        let catalog = self
+            .inner
+            .catalogs
+            .get(collection)
+            .cloned()
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "no managed catalog serves collection {collection:?}"
+                ))
+            })?;
+        let lease = self.inner.host.lease(admin).await?;
+        let listing = Arc::clone(&catalog);
+        let pending = tokio::task::spawn_blocking(move || {
+            let admission = lease.admission()?;
+            listing.unconfirmed_operations(&admission, limit)
+        })
+        .await
+        .map_err(|_| Status::internal("source reconciliation worker failed"))??;
+        let mut reconciled = Reconciled::default();
+        for operation in pending {
+            let settled = match self.inner.host.lease(&operation.principal).await {
+                Ok(lease) => {
+                    let catalog = Arc::clone(&catalog);
+                    let (actor, id) = (operation.principal.clone(), operation.operation_id.clone());
+                    tokio::task::spawn_blocking(move || {
+                        let admission = lease.admission()?;
+                        catalog.settle(&admission, &actor, &id)
+                    })
+                    .await
+                    .map_err(|_| Status::internal("source settlement worker failed"))?
+                }
+                Err(error) => Err(error),
+            };
+            reconciled.record(operation, settled);
+        }
+        Ok(reconciled)
     }
 
     /// Settle a durable write whose original lease lapsed before commit returned,

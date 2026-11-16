@@ -67,10 +67,11 @@ impl ActiveManagedCatalog {
             .clone()
             .expect("recovered activation");
         Ok(Self {
-            inner,
+            inner: Arc::new(inner),
             binding: binding.clone(),
             activation,
             authority: authority.clone(),
+            judging: std::sync::RwLock::new(()),
             #[cfg(any(test, feature = "fault-injection"))]
             settle_pause: std::sync::Mutex::new(None),
         })

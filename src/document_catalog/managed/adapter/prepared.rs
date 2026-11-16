@@ -170,10 +170,11 @@ impl PreparedManagedCatalog {
         })()?;
         inner.managed_activation = Some(activation.clone());
         Ok(ActiveManagedCatalog {
-            inner,
+            inner: Arc::new(inner),
             binding: self.binding,
             activation,
             authority: self.authority,
+            judging: std::sync::RwLock::new(()),
             #[cfg(any(test, feature = "fault-injection"))]
             settle_pause: std::sync::Mutex::new(None),
         })
