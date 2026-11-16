@@ -102,17 +102,20 @@ fn materialize_money(
                 .and_modify(|v| *v = v.max(hit.amount_f64))
                 .or_insert(hit.amount_f64);
         }
-        for (currency, value) in by_currency {
-            if !doc
-                .map_numerics
-                .iter()
-                .any(|m| m.field == spec.money_column && m.key == currency)
-            {
-                doc.map_numerics.push(MapNumericEntry {
-                    field: spec.money_column.clone(),
-                    key: currency,
-                    value,
-                });
+        if !by_currency.is_empty() {
+            let existing = doc.map_numerics.len();
+            doc.map_numerics.reserve(by_currency.len());
+            for (currency, value) in by_currency {
+                if !doc.map_numerics[..existing]
+                    .iter()
+                    .any(|m| m.field == spec.money_column && m.key == currency)
+                {
+                    doc.map_numerics.push(MapNumericEntry {
+                        field: spec.money_column.clone(),
+                        key: currency,
+                        value,
+                    });
+                }
             }
         }
     }
@@ -143,17 +146,20 @@ fn materialize_quantities(
                 .and_modify(|v| *v = v.max(hit.value_f64))
                 .or_insert(hit.value_f64);
         }
-        for (unit, value) in by_unit {
-            if !doc
-                .map_numerics
-                .iter()
-                .any(|m| m.field == spec.quantity_column && m.key == unit)
-            {
-                doc.map_numerics.push(MapNumericEntry {
-                    field: spec.quantity_column.clone(),
-                    key: unit,
-                    value,
-                });
+        if !by_unit.is_empty() {
+            let existing = doc.map_numerics.len();
+            doc.map_numerics.reserve(by_unit.len());
+            for (unit, value) in by_unit {
+                if !doc.map_numerics[..existing]
+                    .iter()
+                    .any(|m| m.field == spec.quantity_column && m.key == unit)
+                {
+                    doc.map_numerics.push(MapNumericEntry {
+                        field: spec.quantity_column.clone(),
+                        key: unit,
+                        value,
+                    });
+                }
             }
         }
     }
@@ -208,17 +214,20 @@ fn materialize_geo_spine(
                 paths.insert(hit.canonical_name.clone());
             }
         }
-        for value in paths {
-            if !doc
-                .map_facets
-                .iter()
-                .any(|m| m.field == spec.geo_spine_column && m.key == value)
-            {
-                doc.map_facets.push(MapFacetEntry {
-                    field: spec.geo_spine_column.clone(),
-                    key: value.clone(),
-                    value,
-                });
+        if !paths.is_empty() {
+            let existing = doc.map_facets.len();
+            doc.map_facets.reserve(paths.len());
+            for value in paths {
+                if !doc.map_facets[..existing]
+                    .iter()
+                    .any(|m| m.field == spec.geo_spine_column && m.key == value)
+                {
+                    doc.map_facets.push(MapFacetEntry {
+                        field: spec.geo_spine_column.clone(),
+                        key: value.clone(),
+                        value,
+                    });
+                }
             }
         }
     }
@@ -331,10 +340,12 @@ fn materialize_minhash(
         && nlp.sketch.word_count > 0
         && !nlp.sketch.minhash.is_empty()
     {
+        let existing = doc.map_unsigned_integers.len();
+        let planned = nlp.sketch.minhash.len() + nlp.sketch.minhash.len().div_ceil(2);
+        doc.map_unsigned_integers.reserve(planned);
         for (idx, &lane) in nlp.sketch.minhash.iter().enumerate() {
             let key = format!("h{idx:02}");
-            if !doc
-                .map_unsigned_integers
+            if !doc.map_unsigned_integers[..existing]
                 .iter()
                 .any(|m| m.field == spec.minhash_column && m.key == key)
             {
@@ -352,8 +363,7 @@ fn materialize_minhash(
                 _ => continue,
             };
             let key = format!("b{band_idx}");
-            if !doc
-                .map_unsigned_integers
+            if !doc.map_unsigned_integers[..existing]
                 .iter()
                 .any(|m| m.field == spec.minhash_column && m.key == key)
             {
@@ -394,17 +404,20 @@ fn materialize_entity_map(
         // kind in one document are all addressable without colliding on map keys.
         pairs.insert(format!("id:{canonical}"), ent.kind.to_lowercase());
     }
-    for (key, value) in pairs {
-        if !doc
-            .map_facets
-            .iter()
-            .any(|m| m.field == column && m.key == key)
-        {
-            doc.map_facets.push(MapFacetEntry {
-                field: column.to_string(),
-                key,
-                value,
-            });
+    if !pairs.is_empty() {
+        let existing = doc.map_facets.len();
+        doc.map_facets.reserve(pairs.len());
+        for (key, value) in pairs {
+            if !doc.map_facets[..existing]
+                .iter()
+                .any(|m| m.field == column && m.key == key)
+            {
+                doc.map_facets.push(MapFacetEntry {
+                    field: column.to_string(),
+                    key,
+                    value,
+                });
+            }
         }
     }
 }

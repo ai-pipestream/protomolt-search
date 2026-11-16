@@ -82,7 +82,6 @@ pub(super) async fn execute_composite(
     if let Some(p) = run.prof.as_mut() {
         p.selection_ms = ms(t_sel);
     }
-    let sources = rerank_sources(&response);
     let boost_id = legacy.as_ref().map(|(id, _)| id.as_str());
     let filter_ids = &base.plan.filter_ids;
     let cascade = matches!(legs.strategy, Strategy::Cascade);
@@ -101,6 +100,7 @@ pub(super) async fn execute_composite(
         let fusion = crate::explain::Fusion::resolve(mode, &leg_opts);
         explain_hits(&mut hits, &response, &legs, &fusion, legacy.as_ref())?;
     }
+    let sources = rerank_sources(base.coordinator.rerank_spec(), &hits, &response);
     if turbo_rerank(&base, &legs.lexical.text, &sources, &mut hits).await? {
         route = "hybrid_search:turbo_rerank";
     }
@@ -150,10 +150,17 @@ fn hybrid_request(
     }
 }
 
-/// The owning shard and inline candidate payload of every hit, the
-/// cascade hits' report taking precedence.
-fn rerank_sources(response: &HybridSearchResponse) -> RerankSources {
-    let mut sources = RerankSources::default();
+/// The owning shard and inline candidate payload of every shortlisted
+/// hit, the cascade hits' report taking precedence.
+fn rerank_sources(
+    spec: Option<&crate::turbo_bridge::rerank::RerankSpec>,
+    hits: &[QueryHit],
+    response: &HybridSearchResponse,
+) -> RerankSources {
+    let mut sources = RerankSources::for_shortlist(spec, hits);
+    if !sources.is_enabled() {
+        return sources;
+    }
     for h in &response.cascade_hits {
         sources.note_owner(h.doc_id, h.shard as usize);
         sources.note_candidate(h.doc_id, h.rerank_candidate.as_ref());
