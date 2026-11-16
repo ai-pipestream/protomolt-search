@@ -22,6 +22,7 @@ impl TonicNetworkFactory {
                     .parse()
                     .expect("timing agreement is ASCII digits and punctuation"),
                 rejections: PeerRejections::new(),
+                closed: tokio::sync::watch::Sender::new(false),
             }),
         }
     }
@@ -33,6 +34,11 @@ impl TonicNetworkFactory {
 }
 
 impl LeaseForwarder {
+    /// Cancel any outbound peer RPCs in flight on this member's transport.
+    pub(crate) fn close(&self) {
+        self.shared.closed.send_replace(true);
+    }
+
     /// Ask `leader` at `addr` for a lease: the leader's barrier position,
     /// or the failure by name. A transport failure or an unreachable
     /// leader is `Unavailable`; a rejection the leader's service answered

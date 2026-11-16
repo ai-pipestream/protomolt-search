@@ -148,6 +148,19 @@ impl TonicNetwork {
     }
 }
 
+async fn race_shutdown<T>(
+    mut closed: tokio::sync::watch::Receiver<bool>,
+    call: impl std::future::Future<Output = Result<Response<T>, Status>>,
+) -> Result<T, Result<Status, &'static str>> {
+    if *closed.borrow_and_update() {
+        return Err(Err("raft host is shutting down"));
+    }
+    tokio::select! {
+        reply = call => reply.map(Response::into_inner).map_err(Ok),
+        _ = closed.wait_for(|stopped| *stopped) => Err(Err("raft host is shutting down")),
+    }
+}
+
 impl RaftNetwork<ControlRaft> for TonicNetwork {
     async fn append_entries(
         &mut self,
@@ -169,12 +182,14 @@ impl RaftNetwork<ControlRaft> for TonicNetwork {
         }
         let ttl = option.hard_ttl();
         let request = self.request(message, &option);
+        let closed = self.shared.closed.subscribe();
         let client = self.client()?;
-        let reply = client
-            .append_entries(request)
+        let reply = race_shutdown(closed, client.append_entries(request))
             .await
-            .map_err(|status| self.failure(RPCTypes::AppendEntries, ttl, status))?
-            .into_inner();
+            .map_err(|err| match err {
+                Ok(status) => self.failure(RPCTypes::AppendEntries, ttl, status),
+                Err(msg) => Self::unreachable(msg.to_string()),
+            })?;
         self.check_reply(reply.header.as_ref())
             .and_then(|()| append_response_from_proto(reply))
             .map_err(|status| Self::network(status.message().to_string()))
@@ -197,12 +212,14 @@ impl RaftNetwork<ControlRaft> for TonicNetwork {
         }
         let ttl = option.hard_ttl();
         let request = self.request(message, &option);
+        let closed = self.shared.closed.subscribe();
         let client = self.client()?;
-        let reply = client
-            .install_snapshot(request)
+        let reply = race_shutdown(closed, client.install_snapshot(request))
             .await
-            .map_err(|status| self.failure(RPCTypes::InstallSnapshot, ttl, status))?
-            .into_inner();
+            .map_err(|err| match err {
+                Ok(status) => self.failure(RPCTypes::InstallSnapshot, ttl, status),
+                Err(msg) => Self::unreachable(msg.to_string()),
+            })?;
         self.check_reply(reply.header.as_ref())
             .map_err(|status| Self::network(status.message().to_string()))?;
         match reply.outcome {
@@ -241,12 +258,14 @@ impl RaftNetwork<ControlRaft> for TonicNetwork {
         let message = vote_request_to_proto(self.header(), &rpc);
         let ttl = option.hard_ttl();
         let request = self.request(message, &option);
+        let closed = self.shared.closed.subscribe();
         let client = self.client()?;
-        let reply = client
-            .vote(request)
+        let reply = race_shutdown(closed, client.vote(request))
             .await
-            .map_err(|status| self.failure(RPCTypes::Vote, ttl, status))?
-            .into_inner();
+            .map_err(|err| match err {
+                Ok(status) => self.failure(RPCTypes::Vote, ttl, status),
+                Err(msg) => Self::unreachable(msg.to_string()),
+            })?;
         self.check_reply(reply.header.as_ref())
             .and_then(|()| vote_response_from_proto(reply))
             .map_err(|status| Self::network(status.message().to_string()))

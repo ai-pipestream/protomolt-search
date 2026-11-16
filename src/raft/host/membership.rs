@@ -252,34 +252,84 @@ impl RaftHost {
         self.isolation.heal();
     }
 
-    pub async fn shutdown(mut self) -> Result<(), Status> {
+    pub async fn shutdown(self) -> Result<(), Status> {
+        let (stopped, listener_res, store, machine_released, log_released) =
+            self.teardown_runtime().await;
+        let storage_res = Self::await_storage_release(store, machine_released, log_released).await;
+        stopped.and(listener_res).and(storage_res)
+    }
+
+    async fn teardown_runtime(
+        mut self,
+    ) -> (
+        Result<(), Status>,
+        Result<(), Status>,
+        SharedStore,
+        watch::Receiver<()>,
+        watch::Receiver<()>,
+    ) {
+        #[cfg(feature = "tls")]
+        if let Some(forwarder) = &self.forwarder {
+            forwarder.close();
+        }
         #[cfg(feature = "tls")]
         if let Some(watch) = self.digest_watch.take() {
             watch.abort();
+            let _ = watch.await;
+        }
+        if let Some(listener) = &mut self.listener {
+            if let Some(stop) = listener.stop.take() {
+                let _ = stop.send(());
+            }
         }
         let stopped = self
             .raft
             .shutdown()
             .await
             .map_err(|e| Status::internal(format!("raft shutdown: {e}")));
-        if let Some(mut listener) = self.listener.take() {
-            if let Some(stop) = listener.stop.take() {
-                let _ = stop.send(());
-            }
-            match tokio::time::timeout(Duration::from_secs(10), &mut listener.task).await {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(e))) => {
-                    return Err(Status::internal(format!("raft listener: {e}")));
-                }
-                Ok(Err(e)) => return Err(Status::internal(format!("raft listener task: {e}"))),
-                Err(_) => {
-                    listener.task.abort();
-                    return Err(Status::internal(
-                        "raft listener did not stop within 10 s; aborted",
-                    ));
-                }
+        let listener_res = match self.listener.take() {
+            Some(listener) => Self::await_listener(listener).await,
+            None => Ok(()),
+        };
+        let log_released = self.log_store.subscribe_release();
+        (
+            stopped,
+            listener_res,
+            self.store,
+            self.machine_released,
+            log_released,
+        )
+    }
+
+    async fn await_listener(mut listener: Listener) -> Result<(), Status> {
+        match tokio::time::timeout(Duration::from_secs(10), &mut listener.task).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(e))) => Err(Status::internal(format!("raft listener: {e}"))),
+            Ok(Err(e)) => Err(Status::internal(format!("raft listener task: {e}"))),
+            Err(_) => {
+                listener.task.abort();
+                let _ = listener.task.await;
+                Err(Status::internal(
+                    "raft listener did not stop within 10 s; aborted",
+                ))
             }
         }
-        stopped
+    }
+
+    async fn await_storage_release(
+        store: SharedStore,
+        mut machine_released: watch::Receiver<()>,
+        mut log_released: watch::Receiver<()>,
+    ) -> Result<(), Status> {
+        let wait = tokio::time::timeout(Duration::from_secs(10), async {
+            while machine_released.changed().await.is_ok() {}
+            while log_released.changed().await.is_ok() {}
+        })
+        .await;
+        if let Ok(mut slot) = store.write() {
+            *slot = None;
+        }
+        drop(store);
+        wait.map_err(|_| Status::internal("raft storage workers did not stop within 10 s"))
     }
 }
