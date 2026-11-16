@@ -1,6 +1,9 @@
 //! The in-process `turbo-client` provider: the lexical lattice plus the
 //! optional one-pass NLP layers.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use tonic::Status;
 
 use super::lattice::LatticeFold;
@@ -19,7 +22,7 @@ pub fn analyze_document_turbo(
     spec: Option<&AnalysisSpec>,
     layers: SessionLayers,
 ) -> Result<AnalyzedDoc, Status> {
-    Ok(turbo_analysis_pass(text, spec, layers)?.doc)
+    Ok(analyze_pass(text, spec, layers, false)?.doc)
 }
 
 pub(super) struct TurboPassOutput {
@@ -46,6 +49,40 @@ pub(super) fn turbo_analysis_pass(
     spec: Option<&AnalysisSpec>,
     layers: SessionLayers,
 ) -> Result<TurboPassOutput, Status> {
+    analyze_pass(text, spec, layers, true)
+}
+
+fn cached_lexical_analyzer(
+    spec: &AnalysisSpec,
+) -> Result<Arc<turbo_client::LexicalAnalyzer>, Status> {
+    type Cache = HashMap<u64, (AnalysisSpec, Arc<turbo_client::LexicalAnalyzer>)>;
+    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+    let fingerprint = super::spec::analysis_fingerprint(Some(spec));
+    let mut cache = CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("lexical analyzer cache poisoned");
+    if let Some((stored, analyzer)) = cache.get(&fingerprint) {
+        if stored == spec {
+            return Ok(Arc::clone(analyzer));
+        }
+    }
+    let analyzer = Arc::new(turbo_client::LexicalAnalyzer::new(turbo_field_config(
+        Some(spec),
+    )?));
+    if cache.len() >= 128 {
+        cache.clear();
+    }
+    cache.insert(fingerprint, (spec.clone(), Arc::clone(&analyzer)));
+    Ok(analyzer)
+}
+
+fn analyze_pass(
+    text: &str,
+    spec: Option<&AnalysisSpec>,
+    layers: SessionLayers,
+    retain_surface: bool,
+) -> Result<TurboPassOutput, Status> {
     check_document_text(text)?;
 
     if layers.dual_cased {
@@ -53,9 +90,12 @@ pub(super) fn turbo_analysis_pass(
     }
     let effective_spec = spec.cloned().unwrap_or_else(body_spec);
     let scoring_only = effective_spec.term_vector_mode == TERM_VECTOR_MODE_SCORING_ONLY;
-    let cfg = turbo_field_config(Some(&effective_spec))?;
-    let lex = turbo_client::LexicalAnalyzer::new(cfg);
-    let surface_tokens: Vec<String> = text.split_whitespace().map(str::to_owned).collect();
+    let lex = cached_lexical_analyzer(&effective_spec)?;
+    let surface_tokens = if retain_surface {
+        text.split_whitespace().map(str::to_owned).collect()
+    } else {
+        Vec::new()
+    };
 
     let (primary_field, cased_field) = if layers.dual_cased {
         let dual = lex.analyze_dual(text).map_err(client_err_to_status)?;
@@ -167,4 +207,38 @@ pub(super) fn turbo_field_to_postings(
         .filter(|&(s, e)| s < e)
         .collect();
     fold.finish(sentences)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_analyzers_reuse_only_matching_specs_and_preserve_surface_output() {
+        let spec = body_spec();
+        let first = cached_lexical_analyzer(&spec).unwrap();
+        assert!(Arc::ptr_eq(
+            &first,
+            &cached_lexical_analyzer(&spec).unwrap()
+        ));
+        let mut cased = spec.clone();
+        cased.char_filters.clear();
+        assert!(!Arc::ptr_eq(
+            &first,
+            &cached_lexical_analyzer(&cased).unwrap()
+        ));
+        let mut invalid = spec.clone();
+        invalid.tokenizer = i32::MAX;
+        assert!(cached_lexical_analyzer(&invalid).is_err());
+        let layers = SessionLayers::default();
+        let text = "Running CAFÉ co-operate";
+        let retained = analyze_pass(text, Some(&spec), layers, true).unwrap();
+        let omitted = analyze_pass(text, Some(&spec), layers, false).unwrap();
+        assert_eq!(
+            retained.surface_tokens,
+            vec!["Running", "CAFÉ", "co-operate"]
+        );
+        assert!(omitted.surface_tokens.is_empty());
+        assert_eq!(retained.doc.fields, omitted.doc.fields);
+    }
 }
