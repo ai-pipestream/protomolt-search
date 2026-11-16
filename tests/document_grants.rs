@@ -69,7 +69,7 @@ fn request<T>(body: T, name: &str) -> Request<T> {
     request
 }
 
-async fn ingest(node: Arc<NodeServiceImpl>, text: &str, audience: &str, color: &str) {
+async fn ingest_local(node: Arc<NodeServiceImpl>, text: &str, audience: &str, color: &str) {
     NodeLink::local(node)
         .add_documents(tokio_stream::iter([AddDocumentsRequest {
             text: text.into(),
@@ -111,10 +111,10 @@ async fn cluster(
                 ..Default::default()
             },
         ));
-        ingest(node.clone(), "alpha alpha", "public", "red").await;
-        ingest(node.clone(), "alpha beta", "public", "blue").await;
+        ingest_local(node.clone(), "alpha alpha", "public", "red").await;
+        ingest_local(node.clone(), "alpha beta", "public", "blue").await;
         if !restricted {
-            ingest(
+            ingest_local(
                 node.clone(),
                 "alpha private secret secret",
                 "private",
@@ -257,7 +257,7 @@ async fn document_grants_match_physical_corpus_scores_and_disclosures() {
                 vec![2, 102]
             );
             // A different unauthorized corpus cannot influence public statistics.
-            ingest(
+            ingest_local(
                 nodes[0].clone(),
                 "alpha alpha alpha more secret",
                 "private",
@@ -541,7 +541,7 @@ async fn dictionaries_and_expansions_disclose_only_the_authorized_corpus() {
             CollectionSet::single(coordinator).with_principals(principals(authority.clone()));
         // A dense hidden dictionary must not consume a reader's visible cap.
         for node in &nodes {
-            ingest(
+            ingest_local(
                 node.clone(),
                 "albatross alchemy algebra algorithm alien secret",
                 "private",
@@ -613,7 +613,7 @@ async fn dictionaries_and_expansions_disclose_only_the_authorized_corpus() {
             }
         }
         for node in nodes.iter().chain(reference_nodes.iter()) {
-            ingest(node.clone(), "alpine", "public", "green").await;
+            ingest_local(node.clone(), "alpine", "public", "green").await;
         }
         let over = SuggestRequest {
             field: "body".into(),

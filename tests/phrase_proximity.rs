@@ -22,9 +22,15 @@ use pipestream_search::pb::{
 use pipestream_search::postings::{AnalyzedDoc, Bm25Index, Bm25Reader, Bm25Store};
 use pipestream_search::proximity;
 use pipestream_search::reshard;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request};
+
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
+
+#[path = "common/ingest.rs"]
+mod ingest;
+use ingest::ingest;
 
 /// `(body, title)`. Under `body_spec` (whitespace tokens, STRIP_INVISIBLE,
 /// Porter): doc 2's soft hyphen is a token that normalizes to nothing, so
@@ -76,19 +82,12 @@ fn doc(body: &str, title: &str, analysis: Option<AnalysisSpec>) -> AddDocumentsR
     }
 }
 
-async fn ingest(addr: &str, docs: &[(&str, &str)], analysis: Option<AnalysisSpec>) {
-    let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
-    let (tx, rx) = mpsc::channel(8);
-    for (body, title) in docs {
-        tx.send(doc(body, title, analysis.clone())).await.unwrap();
-    }
-    drop(tx);
-    let added = client
-        .add_documents(ReceiverStream::new(rx))
-        .await
-        .unwrap()
-        .into_inner()
-        .added;
+async fn ingest_pairs(addr: &str, docs: &[(&str, &str)], analysis: Option<AnalysisSpec>) {
+    let requests = docs
+        .iter()
+        .map(|(body, title)| doc(body, title, analysis.clone()))
+        .collect();
+    let added = ingest(addr, requests).await.unwrap().added;
     assert_eq!(added as usize, docs.len());
 }
 
@@ -103,9 +102,9 @@ async fn native_fleet() -> Fleet {
     let (a, ha) = start_empty_node(proximity_config(0, NATIVE_ANALYSIS_BACKEND)).await;
     let (b, hb) = start_empty_node(proximity_config(SPLIT as u64, NATIVE_ANALYSIS_BACKEND)).await;
     let (m, hm) = start_empty_node(proximity_config(0, NATIVE_ANALYSIS_BACKEND)).await;
-    ingest(&a, &CORPUS[..SPLIT], Some(body_spec())).await;
-    ingest(&b, &CORPUS[SPLIT..], Some(body_spec())).await;
-    ingest(&m, &CORPUS, Some(body_spec())).await;
+    ingest_pairs(&a, &CORPUS[..SPLIT], Some(body_spec())).await;
+    ingest_pairs(&b, &CORPUS[SPLIT..], Some(body_spec())).await;
+    ingest_pairs(&m, &CORPUS, Some(body_spec())).await;
     let with_bm25 = |addrs: Vec<String>| {
         CoordinatorServiceImpl::new(addrs).with_bm25(
             Some(NATIVE_ANALYSIS_BACKEND.to_string()),
@@ -355,8 +354,8 @@ async fn a_bigram_only_fleet_serves_pairs_and_refuses_the_rest() {
     };
     let (a, ha) = start_empty_node(config(0)).await;
     let (b, hb) = start_empty_node(config(SPLIT as u64)).await;
-    ingest(&a, &CORPUS[..SPLIT], Some(body_spec())).await;
-    ingest(&b, &CORPUS[SPLIT..], Some(body_spec())).await;
+    ingest_pairs(&a, &CORPUS[..SPLIT], Some(body_spec())).await;
+    ingest_pairs(&b, &CORPUS[SPLIT..], Some(body_spec())).await;
     let coordinator = CoordinatorServiceImpl::new(vec![a, b]).with_bm25(
         Some(NATIVE_ANALYSIS_BACKEND.to_string()),
         Default::default(),
@@ -400,8 +399,8 @@ async fn a_mixed_fleet_refuses_rather_than_matching_half_the_corpus() {
         ..Default::default()
     })
     .await;
-    ingest(&a, &CORPUS[..SPLIT], Some(body_spec())).await;
-    ingest(&b, &CORPUS[SPLIT..], Some(body_spec())).await;
+    ingest_pairs(&a, &CORPUS[..SPLIT], Some(body_spec())).await;
+    ingest_pairs(&b, &CORPUS[SPLIT..], Some(body_spec())).await;
     let coordinator = CoordinatorServiceImpl::new(vec![a, b]).with_bm25(
         Some(NATIVE_ANALYSIS_BACKEND.to_string()),
         Default::default(),
@@ -513,8 +512,8 @@ async fn the_sidecar_token_layer_yields_the_same_positions_as_native() {
     let (mock, mock_handle) = start_mock_analysis().await;
     let (a, ha) = start_empty_node(proximity_config(0, &mock)).await;
     let (b, hb) = start_empty_node(proximity_config(SPLIT as u64, &mock)).await;
-    ingest(&a, &CORPUS[..SPLIT], None).await;
-    ingest(&b, &CORPUS[SPLIT..], None).await;
+    ingest_pairs(&a, &CORPUS[..SPLIT], None).await;
+    ingest_pairs(&b, &CORPUS[SPLIT..], None).await;
     let coordinator =
         CoordinatorServiceImpl::new(vec![a, b]).with_bm25(Some(mock.clone()), Default::default());
     let request = |slop: u32| Bm25SearchRequest {
@@ -532,13 +531,6 @@ async fn the_sidecar_token_layer_yields_the_same_positions_as_native() {
     ha.abort();
     hb.abort();
     mock_handle.abort();
-}
-
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("phrase-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
 }
 
 /// The reshard replay analyzer over the native provider, the same shape
@@ -643,7 +635,7 @@ async fn positions_and_bigrams_survive_flush_reopen_and_wal_replay() {
         &scale,
     );
     client.configure_vector_backend(backend_req).await.unwrap();
-    ingest(&addr, &CORPUS, Some(body_spec())).await;
+    ingest_pairs(&addr, &CORPUS, Some(body_spec())).await;
     let coordinator = CoordinatorServiceImpl::new(vec![addr.clone()]).with_bm25(
         Some(NATIVE_ANALYSIS_BACKEND.to_string()),
         Default::default(),
@@ -717,7 +709,7 @@ async fn a_catalog_without_positions_refuses_a_positional_node_and_phrases_by_na
     let (addr, handle) = start_empty_node(old).await;
     // Bodies only: this node's table has no title field.
     let bodies: Vec<(&str, &str)> = CORPUS[..3].iter().map(|(body, _)| (*body, "")).collect();
-    ingest(&addr, &bodies, Some(body_spec())).await;
+    ingest_pairs(&addr, &bodies, Some(body_spec())).await;
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     assert!(
         client

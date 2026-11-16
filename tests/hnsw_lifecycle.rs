@@ -35,16 +35,17 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tonic::{Code, Request};
 
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
+
+#[path = "common/ingest.rs"]
+mod ingest;
+use ingest::ingest;
+
 const DIM: usize = 24;
 const SEED: u64 = 0x11FE_C7C1_E000_0001;
 const K: usize = 10;
-
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("hnsw-lifecycle-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn config(index_path: &Path, mmap: bool, wal: bool) -> NodeConfig {
     NodeConfig {
@@ -87,8 +88,7 @@ async fn client(addr: &str) -> NodeServiceClient<Channel> {
 
 /// Append documents then their vectors (positions align); the first global
 /// id the batch received.
-async fn ingest(addr: &str, rows: &[Row]) -> u64 {
-    let mut client = client(addr).await;
+async fn ingest_rows(addr: &str, rows: &[Row]) -> u64 {
     let requests: Vec<AddDocumentsRequest> = rows
         .iter()
         .map(|row| AddDocumentsRequest {
@@ -97,12 +97,9 @@ async fn ingest(addr: &str, rows: &[Row]) -> u64 {
             ..Default::default()
         })
         .collect();
-    let documents = client
-        .add_documents(tokio_stream::iter(requests))
-        .await
-        .unwrap()
-        .into_inner();
+    let documents = ingest(addr, requests).await.unwrap();
     assert_eq!(documents.added as usize, rows.len());
+    let mut client = client(addr).await;
     let vectors: Vec<f32> = rows.iter().flat_map(|r| r.vector.iter().copied()).collect();
     let added = client
         .add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
@@ -279,7 +276,7 @@ async fn sealed_segments_serve_mapped_and_exclude_deleted_rows() {
     let mut live: BTreeMap<u64, Row> = BTreeMap::new();
     for (batch, range) in [0..300, 300..600, 600..700].into_iter().enumerate() {
         let batch_rows = rows(range.clone());
-        let first = ingest(&addr, &batch_rows).await;
+        let first = ingest_rows(&addr, &batch_rows).await;
         assert_eq!(first, range.start as u64);
         for (i, row) in batch_rows.into_iter().enumerate() {
             live.insert(first + i as u64, row);
@@ -379,7 +376,7 @@ async fn replacements_retire_the_old_row_and_serve_the_revision() {
     let path = dir.join("shard.hnsw");
     let (addr, handle) = start_empty_node(config(&path, true, false)).await;
     let base = rows(0..240);
-    assert_eq!(ingest(&addr, &base).await, 0);
+    assert_eq!(ingest_rows(&addr, &base).await, 0);
     flush(&addr).await;
     let mut live: BTreeMap<u64, Row> = base
         .iter()
@@ -390,7 +387,7 @@ async fn replacements_retire_the_old_row_and_serve_the_revision() {
 
     let replaced = [7usize, 100, 239];
     let revisions: Vec<Row> = replaced.iter().map(|&i| row(i, true)).collect();
-    let first_new = ingest(&addr, &revisions).await;
+    let first_new = ingest_rows(&addr, &revisions).await;
     assert_eq!(first_new, 240);
     let committed = client(&addr)
         .await
@@ -651,7 +648,7 @@ async fn compaction_rebuilds_the_graph_and_an_interrupted_publication_rolls_back
     let mut live: BTreeMap<u64, Row> = BTreeMap::new();
     for range in [0..450, 450..900] {
         let batch = rows(range.clone());
-        let first = ingest(&addr, &batch).await;
+        let first = ingest_rows(&addr, &batch).await;
         for (i, row) in batch.into_iter().enumerate() {
             live.insert(first + i as u64, row);
         }

@@ -1,7 +1,6 @@
 //! Regression tests verifying `SegmentedProvider` preserves `FilterRouting`
 //! across unary `try_search` and streaming `try_search_streaming_controlled`.
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -18,6 +17,10 @@ use pipestream_search::vector::{
     VectorStreamEndReason,
 };
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::{scratch_path, ScratchPath};
+
 const DIM: usize = 16;
 const SEG_ROWS: usize = 600;
 const TAIL_ROWS: usize = 50;
@@ -25,22 +28,15 @@ const TOTAL_ROWS: usize = SEG_ROWS * 2 + TAIL_ROWS;
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
-struct TempDir(PathBuf);
+struct TempDir(ScratchPath);
 
 impl TempDir {
     fn new(prefix: &str) -> Self {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("psearch-{prefix}-{}-{id}", std::process::id()));
+        let dir = scratch_path(&format!("psearch-{prefix}-{}-{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
         Self(dir)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

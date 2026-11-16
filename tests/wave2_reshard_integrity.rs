@@ -22,15 +22,19 @@ use pipestream_search::wal::{self, WalManifest, WalWriter};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::{scratch_path, ScratchPath};
+
 const DIM: usize = 16;
 const BITS: usize = 4;
 
 /// A scratch directory removed when the test ends, pass or fail.
-struct TempDir(PathBuf);
+struct TempDir(ScratchPath);
 
 impl TempDir {
     fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("wave2-reshard-{tag}-{}", std::process::id()));
+        let dir = scratch_path(&format!("wave2-reshard-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Self(dir)
@@ -41,12 +45,6 @@ impl std::ops::Deref for TempDir {
     type Target = Path;
     fn deref(&self) -> &Path {
         &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

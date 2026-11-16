@@ -1,17 +1,18 @@
 mod common;
 
-use pipestream_search::authorization::{
-    AccessPermit, AuthorizedStream, Authorizer, PolicyAuthority,
+use pipestream_search::{
+    authorization::{AccessPermit, AuthorizedStream, Authorizer, PolicyAuthority},
+    collections::CollectionSet,
+    coordinator::CoordinatorServiceImpl,
+    pb::{search_service_server::SearchService, *},
+    security::{PrincipalConfig, Principals},
 };
-use pipestream_search::collections::CollectionSet;
-use pipestream_search::coordinator::CoordinatorServiceImpl;
-use pipestream_search::pb::search_service_server::SearchService;
-use pipestream_search::pb::*;
-use pipestream_search::security::{PrincipalConfig, Principals};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tokio_stream::StreamExt;
 use tonic::{Code, Request};
+
+#[path = "common/scratch.rs"]
+mod scratch;
 
 fn policy() -> AccessPolicy {
     AccessPolicy {
@@ -429,8 +430,8 @@ async fn cached_search_is_not_reachable_after_revocation() {
 
 #[test]
 fn policy_configuration_is_explicit_and_rejects_typos() {
-    let path =
-        std::env::temp_dir().join(format!("psearch-access-config-{}.toml", std::process::id()));
+    let tag = format!("psearch-access-config-{}.toml", std::process::id());
+    let path = scratch::scratch_path(&tag);
     let credentials =
         "[[principals]]\nname = \"reader\"\ntoken = \"reader-test-token-0123456789\"\n";
     std::fs::write(&path, credentials).unwrap();
@@ -462,7 +463,6 @@ fn policy_configuration_is_explicit_and_rejects_typos() {
     assert!(Principals::load(&path)
         .unwrap_err()
         .contains("unknown field"));
-    std::fs::remove_file(path).unwrap();
 }
 
 #[tokio::test]

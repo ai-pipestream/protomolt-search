@@ -31,19 +31,15 @@ use pipestream_search::pb::{
 use tokio::net::TcpListener;
 use tonic::Request;
 
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
+
 const DOCS: usize = 40;
 const COURTS: [&str; 4] = ["scotus", "ca9", "ca5", "nysd"];
 const WORDS: [&str; 8] = [
     "court", "appeal", "claim", "denied", "brief", "steps", "reporter", "motion",
 ];
-
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("split_shard_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn shard_config(index_path: PathBuf) -> NodeConfig {
     NodeConfig {

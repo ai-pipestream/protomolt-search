@@ -13,7 +13,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use common::start_empty_node;
 use pipestream_search::analyzer::{analyze_document_native, body_spec, NATIVE_ANALYSIS_BACKEND};
 use pipestream_search::coordinator::CoordinatorServiceImpl;
-use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     search_query, selection_query, AddDocumentsRequest, Bm25SearchRequest, LexicalQuery,
@@ -22,9 +21,11 @@ use pipestream_search::pb::{
 };
 use pipestream_search::postings::AnalyzedDoc;
 use pipestream_search::synonyms::{edit_distance, SynonymTable};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request};
+
+#[path = "common/ingest.rs"]
+mod ingest;
+use ingest::ingest;
 
 const CORPUS: [&str; 8] = [
     "the automobile stalled on the bridge",
@@ -46,27 +47,17 @@ fn config(slot_offset: u64) -> pipestream_search::node::NodeConfig {
     }
 }
 
-async fn ingest(addr: &str, docs: &[&str]) {
-    let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
-    let (tx, rx) = mpsc::channel(8);
-    let n = docs.len();
-    for text in docs {
-        tx.send(AddDocumentsRequest {
+async fn ingest_texts(addr: &str, docs: &[&str]) {
+    let requests = docs
+        .iter()
+        .map(|text| AddDocumentsRequest {
             text: text.to_string(),
             analysis: Some(body_spec()),
             ..Default::default()
         })
-        .await
-        .unwrap();
-    }
-    drop(tx);
-    let added = client
-        .add_documents(ReceiverStream::new(rx))
-        .await
-        .unwrap()
-        .into_inner()
-        .added;
-    assert_eq!(added as usize, n);
+        .collect();
+    let added = ingest(addr, requests).await.unwrap().added;
+    assert_eq!(added as usize, docs.len());
 }
 
 fn coordinator(addrs: Vec<String>) -> CoordinatorServiceImpl {
@@ -117,8 +108,8 @@ fn scores(resp: &pipestream_search::pb::Bm25SearchResponse) -> Vec<(u64, u32)> {
 async fn synonym_rules_add_terms_that_score_as_ordinary_terms_and_are_reported() {
     let (a, _ha) = start_empty_node(config(0)).await;
     let (b, _hb) = start_empty_node(config(SPLIT as u64)).await;
-    ingest(&a, &CORPUS[..SPLIT]).await;
-    ingest(&b, &CORPUS[SPLIT..]).await;
+    ingest_texts(&a, &CORPUS[..SPLIT]).await;
+    ingest_texts(&b, &CORPUS[SPLIT..]).await;
     let fleet = coordinator(vec![a.clone(), b.clone()]);
 
     // Without a rule, "car" finds the car documents alone.
@@ -338,9 +329,9 @@ async fn did_you_mean_equals_the_brute_force_scan_on_one_shard_and_two() {
     let (a, _ha) = start_empty_node(config(0)).await;
     let (b, _hb) = start_empty_node(config(SPLIT as u64)).await;
     let (m, _hm) = start_empty_node(config(0)).await;
-    ingest(&a, &CORPUS[..SPLIT]).await;
-    ingest(&b, &CORPUS[SPLIT..]).await;
-    ingest(&m, &CORPUS).await;
+    ingest_texts(&a, &CORPUS[..SPLIT]).await;
+    ingest_texts(&b, &CORPUS[SPLIT..]).await;
+    ingest_texts(&m, &CORPUS).await;
     let fleet = coordinator(vec![a, b]);
     let mono = coordinator(vec![m]);
     let corpus = analyzed(&CORPUS);

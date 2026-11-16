@@ -28,6 +28,14 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 
+#[path = "common/dir.rs"]
+mod dir;
+use dir::{tempdir, TestDir};
+
+#[path = "common/ingest.rs"]
+mod ingest;
+use ingest::ingest;
+
 const DIM: usize = 16;
 const BIT_WIDTH: usize = 4;
 const ROWS: usize = 2_400;
@@ -37,13 +45,6 @@ const BLOCK: usize = 300;
 
 /// Guards the full-scan A/B switch, which is process-wide.
 static SCAN_MODE: Mutex<()> = Mutex::new(());
-
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("booldom-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn config(index_path: PathBuf, slot_offset: u64) -> pipestream_search::node::NodeConfig {
     pipestream_search::node::NodeConfig {
@@ -147,7 +148,7 @@ fn document(i: usize) -> AddDocumentsRequest {
     }
 }
 
-async fn ingest(addr: &str, shard: usize, vectors: &[f32]) {
+async fn load_shard(addr: &str, shard: usize, vectors: &[f32]) {
     let sample = &vectors[..vectors.len().min(64 * DIM)];
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, sample);
     let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
@@ -161,12 +162,8 @@ async fn ingest(addr: &str, shard: usize, vectors: &[f32]) {
     for block in 0..SHARD_ROWS.div_ceil(BLOCK) {
         let start = first + block * BLOCK;
         let end = (start + BLOCK).min(first + SHARD_ROWS);
-        let (tx, rx) = mpsc::channel(BLOCK);
-        for i in start..end {
-            tx.send(document(i)).await.unwrap();
-        }
-        drop(tx);
-        client.add_documents(ReceiverStream::new(rx)).await.unwrap();
+        let docs = (start..end).map(document).collect();
+        ingest(addr, docs).await.unwrap();
         let (tx, rx) = mpsc::channel(2);
         tx.send(AddVectorsRequest {
             materialized_rows: Vec::new(),
@@ -195,16 +192,19 @@ async fn ingest(addr: &str, shard: usize, vectors: &[f32]) {
 
 struct Fleet {
     coordinator: CoordinatorServiceImpl,
-    dir: PathBuf,
     handles: Vec<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>>,
+    _dir: TestDir,
 }
 
 impl Fleet {
-    fn stop(self) {
-        for handle in self.handles {
+    fn stop(self) {}
+}
+
+impl Drop for Fleet {
+    fn drop(&mut self) {
+        for handle in &self.handles {
             handle.abort();
         }
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -219,7 +219,7 @@ async fn fleet(tag: &str) -> Fleet {
             (shard * SHARD_ROWS) as u64,
         ))
         .await;
-        ingest(&addr, shard, &vectors).await;
+        load_shard(&addr, shard, &vectors).await;
         addrs.push(addr);
         handles.push(handle);
     }
@@ -229,7 +229,7 @@ async fn fleet(tag: &str) -> Fleet {
     );
     Fleet {
         coordinator,
-        dir,
+        _dir: dir,
         handles,
     }
 }
@@ -261,12 +261,9 @@ async fn uneven_fleet(tag: &str) -> Fleet {
         .unwrap();
     let with_vectors = SHARD_ROWS - VECTORLESS;
     for rows in [0..with_vectors, with_vectors..SHARD_ROWS] {
-        let (tx, rx) = mpsc::channel(SHARD_ROWS);
-        for i in rows.clone() {
-            tx.send(document(i)).await.unwrap();
-        }
-        drop(tx);
-        client.add_documents(ReceiverStream::new(rx)).await.unwrap();
+        ingest(&addr, rows.clone().map(document).collect())
+            .await
+            .unwrap();
         if rows.start == 0 {
             let (tx, rx) = mpsc::channel(2);
             let batch = AddVectorsRequest {
@@ -314,7 +311,7 @@ async fn uneven_fleet(tag: &str) -> Fleet {
     );
     Fleet {
         coordinator,
-        dir,
+        _dir: dir,
         handles,
     }
 }

@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use protomolt_embedder::StaticEmbedder;
 use turbo_client::{EmbedPromptRole, LocalEmbedEngine, LocalEncoderOptions, MultiResOptions};
 
+use crate::scratch::{scratch_path, ScratchPath};
+
 const VOCAB_SIZE: usize = 8;
 const DIM: usize = 16;
 const MAX_SEQ: u32 = 8;
@@ -11,15 +13,15 @@ const MAX_SEQ: u32 = 8;
 static NEXT_FIXTURE_ID: AtomicUsize = AtomicUsize::new(1);
 
 struct TempFixtureDir {
-    root: PathBuf,
     bundle_dir: PathBuf,
     native_dir: PathBuf,
+    _root: ScratchPath,
 }
 
 impl TempFixtureDir {
     fn new(tag: &str) -> Self {
         let id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch_path(&format!(
             "turbo-static-parity-{tag}-{}-{id}",
             std::process::id()
         ));
@@ -29,16 +31,10 @@ impl TempFixtureDir {
         std::fs::create_dir_all(bundle_dir.join("reference")).unwrap();
         std::fs::create_dir_all(&native_dir).unwrap();
         Self {
-            root,
             bundle_dir,
             native_dir,
+            _root: root,
         }
-    }
-}
-
-impl Drop for TempFixtureDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 

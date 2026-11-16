@@ -28,6 +28,10 @@ use prost::Message;
 use tokio_stream::iter as stream_iter;
 use tonic::Request;
 
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
+
 const DIM: usize = 16;
 const BIT_WIDTH: usize = 4;
 const SEAL_ROWS: usize = 8;
@@ -36,14 +40,6 @@ const SEED: u64 = 0xE071_5107;
 
 type RowSpec = (&'static str, AnalyzedField, AnalyzedField);
 type ServerHandle = tokio::task::JoinHandle<Result<(), tonic::transport::Error>>;
-
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("wave2_empty_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn empty_row(text: &'static str) -> RowSpec {
     let body = AnalyzedField {

@@ -17,7 +17,6 @@
 mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use common::{fit_calibration, unit_vectors};
@@ -48,21 +47,11 @@ use turbo_client::{
     OnePassQueryBuilder, QuerySpellchecker, SpellcheckConfig, SurfaceLexiconBuilder,
 };
 
-const DIM: usize = 32;
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
 
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "turboembed_query_{tag}_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
+const DIM: usize = 32;
 
 fn full_nlp_spec() -> NlpColumnSpec {
     NlpColumnSpec {

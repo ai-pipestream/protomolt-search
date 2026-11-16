@@ -12,9 +12,12 @@ use tonic::Code;
 struct Directory(PathBuf);
 impl Directory {
     fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-            "source-actor-retries-{}-{}",
+            "source-actor-retries-{}-{}-{}",
             std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

@@ -32,6 +32,10 @@ use tokio_stream::StreamExt;
 use tonic::transport::{Endpoint, Server};
 use tonic::{Code, Request};
 
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
+
 fn pem(name: &str) -> Vec<u8> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/certs")
@@ -619,13 +623,6 @@ fn the_embedded_runtime_carries_no_tls_stack() {
         "TLS crates in the embedded tree: {offending:?}"
     );
     assert!(tree.lines().any(|l| l.starts_with("pipestream-search v")));
-}
-
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("security-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
 }
 
 type CfgResult = Result<pipestream_search::config::Config, String>;

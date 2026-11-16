@@ -8,21 +8,22 @@ mod common;
 
 use pipestream_search::coordinator::CoordinatorServiceImpl;
 use pipestream_search::node::NodeConfig;
-use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     score_signal, search_query, selection_query, selection_score_strategy, AddDocumentsRequest,
-    AddVectorsRequest, BoostQuery, CompositeScoreOperation, CompositeScorer,
-    CompositeSearchStrategy, DenseQuery, FilterQuery, IntegerValue, LexicalQuery,
-    MissingScorePolicy, NamedProjection, NumericValue, QueryRequest, QueryResponse, QuerySort,
-    RrfScore, ScoreDimension, ScoreNormalization, ScoreOp, ScoreSignal, ScoreStage, SearchQuery,
-    SelectionOperator, SelectionQuery, SelectionScoreStrategy,
+    BoostQuery, CompositeScoreOperation, CompositeScorer, CompositeSearchStrategy, DenseQuery,
+    FilterQuery, IntegerValue, LexicalQuery, MissingScorePolicy, NamedProjection, NumericValue,
+    QueryRequest, QueryResponse, QuerySort, RrfScore, ScoreDimension, ScoreNormalization, ScoreOp,
+    ScoreSignal, ScoreStage, SearchQuery, SelectionOperator, SelectionQuery,
+    SelectionScoreStrategy,
 };
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 
-use common::{fit_calibration, mock::start_mock_analysis, start_empty_node, unit_vectors};
+use common::{fit_calibration, mock::start_mock_analysis, unit_vectors};
+
+#[path = "common/cluster.rs"]
+mod cluster;
+use cluster::{start_shard, ShardGuard, ShardSpec};
 
 const DIM: usize = 64;
 const SHARD_DOCS: usize = 4;
@@ -31,74 +32,58 @@ const N_DOCS: usize = 2 * SHARD_DOCS;
 /// The query_api corpus: "zebra" in even docs, "plain" in odd docs,
 /// `year = i` everywhere, seeded unit vectors; the query vector is doc
 /// 0's own (so the dense order and the lexical order disagree).
-async fn start_cluster() -> (
-    CoordinatorServiceImpl,
-    Vec<f32>,
-    Vec<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>>,
-) {
+async fn start_fleet() -> (CoordinatorServiceImpl, Vec<f32>, Vec<ShardGuard>) {
     let (analysis, mock) = start_mock_analysis().await;
     let corpus = unit_vectors(N_DOCS, DIM, 0xC0FE_0001);
     let (shift, scale) = fit_calibration(DIM, 4, &corpus);
-    let mut handles = vec![mock];
+    let mut handles = vec![ShardGuard::from(mock)];
     let mut addrs = Vec::new();
     for shard in 0..2usize {
-        let (addr, handle) = start_empty_node(NodeConfig {
-            slot_offset: (shard * SHARD_DOCS) as u64,
-            analysis_addr: Some(analysis.clone()),
-            integer_fields: vec!["year".into()],
-            numeric_fields: vec!["quality".into()],
-            ..Default::default()
-        })
-        .await;
-        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
-        client
-            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-                DIM, 4, &shift, &scale,
-            ))
-            .await
-            .unwrap();
-        let (tx, rx) = mpsc::channel(16);
-        for i in 0..SHARD_DOCS {
-            let id = shard * SHARD_DOCS + i;
-            let text = if id.is_multiple_of(2) {
-                format!("zebra document {id}")
-            } else {
-                format!("plain document {id}")
-            };
-            tx.send(AddDocumentsRequest {
-                text,
-                integers: vec![IntegerValue {
-                    field: "year".into(),
-                    value: id as i64,
-                }],
-                // "quality" lands on EVEN docs only: the corpus's
-                // honestly-partial column, for missing-policy tests.
-                numerics: if id.is_multiple_of(2) {
-                    vec![NumericValue {
-                        field: "quality".into(),
-                        value: id as f64 + 1.0,
-                    }]
-                } else {
-                    Vec::new()
-                },
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        }
-        drop(tx);
-        client.add_documents(ReceiverStream::new(rx)).await.unwrap();
         let start = shard * SHARD_DOCS;
-        let (vtx, vrx) = mpsc::channel(4);
-        vtx.send(AddVectorsRequest {
-            materialized_rows: Vec::new(),
+        let docs = (0..SHARD_DOCS)
+            .map(|i| {
+                let id = shard * SHARD_DOCS + i;
+                let text = if id.is_multiple_of(2) {
+                    format!("zebra document {id}")
+                } else {
+                    format!("plain document {id}")
+                };
+                AddDocumentsRequest {
+                    text,
+                    integers: vec![IntegerValue {
+                        field: "year".into(),
+                        value: id as i64,
+                    }],
+                    // "quality" lands on EVEN docs only: the corpus's
+                    // honestly-partial column, for missing-policy tests.
+                    numerics: if id.is_multiple_of(2) {
+                        vec![NumericValue {
+                            field: "quality".into(),
+                            value: id as f64 + 1.0,
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    ..Default::default()
+                }
+            })
+            .collect();
+        let (addr, handle) = start_shard(ShardSpec {
+            config: NodeConfig {
+                slot_offset: (shard * SHARD_DOCS) as u64,
+                analysis_addr: Some(analysis.clone()),
+                integer_fields: vec!["year".into()],
+                numeric_fields: vec!["quality".into()],
+                ..Default::default()
+            },
+            backend: Some(pipestream_search::harness::embedded_backend_request(
+                DIM, 4, &shift, &scale,
+            )),
+            docs,
             vectors: corpus[start * DIM..(start + SHARD_DOCS) * DIM].to_vec(),
             dim: DIM as u32,
         })
-        .await
-        .unwrap();
-        drop(vtx);
-        client.add_vectors(ReceiverStream::new(vrx)).await.unwrap();
+        .await;
         addrs.push(addr);
         handles.push(handle);
     }
@@ -222,7 +207,7 @@ fn recompute(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scorer_reorders_the_hybrid_pool_and_reports_dimensions() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
     let mut d_vec = query_dim("vec", "vec");
     d_vec.weight = Some(2.0);
     let mut d_lex = query_dim("lex", "lex");
@@ -310,7 +295,7 @@ async fn scorer_reorders_the_hybrid_pool_and_reports_dimensions() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dimension_weights_choose_the_winning_leg() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
     // The legs disagree by construction: the dense top is doc 0 (its
     // own vector), the lexical top for "document 6" is doc 6 (the only
     // doc containing the term "6").
@@ -350,7 +335,7 @@ async fn dimension_weights_choose_the_winning_leg() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn single_leaf_scorer_pages_within_the_selection_pool() {
-    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let (coordinator, _qvec, _handles) = start_fleet().await;
     let make = |k: u32, cursor: String| QueryRequest {
         k,
         selection_k: 8,
@@ -412,7 +397,7 @@ async fn single_leaf_scorer_pages_within_the_selection_pool() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn boost_signals_feed_the_scorer() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
     let boost = BoostQuery {
         query: Some(SearchQuery {
             id: "boost".into(),
@@ -488,7 +473,7 @@ async fn boost_signals_feed_the_scorer() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn error_policy_refuses_on_a_real_union_gap() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
     let mut d = query_dim("lex", "lex");
     d.missing = MissingScorePolicy::Error as i32;
     let err = query(
@@ -512,7 +497,7 @@ async fn error_policy_refuses_on_a_real_union_gap() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scorer_interplays_refuse_by_name() {
-    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let (coordinator, _qvec, _handles) = start_fleet().await;
     let base = || {
         Some(scorer(
             CompositeScoreOperation::WeightedSum,
@@ -659,7 +644,7 @@ fn dense_boost(id: &str, vector: &[f32]) -> BoostQuery {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dense_boost_reranks_a_lexical_leaf() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
     // "document" scores every doc identically; the dense boost breaks
     // the tie by similarity to doc 0's own vector, decisively.
     let mut boost = dense_boost("sim", &qvec);
@@ -700,7 +685,7 @@ async fn dense_boost_reranks_a_lexical_leaf() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lexical_boost_windows_a_single_leaf_pool() {
-    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let (coordinator, _qvec, _handles) = start_fleet().await;
     // Base order for "document" is the doc-id tie order 0..7; the
     // boost rescores only the top-4 window, so "zebra" lifts docs 0
     // and 2 while docs 4 and 6 (equally zebra-bearing, outside the
@@ -736,7 +721,7 @@ async fn lexical_boost_windows_a_single_leaf_pool() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lexical_boost_on_a_dense_leaf_carries_its_own_analysis() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
     // A dense-only selection has no lexical leaf to inherit from, so
     // the boost's own analysis spec is admitted.
     let mut boost = lexical_boost("plain", "plain");
@@ -791,7 +776,7 @@ async fn lexical_boost_on_a_dense_leaf_carries_its_own_analysis() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multiple_boosts_combine_through_the_scorer() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
     let mut d_sim = query_dim("sim", "sim");
     d_sim.weight = Some(10.0);
     let mut d_plain = query_dim("plain", "plain");
@@ -829,7 +814,7 @@ async fn multiple_boosts_combine_through_the_scorer() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn boost_shapes_refuse_by_name() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
     let browse = SelectionQuery {
         node: Some(selection_query::Node::Filter(FilterQuery {
             id: "f".into(),
@@ -911,7 +896,7 @@ fn stored_dim(id: &str, stage: ScoreStage) -> ScoreDimension {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stored_value_dimension_orders_by_the_column() {
-    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let (coordinator, _qvec, _handles) = start_fleet().await;
     let response = query(
         &coordinator,
         QueryRequest {
@@ -940,7 +925,7 @@ async fn stored_value_dimension_orders_by_the_column() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stored_value_missing_policies_on_a_partial_column() {
-    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let (coordinator, _qvec, _handles) = start_fleet().await;
     // "quality" lives on even docs only (value id + 1). Under the ZERO
     // default the odd docs score 0 and tie in id order behind every
     // even doc.
@@ -987,7 +972,7 @@ async fn stored_value_missing_policies_on_a_partial_column() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stored_value_typo_refuses_by_name() {
-    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let (coordinator, _qvec, _handles) = start_fleet().await;
     let err = query(
         &coordinator,
         QueryRequest {
@@ -1008,7 +993,7 @@ async fn stored_value_typo_refuses_by_name() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn projections_ride_every_shape() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
     let projections = vec![
         NamedProjection {
             name: "year".into(),
@@ -1092,7 +1077,7 @@ async fn projections_ride_every_shape() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn profile_reports_phases_without_altering_results() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
     let make = |profile: bool| QueryRequest {
         k: 8,
         selection_k: 8,

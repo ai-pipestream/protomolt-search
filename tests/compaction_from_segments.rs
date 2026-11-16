@@ -55,6 +55,14 @@ use tonic::Request;
 use common::mock::start_mock_analysis;
 use common::{fit_calibration, start_empty_node, start_opened_node, unit_vectors, BIT_WIDTH, DIM};
 
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
+
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::scratch_path;
+
 const SEED: u64 = 0x5E61_7A11;
 /// Rows per sealed segment of the fixture: several segments per run.
 const SEAL: usize = 48;
@@ -62,14 +70,6 @@ const SEAL: usize = 48;
 const BOUND: u32 = 96;
 const GROUPS: [&str; 3] = ["red", "green", "blue"];
 const EXTRAS: [&str; 4] = ["one", "two", "three", "four"];
-
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("walless_compaction_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 /// The generation binding a qualifying catalog carries: published onto
 /// the empty catalog before the node first opens it, exactly where the
@@ -1102,7 +1102,7 @@ fn an_interrupted_walless_cutover_rolls_back_at_open() {
     // from-segments cutover: the backup the cutover kept, the marker
     // naming the staged outputs and the replaced inputs, and — in the
     // "after publish" case — the new manifest already in place.
-    let dir = std::env::temp_dir().join(format!("walless-rollback-{}", std::process::id()));
+    let dir = scratch_path(&format!("walless-rollback-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let index_path = dir.join("shard.tv");

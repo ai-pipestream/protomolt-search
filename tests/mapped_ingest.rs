@@ -338,7 +338,7 @@ fn explicit_bind() -> MappedBind {
     binding
 }
 
-async fn ingest(
+async fn send(
     addr: &str,
     bind: MappedBind,
     docs: Vec<Vec<u8>>,
@@ -917,7 +917,7 @@ async fn mapped_ingest_lands_on_every_plane() {
     let (addr, _node) = start_empty_node(case_node_config(analysis.clone())).await;
     seed_calibration(&addr).await;
 
-    let response = ingest(
+    let response = send(
         &addr,
         bind(),
         (0..N_DOCS).map(|i| doc(i).encode()).collect(),
@@ -1047,7 +1047,7 @@ async fn bind_refusals_name_the_gap() {
     let mut unbound = bind();
     unbound.expected_fingerprint = String::new();
     expect_refusal(
-        ingest(&addr, unbound, vec![]).await,
+        send(&addr, unbound, vec![]).await,
         "expected_fingerprint is required",
     );
 
@@ -1055,17 +1055,17 @@ async fn bind_refusals_name_the_gap() {
     let real = derive_plan(&case_set(), "law.v1.Case").unwrap().fingerprint;
     let mut stale = bind();
     stale.expected_fingerprint = "deadbeef".into();
-    expect_refusal(ingest(&addr, stale, vec![]).await, &real);
+    expect_refusal(send(&addr, stale, vec![]).await, &real);
 
     // Two TEXT fields and no body_path: refused naming both.
     let mut ambiguous = bind();
     ambiguous.body_path = String::new();
-    expect_refusal(ingest(&addr, ambiguous, vec![]).await, "meta.author");
+    expect_refusal(send(&addr, ambiguous, vec![]).await, "meta.author");
 
     // body_path must be one of the plan's TEXT fields.
     let mut wrong_body = bind();
     wrong_body.body_path = "price".into();
-    expect_refusal(ingest(&addr, wrong_body, vec![]).await, "TEXT fields");
+    expect_refusal(send(&addr, wrong_body, vec![]).await, "TEXT fields");
 
     // A shard that does not declare the landing columns refuses at
     // bind, listing every gap with its flag.
@@ -1077,7 +1077,7 @@ async fn bind_refusals_name_the_gap() {
     })
     .await;
     expect_refusal(
-        ingest(&bare_addr, bind(), vec![]).await,
+        send(&bare_addr, bind(), vec![]).await,
         "\"price\" (--numeric-fields)",
     );
 
@@ -1104,7 +1104,7 @@ async fn bind_refusals_name_the_gap() {
     })
     .await;
     expect_refusal(
-        ingest(&derived_addr, bind(), vec![]).await,
+        send(&derived_addr, bind(), vec![]).await,
         "lands as \"year\", a derived column",
     );
 
@@ -1154,43 +1154,40 @@ async fn document_refusals_name_position_and_field() {
     let mut no_vector = doc(0);
     no_vector.embedding = Vec::new();
     expect_refusal(
-        ingest(&addr, bind(), vec![no_vector.encode()]).await,
+        send(&addr, bind(), vec![no_vector.encode()]).await,
         "document 0",
     );
     expect_refusal(
-        ingest(&addr, bind(), vec![no_vector.encode()]).await,
+        send(&addr, bind(), vec![no_vector.encode()]).await,
         "has no vector",
     );
 
     let mut no_id = doc(0);
     no_id.id = None;
-    expect_refusal(
-        ingest(&addr, bind(), vec![no_id.encode()]).await,
-        "has no id",
-    );
+    expect_refusal(send(&addr, bind(), vec![no_id.encode()]).await, "has no id");
 
     let mut no_body = doc(0);
     no_body.title = None;
     expect_refusal(
-        ingest(&addr, bind(), vec![no_body.encode()]).await,
+        send(&addr, bind(), vec![no_body.encode()]).await,
         "no body text",
     );
 
     let mut truncated = doc(0).encode();
     truncated.truncate(truncated.len() - 3);
-    expect_refusal(ingest(&addr, bind(), vec![truncated]).await, "document 0");
+    expect_refusal(send(&addr, bind(), vec![truncated]).await, "document 0");
 
     let mut short = doc(1);
     short.embedding = embedding_of(1)[..4].to_vec();
     expect_refusal(
-        ingest(&addr, bind(), vec![doc(0).encode(), short.encode()]).await,
+        send(&addr, bind(), vec![doc(0).encode(), short.encode()]).await,
         "4 floats",
     );
 
     // Nothing above poisoned the shard: a clean stream still lands.
     // (The dim-mismatch stream above applied its first document before
     // refusing the second, exactly like ordinary ingest.)
-    let response = ingest(&addr, bind(), vec![doc(2).encode()])
+    let response = send(&addr, bind(), vec![doc(2).encode()])
         .await
         .expect("the shard ingests after refusals");
     assert_eq!(response.added, 1);
@@ -1208,7 +1205,7 @@ async fn closed_enum_unknowns_preserve_presence_and_prior_values_in_query() {
     known_then_unknown.extend([40, 99]);
     let mut unknown_then_known = unknown.encode();
     unknown_then_known.extend([40, 1]);
-    let response = ingest(
+    let response = send(
         &addr,
         bind(),
         vec![unknown.encode(), known_then_unknown, unknown_then_known],
@@ -1253,7 +1250,7 @@ async fn lockstep_refusal_when_document_leg_is_ahead() {
     seed_calibration(&addr).await;
 
     // Bind while empty; this test targets alignment after an established bind.
-    ingest(&addr, bind(), vec![]).await.unwrap();
+    send(&addr, bind(), vec![]).await.unwrap();
 
     let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
     let (tx, rx) = mpsc::channel(4);
@@ -1266,10 +1263,7 @@ async fn lockstep_refusal_when_document_leg_is_ahead() {
     drop(tx);
     client.add_documents(ReceiverStream::new(rx)).await.unwrap();
 
-    expect_refusal(
-        ingest(&addr, bind(), vec![doc(0).encode()]).await,
-        "lockstep",
-    );
+    expect_refusal(send(&addr, bind(), vec![doc(0).encode()]).await, "lockstep");
 }
 
 /// CEL materialization is a bind property: derived columns compute from
@@ -1288,7 +1282,7 @@ async fn materialized_columns_ride_the_bind() {
             kind: MaterializeKind::F64 as i32,
         }],
     });
-    ingest(
+    send(
         &addr,
         with_spec,
         (0..N_DOCS).map(|i| doc(i).encode()).collect(),
@@ -1389,7 +1383,7 @@ async fn binding_survives_restart_and_refuses_a_different_plan() {
     let mut wrong_wire_title = doc(2).encode();
     wrong_wire_title.extend([0x10, 0x01]);
     let original_documents = vec![doc(0).encode(), doc(1).encode(), wrong_wire_title];
-    let response = ingest(&addr, bind(), original_documents.clone())
+    let response = send(&addr, bind(), original_documents.clone())
         .await
         .expect("mapped ingest succeeds");
     assert_eq!(response.added, 3);
@@ -1432,7 +1426,7 @@ async fn binding_survives_restart_and_refuses_a_different_plan() {
     );
 
     // Same plan: still bound, ids continue.
-    let more = ingest(&addr2, bind(), vec![doc(3).encode()])
+    let more = send(&addr2, bind(), vec![doc(3).encode()])
         .await
         .expect("the same plan keeps ingesting after restart");
     assert_eq!(more.added, 1);
@@ -1444,12 +1438,12 @@ async fn binding_survives_restart_and_refuses_a_different_plan() {
     let mut other_plan = bind();
     other_plan.descriptor_set = case_set_without_tags();
     other_plan.expected_fingerprint = variant.fingerprint;
-    expect_refusal(ingest(&addr2, other_plan, vec![]).await, "durably bound");
+    expect_refusal(send(&addr2, other_plan, vec![]).await, "durably bound");
 
     // Same plan, different body.
     let mut other_body = bind();
     other_body.body_path = "meta.author".into();
-    expect_refusal(ingest(&addr2, other_body, vec![]).await, "the body");
+    expect_refusal(send(&addr2, other_body, vec![]).await, "the body");
 
     // Same plan, a materialize spec the binding does not carry.
     let mut other_spec = bind();
@@ -1460,7 +1454,7 @@ async fn binding_survives_restart_and_refuses_a_different_plan() {
             kind: MaterializeKind::F64 as i32,
         }],
     });
-    expect_refusal(ingest(&addr2, other_spec, vec![]).await, "materialize spec");
+    expect_refusal(send(&addr2, other_spec, vec![]).await, "materialize spec");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1494,7 +1488,7 @@ async fn reshard_binding(explicit: bool) {
     })
     .await;
     seed_calibration(&addr).await;
-    ingest(
+    send(
         &addr,
         if explicit { explicit_bind() } else { bind() },
         (0..4).map(|i| doc(i).encode()).collect(),
@@ -1796,7 +1790,7 @@ async fn chunked_ingest_denormalizes_and_collapses() {
             &chunks,
         ));
     }
-    let response = ingest(&addr, opinion_bind(), docs)
+    let response = send(&addr, opinion_bind(), docs)
         .await
         .expect("chunked ingest");
     assert_eq!(response.added, 5, "rows = chunks");
@@ -1898,7 +1892,7 @@ async fn chunked_refusals_name_document_chunk_and_field() {
     // The body must live inside the CHUNKS scope.
     let mut parent_body = opinion_bind();
     parent_body.body_path = "case_name".into();
-    expect_refusal(ingest(&addr, parent_body, vec![]).await, "CHUNKS-scope");
+    expect_refusal(send(&addr, parent_body, vec![]).await, "CHUNKS-scope");
 
     let good = |row: usize| chunk_of(0, row, row);
     let doc_with =
@@ -1907,32 +1901,32 @@ async fn chunked_refusals_name_document_chunk_and_field() {
     let mut no_vector = good(1);
     no_vector.embedding = Vec::new();
     expect_refusal(
-        ingest(&addr, opinion_bind(), vec![doc_with(&[good(0), no_vector])]).await,
+        send(&addr, opinion_bind(), vec![doc_with(&[good(0), no_vector])]).await,
         "document 0: chunk 1:",
     );
 
     let mut no_cid = good(0);
     no_cid.cid = None;
     expect_refusal(
-        ingest(&addr, opinion_bind(), vec![doc_with(&[no_cid])]).await,
+        send(&addr, opinion_bind(), vec![doc_with(&[no_cid])]).await,
         "the chunk has no id",
     );
 
     let mut no_text = good(0);
     no_text.text = None;
     expect_refusal(
-        ingest(&addr, opinion_bind(), vec![doc_with(&[no_text])]).await,
+        send(&addr, opinion_bind(), vec![doc_with(&[no_text])]).await,
         "no body text",
     );
 
     let orphan = opinion_doc(None, "case name 0", "ca9", 1990, &[good(0)]);
     expect_refusal(
-        ingest(&addr, opinion_bind(), vec![orphan]).await,
+        send(&addr, opinion_bind(), vec![orphan]).await,
         "identity is required",
     );
 
     // Nothing above poisoned the shard.
-    let response = ingest(&addr, opinion_bind(), vec![doc_with(&[good(0), good(1)])])
+    let response = send(&addr, opinion_bind(), vec![doc_with(&[good(0), good(1)])])
         .await
         .expect("the shard ingests after refusals");
     assert_eq!(response.added, 2);
@@ -2074,7 +2068,7 @@ async fn vector_names_cannot_shadow_node_columns_outside_the_mapped_plan() {
         };
         columns.push("embedding".into());
         let (address, node) = start_empty_node(config).await;
-        let error = ingest(&address, bind(), vec![]).await.unwrap_err();
+        let error = send(&address, bind(), vec![]).await.unwrap_err();
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert!(
             error.message().contains("vector column"),
@@ -2113,7 +2107,7 @@ async fn named_vector_binding_cannot_relabel_legacy_or_populated_shards() {
                 .unwrap();
         }
         expect_refusal(
-            ingest(&address, bind(), vec![]).await,
+            send(&address, bind(), vec![]).await,
             if legacy {
                 "vector field binding"
             } else {
@@ -2142,7 +2136,7 @@ async fn empty_generations_recover_and_transfer_bindings_without_source_rows() {
             ..case_node_config(analysis.clone())
         };
         let (address, node) = start_empty_node(config.clone()).await;
-        ingest(&address, bind(), vec![]).await.unwrap();
+        send(&address, bind(), vec![]).await.unwrap();
         let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
         let flushed = client
             .flush(pipestream_search::pb::FlushRequest {})
@@ -2233,9 +2227,7 @@ async fn empty_generations_recover_and_transfer_bindings_without_source_rows() {
         // document from landing.
         let (target, receiver) = common::start_opened_node(target_config).await;
         seed_calibration(&target).await;
-        let inserted = ingest(&target, bind(), vec![doc(0).encode()])
-            .await
-            .unwrap();
+        let inserted = send(&target, bind(), vec![doc(0).encode()]).await.unwrap();
         assert_eq!(inserted.first_id, 0);
         assert_eq!(inserted.added, 1);
         let mut client = NodeServiceClient::connect(target).await.unwrap();
@@ -2270,7 +2262,7 @@ async fn compaction_keeps_vector_bindings_in_images_and_rewritten_logs() {
         })
         .await;
         seed_calibration(&address).await;
-        ingest(
+        send(
             &address,
             if explicit { explicit_bind() } else { bind() },
             (0..4).map(|i| doc(i).encode()).collect(),
@@ -2401,7 +2393,7 @@ async fn compaction_keeps_vector_bindings_in_images_and_rewritten_logs() {
             // on the next peer snapshot install.
             let (restored, restored_handle) =
                 common::start_opened_node(target_config.clone()).await;
-            let inserted = ingest(
+            let inserted = send(
                 &restored,
                 if explicit { explicit_bind() } else { bind() },
                 vec![doc(0).encode()],
@@ -2527,7 +2519,7 @@ async fn mapped_ingest_refuses_an_invalid_utf8_document_and_preserves_the_seed()
         let (addr, _node) = start_empty_node(boundary_config(analysis.clone())).await;
         seed_calibration(&addr).await;
         assert_eq!(
-            ingest(
+            send(
                 &addr,
                 boundary_bind(syntax),
                 vec![boundary_document(0, &[])]
@@ -2540,7 +2532,7 @@ async fn mapped_ingest_refuses_an_invalid_utf8_document_and_preserves_the_seed()
         assert_eq!(mapped_counts(&addr).await, (1, 1));
 
         let invalid_title = boundary_document(2, &[0x12, 0x02, 0xc3, 0x28]);
-        let error = ingest(&addr, boundary_bind(syntax), vec![invalid_title])
+        let error = send(&addr, boundary_bind(syntax), vec![invalid_title])
             .await
             .unwrap_err();
         assert_eq!(
@@ -2584,7 +2576,7 @@ async fn mapped_ingest_accepts_ten_byte_boundaries_and_refuses_overwide_varints(
     for syntax in ["proto2", "proto3"] {
         let (addr, _node) = start_empty_node(boundary_config(analysis.clone())).await;
         seed_calibration(&addr).await;
-        ingest(
+        send(
             &addr,
             boundary_bind(syntax),
             vec![boundary_document(0, &[])],
@@ -2596,9 +2588,7 @@ async fn mapped_ingest_accepts_ten_byte_boundaries_and_refuses_overwide_varints(
             .enumerate()
             .map(|(i, wire)| boundary_document(i + 1, wire))
             .collect();
-        let accepted = ingest(&addr, boundary_bind(syntax), controls)
-            .await
-            .unwrap();
+        let accepted = send(&addr, boundary_bind(syntax), controls).await.unwrap();
         assert_eq!(accepted.added, 4, "{syntax}");
         assert_eq!(mapped_counts(&addr).await, (5, 5), "{syntax}");
         let mut hits = boundary_hits(&addr, &analysis).await;
@@ -2622,7 +2612,7 @@ async fn mapped_ingest_accepts_ten_byte_boundaries_and_refuses_overwide_varints(
             .map(|hit| (hit.doc_id, hit.projected.clone()))
             .collect();
 
-        let error = ingest(
+        let error = send(
             &addr,
             boundary_bind(syntax),
             vec![boundary_document(5, &overwide_u64)],
@@ -2671,7 +2661,7 @@ async fn empty_secondary_text_is_omitted_while_body_and_source_survive_reopen() 
         let absent_author = boundary_document(1, &[]);
         let explicitly_empty_author = boundary_document(3, &[0x3a, 0x02, 0x0a, 0x00]);
         let original_documents = vec![absent_author, explicitly_empty_author];
-        let accepted = ingest(&addr, boundary_bind(syntax), original_documents.clone())
+        let accepted = send(&addr, boundary_bind(syntax), original_documents.clone())
             .await
             .unwrap();
         assert_eq!((accepted.added, accepted.total), (2, 2), "{syntax}");

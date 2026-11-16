@@ -27,6 +27,14 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request};
 
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
+
+#[path = "common/ingest.rs"]
+mod ingest;
+use ingest::ingest;
+
 /// A corpus whose dictionary has a dense "cour…" neighbourhood, so a
 /// prefix expands to several stems while its neighbours do not match.
 const CORPUS: [&str; 8] = [
@@ -50,25 +58,16 @@ fn config(slot_offset: u64) -> NodeConfig {
     }
 }
 
-async fn ingest(addr: &str, docs: &[&str]) {
-    let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
-    let (tx, rx) = mpsc::channel(8);
-    for text in docs {
-        tx.send(AddDocumentsRequest {
+async fn ingest_texts(addr: &str, docs: &[&str]) {
+    let requests = docs
+        .iter()
+        .map(|text| AddDocumentsRequest {
             text: text.to_string(),
             analysis: Some(body_spec()),
             ..Default::default()
         })
-        .await
-        .unwrap();
-    }
-    drop(tx);
-    let added = client
-        .add_documents(ReceiverStream::new(rx))
-        .await
-        .unwrap()
-        .into_inner()
-        .added;
+        .collect();
+    let added = ingest(addr, requests).await.unwrap().added;
     assert_eq!(added as usize, docs.len());
 }
 
@@ -149,8 +148,8 @@ fn analyzed_corpus() -> Vec<AnalyzedDoc> {
 async fn prefix_expansion_is_the_brute_force_dictionary_scan() {
     let (a, ha) = start_empty_node(config(0)).await;
     let (b, hb) = start_empty_node(config(SPLIT as u64)).await;
-    ingest(&a, &CORPUS[..SPLIT]).await;
-    ingest(&b, &CORPUS[SPLIT..]).await;
+    ingest_texts(&a, &CORPUS[..SPLIT]).await;
+    ingest_texts(&b, &CORPUS[SPLIT..]).await;
     let coordinator = coordinator(vec![a.clone(), b.clone()]);
     let corpus = analyzed_corpus();
 
@@ -198,8 +197,8 @@ async fn prefix_expansion_is_the_brute_force_dictionary_scan() {
 async fn the_cap_refuses_with_the_count_and_never_truncates() {
     let (a, ha) = start_empty_node(config(0)).await;
     let (b, hb) = start_empty_node(config(SPLIT as u64)).await;
-    ingest(&a, &CORPUS[..SPLIT]).await;
-    ingest(&b, &CORPUS[SPLIT..]).await;
+    ingest_texts(&a, &CORPUS[..SPLIT]).await;
+    ingest_texts(&b, &CORPUS[SPLIT..]).await;
     let coordinator = coordinator(vec![a.clone(), b.clone()]);
     let corpus = analyzed_corpus();
     let want = brute_force(&corpus, "cou");
@@ -274,9 +273,9 @@ async fn distributed_prefix_scoring_equals_the_monolith() {
     let (a, ha) = start_empty_node(config(0)).await;
     let (b, hb) = start_empty_node(config(SPLIT as u64)).await;
     let (m, hm) = start_empty_node(config(0)).await;
-    ingest(&a, &CORPUS[..SPLIT]).await;
-    ingest(&b, &CORPUS[SPLIT..]).await;
-    ingest(&m, &CORPUS).await;
+    ingest_texts(&a, &CORPUS[..SPLIT]).await;
+    ingest_texts(&b, &CORPUS[SPLIT..]).await;
+    ingest_texts(&m, &CORPUS).await;
     let fleet = coordinator(vec![a, b]);
     let mono = coordinator(vec![m]);
     for (text, prefixes) in [
@@ -392,13 +391,6 @@ async fn distributed_prefix_scoring_equals_the_monolith() {
 
 type Predicate = Box<dyn Fn(&str) -> bool>;
 
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("prefix-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 /// The mmap reader's path: a large dictionary flushed to disk, expanded
 /// through the byte-sorted directory's binary search, equal to the heap
 /// store's ordered-map walk and to the brute-force scan.
@@ -453,7 +445,7 @@ async fn the_shard_rpc_reports_counts_and_unknown_fields() {
         ..config(0)
     })
     .await;
-    ingest(&addr, &CORPUS).await;
+    ingest_texts(&addr, &CORPUS).await;
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     assert!(
         client

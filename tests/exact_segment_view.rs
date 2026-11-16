@@ -14,16 +14,20 @@ use pipestream_search::vector::EMBEDDED_TURBOVEC;
 use std::path::PathBuf;
 use tonic::Request;
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::{scratch_path, ScratchPath};
+
 const DIM: usize = 16;
 struct Fixture {
-    directory: PathBuf,
     index: PathBuf,
     vectors: Vec<f32>,
+    directory: ScratchPath,
 }
 impl Fixture {
     fn new(gap: bool) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let directory = std::env::temp_dir().join(format!(
+        let directory = scratch_path(&format!(
             "exact-segment-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -83,9 +87,9 @@ impl Fixture {
                 .unwrap();
         }
         Self {
-            directory,
             index,
             vectors,
+            directory,
         }
     }
     fn config(&self) -> NodeConfig {
@@ -167,12 +171,7 @@ async fn a_same_sized_stale_sidecar_cannot_replace_sealed_vector_values() {
     std::fs::write(&path, b"obsolete sidecar").unwrap();
     let reopened = NodeServiceImpl::open(fixture.config(), None).unwrap();
     assert_eq!(fixture.scores(&reopened).await.hits, response.hits);
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.directory);
-    }
+    let _ = &fixture.directory;
 }
 
 #[test]

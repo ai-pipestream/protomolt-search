@@ -10,9 +10,12 @@
 mod common;
 
 use pipestream_search::coordinator::CoordinatorServiceImpl;
-use pipestream_search::pb::node_service_client::NodeServiceClient;
 
 use common::{fit_calibration, mock::start_mock_analysis, unit_vectors, DIM};
+
+#[path = "common/cluster.rs"]
+mod cluster;
+use cluster::{start_shard, ShardGuard, ShardSpec};
 
 const N: usize = 12;
 
@@ -77,100 +80,42 @@ fn build_corpus() -> Corpus {
     }
 }
 
-async fn start_cluster(
+async fn start_fleet(
     analysis: &str,
     corpus: &Corpus,
     n_shards: usize,
     shift: &[f32],
     scale: &[f32],
     share_floors: bool,
-) -> (
-    Vec<String>,
-    Vec<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>>,
-) {
+) -> (Vec<String>, Vec<ShardGuard>) {
     let per = N / n_shards;
     let mut addrs = Vec::new();
     let mut handles = Vec::new();
     for shard in 0..n_shards {
         let start = shard * per;
-        let texts: Vec<String> = corpus.texts[start..start + per].to_vec();
-        let vectors = corpus.vectors[start * DIM..(start + per) * DIM].to_vec();
-        let (addr, handle) = common::start_empty_node(pipestream_search::node::NodeConfig {
-            slot_offset: (shard * per) as u64,
-            analysis_addr: Some(analysis.to_string()),
-            share_floors,
-            ..Default::default()
+        let docs = corpus.texts[start..start + per]
+            .iter()
+            .map(|text| pipestream_search::pb::AddDocumentsRequest {
+                text: text.clone(),
+                ..Default::default()
+            })
+            .collect();
+        // Docs first (ids 0..), then vectors, so slots align.
+        let (addr, handle) = start_shard(ShardSpec {
+            config: pipestream_search::node::NodeConfig {
+                slot_offset: (shard * per) as u64,
+                analysis_addr: Some(analysis.to_string()),
+                share_floors,
+                ..Default::default()
+            },
+            backend: Some(pipestream_search::harness::embedded_backend_request(
+                DIM, 4, shift, scale,
+            )),
+            docs,
+            vectors: corpus.vectors[start * DIM..(start + per) * DIM].to_vec(),
+            dim: DIM as u32,
         })
         .await;
-        // Seed, ingest docs first (ids 0..), then vectors (slots align).
-        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
-        client
-            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-                DIM, 4, shift, scale,
-            ))
-            .await
-            .unwrap();
-        {
-            let (tx, rx) = tokio::sync::mpsc::channel(8);
-            let feed = tokio::spawn(async move {
-                for text in texts {
-                    tx.send(pipestream_search::pb::AddDocumentsRequest {
-                        nlp_materialization: String::new(),
-                        unsigned_integers: Vec::new(),
-                        map_integers: Vec::new(),
-                        map_unsigned_integers: Vec::new(),
-                        derived_fingerprint: String::new(),
-                        original_source: None,
-                        source_chunk_ordinal: None,
-                        identity: None,
-                        collection: String::new(),
-                        cased_field: String::new(),
-                        sentence_fields: Vec::new(),
-                        materialize: None,
-                        map_numerics: Vec::new(),
-                        map_facets: Vec::new(),
-                        numerics: Vec::new(),
-                        facets: Vec::new(),
-                        text,
-                        analysis: None,
-                        lineage: None,
-                        fields: Vec::new(),
-                        integers: Vec::new(),
-                        timestamps: Vec::new(),
-                        geo_points: Vec::new(),
-                        quality: None,
-                        geography: None,
-                        phrases: Vec::new(),
-                        phrase_fingerprint: 0,
-                        phrase_field: String::new(),
-                        position_fields: Vec::new(),
-                        bigram_fields: Vec::new(),
-                    })
-                    .await
-                    .unwrap();
-                }
-            });
-            client
-                .add_documents(tokio_stream::wrappers::ReceiverStream::new(rx))
-                .await
-                .unwrap();
-            feed.await.unwrap();
-        }
-        {
-            let (tx, rx) = tokio::sync::mpsc::channel(4);
-            tx.send(pipestream_search::pb::AddVectorsRequest {
-                materialized_rows: Vec::new(),
-                vectors,
-                dim: DIM as u32,
-            })
-            .await
-            .unwrap();
-            drop(tx);
-            client
-                .add_vectors(tokio_stream::wrappers::ReceiverStream::new(rx))
-                .await
-                .unwrap();
-        }
         addrs.push(addr);
         handles.push(handle);
     }
@@ -232,7 +177,7 @@ async fn cascade_includes_whole_boundary_tie_group_and_is_deterministic() {
     let (analysis, mock) = start_mock_analysis().await;
     let corpus = build_corpus();
     let (shift, scale) = fit_calibration(DIM, 4, &corpus.vectors);
-    let (addrs, handles) = start_cluster(&analysis, &corpus, 3, &shift, &scale, true).await;
+    let (addrs, handles) = start_fleet(&analysis, &corpus, 3, &shift, &scale, true).await;
     let coordinator =
         CoordinatorServiceImpl::new(addrs).with_bm25(Some(analysis), Default::default());
 
@@ -301,9 +246,8 @@ async fn distributed_cascade_matches_monolithic_exactly() {
     let corpus = build_corpus();
     let (shift, scale) = fit_calibration(DIM, 4, &corpus.vectors);
 
-    let (addrs, handles) = start_cluster(&analysis, &corpus, 3, &shift, &scale, true).await;
-    let (mono_addrs, mono_handles) =
-        start_cluster(&analysis, &corpus, 1, &shift, &scale, true).await;
+    let (addrs, handles) = start_fleet(&analysis, &corpus, 3, &shift, &scale, true).await;
+    let (mono_addrs, mono_handles) = start_fleet(&analysis, &corpus, 1, &shift, &scale, true).await;
 
     let distributed =
         CoordinatorServiceImpl::new(addrs).with_bm25(Some(analysis.clone()), Default::default());
@@ -370,7 +314,7 @@ async fn floor_shared_candidates_equal_full_scan_candidates() {
 
     let mut per_mode = Vec::new();
     for share in [true, false] {
-        let (addrs, handles) = start_cluster(&analysis, &corpus, 3, &shift, &scale, share).await;
+        let (addrs, handles) = start_fleet(&analysis, &corpus, 3, &shift, &scale, share).await;
         let coordinator = CoordinatorServiceImpl::new(addrs);
         let result = coordinator
             .fanout_search("e", &corpus.query, 2, true, &Default::default())

@@ -1,13 +1,15 @@
 //! One access policy format and one replay journal format: a retired
 //! version is refused, and a new journal starts under authority.
 
-use std::path::PathBuf;
-
 use pipestream_search::authorization::PolicyAuthority;
 use pipestream_search::pb::{
     AccessAction, AccessPolicy, CollectionGrant, CollectionResource, ReplayStreamBinding,
 };
 use pipestream_search::replay_journal::ReplayJournal;
+
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::{scratch_path, ScratchPath};
 
 fn policy(format_version: u32) -> AccessPolicy {
     AccessPolicy {
@@ -44,20 +46,14 @@ fn only_the_current_access_policy_format_is_accepted() {
 }
 
 /// A scratch directory removed when the test ends, pass or fail.
-struct TempDir(PathBuf);
+struct TempDir(ScratchPath);
 
 impl TempDir {
     fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("wave2-ladders-{tag}-{}", std::process::id()));
+        let dir = scratch_path(&format!("wave2-ladders-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Self(dir)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

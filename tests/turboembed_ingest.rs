@@ -43,19 +43,9 @@ use pipestream_search::wal;
 use tonic::{Code, Request};
 use turbo_client::{BundleScoringFingerprint, BundleScoringSpec, IndexGenerationHandshake};
 
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "turboembed_ingest_{tag}_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
 
 fn lattice_spec() -> AnalysisSpec {
     AnalysisSpec {

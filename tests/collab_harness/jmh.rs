@@ -17,27 +17,22 @@
 //! `target_batch_ns`, keeping clock overhead out of sub-microsecond calls.
 //! Every input and result passes through [`std::hint::black_box`].
 //!
-//! Plain `cargo test` measures the unoptimized test profile, which the
-//! receipt records as `debug_assertions: true`; use `cargo test --release`
-//! for numbers worth comparing. Environment overrides for full sweeps: `COLLAB_JMH_FORKS`,
-//! `COLLAB_JMH_WARMUP`, `COLLAB_JMH_ITERATIONS`,
-//! `COLLAB_JMH_TARGET_BATCH_NS`, and `COLLAB_JMH_RECEIPT_DIR` to keep the
-//! receipts somewhere other than a temporary directory.
-
-use std::hint::black_box;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+//! Plain `cargo test` measures the unoptimized test profile (`debug_assertions: true`);
+//! use `cargo test --release` for numbers worth comparing. Environment overrides:
+//! `COLLAB_JMH_FORKS`, `COLLAB_JMH_WARMUP`, `COLLAB_JMH_ITERATIONS`,
+//! `COLLAB_JMH_TARGET_BATCH_NS`, and `COLLAB_JMH_RECEIPT_DIR`.
 
 use pipestream_search::test_support::ForkGuarded;
 use serde_json::{json, Value};
+use std::hint::black_box;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+#[path = "../common/scratch.rs"]
+mod scratch;
 
-/// Names the benchmark a re-executed child must measure.
 pub const FORK_ENV: &str = "COLLAB_JMH_FORK";
-/// Names the file a child writes its samples to.
 pub const FORK_OUT_ENV: &str = "COLLAB_JMH_FORK_OUT";
-/// Receipt schema identifier.
 pub const SCHEMA: &str = "collab-jmh/v1";
-/// Upper bound on the calibrated batch size.
 const MAX_BATCH_OPS: u64 = 1 << 24;
 
 /// Shape of one trial.
@@ -244,9 +239,13 @@ fn summary_json(s: &Summary) -> Value {
 /// Where receipts go when the caller has no preference: the directory in
 /// `COLLAB_JMH_RECEIPT_DIR`, else a per-process temporary directory.
 pub fn default_receipt_dir() -> PathBuf {
-    std::env::var_os("COLLAB_JMH_RECEIPT_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("collab-jmh-{}", std::process::id())))
+    let fallback = || {
+        PathBuf::from(scratch::scratch_path(&format!(
+            "collab-jmh-{}",
+            std::process::id()
+        )))
+    };
+    std::env::var_os("COLLAB_JMH_RECEIPT_DIR").map_or_else(fallback, PathBuf::from)
 }
 
 /// Stdout of `git` run in the package root, through the fork guard so a
@@ -455,9 +454,9 @@ fn t99_past_the_table_tracks_the_exact_student_t_quantile() {
 
 #[test]
 fn guards_cover_cleanup_and_degenerate_trials() {
-    let path = std::env::temp_dir().join(format!("collab-jmh-guard-{}", std::process::id()));
+    let path = scratch::scratch_path(&format!("collab-jmh-guard-{}", std::process::id()));
     std::fs::write(&path, b"x").unwrap();
-    let guarded = path.clone();
+    let guarded = path.to_path_buf();
     let unwound = std::panic::catch_unwind(move || {
         let _remove = RemoveOnDrop(guarded);
         panic!("child failed");
@@ -474,7 +473,7 @@ fn guards_cover_cleanup_and_degenerate_trials() {
             iterations: 1,
             target_batch_ns: 1,
         },
-        receipt_dir: path,
+        receipt_dir: path.to_path_buf(),
     };
     let refused = std::panic::catch_unwind(|| bench.run_forks());
     // One sample is refused before anything is created.

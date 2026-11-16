@@ -27,7 +27,6 @@ mod stage2;
 #[path = "turboembed_rerank_ops/vocab_mock.rs"]
 mod vocab_mock;
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -77,18 +76,8 @@ use turbo_client::{
     RemoteChannelPool, RemoteClient, RemoteEndpointConfig, RemotePriority, VocabularyCorpusIdf,
 };
 
-const DIM: usize = 32;
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
 
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "turboembed_rerank_ops_{tag}_{}_{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
+const DIM: usize = 32;

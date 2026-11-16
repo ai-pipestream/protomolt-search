@@ -49,19 +49,15 @@ use tonic::Request;
 use common::mock::start_mock_analysis;
 use common::{fit_calibration, start_empty_node, start_opened_node, unit_vectors, BIT_WIDTH, DIM};
 
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
+
 /// Rows ingested before the first compaction.
 const N: usize = 1_200;
 const GROUPS: [&str; 3] = ["red", "green", "blue"];
 const EXTRAS: [&str; 4] = ["one", "two", "three", "four"];
 const SEED: u64 = 0xC0A5_7A11;
-
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("protomolt_compaction_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn config(index_path: Option<PathBuf>, analysis: &str) -> NodeConfig {
     NodeConfig {

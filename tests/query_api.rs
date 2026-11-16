@@ -29,6 +29,10 @@ use tonic::Request;
 use common::{fit_calibration, mock::start_mock_analysis, start_empty_node, unit_vectors};
 use prost::Message;
 
+#[path = "common/cluster.rs"]
+mod cluster;
+use cluster::{start_shard, ShardGuard, ShardSpec};
+
 const DIM: usize = 64;
 const SHARD_DOCS: usize = 4;
 const N_DOCS: usize = 2 * SHARD_DOCS;
@@ -37,23 +41,15 @@ const COURTS: [&str; 3] = ["ca9", "ca2", "scotus"];
 /// Corpus: doc i's text mentions "zebra" for even i, and every doc
 /// carries `year = i` for filters. Vectors are the seeded unit corpus;
 /// the test query vector is doc 0's own.
-async fn start_cluster() -> (
-    CoordinatorServiceImpl,
-    Vec<f32>,
-    Vec<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>>,
-) {
-    start_cluster_with_addrs().await.0
+async fn start_fleet() -> (CoordinatorServiceImpl, Vec<f32>, Vec<ShardGuard>) {
+    start_fleet_with_addrs().await.0
 }
 
-async fn start_cluster_with_addrs() -> (
-    (
-        CoordinatorServiceImpl,
-        Vec<f32>,
-        Vec<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>>,
-    ),
+async fn start_fleet_with_addrs() -> (
+    (CoordinatorServiceImpl, Vec<f32>, Vec<ShardGuard>),
     Vec<String>,
 ) {
-    start_cluster_with_identities(false).await
+    start_fleet_with_identities(false).await
 }
 
 fn fixture_identity(id: u64) -> Option<pipestream_search::pb::DocumentIdentity> {
@@ -64,90 +60,74 @@ fn fixture_identity(id: u64) -> Option<pipestream_search::pb::DocumentIdentity> 
     })
 }
 
-async fn start_cluster_with_identities(
+async fn start_fleet_with_identities(
     identities: bool,
 ) -> (
-    (
-        CoordinatorServiceImpl,
-        Vec<f32>,
-        Vec<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>>,
-    ),
+    (CoordinatorServiceImpl, Vec<f32>, Vec<ShardGuard>),
     Vec<String>,
 ) {
     let (analysis, mock) = start_mock_analysis().await;
     let corpus = unit_vectors(N_DOCS, DIM, 0xC0FE_0001);
     let (shift, scale) = fit_calibration(DIM, 4, &corpus);
-    let mut handles = vec![mock];
+    let mut handles = vec![ShardGuard::from(mock)];
     let mut addrs = Vec::new();
     for shard in 0..2usize {
-        let (addr, handle) = start_empty_node(NodeConfig {
-            slot_offset: (shard * SHARD_DOCS) as u64,
-            analysis_addr: Some(analysis.clone()),
-            integer_fields: vec!["year".into()],
-            facet_fields: vec!["court".into()],
-            ..Default::default()
-        })
-        .await;
-        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
-        client
-            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-                DIM, 4, &shift, &scale,
-            ))
-            .await
-            .unwrap();
-        let (tx, rx) = mpsc::channel(16);
-        for i in 0..SHARD_DOCS {
-            let id = shard * SHARD_DOCS + i;
-            let text = if id.is_multiple_of(2) {
-                format!("zebra document {id}")
-            } else {
-                format!("plain document {id}")
-            };
-            tx.send(AddDocumentsRequest {
-                text,
-                original_source: identities
-                    .then(|| common::protobuf_source("fixture", &id.to_string())),
-                identity: identities.then(|| fixture_identity(id as u64)).flatten(),
-                source_chunk_ordinal: if identities {
-                    fixture_identity(id as u64).and_then(|identity| identity.chunk_ordinal)
-                } else {
-                    None
-                },
-                integers: vec![IntegerValue {
-                    field: "year".into(),
-                    value: id as i64,
-                }],
-                // A facet column and lineage for the sort and collapse
-                // tests: three courts round-robin, parents in pairs,
-                // groups in fours.
-                facets: vec![FacetValue {
-                    field: "court".into(),
-                    value: COURTS[id % 3].into(),
-                }],
-                lineage: Some(DocLineage {
-                    parent_id: (id / 2) as u64,
-                    group_id: (id / 4) as u64,
-                    span_start: 0,
-                    span_end: 0,
-                }),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        }
-        drop(tx);
-        client.add_documents(ReceiverStream::new(rx)).await.unwrap();
         let start = shard * SHARD_DOCS;
-        let (vtx, vrx) = mpsc::channel(4);
-        vtx.send(AddVectorsRequest {
-            materialized_rows: Vec::new(),
+        let docs = (0..SHARD_DOCS)
+            .map(|i| {
+                let id = shard * SHARD_DOCS + i;
+                let text = if id.is_multiple_of(2) {
+                    format!("zebra document {id}")
+                } else {
+                    format!("plain document {id}")
+                };
+                AddDocumentsRequest {
+                    text,
+                    original_source: identities
+                        .then(|| common::protobuf_source("fixture", &id.to_string())),
+                    identity: identities.then(|| fixture_identity(id as u64)).flatten(),
+                    source_chunk_ordinal: if identities {
+                        fixture_identity(id as u64).and_then(|identity| identity.chunk_ordinal)
+                    } else {
+                        None
+                    },
+                    integers: vec![IntegerValue {
+                        field: "year".into(),
+                        value: id as i64,
+                    }],
+                    // A facet column and lineage for the sort and collapse
+                    // tests: three courts round-robin, parents in pairs,
+                    // groups in fours.
+                    facets: vec![FacetValue {
+                        field: "court".into(),
+                        value: COURTS[id % 3].into(),
+                    }],
+                    lineage: Some(DocLineage {
+                        parent_id: (id / 2) as u64,
+                        group_id: (id / 4) as u64,
+                        span_start: 0,
+                        span_end: 0,
+                    }),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        let (addr, handle) = start_shard(ShardSpec {
+            config: NodeConfig {
+                slot_offset: (shard * SHARD_DOCS) as u64,
+                analysis_addr: Some(analysis.clone()),
+                integer_fields: vec!["year".into()],
+                facet_fields: vec!["court".into()],
+                ..Default::default()
+            },
+            backend: Some(pipestream_search::harness::embedded_backend_request(
+                DIM, 4, &shift, &scale,
+            )),
+            docs,
             vectors: corpus[start * DIM..(start + SHARD_DOCS) * DIM].to_vec(),
             dim: DIM as u32,
         })
-        .await
-        .unwrap();
-        drop(vtx);
-        client.add_vectors(ReceiverStream::new(vrx)).await.unwrap();
+        .await;
         addrs.push(addr);
         handles.push(handle);
     }
@@ -158,7 +138,7 @@ async fn start_cluster_with_identities(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dense_results_preserve_identity_in_classic_and_streaming_scans() {
-    let ((coordinator, vector, handles), _) = start_cluster_with_identities(true).await;
+    let ((coordinator, vector, handles), _) = start_fleet_with_identities(true).await;
     let request = QueryRequest {
         k: N_DOCS as u32,
         selection: Some(dense_leaf("vec", &vector)),
@@ -196,7 +176,7 @@ async fn dense_results_preserve_identity_in_classic_and_streaming_scans() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lexical_results_preserve_imported_identity_through_public_and_streamed_queries() {
-    let ((coordinator, _, handles), addrs) = start_cluster_with_identities(true).await;
+    let ((coordinator, _, handles), addrs) = start_fleet_with_identities(true).await;
     let request = QueryRequest {
         explain: true,
         k: N_DOCS as u32,
@@ -281,7 +261,7 @@ async fn lexical_results_preserve_imported_identity_through_public_and_streamed_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_query_shape_and_collapse_carries_imported_identity() {
-    let ((coordinator, vector, handles), _) = start_cluster_with_identities(true).await;
+    let ((coordinator, vector, handles), _) = start_fleet_with_identities(true).await;
     let selections = vec![
         cel_filter("all", "year >= 0"),
         boolean(
@@ -524,7 +504,7 @@ fn stream_parts(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn single_leaves_execute_their_ordinary_routes() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
 
     // Lexical leaf == Bm25Search, bitwise, with named provenance.
     let public = query(
@@ -611,7 +591,7 @@ async fn single_leaves_execute_their_ordinary_routes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dense_execution_modes_are_explicit_and_fail_closed() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
 
     let run = |mode: DenseExecutionMode| QueryRequest {
         k: 5,
@@ -886,7 +866,7 @@ candidates = {ROWS}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn filters_ride_the_and_wrapper_and_conjoin() {
-    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let (coordinator, _qvec, _handles) = start_fleet().await;
 
     let public = query(
         &coordinator,
@@ -927,7 +907,7 @@ async fn filters_ride_the_and_wrapper_and_conjoin() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn composites_execute_their_fusion_modes() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
 
     let two_leaves = || vec![dense_leaf("vec", &qvec), lexical_leaf("lex", "zebra")];
     for (strategy, operator, mode, executed) in [
@@ -1015,7 +995,7 @@ async fn composites_execute_their_fusion_modes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_boost_rescoring_draws_from_selection_k_and_returns_k() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
 
     let public = query(
         &coordinator,
@@ -1078,7 +1058,7 @@ async fn a_boost_rescoring_draws_from_selection_k_and_returns_k() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unsupported_shapes_refuse_by_name() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
 
     let or_two = |strategy| {
         composite(
@@ -1269,7 +1249,7 @@ async fn unsupported_shapes_refuse_by_name() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn recursive_boolean_is_exact_across_hybrid_signals_filters_aggregation_and_pages() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
     let selection = || {
         boolean(
             vec![
@@ -1425,7 +1405,7 @@ async fn recursive_boolean_is_exact_across_hybrid_signals_filters_aggregation_an
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn boolean_candidate_rescore_preserves_the_ordinary_score_stage_bits() {
-    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let (coordinator, _qvec, _handles) = start_fleet().await;
     let lexical = || SelectionQuery {
         node: Some(selection_query::Node::Search(SearchQuery {
             id: "body".into(),
@@ -1481,7 +1461,7 @@ async fn boolean_candidate_rescore_preserves_the_ordinary_score_stage_bits() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_empty_boolean_match_set_has_an_empty_aggregate() {
-    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let (coordinator, _qvec, _handles) = start_fleet().await;
     let response = query(
         &coordinator,
         QueryRequest {
@@ -1518,7 +1498,7 @@ async fn an_empty_boolean_match_set_has_an_empty_aggregate() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pages_stitch_into_the_full_ranking() {
-    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let (coordinator, _qvec, _handles) = start_fleet().await;
     let leaf = || lexical_leaf("lex", "document");
 
     let full = query(
@@ -1571,7 +1551,7 @@ async fn pages_stitch_into_the_full_ranking() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn composite_pages_within_its_fixed_pool() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
     let selection = || {
         composite(
             SelectionOperator::Or,
@@ -1639,7 +1619,7 @@ async fn composite_pages_within_its_fixed_pool() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_changed_corpus_refuses_the_cursor() {
-    let ((coordinator, _qvec, _handles), addrs) = start_cluster_with_addrs().await;
+    let ((coordinator, _qvec, _handles), addrs) = start_fleet_with_addrs().await;
     let leaf = || lexical_leaf("lex", "document");
 
     let first = query(
@@ -1711,7 +1691,7 @@ async fn a_changed_corpus_refuses_the_cursor() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn filter_only_browse_pages_in_id_order() {
-    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let (coordinator, _qvec, _handles) = start_fleet().await;
 
     // One bare filter is a browse; docs 2..=6 pass, ids ascending.
     let full = query(
@@ -1775,7 +1755,7 @@ async fn filter_only_browse_pages_in_id_order() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn browse_refuses_an_unknown_column_by_name() {
-    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let (coordinator, _qvec, _handles) = start_fleet().await;
     let err = query(
         &coordinator,
         QueryRequest {
@@ -1792,7 +1772,7 @@ async fn browse_refuses_an_unknown_column_by_name() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sorted_browse_orders_by_column_and_pages() {
-    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let (coordinator, _qvec, _handles) = start_fleet().await;
     let selection = || cel_filter("f", "year >= 1");
     let by = |column: &str, descending: bool| QuerySort {
         map: None,
@@ -1890,7 +1870,7 @@ async fn sorted_browse_orders_by_column_and_pages() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_key_sort_orders_text_then_number_and_pages() {
-    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let (coordinator, _qvec, _handles) = start_fleet().await;
     let by = |column: &str, descending: bool| QuerySort {
         map: None,
         column: column.into(),
@@ -2001,7 +1981,7 @@ async fn multi_key_sort_orders_text_then_number_and_pages() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lexical_leaf_sorts_its_exact_membership_without_scores() {
-    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let (coordinator, _qvec, _handles) = start_fleet().await;
     // "zebra" matches the even ids; year descending orders them 6,4,2,0.
     let resp = query(
         &coordinator,
@@ -2111,7 +2091,7 @@ async fn a_lexical_leaf_sorts_its_exact_membership_without_scores() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn collapse_groups_the_pool_by_key_with_inner_hits_and_pages() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
     let collapse = |column: &str, inner_hits: u32| {
         Some(CollapseSpec {
             map: None,
@@ -2380,7 +2360,7 @@ async fn collapse_groups_the_pool_by_key_with_inner_hits_and_pages() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn public_query_stream_is_exact_certified_and_retry_stable() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
 
     for (name, request, provisional_phase) in [
         (
@@ -2486,7 +2466,7 @@ async fn public_query_stream_is_exact_certified_and_retry_stable() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn public_query_stream_errors_are_terminal_not_partial_success() {
-    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let (coordinator, _qvec, _handles) = start_fleet().await;
     let events = streamed_query(&coordinator, None, 0).await;
     let (revisions, completion) = stream_parts(&events);
     assert_eq!(revisions.len(), 1);
@@ -2498,7 +2478,7 @@ async fn public_query_stream_errors_are_terminal_not_partial_success() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn public_query_stream_missing_shard_cannot_certify_completion() {
-    let ((_, qvec, _handles), mut addrs) = start_cluster_with_addrs().await;
+    let ((_, qvec, _handles), mut addrs) = start_fleet_with_addrs().await;
     addrs.push("http://127.0.0.1:1".into());
     let coordinator = CoordinatorServiceImpl::new(addrs);
     let events = streamed_query(
@@ -2524,7 +2504,7 @@ async fn public_query_stream_deadline_and_client_drop_cancel_analysis() {
     use common::mock::start_mock_analysis_delayed;
     use std::time::{Duration, Instant};
 
-    let ((_, _qvec, _handles), addrs) = start_cluster_with_addrs().await;
+    let ((_, _qvec, _handles), addrs) = start_fleet_with_addrs().await;
     let (analysis, _slow_handle, probe) = start_mock_analysis_delayed(Duration::from_secs(5)).await;
     let coordinator =
         CoordinatorServiceImpl::new(addrs).with_bm25(Some(analysis), Default::default());

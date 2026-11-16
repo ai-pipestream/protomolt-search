@@ -1,5 +1,9 @@
 use pipestream_search::turbo_bridge::splade::SpladeFieldIndex;
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::scratch_path;
+
 #[test]
 fn block_skip_must_include_unaligned_query_terms() {
     for scale in [1.0_f32, 0.01] {
@@ -36,7 +40,7 @@ fn new_column_payloads_are_crc_covered_and_roundtrip() {
     use pipestream_search::postings::{
         AnalyzedDoc, AnalyzedField, Bm25Index, Bm25Reader, Bm25Store,
     };
-    let dir = std::env::temp_dir().join(format!("review125-crc-{}", std::process::id()));
+    let dir = scratch_path(&format!("review125-crc-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("columns.bm25");
     let mut store = Bm25Store::with_text_fields(&["body"]).with_positions(&["body"]);
@@ -227,7 +231,7 @@ fn canonical_splade_v2_bytes_reject_v1_magic_and_mixed_scales_survive_transpose(
         std::io::ErrorKind::InvalidData
     );
 
-    let dir = std::env::temp_dir().join(format!("splade-scales-{}", std::process::id()));
+    let dir = scratch_path(&format!("splade-scales-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut store = Bm25Store::with_text_fields(&["body"]);
     let scales = [0.00001_f32, 0.00002, 0.5];

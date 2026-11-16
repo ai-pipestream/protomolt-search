@@ -27,15 +27,11 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 
-const ROWS: usize = 3_000;
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
 
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("scan_budget_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
+const ROWS: usize = 3_000;
 
 fn shard_config(index_path: PathBuf) -> NodeConfig {
     NodeConfig {

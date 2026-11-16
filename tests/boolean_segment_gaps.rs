@@ -12,6 +12,10 @@ use pipestream_search::segments::{OpenedSegmentSet, SegmentCatalog, SegmentSourc
 use pipestream_search::vector::{VectorIndex, EMBEDDED_TURBOVEC};
 use tonic::Request;
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::scratch_path;
+
 fn documents() -> Bm25Store {
     let mut store = Bm25Store::with_text_fields(&["body"]);
     for slot in 0..2 {
@@ -26,7 +30,7 @@ fn documents() -> Bm25Store {
 
 #[tokio::test]
 async fn document_only_segment_is_a_gap_in_bitmap_and_boolean_membership() {
-    let root = std::env::temp_dir().join(format!("boolean-segment-gaps-{}", std::process::id()));
+    let root = scratch_path(&format!("boolean-segment-gaps-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let vectors = unit_vectors(8, 16, 731);

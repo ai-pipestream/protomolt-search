@@ -31,16 +31,17 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
+
+#[path = "common/ingest.rs"]
+mod ingest;
+use ingest::ingest;
+
 const N: usize = 60;
 const DIM: usize = 16;
 const SEAL: usize = 16;
-
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("derived-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn column(name: &str, kind: MaterializeKind, expression: &str) -> DerivedColumn {
     DerivedColumn {
@@ -132,19 +133,6 @@ fn config(index_path: Option<PathBuf>, derived: Option<Arc<Declaration>>) -> Nod
         derived,
         ..Default::default()
     }
-}
-
-async fn ingest(addr: &str, docs: Vec<AddDocumentsRequest>) -> Result<(), tonic::Status> {
-    let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
-    let (tx, rx) = mpsc::channel(docs.len().max(1));
-    for doc in docs {
-        tx.send(doc).await.unwrap();
-    }
-    drop(tx);
-    client
-        .add_documents(ReceiverStream::new(rx))
-        .await
-        .map(|_| ())
 }
 
 fn root(addr: &str) -> CoordinatorServiceImpl {

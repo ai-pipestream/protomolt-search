@@ -46,16 +46,12 @@ use tonic::transport::Error as TransportError;
 
 use common::{fit_calibration, unit_vectors, BIT_WIDTH, DIM};
 
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
+
 const N: usize = 3_000;
 const DOCS: usize = 1_500;
-
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("turbovec_reshard_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 /// Deterministic document text with shared terms (so BM25 has something
 /// to rank) and enough variety to keep doc lengths unequal.
@@ -106,7 +102,7 @@ async fn start_wal_node(
 /// Ingest documents first (ids 0..docs), then vectors (ids 0..vecs), so
 /// the two sides share the aligned positional id space the court ingest
 /// path uses; then flush.
-async fn ingest(
+async fn load_corpus(
     client: &mut NodeServiceClient<tonic::transport::Channel>,
     corpus: &[f32],
     vectors: usize,
@@ -298,7 +294,7 @@ async fn split_reconstructs_parent_topk() {
 
     let (mut client, index_path, _node) =
         start_wal_node(&dir, "shard.tv", 0, 64, &analysis_addr, &shift, &scale).await;
-    ingest(&mut client, &corpus, N, DOCS).await;
+    load_corpus(&mut client, &corpus, N, DOCS).await;
 
     // The parent sealed two segments (the rows with documents, then the
     // vector-only rows); the reference is the whole corpus in one image.
@@ -363,7 +359,7 @@ async fn merge_reproduces_monolithic() {
     let half = N / 2;
     let (mut a, a_path, _node_a) =
         start_wal_node(&dir, "a.tv", 0, 64, &analysis_addr, &shift, &scale).await;
-    ingest(&mut a, &corpus[..half * DIM], half, DOCS / 2).await;
+    load_corpus(&mut a, &corpus[..half * DIM], half, DOCS / 2).await;
     let (mut b, b_path, _node_b) = start_wal_node(
         &dir,
         "b.tv",
@@ -374,7 +370,7 @@ async fn merge_reproduces_monolithic() {
         &scale,
     )
     .await;
-    ingest(&mut b, &corpus[half * DIM..], half, DOCS / 2).await;
+    load_corpus(&mut b, &corpus[half * DIM..], half, DOCS / 2).await;
 
     let generations = [a_path, b_path]
         .iter()
@@ -537,7 +533,7 @@ async fn split_consumes_each_bucket_once() {
         &scale,
     )
     .await;
-    ingest(&mut client, &corpus, n, 0).await;
+    load_corpus(&mut client, &corpus, n, 0).await;
     let mut parent = VectorIndex::load(
         EMBEDDED_TURBOVEC,
         &common::catalog::segment_vector(&index_path, 0),
@@ -595,7 +591,7 @@ async fn split_finer_than_buckets_repartitions() {
 
     let (mut client, index_path, _node) =
         start_wal_node(&dir, "shard.tv", 0, 2, &analysis_addr, &shift, &scale).await;
-    ingest(&mut client, &corpus, n, 0).await;
+    load_corpus(&mut client, &corpus, n, 0).await;
     let mut parent = VectorIndex::load(
         EMBEDDED_TURBOVEC,
         &common::catalog::segment_vector(&index_path, 0),
@@ -858,7 +854,7 @@ async fn one_child_reshard_compacts_generation_tombstones() {
     std::mem::forget(analysis);
     let (mut client, index_path, _node) =
         start_wal_node(&dir, "parent.tv", 0, 8, &analysis_addr, &shift, &scale).await;
-    ingest(&mut client, &corpus, rows, rows).await;
+    load_corpus(&mut client, &corpus, rows, rows).await;
     client
         .delete_documents(DeleteDocumentsRequest {
             expected_wal_generation: None,
@@ -918,7 +914,7 @@ async fn split_logs_redistributes_two_shards_into_four() {
     let half = N / 2;
     let (mut a, a_path, _node_a) =
         start_wal_node(&dir, "a.tv", 0, 64, &analysis_addr, &shift, &scale).await;
-    ingest(&mut a, &corpus[..half * DIM], half, DOCS / 2).await;
+    load_corpus(&mut a, &corpus[..half * DIM], half, DOCS / 2).await;
     let (mut b, b_path, _node_b) = start_wal_node(
         &dir,
         "b.tv",
@@ -929,7 +925,7 @@ async fn split_logs_redistributes_two_shards_into_four() {
         &scale,
     )
     .await;
-    ingest(&mut b, &corpus[half * DIM..], half, DOCS / 2).await;
+    load_corpus(&mut b, &corpus[half * DIM..], half, DOCS / 2).await;
 
     let generations = [a_path, b_path]
         .iter()
