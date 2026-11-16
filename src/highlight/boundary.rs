@@ -1,7 +1,7 @@
 //! Character boundaries of a stored text and the whitespace-snapped
 //! window cut over them.
 
-use tonic::Status;
+use super::HighlightError;
 
 /// UTF-8 character-boundary map for one text: the boundaries of every
 /// scalar, so a persisted UTF-8 byte offset is validated on a character
@@ -25,10 +25,10 @@ impl CharBoundaryMap {
         self.boundaries.last().map_or(0, |b| b.0)
     }
 
-    pub(super) fn byte_at(&self, offset: u32) -> Result<usize, Status> {
+    pub(super) fn byte_at(&self, offset: u32) -> Result<usize, HighlightError> {
         match self.boundaries.binary_search_by_key(&offset, |b| b.0) {
             Ok(i) => Ok(self.boundaries[i].1),
-            Err(_) => Err(Status::internal(format!(
+            Err(_) => Err(HighlightError::internal(format!(
                 "highlight: UTF-8 byte offset {offset} is not a character boundary of the stored \
                  text (a multi-byte scalar is split, or the span outruns the text)"
             ))),
@@ -75,7 +75,7 @@ pub(super) fn window(
     bounds: (u32, u32),
     anchor: (u32, u32),
     max_chars: u32,
-) -> Result<(u32, u32), Status> {
+) -> Result<(u32, u32), HighlightError> {
     let (lo, hi) = bounds;
     // Lead with a third of the budget before the anchor, the rest after.
     let lead = max_chars / 3;
@@ -87,9 +87,9 @@ pub(super) fn window(
     // Snap inward: the start moves forward to the first character after
     // a whitespace (or stays at the bound); the end moves back to the
     // last whitespace (or stays at the bound).
-    let mut si = map
-        .ceil_index_of(start)
-        .ok_or_else(|| Status::internal("highlight: window start off a character boundary"))?;
+    let mut si = map.ceil_index_of(start).ok_or_else(|| {
+        HighlightError::internal("highlight: window start off a character boundary")
+    })?;
     if start != lo {
         while si + 1 < map.boundaries.len()
             && map.boundaries[si].0 < hi
@@ -105,9 +105,9 @@ pub(super) fn window(
             si += 1;
         }
     }
-    let mut ei = map
-        .floor_index_of(end)
-        .ok_or_else(|| Status::internal("highlight: window end off a character boundary"))?;
+    let mut ei = map.floor_index_of(end).ok_or_else(|| {
+        HighlightError::internal("highlight: window end off a character boundary")
+    })?;
     if end != hi {
         // If the end lands mid-token (the character before it and the
         // character at it are both non-space), back up to whitespace.
@@ -127,13 +127,13 @@ pub(super) fn window(
     // The anchor did not survive the snap: take its own run instead.
     let mut ai = map
         .index_of(anchor.0)
-        .ok_or_else(|| Status::internal("highlight: anchor off a character boundary"))?;
+        .ok_or_else(|| HighlightError::internal("highlight: anchor off a character boundary"))?;
     while ai > 0 && map.boundaries[ai - 1].0 >= lo && !is_space_at(text, map, ai - 1) {
         ai -= 1;
     }
-    let mut bi = map
-        .index_of(anchor.1)
-        .ok_or_else(|| Status::internal("highlight: anchor end off a character boundary"))?;
+    let mut bi = map.index_of(anchor.1).ok_or_else(|| {
+        HighlightError::internal("highlight: anchor end off a character boundary")
+    })?;
     while bi + 1 < map.boundaries.len() && map.boundaries[bi].0 < hi && !is_space_at(text, map, bi)
     {
         bi += 1;

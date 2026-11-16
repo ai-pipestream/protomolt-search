@@ -1,7 +1,7 @@
 //! Snippet selection: candidate units, their ranking, and the cut of
 //! each chosen unit.
 
-use tonic::Status;
+use super::HighlightError;
 
 use super::boundary::{window, CharBoundaryMap};
 use super::{merge_spans, Cut, Mode, Snippet};
@@ -44,7 +44,7 @@ pub fn snippets(
     mode: Mode,
     max_snippets: usize,
     max_chars: u32,
-) -> Result<Vec<Snippet>, Status> {
+) -> Result<Vec<Snippet>, HighlightError> {
     if occurrences.is_empty() || max_snippets == 0 {
         return Ok(Vec::new());
     }
@@ -99,11 +99,11 @@ pub fn snippets(
 fn validate_occurrences(
     map: &CharBoundaryMap,
     occurrences: &[(usize, (u32, u32))],
-) -> Result<(), Status> {
+) -> Result<(), HighlightError> {
     let text_end = map.len_bytes();
     for &(_, (start, end)) in occurrences {
         if start > end || end > text_end {
-            return Err(Status::internal(format!(
+            return Err(HighlightError::internal(format!(
                 "highlight: occurrence [{start}, {end}) outruns the stored text of {text_end} \
              UTF-8 bytes"
             )));
@@ -121,9 +121,9 @@ fn validate_occurrences(
 fn sentence_units(
     sentences: Option<&[(u32, u32)]>,
     occurrences: &[(usize, (u32, u32))],
-) -> Result<Vec<Unit>, Status> {
+) -> Result<Vec<Unit>, HighlightError> {
     let sentences = sentences.ok_or_else(|| {
-        Status::failed_precondition(
+        HighlightError::failed_precondition(
             "highlight: sentence mode over a field without stored sentence spans",
         )
     })?;
@@ -133,7 +133,7 @@ fn sentence_units(
         let si = match sentences.binary_search_by(|s| s.0.cmp(&start)) {
             Ok(i) => i,
             Err(0) => {
-                return Err(Status::internal(format!(
+                return Err(HighlightError::internal(format!(
                     "highlight: occurrence [{start}, {end}) lies before every stored \
                      sentence span"
                 )))
@@ -142,7 +142,7 @@ fn sentence_units(
         };
         let (s_start, s_end) = sentences[si];
         if !(s_start <= start && end <= s_end) {
-            return Err(Status::internal(format!(
+            return Err(HighlightError::internal(format!(
                 "highlight: occurrence [{start}, {end}) lies outside every stored \
                  sentence span (nearest [{s_start}, {s_end}))"
             )));
@@ -189,7 +189,7 @@ fn cut_bounds(
     unit_bounds: (u32, u32),
     anchor: (u32, u32),
     max_chars: u32,
-) -> Result<((u32, u32), Cut), Status> {
+) -> Result<((u32, u32), Cut), HighlightError> {
     Ok(match mode {
         Mode::Sentence => {
             if unit_bounds.1 - unit_bounds.0 <= max_chars {

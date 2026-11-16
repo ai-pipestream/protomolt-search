@@ -179,3 +179,129 @@ fn a_highlight_wider_than_the_budget_keeps_its_whole_token() {
     assert_eq!(got[0].text, long);
     assert_eq!(got[0].highlights, vec![at(&text, &long, 0)]);
 }
+
+fn assert_status(error: HighlightError, code: tonic::Code, message: &str) {
+    let status = tonic::Status::from(error);
+    assert_eq!(status.code(), code);
+    assert_eq!(status.message().as_bytes(), message.as_bytes());
+}
+
+#[test]
+fn domain_error_is_compact_and_formats_readably() {
+    assert!(size_of::<HighlightError>() <= 32);
+    assert!(size_of::<Result<(), HighlightError>>() <= 32);
+    let original = HighlightError::internal("original highlight error");
+    let cloned = original.clone();
+    assert_eq!(original, cloned);
+    assert_eq!(original.message(), "original highlight error");
+    assert_eq!(original.to_string(), "original highlight error");
+    assert!(format!("{original:?}").contains("original highlight error"));
+}
+
+#[test]
+fn plan_errors_preserve_every_code_and_message() {
+    let spec = |mode, max_snippets, max_chars, fields: &[&str]| crate::pb::HighlightSpec {
+        mode,
+        max_snippets,
+        max_chars,
+        fields: fields.iter().map(|field| field.to_string()).collect(),
+    };
+    let cases = [
+        (
+            spec(999, 0, 0, &[]),
+            "HighlightSpec.mode 999 is not a HighlightMode".to_string(),
+        ),
+        (
+            spec(0, 65, 0, &[]),
+            "HighlightSpec.max_snippets 65 exceeds the maximum 64".to_string(),
+        ),
+        (
+            spec(0, 0, 15, &[]),
+            "HighlightSpec.max_chars 15 is below the minimum 16".to_string(),
+        ),
+        (
+            spec(0, 0, 4097, &[]),
+            "HighlightSpec.max_chars 4097 exceeds the maximum 4096".to_string(),
+        ),
+        (
+            spec(0, 0, 0, &[""]),
+            "HighlightSpec.fields: a field name is empty".to_string(),
+        ),
+        (
+            spec(0, 0, 0, &["body", "body"]),
+            "HighlightSpec.fields: \"body\" repeats".to_string(),
+        ),
+    ];
+    for (spec, message) in cases {
+        let error = Plan::from_spec(&spec).unwrap_err();
+        assert_eq!(error.message(), message);
+        assert_status(error, tonic::Code::InvalidArgument, &message);
+    }
+}
+
+#[test]
+fn snippet_errors_preserve_every_code_and_message() {
+    let missing = snippets("one two", None, &[(0, (0, 1))], Mode::Sentence, 1, 30).unwrap_err();
+    assert_status(
+        missing,
+        tonic::Code::FailedPrecondition,
+        "highlight: sentence mode over a field without stored sentence spans",
+    );
+    let overrun = snippets("one", None, &[(0, (0, 99))], Mode::Window, 1, 30).unwrap_err();
+    assert_status(
+        overrun,
+        tonic::Code::Internal,
+        "highlight: occurrence [0, 99) outruns the stored text of 3 UTF-8 bytes",
+    );
+    let split = snippets("😀", None, &[(0, (1, 2))], Mode::Window, 1, 30).unwrap_err();
+    assert_status(
+        split,
+        tonic::Code::Internal,
+        "highlight: UTF-8 byte offset 1 is not a character boundary of the stored text \
+         (a multi-byte scalar is split, or the span outruns the text)",
+    );
+    let before = snippets(
+        "one two",
+        Some(&[(4, 7)]),
+        &[(0, (0, 1))],
+        Mode::Sentence,
+        1,
+        30,
+    )
+    .unwrap_err();
+    assert_status(
+        before,
+        tonic::Code::Internal,
+        "highlight: occurrence [0, 1) lies before every stored sentence span",
+    );
+    let outside = snippets(
+        "one two",
+        Some(&[(0, 3)]),
+        &[(0, (4, 7))],
+        Mode::Sentence,
+        1,
+        30,
+    )
+    .unwrap_err();
+    assert_status(
+        outside,
+        tonic::Code::Internal,
+        "highlight: occurrence [4, 7) lies outside every stored sentence span (nearest [0, 3))",
+    );
+}
+
+#[test]
+fn internal_window_errors_preserve_their_exact_messages() {
+    for message in [
+        "highlight: window start off a character boundary",
+        "highlight: window end off a character boundary",
+        "highlight: anchor off a character boundary",
+        "highlight: anchor end off a character boundary",
+    ] {
+        assert_status(
+            HighlightError::internal(message),
+            tonic::Code::Internal,
+            message,
+        );
+    }
+}
