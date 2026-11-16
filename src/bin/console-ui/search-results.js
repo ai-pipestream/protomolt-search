@@ -1,5 +1,6 @@
 // The pinned baseline, export, the column names seen, and stored text.
-import { api, clear, el, errorText } from './common.js';
+import { bff } from './bff.js';
+import { clear, el, errorText } from './common.js';
 import { encodeState, identifiersIn, toCsv } from './query-state.js';
 import { $, BASELINE_KEY, COLUMNS_KEY, COLUMNS_MAX, COLUMN_INPUTS, state } from './search-state.js';
 import { readForm } from './search-form.js';
@@ -131,8 +132,8 @@ export async function fetchTexts(ids) {
   const missing = ids.filter((id) => id != null && !state.texts.has(String(id)));
   if (!missing.length) return;
   try {
-    const r = await api.post('/api/documents', { doc_ids: missing });
-    for (const d of r.documents || []) state.texts.set(String(d.doc_id), d);
+    const r = await bff.call('PreviewDocuments', { doc_ids: missing, max_chars: 4000 });
+    for (const d of r.documents || []) state.texts.set(String(d.docId), { doc_id: d.docId, text: d.snippet, truncated: d.truncated });
   } catch (e) {
     // Text is a convenience; the hit list still renders.
     for (const id of missing) state.texts.set(String(id), { text: '', error: errorText(e) });

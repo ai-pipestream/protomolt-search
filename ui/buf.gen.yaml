@@ -1,0 +1,10 @@
+# TypeScript stubs for the BFF service. Run through scripts/gen.sh, never by
+# hand: it assembles the vendored protos with ui/proto, pins the buf CLI,
+# and `--check` fails when committed stubs or the descriptor drift.
+version: v2
+plugins:
+  - local: node_modules/.bin/protoc-gen-es
+    out: src/gen
+    include_imports: true
+    opt:
+      - target=ts

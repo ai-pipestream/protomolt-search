@@ -17,6 +17,7 @@ pub(super) const EMBEDDED: &[(&str, &str)] = &[
     ),
     ("app.css", include_str!("../bin/console-ui/app.css")),
     ("common.js", include_str!("../bin/console-ui/common.js")),
+    ("bff.js", include_str!("../bin/console-ui/bff.js")),
     (
         "query-state.js",
         include_str!("../bin/console-ui/query-state.js"),
@@ -93,6 +94,11 @@ pub(super) fn asset_name(path: &str) -> Option<&str> {
         .iter()
         .any(|ext| name.ends_with(ext));
     (typed && !name.starts_with('.') && name.bytes().all(allowed)).then_some(name)
+}
+
+/// The operator pages, served only with the raw explorer.
+pub(super) fn is_raw_page(name: &str) -> bool {
+    matches!(name, "explorer.html" | "dashboard.html")
 }
 
 fn content_type(name: &str) -> &'static str {

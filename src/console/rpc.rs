@@ -167,7 +167,10 @@ pub(super) async fn stream_rpc(
 /// without reading would otherwise park this task on the write for
 /// good; the gRPC stream behind it then goes unread and its data holds
 /// flow-control window on the channel every other call shares.
-pub(super) async fn write_frame(stream: &mut TcpStream, parts: &[&[u8]]) -> std::io::Result<()> {
+pub(super) async fn write_frame<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    parts: &[&[u8]],
+) -> std::io::Result<()> {
     let write = async {
         for part in parts {
             stream.write_all(part).await?;

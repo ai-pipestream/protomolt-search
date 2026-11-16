@@ -1,6 +1,7 @@
 // Keyboard shortcuts, typeahead and did-you-mean, the streaming query,
 // and the A/B comparison through VariantSearch.
-import { api, clear, el, enums, fmtMs, fmtNum } from './common.js';
+import { bff, progressive } from './bff.js';
+import { clear, el, enums, fmtMs, fmtNum } from './common.js';
 import { $, state } from './search-state.js';
 import { buildRequest, queryVector } from './search-request.js';
 import { hideError, page, render, run, showError } from './search-run.js';
@@ -55,7 +56,7 @@ export async function typeahead() {
   const prefix = m[1].toLowerCase();
   try {
     const asked = state.suggestSeq;
-    const r = await api.rpc('SearchService', 'Suggest', { field: 'body', prefix, limit: 8, analysis: state.config.body_spec });
+    const r = await bff.call('Suggest', { field: 'body', prefix, limit: 8, analysis: state.config.body_spec });
     // A run, or a later keystroke's answer, closed the list meanwhile.
     if (asked !== state.suggestSeq) return;
     const list = clear($('suggest'));
@@ -86,7 +87,7 @@ export async function didYouMean() {
   const text = $('q').value.trim();
   if (!text || $('shape').value === 'browse') return;
   try {
-    const r = await api.rpc('SearchService', 'TermSuggest', { field: 'body', text, mode: 'TERM_SUGGEST_MODE_MISSING', limit: 3, analysis: state.config.body_spec });
+    const r = await bff.call('TermSuggest', { field: 'body', text, mode: 'TERM_SUGGEST_MODE_MISSING', limit: 3, analysis: state.config.body_spec });
     const terms = (r.terms || []).filter((t) => t.candidates?.length);
     if (!terms.length) return;
     clear(box).append('Did you mean: ');
@@ -133,8 +134,9 @@ export async function streamQuery() {
   log.classList.remove('hidden');
   $('stream').textContent = 'Stop';
   const started = performance.now();
-  state.stream = api.stream('SearchService', 'QueryStream', { query: request }, {
-    onEvent: async (msg) => {
+  // A new stream stops the one before it (progressive.start aborts it).
+  state.stream = { close: progressive.start('QueryStream', { query: request }, {
+    onMessage: async (msg) => {
       if (msg.revision) {
         const r = msg.revision;
         const hits = r.hits || [];
@@ -158,7 +160,7 @@ export async function streamQuery() {
     },
     onError: (err) => { showError(err); stopStream(); },
     onEnd: () => stopStream(),
-  });
+  }) };
 }
 
 export function stopStream() {
@@ -213,7 +215,7 @@ export async function runAb() {
   state.request = request;
   $('run-ab').disabled = true;
   try {
-    const response = await api.rpc('SearchService', 'VariantSearch', request);
+    const response = await bff.call('VariantSearch', request);
     state.response = response;
     state.tab = 'response';
     renderRaw();

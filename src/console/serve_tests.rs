@@ -14,7 +14,9 @@ async fn console(max_connections: usize, ui_dir: Option<&Path>) -> SocketAddr {
     })
     .await
     .unwrap()
-    .with_max_connections(max_connections);
+    .with_max_connections(max_connections)
+    .with_raw_explorer()
+    .unwrap();
     let console = match ui_dir {
         Some(dir) => console.with_ui_dir(dir).unwrap(),
         None => console,

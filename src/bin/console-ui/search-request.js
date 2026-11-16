@@ -1,5 +1,6 @@
 // The search form's dynamic controls and the QueryRequest built from it.
-import { api, clear, el, enums } from './common.js';
+import { bff } from './bff.js';
+import { clear, el, enums } from './common.js';
 import { parseSynonyms, splitTopLevel } from './query-state.js';
 import { $, MISSING, NORMALIZATIONS, SCORE_OPS, state } from './search-state.js';
 
@@ -184,7 +185,7 @@ export async function queryVector(text) {
   }
   if (!state.config.analysis) throw { error: 'a dense query needs a pasted vector: no analysis sidecar is configured', code: 'FAILED_PRECONDITION' };
   if (state.vector && state.vector.text === text) return state.vector.vector;
-  const r = await api.post('/api/embed', { text });
+  const r = await bff.call('PreviewEmbedding', { text });
   state.vector = { text, vector: r.vector };
   return r.vector;
 }

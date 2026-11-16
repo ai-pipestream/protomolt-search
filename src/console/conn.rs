@@ -56,6 +56,7 @@ struct Head {
     target: String,
     keep_alive: bool,
     framing: Framing,
+    headers: Headers,
 }
 
 fn bad(status: u16, message: &str) -> Reply {
@@ -225,6 +226,7 @@ pub(super) async fn read_request<S: AsyncRead + Unpin>(
         query,
         body,
         keep_alive: head.keep_alive,
+        headers: head.headers,
     }))
 }
 
@@ -249,12 +251,16 @@ fn parse_head(bytes: &[u8], max_body: usize) -> Result<Head, Reply> {
         _ => return Err(bad(505, "only HTTP/1.0 and HTTP/1.1 are served")),
     };
     let (mut connection, mut lengths, mut codings) = (Vec::new(), Vec::new(), Vec::new());
+    let mut headers = Headers::default();
     for (name, value) in lines.filter_map(|l| l.split_once(':')) {
         let list = value.split(',').map(|v| v.trim().to_ascii_lowercase());
         match name.trim().to_ascii_lowercase().as_str() {
             "connection" => connection.extend(list),
             "content-length" => lengths.extend(list),
             "transfer-encoding" => codings.extend(list),
+            "host" => headers.host = Some(value.trim().to_ascii_lowercase()),
+            "origin" => headers.origin = Some(value.trim().to_ascii_lowercase()),
+            "content-type" => headers.content_type = media_type(value),
             _ => {}
         }
     }
@@ -268,7 +274,18 @@ fn parse_head(bytes: &[u8], max_body: usize) -> Result<Head, Reply> {
         target: target.to_string(),
         keep_alive,
         framing: framing(&lengths, &codings, max_body)?,
+        headers,
     })
+}
+
+/// A `Content-Type` value without its parameters, lowercased.
+fn media_type(value: &str) -> String {
+    value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
 }
 
 fn framing(lengths: &[String], codings: &[String], max_body: usize) -> Result<Framing, Reply> {
@@ -294,8 +311,8 @@ fn framing(lengths: &[String], codings: &[String], max_body: usize) -> Result<Fr
 }
 
 /// Serves one connection: requests in order, each reply flagged with
-/// whether the connection stays open. A server-sent stream is the last
-/// response on its connection.
+/// whether the connection stays open. A stream (server-sent events or a
+/// Connect stream) is the last response on its connection.
 pub(super) async fn handle_conn(stream: TcpStream, ctx: Arc<Ctx>) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
     let mut conn = Conn::new(stream);
@@ -306,14 +323,21 @@ pub(super) async fn handle_conn(stream: TcpStream, ctx: Arc<Ctx>) -> std::io::Re
             Next::Closed => return Ok(()),
         };
         let segments: Vec<&str> = request.path.split('/').filter(|s| !s.is_empty()).collect();
+        let out = &mut conn.stream;
+        let connect_stream = request.headers.content_type == CONNECT_STREAM_TYPE;
         match (request.method.as_str(), segments.as_slice()) {
-            ("GET", ["api", "stream", service, method])
-            | ("POST", ["api", "stream", service, method]) => {
-                return stream_rpc(&mut conn.stream, &ctx, service, method, &request).await;
+            ("GET" | "POST", ["api", "stream", service, method]) if ctx.raw_explorer => {
+                return stream_rpc(out, &ctx, service, method, &request).await;
+            }
+            ("POST", ["bff", "v1", "sse", method]) => {
+                return bff_sse(out, &ctx, &request, method).await;
+            }
+            ("POST", ["bff", "v1", BFF_SERVICE, method]) if connect_stream => {
+                return bff_connect_stream(out, &ctx, &request, method).await;
             }
             _ => {
                 let reply = route(&ctx, &request, &segments).await;
-                write_reply(&mut conn.stream, reply, request.keep_alive).await?;
+                write_reply(out, reply, request.keep_alive).await?;
                 if !request.keep_alive {
                     return Ok(());
                 }
