@@ -9,27 +9,15 @@ use super::refuse;
 use super::response::{fill_projected, ms};
 use super::run::Base;
 use crate::coordinator::CoordinatorServiceImpl;
-use crate::pb::{QueryHit, QueryResponse};
+use crate::pb::QueryHit;
 
 /// What a page step produced: the page, or the depth a single-leaf
-/// collapse must re-run at to find its groups.
+/// collapse must re-run at to find its groups. The leaf's order is
+/// depth-independent, so a deeper pool only adds groups after the ones
+/// already found.
 pub(super) enum Paged {
     Done(Vec<QueryHit>, Vec<crate::pb::QueryGroup>, String, String),
     Deepen(u32),
-}
-
-/// Re-run the request with a deeper collapse pool: the leaf's order is
-/// depth-independent, so a deeper pool only adds groups after the ones
-/// already found.
-pub(super) async fn deepen(base: &Base<'_>, depth: u32) -> Result<QueryResponse, Status> {
-    let mut again = base.req.clone();
-    again.selection_k = depth;
-    Box::pin(super::execute(
-        base.coordinator,
-        again,
-        base.finish_deadline_us,
-    ))
-    .await
 }
 
 /// A collapse group's identity: an integer or a facet term.

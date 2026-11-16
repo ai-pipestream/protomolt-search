@@ -5,7 +5,7 @@
 use tonic::Status;
 
 use super::boosts::{apply_boosts, window_boosts};
-use super::collapse::{deepen, fill_projected_groups, page_or_collapse, PageStep, Paged};
+use super::collapse::{fill_projected_groups, page_or_collapse, PageStep, Paged};
 use super::response::{aggregate_pool, apply_scorer, done, fill_projected, finish_prof};
 use super::run::Run;
 use crate::pb::{QueryHit, QueryResponse};
@@ -14,10 +14,18 @@ use crate::pb::{QueryHit, QueryResponse};
 pub(super) enum Answer {
     /// The page cut from this run's pool; the route finishes it with
     /// what only it reports.
-    Paged(QueryResponse),
-    /// A single-leaf collapse found too few groups and the request was
-    /// re-run deeper: the complete response of that run.
-    Deepened(QueryResponse),
+    Paged(Box<QueryResponse>),
+    /// A single-leaf collapse found too few groups: the request must be
+    /// re-run with a pool this deep.
+    Deepen(u32),
+}
+
+/// What a route produced for the entry point.
+pub(super) enum Routed {
+    /// The finished response.
+    Done(Box<QueryResponse>),
+    /// The pool depth the entry point re-runs the request at.
+    Deepen(u32),
 }
 
 /// Reorder the selected pool, cut the page (or the page of collapse
@@ -51,7 +59,7 @@ pub(super) async fn answer_pool(
     };
     let (mut hits, mut groups, next, executed) =
         match page_or_collapse(&step, hits, executed, &mut run.prof).await? {
-            Paged::Deepen(depth) => return deepen(&base, depth).await.map(Answer::Deepened),
+            Paged::Deepen(depth) => return Ok(Answer::Deepen(depth)),
             Paged::Done(hits, groups, next, executed) => (hits, groups, next, executed),
         };
     fill_projected(coordinator, &run.projections, &mut hits, &mut run.prof).await?;
@@ -66,5 +74,5 @@ pub(super) async fn answer_pool(
     response.groups = groups;
     response.aggregate =
         aggregate_pool(coordinator, run.pool_aggregate.as_ref(), &pool_ids).await?;
-    Ok(Answer::Paged(response))
+    Ok(Answer::Paged(Box::new(response)))
 }

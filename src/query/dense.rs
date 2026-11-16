@@ -3,7 +3,7 @@
 
 use tonic::{Request, Status};
 
-use super::pool::{answer_pool, Answer};
+use super::pool::{answer_pool, Answer, Routed};
 use super::rerank::{turbo_rerank, RerankSources};
 use super::response::{leaf_signal, matched, ms, scored_hit};
 use super::run::Run;
@@ -18,7 +18,7 @@ pub(super) async fn execute_dense(
     mut run: Run<'_>,
     id: &str,
     query: &DenseQuery,
-) -> Result<QueryResponse, Status> {
+) -> Result<Routed, Status> {
     let base = run.base;
     let t_sel = std::time::Instant::now();
     let request = search_request(&mut run, query);
@@ -64,11 +64,11 @@ pub(super) async fn execute_dense(
         route = "search:turbo_rerank";
     }
     let mut answer = match answer_pool(&mut run, hits, route, response.request_id).await? {
-        Answer::Deepened(response) => return Ok(response),
-        Answer::Paged(response) => response,
+        Answer::Deepen(depth) => return Ok(Routed::Deepen(depth)),
+        Answer::Paged(response) => *response,
     };
     report_dense(run, &mut answer);
-    Ok(answer)
+    Ok(Routed::Done(Box::new(answer)))
 }
 
 fn search_request(run: &mut Run<'_>, query: &DenseQuery) -> SearchRequest {
