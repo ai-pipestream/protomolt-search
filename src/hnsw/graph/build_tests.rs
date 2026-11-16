@@ -1,5 +1,6 @@
 //! Unit tests for parallel cold-start skeleton bootstrap, doubling waves,
-//! slice connectivity repair, and `Probe::local_share`.
+//! bulk and slice connectivity repair across `Parallel` and `FixedOrder` modes,
+//! and `Probe::local_share`.
 
 use std::sync::atomic::{AtomicU32, Ordering as Atomic};
 
@@ -11,7 +12,7 @@ use crate::vector::{VectorProvider, VectorSearchOptions};
 
 use super::super::distance::Kernel;
 use super::probe::Probe;
-use super::{GraphLinks, LinkBuilder, Store, NO_NODE};
+use super::{level_for, GraphLinks, LinkBuilder, Store, NO_NODE};
 
 fn exact_top_k(corpus: &[f32], dim: usize, query: &[f32], k: usize) -> Vec<u32> {
     let mut ranked: Vec<(u32, f32)> = corpus
@@ -220,4 +221,145 @@ fn parallel_waves_keep_upper_layers_deterministic_under_contention() {
             });
         }
     });
+}
+
+fn unrepaired_sequential_links(store: &Store) -> GraphLinks {
+    let n = store.n();
+    let stride0 = store.m0 + 1;
+    let stride_up = store.m + 1;
+    let mut level = Vec::with_capacity(n);
+    let mut upper_slot = Vec::with_capacity(n);
+    let mut upper_base = Vec::new();
+    let mut upper_cells = 0usize;
+    for i in 0..n {
+        let lvl = level_for(store.seed, i as u32, store.level_mult);
+        level.push(lvl);
+        if lvl == 0 {
+            upper_slot.push(NO_NODE);
+        } else {
+            upper_slot.push(upper_base.len() as u32);
+            upper_base.push(upper_cells as u32);
+            upper_cells += usize::from(lvl) * stride_up;
+        }
+    }
+    let links0 = (0..n * stride0).map(|_| AtomicU32::new(0)).collect();
+    let upper = (0..upper_cells).map(|_| AtomicU32::new(0)).collect();
+    let links = GraphLinks::from_parts(level, upper_slot, upper_base, links0, upper, NO_NODE, 0);
+    LinkBuilder::new(store, &links).insert_sequential(0..n as u32);
+    links
+}
+
+fn snapshot_links(links: &GraphLinks) -> ((u32, u8), Vec<u32>, Vec<u32>) {
+    let l0 = links
+        .links0
+        .iter()
+        .map(|c| c.load(Atomic::Relaxed))
+        .collect();
+    let up = links
+        .upper
+        .iter()
+        .map(|c| c.load(Atomic::Relaxed))
+        .collect();
+    (links.entry_state(), l0, up)
+}
+
+#[test]
+fn small_and_default_m_fixed_order_builds_leave_zero_unreachable_nodes() {
+    const DIM: usize = 24;
+    const SMALL_M_ROWS: usize = 1_200;
+    let small_corpus = unit_vectors(SMALL_M_ROWS, DIM, 0x4A5E_7711);
+
+    for seed in 0..8u64 {
+        let cfg = HnswConfig {
+            m: 4,
+            ef_construction: 24,
+            seed: 100 + seed,
+            build_mode: BuildMode::FixedOrder,
+            ..HnswConfig::default()
+        };
+        let mut store = Store::new(DIM, 4, 24, cfg.seed, Kernel::detect());
+        store.append_unlinked(&small_corpus).unwrap();
+        let links = store.build_links(false).unwrap();
+        assert_eq!(
+            reachable_layer0_count(&store, &links),
+            SMALL_M_ROWS,
+            "seed {seed}: small-M sequential Store::build_links left unreachable layer-0 nodes"
+        );
+
+        let mut index = HnswIndex::new(DIM, cfg).unwrap();
+        index.add(&small_corpus, DIM).unwrap();
+        index.prepare().unwrap();
+        assert_eq!(index.unreachable_from_entry(), 0, "seed {seed}");
+    }
+
+    const DEFAULT_ROWS: usize = 1_100;
+    let default_corpus = unit_vectors(DEFAULT_ROWS, DIM, 0x4A5E_9922);
+    let default_cfg = HnswConfig {
+        build_mode: BuildMode::FixedOrder,
+        ..HnswConfig::default()
+    };
+    let mut default_store = Store::new(
+        DIM,
+        default_cfg.m as usize,
+        default_cfg.ef_construction as usize,
+        default_cfg.seed,
+        Kernel::detect(),
+    );
+    default_store.append_unlinked(&default_corpus).unwrap();
+    let default_links = default_store.build_links(false).unwrap();
+    assert_eq!(
+        reachable_layer0_count(&default_store, &default_links),
+        DEFAULT_ROWS
+    );
+
+    let mut default_index = HnswIndex::new(DIM, default_cfg).unwrap();
+    default_index.add(&default_corpus, DIM).unwrap();
+    default_index.prepare().unwrap();
+    assert_eq!(default_index.unreachable_from_entry(), 0);
+}
+
+#[test]
+fn repair_connectivity_is_noop_when_connected_and_deterministic_on_islands() {
+    const DIM: usize = 24;
+    let connected_corpus = unit_vectors(1_100, DIM, 0x4A5E_9922);
+    let mut connected_store = Store::new(DIM, 16, 200, 42, Kernel::detect());
+    connected_store.append_unlinked(&connected_corpus).unwrap();
+
+    let raw_connected = unrepaired_sequential_links(&connected_store);
+    assert_eq!(
+        reachable_layer0_count(&connected_store, &raw_connected),
+        1_100
+    );
+    let before = snapshot_links(&raw_connected);
+    let repaired_noop = super::super::repair::repair_connectivity(&LinkBuilder::new(
+        &connected_store,
+        &raw_connected,
+    ));
+    assert_eq!(repaired_noop, 0);
+    assert_eq!(snapshot_links(&raw_connected), before);
+    assert_eq!(
+        snapshot_links(&connected_store.build_links(false).unwrap()),
+        before
+    );
+
+    let island_corpus = unit_vectors(1_200, DIM, 0x4A5E_7711);
+    let mut island_store = Store::new(DIM, 4, 24, 100, Kernel::detect());
+    island_store.append_unlinked(&island_corpus).unwrap();
+
+    let raw_islands = unrepaired_sequential_links(&island_store);
+    assert!(reachable_layer0_count(&island_store, &raw_islands) < 1_200);
+    let repaired =
+        super::super::repair::repair_connectivity(&LinkBuilder::new(&island_store, &raw_islands));
+    assert!(repaired >= 1);
+    assert_eq!(reachable_layer0_count(&island_store, &raw_islands), 1_200);
+
+    let expected = snapshot_links(&raw_islands);
+    assert_eq!(
+        snapshot_links(&island_store.build_links(false).unwrap()),
+        expected
+    );
+    assert_eq!(
+        snapshot_links(&island_store.build_links(false).unwrap()),
+        expected
+    );
 }
