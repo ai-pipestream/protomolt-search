@@ -74,13 +74,18 @@ fn a_bitmap_span_reads_like_the_flags_it_packs() {
                 (0, rows / 2),
                 (rows / 3, rows),
                 (rows / 2, rows / 2),
+                (rows / 2, rows + 65),
+                (rows, rows / 2),
             ] {
                 assert_eq!(packed.any_in(start, end), plain.any_in(start, end));
                 let (mut from_bits, mut from_flags) = (Vec::new(), Vec::new());
                 packed.for_each_in(start, end, |row| from_bits.push(row));
                 plain.for_each_in(start, end, |row| from_flags.push(row));
                 assert_eq!(from_bits, from_flags, "rows {rows} span {start}..{end}");
-                let expected: Vec<usize> = (start..end).filter(|&row| flags[row]).collect();
+                let clamped_end = end.min(rows);
+                let expected: Vec<usize> = (start.min(clamped_end)..clamped_end)
+                    .filter(|&row| flags[row])
+                    .collect();
                 assert_eq!(from_bits, expected);
             }
         }

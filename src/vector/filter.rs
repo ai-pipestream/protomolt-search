@@ -125,16 +125,20 @@ impl<'a> Mask<'a> {
     /// Whether any row of `[start, end)` is allowed. A bitmap answers a
     /// word at a time, so a span the mask leaves empty costs its words.
     pub fn any_in(&self, start: usize, end: usize) -> bool {
+        let end = end.min(self.len());
+        let start = start.min(end);
         match self {
             Mask::Bools(allow) => allow[start..end].iter().any(|&on| on),
             Mask::Bits(bits) => bits.count_range(start, end) > 0,
-            Mask::All(len) => start < end.min(*len),
+            Mask::All(_) => start < end,
         }
     }
 
     /// The allowed rows of `[start, end)` ascending, read from the mask in
     /// the shape it is held in: no flag buffer is built for the span.
     pub fn for_each_in(&self, start: usize, end: usize, mut each: impl FnMut(usize)) {
+        let end = end.min(self.len());
+        let start = start.min(end);
         match self {
             Mask::Bools(allow) => {
                 for (offset, &on) in allow[start..end].iter().enumerate() {
@@ -144,7 +148,7 @@ impl<'a> Mask<'a> {
                 }
             }
             Mask::Bits(bits) => bits.iter_range(start, end).for_each(each),
-            Mask::All(len) => (start..end.min(*len)).for_each(each),
+            Mask::All(_) => (start..end).for_each(each),
         }
     }
 

@@ -151,22 +151,19 @@ fn collapsed_floors_are_sound_and_external_floor_is_lossless() {
     let query = unit_vectors(1, dim, 0xC0AC_0001);
     let parents = run_parents(n, 9);
 
+    let scan = ChunkedScan {
+        index: &index,
+        query: &query,
+        k,
+        chunk_blocks: 8,
+        allow: None,
+    };
+
     let mut published = Vec::new();
-    let (hits, stats) = chunked_topk_collapsed(
-        ChunkedScan {
-            index: &index,
-            query: &query,
-            k,
-            chunk_blocks: 8,
-            allow: None,
-        },
-        &parents,
-        &mut || None,
-        &mut |f| {
-            published.push(f);
-            true
-        },
-    );
+    let (hits, stats) = chunked_topk_collapsed(scan, &parents, &mut || None, &mut |f| {
+        published.push(f);
+        true
+    });
     assert!(!published.is_empty());
     assert!(
         published.windows(2).all(|w| w[0] <= w[1]),
@@ -184,47 +181,15 @@ fn collapsed_floors_are_sound_and_external_floor_is_lossless() {
     // a debounce interval produces at the node. The scan still OFFERS
     // every floor; only the wire count drops. Reporting one number
     // for both is what made those knobs measure as inert.
-    let (_, muted) = chunked_topk_collapsed(
-        ChunkedScan {
-            index: &index,
-            query: &query,
-            k,
-            chunk_blocks: 8,
-            allow: None,
-        },
-        &parents,
-        &mut || None,
-        &mut |_| false,
-    );
+    let (_, muted) = chunked_topk_collapsed(scan, &parents, &mut || None, &mut |_| false);
     assert_eq!(muted.floors_offered, stats.floors_offered);
     assert_eq!(muted.floors_published, 0);
 
     // Seed the true k-th best as an external floor: results identical,
     // strictly fewer candidates collected.
-    let (unseeded, base) = chunked_topk_collapsed(
-        ChunkedScan {
-            index: &index,
-            query: &query,
-            k,
-            chunk_blocks: 8,
-            allow: None,
-        },
-        &parents,
-        &mut || None,
-        &mut |_| false,
-    );
-    let (seeded, pruned) = chunked_topk_collapsed(
-        ChunkedScan {
-            index: &index,
-            query: &query,
-            k,
-            chunk_blocks: 8,
-            allow: None,
-        },
-        &parents,
-        &mut || Some(kth),
-        &mut |_| false,
-    );
+    let (unseeded, base) = chunked_topk_collapsed(scan, &parents, &mut || None, &mut |_| false);
+    let (seeded, pruned) =
+        chunked_topk_collapsed(scan, &parents, &mut || Some(kth), &mut |_| false);
     assert_eq!(signature(&unseeded), signature(&seeded));
     assert!(pruned.candidates_collected < base.candidates_collected);
 }

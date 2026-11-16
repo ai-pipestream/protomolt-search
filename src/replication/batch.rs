@@ -48,20 +48,22 @@ impl<T: Message> Run<T> {
     pub(super) fn extend(&mut self, rows: u64, required: u32, requests: Vec<T>) -> Option<Vec<T>> {
         let bytes = encoded_bytes(&requests);
         if required != self.required
-            || self.rows + rows > MAX_STREAM_ROWS
-            || self.bytes + bytes > MAX_STREAM_BYTES
+            || self.rows.saturating_add(rows) > MAX_STREAM_ROWS
+            || self.bytes.saturating_add(bytes) > MAX_STREAM_BYTES
         {
             return Some(requests);
         }
-        self.rows += rows;
-        self.bytes += bytes;
+        self.rows = self.rows.saturating_add(rows);
+        self.bytes = self.bytes.saturating_add(bytes);
         self.requests.extend(requests);
         None
     }
 }
 
 fn encoded_bytes<T: Message>(requests: &[T]) -> usize {
-    requests.iter().map(Message::encoded_len).sum()
+    requests
+        .iter()
+        .fold(0usize, |acc, r| acc.saturating_add(r.encoded_len()))
 }
 
 /// The append run a catch-up holds between records. Only one kind is held
