@@ -139,6 +139,16 @@ name = "console"
 path = "src/bin/console.rs"
 required-features = ["net"]
 
+# Debug info is most of what a test build writes to disk: 196 test
+# binaries each link the whole crate and its dependency tree. Line tables
+# keep panic and backtrace locations for this crate; dependencies carry
+# none. Release builds are untouched.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [build-dependencies]
 tonic-prost-build = "0.14"
 
