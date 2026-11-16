@@ -1,6 +1,6 @@
 //! Ingest-time function calls.
 
-use tonic::Status;
+use super::ValuesError;
 
 use super::functions::{
     check_fn_arity, civil_of_micros, eval_fn, fn_display, fn_signature, fnv1a64_bytes, FnSignature,
@@ -15,7 +15,7 @@ pub(super) fn ingest_func(
     func: &pb::ValueFunc,
     env: &IngestEnv,
     strict: bool,
-) -> Result<Option<IngestVal>, Status> {
+) -> Result<Option<IngestVal>, ValuesError> {
     use pb::value_expr::Expr as V;
 
     let f = match pb::ValueFn::try_from(func.function) {
@@ -70,7 +70,7 @@ fn ingest_numeric_func(
     func: &pb::ValueFunc,
     env: &IngestEnv,
     strict: bool,
-) -> Result<Option<IngestVal>, Status> {
+) -> Result<Option<IngestVal>, ValuesError> {
     let type_preserving = matches!(
         f,
         pb::ValueFn::Abs | pb::ValueFn::Sign | pb::ValueFn::Greatest | pb::ValueFn::Least

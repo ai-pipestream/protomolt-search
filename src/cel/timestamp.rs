@@ -1,11 +1,11 @@
 //! RFC 3339 to epoch microseconds, by exact integer math.
 
-use tonic::Status;
+use super::CelError;
 
 use super::ast::Ast;
 use super::refuse;
 
-pub(super) fn timestamp_argument(args: &[Ast]) -> Result<i64, Status> {
+pub(super) fn timestamp_argument(args: &[Ast]) -> Result<i64, CelError> {
     match args {
         [Ast::Str(s)] => parse_rfc3339_micros(s),
         _ => Err(refuse(
@@ -54,11 +54,11 @@ struct Instant<'a> {
 }
 
 impl Instant<'_> {
-    fn bad(&self, what: &str) -> Status {
+    fn bad(&self, what: &str) -> CelError {
         refuse(format!("timestamp {:?}: {what}", self.text))
     }
 
-    fn digits(&self, range: std::ops::Range<usize>) -> Result<i64, Status> {
+    fn digits(&self, range: std::ops::Range<usize>) -> Result<i64, CelError> {
         let part = self.bytes.get(range).ok_or_else(|| self.bad("truncated"))?;
         if !part.iter().all(u8::is_ascii_digit) {
             return Err(self.bad("expected digits"));
@@ -69,7 +69,7 @@ impl Instant<'_> {
             .expect("bounded digit run"))
     }
 
-    fn sep(&self, i: usize, c: u8) -> Result<(), Status> {
+    fn sep(&self, i: usize, c: u8) -> Result<(), CelError> {
         if self.bytes.get(i) == Some(&c) {
             Ok(())
         } else {
@@ -79,7 +79,7 @@ impl Instant<'_> {
 
     /// The `YYYY-MM-DDTHH:MM:SS` in the first 19 bytes, as seconds since the
     /// epoch before any offset applies.
-    fn civil_seconds(&self) -> Result<i64, Status> {
+    fn civil_seconds(&self) -> Result<i64, CelError> {
         let year = self.digits(0..4)?;
         self.sep(4, b'-')?;
         let month = self.digits(5..7)? as u32;
@@ -114,7 +114,7 @@ impl Instant<'_> {
 
     /// An optional fractional second at `*i`, in microseconds. The first
     /// six digits count; the remainder floors away, as at ingest.
-    fn fraction(&self, i: &mut usize) -> Result<i64, Status> {
+    fn fraction(&self, i: &mut usize) -> Result<i64, CelError> {
         let b = self.bytes;
         let mut micros_frac: i64 = 0;
         if b.get(*i) == Some(&b'.') {
@@ -134,7 +134,7 @@ impl Instant<'_> {
     }
 
     /// The zone at `*i`: `Z`, or a `+HH:MM` / `-HH:MM` offset in seconds.
-    fn offset(&self, i: &mut usize) -> Result<i64, Status> {
+    fn offset(&self, i: &mut usize) -> Result<i64, CelError> {
         match self.bytes.get(*i) {
             Some(b'Z') | Some(b'z') => {
                 *i += 1;
@@ -162,7 +162,7 @@ impl Instant<'_> {
 /// same drop (and the same direction) as
 /// [`crate::node::timestamp_to_epoch_micros`] at ingest, so a filter
 /// bound and a stored value truncate identically.
-pub(super) fn parse_rfc3339_micros(s: &str) -> Result<i64, Status> {
+pub(super) fn parse_rfc3339_micros(s: &str) -> Result<i64, CelError> {
     let instant = Instant {
         text: s,
         bytes: s.as_bytes(),

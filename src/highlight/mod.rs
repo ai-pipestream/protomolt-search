@@ -43,55 +43,13 @@ pub const MAX_SNIPPETS: u32 = 64;
 /// Largest `max_chars` accepted: past this a snippet is a document.
 pub const MAX_CHARS: u32 = 4096;
 
-/// A compact domain error, converted to transport status only at the edge.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HighlightError {
-    InvalidArgument(Box<str>),
-    Internal(Box<str>),
-    FailedPrecondition(Box<str>),
-}
-
-impl HighlightError {
-    pub(crate) fn invalid_argument(message: impl Into<Box<str>>) -> Self {
-        Self::InvalidArgument(message.into())
-    }
-
-    pub(crate) fn internal(message: impl Into<Box<str>>) -> Self {
-        Self::Internal(message.into())
-    }
-
-    pub(crate) fn failed_precondition(message: impl Into<Box<str>>) -> Self {
-        Self::FailedPrecondition(message.into())
-    }
-
-    pub fn message(&self) -> &str {
-        match self {
-            Self::InvalidArgument(message)
-            | Self::Internal(message)
-            | Self::FailedPrecondition(message) => message,
-        }
-    }
-}
-
-impl std::fmt::Display for HighlightError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.message())
-    }
-}
-
-impl std::error::Error for HighlightError {}
-
-impl From<HighlightError> for tonic::Status {
-    fn from(error: HighlightError) -> Self {
-        match error {
-            HighlightError::InvalidArgument(message) => {
-                Self::invalid_argument(String::from(message))
-            }
-            HighlightError::Internal(message) => Self::internal(String::from(message)),
-            HighlightError::FailedPrecondition(message) => {
-                Self::failed_precondition(String::from(message))
-            }
-        }
+crate::domain_error::domain_error! {
+    /// A compact domain error, converted to transport status only at the edge.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum HighlightError {
+        InvalidArgument => invalid_argument,
+        Internal => internal,
+        FailedPrecondition => failed_precondition,
     }
 }
 

@@ -1,6 +1,6 @@
 //! The resolved expression, its static types, and evaluated values.
 
-use tonic::Status;
+use super::ValuesError;
 
 use super::refuse;
 use crate::pb;
@@ -217,7 +217,7 @@ pub enum Val {
 }
 
 /// Decode one wire comparison op.
-pub(super) fn cmp_op_of(op: i32) -> Result<CmpOp, Status> {
+pub(super) fn cmp_op_of(op: i32) -> Result<CmpOp, ValuesError> {
     match pb::ValueCmpOp::try_from(op) {
         Ok(pb::ValueCmpOp::Eq) => Ok(CmpOp::Eq),
         Ok(pb::ValueCmpOp::Ne) => Ok(CmpOp::Ne),

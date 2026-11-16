@@ -2,13 +2,13 @@
 
 use std::collections::HashMap;
 
+use super::MappingError;
 use prost_reflect::{DynamicMessage, MapKey, Value};
-use tonic::Status;
 
 use super::extractor::{Land, Slot};
 use super::refuse_at;
 
-fn integer_value(path: &str, value: &Value) -> Result<i64, Status> {
+fn integer_value(path: &str, value: &Value) -> Result<i64, MappingError> {
     match value {
         Value::I32(v) => Ok(i64::from(*v)),
         Value::I64(v) => Ok(*v),
@@ -19,7 +19,7 @@ fn integer_value(path: &str, value: &Value) -> Result<i64, Status> {
     }
 }
 
-pub(super) fn project_leaf(land: &Land, path: &str, value: &Value) -> Result<Slot, Status> {
+pub(super) fn project_leaf(land: &Land, path: &str, value: &Value) -> Result<Slot, MappingError> {
     Ok(match (land, value) {
         (Land::Map(inner), Value::Map(entries)) => project_map(inner, path, entries)?,
 
@@ -73,7 +73,11 @@ pub(super) fn project_leaf(land: &Land, path: &str, value: &Value) -> Result<Slo
 
 /// Projects a map's entries in key order onto the map column of the value
 /// landing.
-fn project_map(inner: &Land, path: &str, entries: &HashMap<MapKey, Value>) -> Result<Slot, Status> {
+fn project_map(
+    inner: &Land,
+    path: &str,
+    entries: &HashMap<MapKey, Value>,
+) -> Result<Slot, MappingError> {
     let mut entries = entries
         .iter()
         .map(|(key, value)| {
@@ -87,7 +91,7 @@ fn project_map(inner: &Land, path: &str, entries: &HashMap<MapKey, Value>) -> Re
             };
             Ok((key, project_leaf(inner, path, value)?))
         })
-        .collect::<Result<Vec<_>, Status>>()?;
+        .collect::<Result<Vec<_>, MappingError>>()?;
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(match inner {
         Land::Int => Slot::MapInteger(
@@ -124,7 +128,7 @@ fn project_map(inner: &Land, path: &str, entries: &HashMap<MapKey, Value>) -> Re
                     }
                     Ok((key, value))
                 })
-                .collect::<Result<_, Status>>()?,
+                .collect::<Result<_, MappingError>>()?,
         ),
         _ => Slot::MapFacet(
             entries
@@ -140,7 +144,7 @@ fn project_map(inner: &Land, path: &str, entries: &HashMap<MapKey, Value>) -> Re
     })
 }
 
-fn project_timestamp(path: &str, v: &DynamicMessage) -> Result<Slot, Status> {
+fn project_timestamp(path: &str, v: &DynamicMessage) -> Result<Slot, MappingError> {
     let seconds = v
         .get_field_by_name("seconds")
         .and_then(|v| v.as_i64())
@@ -149,7 +153,8 @@ fn project_timestamp(path: &str, v: &DynamicMessage) -> Result<Slot, Status> {
         .get_field_by_name("nanos")
         .and_then(|v| v.as_i32())
         .ok_or_else(|| refuse_at(path, "Timestamp nanos does not match its descriptor"))?;
-    crate::protobuf::validate_timestamp(path, &prost_types::Timestamp { seconds, nanos })?;
+    crate::protobuf::validate_timestamp(path, &prost_types::Timestamp { seconds, nanos })
+        .map_err(MappingError::foreign)?;
 
     Ok(Slot::Ts { seconds, nanos })
 }

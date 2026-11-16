@@ -1,6 +1,6 @@
 //! Resolution of function calls, Kleene logic, and the conditional.
 
-use tonic::Status;
+use super::ValuesError;
 
 use super::functions::{check_fn_arity, fn_display, fn_signature, FnSignature};
 use super::lookup::ColumnLookup;
@@ -12,7 +12,7 @@ use crate::pb;
 pub(super) fn resolve_func(
     func: &pb::ValueFunc,
     cols: &dyn ColumnLookup,
-) -> Result<(ResolvedValue, ValueType), Status> {
+) -> Result<(ResolvedValue, ValueType), ValuesError> {
     let f = match pb::ValueFn::try_from(func.function) {
         Ok(pb::ValueFn::Unspecified) | Err(_) => {
             return Err(refuse("function node with an unknown function"));
@@ -35,7 +35,7 @@ fn resolve_string_hash(
     display: &str,
     func: &pb::ValueFunc,
     cols: &dyn ColumnLookup,
-) -> Result<(ResolvedValue, ValueType), Status> {
+) -> Result<(ResolvedValue, ValueType), ValuesError> {
     if !cols.at_ingest() {
         return Err(refuse(format!(
             "{display} computes at ingest; at query time read the derived \
@@ -60,7 +60,7 @@ fn resolve_calendar_part(
     display: &str,
     func: &pb::ValueFunc,
     cols: &dyn ColumnLookup,
-) -> Result<(ResolvedValue, ValueType), Status> {
+) -> Result<(ResolvedValue, ValueType), ValuesError> {
     let (rv, vt) = resolve(&func.args[0], cols)?;
 
     match vt {
@@ -81,7 +81,7 @@ fn resolve_numeric_func(
     display: &str,
     func: &pb::ValueFunc,
     cols: &dyn ColumnLookup,
-) -> Result<(ResolvedValue, ValueType), Status> {
+) -> Result<(ResolvedValue, ValueType), ValuesError> {
     let type_preserving = matches!(
         f,
         pb::ValueFn::Abs | pb::ValueFn::Sign | pb::ValueFn::Greatest | pb::ValueFn::Least
@@ -137,7 +137,7 @@ fn resolve_numeric_func(
 pub(super) fn resolve_logic(
     logic: &pb::ValueLogic,
     cols: &dyn ColumnLookup,
-) -> Result<(ResolvedValue, ValueType), Status> {
+) -> Result<(ResolvedValue, ValueType), ValuesError> {
     let and = match pb::ValueLogicOp::try_from(logic.op) {
         Ok(pb::ValueLogicOp::And) => true,
         Ok(pb::ValueLogicOp::Or) => false,
@@ -164,7 +164,7 @@ pub(super) fn resolve_logic(
 pub(super) fn resolve_ternary(
     t: &pb::ValueTernary,
     cols: &dyn ColumnLookup,
-) -> Result<(ResolvedValue, ValueType), Status> {
+) -> Result<(ResolvedValue, ValueType), ValuesError> {
     let cond = t
         .cond
         .as_ref()

@@ -140,7 +140,10 @@ fn validate_scorer(
              order is the whole contract of the route",
         ));
     }
-    crate::ltr::Scorer::validate(scorer, &signal_ids(plan, &req.boosts)).map(Some)
+    Ok(Some(crate::ltr::Scorer::validate(
+        scorer,
+        &signal_ids(plan, &req.boosts),
+    )?))
 }
 
 /// Projections: the lexical route carries them natively (bitwise the

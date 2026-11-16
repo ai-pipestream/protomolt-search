@@ -17,14 +17,25 @@
 //! score descending, doc id ascending: ties are broken on exactly the
 //! score the client sees, never on hidden f64 residue.
 
-use tonic::Status;
+#![deny(clippy::result_large_err)]
 
 use crate::pb::{
     CompositeScoreOperation, DimensionScore, MissingScorePolicy, QueryHit, ScoreNormalization,
 };
 
-fn refuse(msg: impl Into<String>) -> Status {
-    Status::invalid_argument(msg.into())
+crate::domain_error::domain_error! {
+    /// Why a composite scorer was refused, converted to transport status
+    /// only at the RPC edge.
+    #[derive(Debug, Clone)]
+    pub enum LtrError {
+        InvalidArgument => invalid_argument,
+        FailedPrecondition => failed_precondition,
+    }
+    foreign: ScoreStage
+}
+
+fn refuse(msg: impl Into<String>) -> LtrError {
+    LtrError::invalid_argument(msg.into())
 }
 
 /// What a request id names, for source validation: a dimension may
@@ -107,7 +118,7 @@ impl Scorer {
         &self,
         hits: &mut [QueryHit],
         stored: &[std::collections::HashMap<u64, f64>],
-    ) -> Result<(), Status> {
+    ) -> Result<(), LtrError> {
         debug_assert_eq!(stored.len(), self.stored.len());
         if hits.is_empty() {
             return Ok(());
@@ -121,7 +132,7 @@ impl Scorer {
             let vals: Vec<Option<f64>> = hits.iter().map(|h| raw_of(dim, h, stored)).collect();
             if dim.missing == MissingScorePolicy::Error {
                 if let Some(i) = vals.iter().position(Option::is_none) {
-                    return Err(Status::failed_precondition(format!(
+                    return Err(LtrError::failed_precondition(format!(
                         "document {} carries no {:?} signal and dimension {:?} names the \
                          ERROR missing policy; the request asserted every candidate has \
                          it",
@@ -160,7 +171,7 @@ impl Scorer {
             }
             let score = self.combine(&mut entries, &mut reports);
             if !score.is_finite() {
-                return Err(Status::failed_precondition(format!(
+                return Err(LtrError::failed_precondition(format!(
                     "the scorer produced a non-finite score for document {}; every \
                      produced score must be finite",
                     hit.doc_id

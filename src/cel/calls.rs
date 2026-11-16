@@ -1,6 +1,6 @@
 //! Membership and the function vocabulary of the predicate compiler.
 
-use tonic::Status;
+use super::CelError;
 
 use super::ast::{Ast, RelOp};
 use super::predicate::{compile_number_relation, int_literal, side_of, wrap, Side};
@@ -9,7 +9,7 @@ use crate::pb;
 
 /// `in` has two compiled shapes: `"key" in map_column` (key presence)
 /// and `column in [v, ...]` (membership).
-pub(super) fn compile_in(lhs: Side, rhs: Side) -> Result<pb::FilterExpr, Status> {
+pub(super) fn compile_in(lhs: Side, rhs: Side) -> Result<pb::FilterExpr, CelError> {
     match (lhs, rhs) {
         (Side::Str(key), Side::Column(column)) => Ok(wrap(pb::filter_expr::Expr::TypedMapHasKey(
             pb::MapKeyPredicate { column, key },
@@ -34,7 +34,7 @@ pub(super) fn compile_in(lhs: Side, rhs: Side) -> Result<pb::FilterExpr, Status>
 
 /// `column in [v, ...]`: a facet value set for strings, a disjunction of
 /// point ranges for numbers.
-fn compile_membership(col: Side, items: Vec<Ast>) -> Result<pb::FilterExpr, Status> {
+fn compile_membership(col: Side, items: Vec<Ast>) -> Result<pb::FilterExpr, CelError> {
     if items.is_empty() {
         return Err(refuse(
             "membership in an empty list is a predicate nobody meant to send",
@@ -100,7 +100,7 @@ fn compile_membership(col: Side, items: Vec<Ast>) -> Result<pb::FilterExpr, Stat
 
 /// The compiled function vocabulary, everything else refused by name
 /// with the reason.
-pub(super) fn compile_call(name: &str, args: &[Ast]) -> Result<pb::FilterExpr, Status> {
+pub(super) fn compile_call(name: &str, args: &[Ast]) -> Result<pb::FilterExpr, CelError> {
     match name {
         "has" => {
             if args.len() != 1 {
@@ -169,7 +169,7 @@ pub(super) fn compile_call(name: &str, args: &[Ast]) -> Result<pb::FilterExpr, S
     }
 }
 
-fn compile_radius(name: &str, args: &[Ast]) -> Result<pb::FilterExpr, Status> {
+fn compile_radius(name: &str, args: &[Ast]) -> Result<pb::FilterExpr, CelError> {
     let (column, rest) = geo_args(name, args, 3)?;
     let metric = if name == "within_radius" {
         pb::GeoMetric::Haversine
@@ -190,7 +190,7 @@ fn compile_radius(name: &str, args: &[Ast]) -> Result<pb::FilterExpr, Status> {
 /// Method-call syntax puts the receiver first: `court.startsWith("ca")` is
 /// `Call("startsWith", [court, "ca"])`. A prefix is a dictionary range on a
 /// byte-sorted dictionary.
-fn compile_starts_with(args: &[Ast]) -> Result<pb::FilterExpr, Status> {
+fn compile_starts_with(args: &[Ast]) -> Result<pb::FilterExpr, CelError> {
     if args.len() != 2 {
         return Err(refuse(
             "startsWith() takes a column receiver and one string",
@@ -230,7 +230,7 @@ fn compile_starts_with(args: &[Ast]) -> Result<pb::FilterExpr, Status> {
 
 /// Geo function arguments: a column identifier plus `n` numeric
 /// literals.
-fn geo_args(name: &str, args: &[Ast], n: usize) -> Result<(String, Vec<f64>), Status> {
+fn geo_args(name: &str, args: &[Ast], n: usize) -> Result<(String, Vec<f64>), CelError> {
     if args.len() != n + 1 {
         return Err(refuse(format!(
             "{name}() takes a geo column and {n} numbers, got {} arguments",

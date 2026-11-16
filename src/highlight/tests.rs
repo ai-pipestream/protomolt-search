@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain_error::assert_status;
 
 fn u8len(s: &str) -> u32 {
     s.len() as u32
@@ -178,12 +179,6 @@ fn a_highlight_wider_than_the_budget_keeps_its_whole_token() {
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].text, long);
     assert_eq!(got[0].highlights, vec![at(&text, &long, 0)]);
-}
-
-fn assert_status(error: HighlightError, code: tonic::Code, message: &str) {
-    let status = tonic::Status::from(error);
-    assert_eq!(status.code(), code);
-    assert_eq!(status.message().as_bytes(), message.as_bytes());
 }
 
 #[test]

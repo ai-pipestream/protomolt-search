@@ -55,11 +55,11 @@ const IDS: &[(&str, SignalKind)] = &[
     ("f", SignalKind::Filter),
 ];
 
-fn validate(s: &CompositeScorer) -> Result<Scorer, Status> {
+fn validate(s: &CompositeScorer) -> Result<Scorer, LtrError> {
     Scorer::validate(s, IDS)
 }
 
-fn msg(err: Status) -> String {
+fn msg(err: LtrError) -> String {
     err.message().to_string()
 }
 

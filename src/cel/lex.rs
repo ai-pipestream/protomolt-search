@@ -1,6 +1,6 @@
 //! The lexer: CEL source text to tokens.
 
-use tonic::Status;
+use super::CelError;
 
 use super::refuse;
 
@@ -38,7 +38,7 @@ pub(super) enum Tok {
     Percent,
 }
 
-pub(super) fn lex(s: &str) -> Result<Vec<Tok>, Status> {
+pub(super) fn lex(s: &str) -> Result<Vec<Tok>, CelError> {
     let b = s.as_bytes();
     let mut toks = Vec::new();
     let mut i = 0;
@@ -105,7 +105,7 @@ fn single_char_token(c: u8) -> Option<Tok> {
 
 /// An operator that is one or two bytes long: `!` `!=` `==` `<` `<=` `>`
 /// `>=` `&&` `||`. The lone halves of the two-byte-only ones refuse.
-fn lex_operator(b: &[u8], i: usize) -> Result<(Tok, usize), Status> {
+fn lex_operator(b: &[u8], i: usize) -> Result<(Tok, usize), CelError> {
     let doubled = |second: u8| b.get(i + 1) == Some(&second);
     Ok(match b[i] {
         b'!' if doubled(b'=') => (Tok::NotEq, i + 2),
@@ -133,7 +133,7 @@ fn lex_operator(b: &[u8], i: usize) -> Result<(Tok, usize), Status> {
 }
 
 /// An identifier or the `in` keyword starting at `start`.
-fn lex_word(s: &str, start: usize) -> Result<(Tok, usize), Status> {
+fn lex_word(s: &str, start: usize) -> Result<(Tok, usize), CelError> {
     let b = s.as_bytes();
     let mut i = start;
     while i < b.len() && (b[i] == b'_' || b[i].is_ascii_alphanumeric()) {
@@ -166,7 +166,7 @@ fn lex_word(s: &str, start: usize) -> Result<(Tok, usize), Status> {
 /// A quoted string with the common escapes. Unknown escapes refuse by
 /// name — a silently-passed-through backslash is how a query means one
 /// thing and matches another.
-fn lex_string(b: &[u8], start: usize) -> Result<(Tok, usize), Status> {
+fn lex_string(b: &[u8], start: usize) -> Result<(Tok, usize), CelError> {
     let quote = b[start];
     let mut out = String::new();
     let mut i = start + 1;
@@ -226,7 +226,7 @@ fn lex_string(b: &[u8], start: usize) -> Result<(Tok, usize), Status> {
 
 /// A signed integer, unsigned integer, or float literal. Decimal and
 /// hexadecimal integers accept a `u`/`U` suffix for the full u64 domain.
-fn lex_number(b: &[u8], start: usize) -> Result<(Tok, usize), Status> {
+fn lex_number(b: &[u8], start: usize) -> Result<(Tok, usize), CelError> {
     let mut i = start;
     if b[i] == b'0' && matches!(b.get(i + 1), Some(b'x') | Some(b'X')) {
         i += 2;

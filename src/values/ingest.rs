@@ -1,7 +1,7 @@
 //! Ingest-time evaluation of a compiled expression against one document's
 //! own values, for materialized columns.
 
-use tonic::Status;
+use super::ValuesError;
 
 use super::eval::{double_arith, int_arith, uint_arith};
 use super::functions::fnv1a64_bytes;
@@ -18,7 +18,10 @@ use crate::pb;
 /// checked integer arithmetic); `Err` is a REAL conflict the document
 /// exposes — int mixed with double, an ambiguous name — refused loudly
 /// per the loud-failure rule, never stored as a guess.
-pub fn eval_ingest(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<IngestVal>, Status> {
+pub fn eval_ingest(
+    expr: &pb::ValueExpr,
+    env: &IngestEnv,
+) -> Result<Option<IngestVal>, ValuesError> {
     // Check all branches without evaluating them. A type error in an untaken
     // branch is still an error; arithmetic absence there must not propagate.
     resolve(expr, env)?;
@@ -34,7 +37,7 @@ pub fn eval_ingest(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Inges
 pub fn eval_ingest_derived(
     expr: &pb::ValueExpr,
     env: &IngestEnv,
-) -> Result<Option<IngestVal>, Status> {
+) -> Result<Option<IngestVal>, ValuesError> {
     resolve(expr, env)?;
     eval_ingest_inner(expr, env, true)
 }
@@ -46,7 +49,7 @@ fn arith_overflow(
     a: impl std::fmt::Display,
     b: impl std::fmt::Display,
     zero_divisor: bool,
-) -> Status {
+) -> ValuesError {
     let cause = if zero_divisor {
         "division by zero"
     } else {
@@ -63,7 +66,7 @@ pub(super) fn eval_ingest_inner(
     expr: &pb::ValueExpr,
     env: &IngestEnv,
     strict: bool,
-) -> Result<Option<IngestVal>, Status> {
+) -> Result<Option<IngestVal>, ValuesError> {
     use pb::value_expr::Expr as V;
     match expr
         .expr
@@ -131,7 +134,7 @@ pub(super) fn eval_ingest_inner(
 }
 
 /// A plain column read from the document's own numeric families.
-fn ingest_column(name: &str, env: &IngestEnv) -> Result<Option<IngestVal>, Status> {
+fn ingest_column(name: &str, env: &IngestEnv) -> Result<Option<IngestVal>, ValuesError> {
     let num = env.numerics.get(name);
     let int = env.integers.get(name);
     let uint = env.unsigned_integers.get(name);
@@ -165,7 +168,7 @@ fn ingest_negate(
     inner: &pb::ValueExpr,
     env: &IngestEnv,
     strict: bool,
-) -> Result<Option<IngestVal>, Status> {
+) -> Result<Option<IngestVal>, ValuesError> {
     Ok(match eval_ingest_inner(inner, env, strict)? {
         None => None,
         Some(IngestVal::Int(v)) => match v.checked_neg() {
@@ -193,7 +196,7 @@ fn ingest_arith(
     arith: &pb::ValueArith,
     env: &IngestEnv,
     strict: bool,
-) -> Result<Option<IngestVal>, Status> {
+) -> Result<Option<IngestVal>, ValuesError> {
     let left = arith
         .left
         .as_ref()

@@ -1,8 +1,8 @@
 //! The plan walk: one message's fields in declaration order, expanded into
 //! planned fields.
 
+use super::MappingError;
 use prost_types::FieldDescriptorProto;
-use tonic::Status;
 
 use super::hint_bytes::HintMap;
 use super::hint_resolve::{is_repeated, resolve_hint, shape, wrapper_kind, ResolvedHint, Shape};
@@ -102,7 +102,7 @@ impl<'a> PlanWalk<'a> {
         path_prefix: &str,
         name_prefix: &str,
         depth: usize,
-    ) -> Result<(), Status> {
+    ) -> Result<(), MappingError> {
         self.visiting.push(entry.full.clone());
         for (field_idx, field) in entry.desc.field.iter().enumerate() {
             let path = join_path(path_prefix, field.name());
@@ -144,7 +144,7 @@ impl<'a> PlanWalk<'a> {
         path: &str,
         name: &str,
         depth: usize,
-    ) -> Result<bool, Status> {
+    ) -> Result<bool, MappingError> {
         let Shape::Message {
             full,
             entry: child,

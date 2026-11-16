@@ -37,7 +37,7 @@
 //! the prost-decoded structures iterate in, because both read the same
 //! bytes and protobuf preserves repeated-field order.
 
-use tonic::Status;
+#![deny(clippy::result_large_err)]
 
 use crate::pb;
 
@@ -90,11 +90,23 @@ const MAX_DEPTH: usize = 8;
 /// fingerprint requires a new index binding, never a silent rebind.
 const FINGERPRINT_VERSION: &str = "pipestream-search.plan.v3";
 
-/// One refusal, uniformly shaped: every message begins `plan: `.
-fn refuse(msg: impl Into<String>) -> Status {
-    Status::invalid_argument(format!("plan: {}", msg.into()))
+crate::domain_error::domain_error! {
+    /// Why a mapping, plan, or projection was refused, converted to
+    /// transport status only at the RPC edge.
+    #[derive(Debug, Clone)]
+    pub enum MappingError {
+        InvalidArgument => invalid_argument,
+        Internal => internal,
+        ResourceExhausted => resource_exhausted,
+    }
+    foreign: Foreign
 }
 
-fn refuse_at(path: &str, msg: impl AsRef<str>) -> Status {
+/// One refusal, uniformly shaped: every message begins `plan: `.
+fn refuse(msg: impl Into<String>) -> MappingError {
+    MappingError::invalid_argument(format!("plan: {}", msg.into()))
+}
+
+fn refuse_at(path: &str, msg: impl AsRef<str>) -> MappingError {
     refuse(format!("{}: {}", path, msg.as_ref()))
 }

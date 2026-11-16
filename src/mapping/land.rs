@@ -3,10 +3,10 @@
 
 use std::collections::HashMap;
 
+use super::MappingError;
 use prost_reflect::DescriptorPool;
 use prost_types::field_descriptor_proto::Type;
 use prost_types::FieldDescriptorProto;
-use tonic::Status;
 
 use super::extractor::Land;
 use super::hint_resolve::wrapper_kind;
@@ -37,7 +37,7 @@ pub(super) fn land_for(
     leaf: &FieldDescriptorProto,
     enums: &HashMap<String, HashMap<i64, String>>,
     pool: &DescriptorPool,
-) -> Result<Land, Status> {
+) -> Result<Land, MappingError> {
     if matches!(
         pb::ColumnFamily::try_from(field.family),
         Ok(pb::ColumnFamily::MapFacet
@@ -80,7 +80,7 @@ fn map_land(
     leaf: &FieldDescriptorProto,
     enums: &HashMap<String, HashMap<i64, String>>,
     pool: &DescriptorPool,
-) -> Result<Land, Status> {
+) -> Result<Land, MappingError> {
     let entry = pool
         .get_message_by_name(leaf.type_name().trim_start_matches('.'))
         .filter(|entry| entry.is_map_entry())
@@ -118,7 +118,7 @@ fn family_land(
     field: &pb::MappedField,
     leaf: &FieldDescriptorProto,
     enums: &HashMap<String, HashMap<i64, String>>,
-) -> Result<Land, Status> {
+) -> Result<Land, MappingError> {
     let family = field.family;
 
     if family == pb::ColumnFamily::TextField as i32 {
@@ -175,7 +175,7 @@ fn family_land(
             )),
         };
     }
-    Err(Status::internal(format!(
+    Err(MappingError::internal(format!(
         "plan: field {} landed family {} with no extraction rule",
         field.path, family
     )))
@@ -185,7 +185,7 @@ fn facet_land(
     field: &pb::MappedField,
     leaf: &FieldDescriptorProto,
     enums: &HashMap<String, HashMap<i64, String>>,
-) -> Result<Land, Status> {
+) -> Result<Land, MappingError> {
     match leaf.r#type() {
         Type::String => Ok(Land::FacetStr),
         Type::Bool => Ok(Land::FacetBool),

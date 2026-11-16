@@ -3,8 +3,8 @@
 
 use std::collections::HashMap;
 
+use super::MappingError;
 use prost_types::{DescriptorProto, FieldDescriptorProto, FileDescriptorSet};
-use tonic::Status;
 
 use super::refuse_at;
 
@@ -56,7 +56,7 @@ impl<'a> TypeIndex<'a> {
         &self,
         type_name: &str,
         path: &str,
-    ) -> Result<&MsgEntry<'a>, Status> {
+    ) -> Result<&MsgEntry<'a>, MappingError> {
         let full = type_name.strip_prefix('.').ok_or_else(|| {
             refuse_at(
                 path,
@@ -80,7 +80,7 @@ impl<'a> TypeIndex<'a> {
         &self,
         root: &MsgEntry<'a>,
         path: &str,
-    ) -> Result<&'a FieldDescriptorProto, Status> {
+    ) -> Result<&'a FieldDescriptorProto, MappingError> {
         let mut current = root.desc;
         let segments: Vec<&str> = path.split('.').collect();
         for (position, segment) in segments.iter().enumerate() {

@@ -1,6 +1,6 @@
 //! The value grammar of the parser.
 
-use tonic::Status;
+use super::CelError;
 
 use super::ast::{Ast, RelOp, VOp};
 use super::lex::Tok;
@@ -12,7 +12,7 @@ impl Parser {
     /// `?:` (right-associative, lowest) over `||` over `&&` over
     /// relations over arithmetic. `in` is the one relation that stays
     /// refused: a list is not a value.
-    pub(super) fn value_expr(&mut self) -> Result<Ast, Status> {
+    pub(super) fn value_expr(&mut self) -> Result<Ast, CelError> {
         let cond = self.value_or()?;
         if !self.eat(&Tok::Question) {
             return Ok(cond);
@@ -28,7 +28,7 @@ impl Parser {
         ))
     }
 
-    fn value_or(&mut self) -> Result<Ast, Status> {
+    fn value_or(&mut self) -> Result<Ast, CelError> {
         let first = self.value_and()?;
         if self.peek() != Some(&Tok::OrOr) {
             return Ok(first);
@@ -40,7 +40,7 @@ impl Parser {
         Ok(Ast::Or(children))
     }
 
-    fn value_and(&mut self) -> Result<Ast, Status> {
+    fn value_and(&mut self) -> Result<Ast, CelError> {
         let first = self.value_rel()?;
         if self.peek() != Some(&Tok::AndAnd) {
             return Ok(first);
@@ -56,7 +56,7 @@ impl Parser {
     /// CEL's grammar; a chained relation compiles here and the type
     /// check refuses the nonsense (`a < b < c` compares a bool with a
     /// number).
-    fn value_rel(&mut self) -> Result<Ast, Status> {
+    fn value_rel(&mut self) -> Result<Ast, CelError> {
         let mut e = self.additive()?;
         loop {
             let op = match self.peek() {
@@ -79,7 +79,7 @@ impl Parser {
         }
     }
 
-    fn additive(&mut self) -> Result<Ast, Status> {
+    fn additive(&mut self) -> Result<Ast, CelError> {
         let mut e = self.multiplicative()?;
         loop {
             let op = match self.peek() {
@@ -92,7 +92,7 @@ impl Parser {
         }
     }
 
-    fn multiplicative(&mut self) -> Result<Ast, Status> {
+    fn multiplicative(&mut self) -> Result<Ast, CelError> {
         let mut e = self.value_unary()?;
         loop {
             let op = match self.peek() {
@@ -106,7 +106,7 @@ impl Parser {
         }
     }
 
-    fn value_unary(&mut self) -> Result<Ast, Status> {
+    fn value_unary(&mut self) -> Result<Ast, CelError> {
         if self.eat(&Tok::Bang) {
             return Ok(Ast::Not(Box::new(self.value_unary()?)));
         }

@@ -1,5 +1,6 @@
 //! Document sources feeding the ingest pipeline: plain, mapped, and prepared.
 
+use crate::domain_error::DomainError;
 use crate::node::*;
 
 /// One document held between submission and apply: the request itself,
@@ -150,12 +151,10 @@ impl MappedSource<'_> {
     ) -> Result<(), Status> {
         let position = self.position;
         self.position += 1;
-        let rows = self.extractor.extract(bytes).map_err(|status| {
-            Status::new(
-                status.code(),
-                format!("document {position}: {}", status.message()),
-            )
-        })?;
+        let rows = self
+            .extractor
+            .extract(bytes)
+            .map_err(|error| Status::from(error.prefixed(&format!("document {position}: "))))?;
         self.parents += 1;
         self.original_source.payload = bytes.to_vec();
         let chunked = !self.extractor.plan().chunks_path.is_empty();

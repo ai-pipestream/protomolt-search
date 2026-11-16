@@ -172,7 +172,7 @@ fn project_rows(
             let size = row.encoded_len() as u64;
             let framed = 1 + prost::encoding::encoded_len_varint(size) as u64 + size;
             if framed > request.max_bytes - used {
-                return Err(Status::resource_exhausted(
+                return Err(crate::mapping::MappingError::resource_exhausted(
                     "document projection exceeds max_bytes",
                 ));
             }

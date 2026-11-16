@@ -1,7 +1,7 @@
 //! The boolean layer of the value compiler: Kleene logic, comparisons, and
 //! the conditional.
 
-use tonic::Status;
+use super::CelError;
 
 use super::ast::{Ast, RelOp};
 use super::refuse;
@@ -13,7 +13,7 @@ use crate::pb;
 pub(super) fn compile_value_tail(
     ast: &Ast,
     depth: usize,
-) -> Result<(pb::ValueExpr, Option<VType>), Status> {
+) -> Result<(pb::ValueExpr, Option<VType>), CelError> {
     use pb::value_expr::Expr as V;
     match ast {
         Ast::Str(v) => Ok((value_of(V::StringLiteral(v.clone())), Some(VType::Str))),
@@ -57,7 +57,7 @@ fn compile_logic(
     and: bool,
     children: &[Ast],
     depth: usize,
-) -> Result<(pb::ValueExpr, Option<VType>), Status> {
+) -> Result<(pb::ValueExpr, Option<VType>), CelError> {
     use pb::value_expr::Expr as V;
 
     let sym = if and { "&&" } else { "||" };
@@ -95,7 +95,7 @@ fn compile_compare(
     op: &RelOp,
     r: &Ast,
     depth: usize,
-) -> Result<(pb::ValueExpr, Option<VType>), Status> {
+) -> Result<(pb::ValueExpr, Option<VType>), CelError> {
     use pb::value_expr::Expr as V;
 
     let (le, lt) = compile_value_ast(l, depth + 1)?;
@@ -162,7 +162,7 @@ fn compile_ternary(
     t: &Ast,
     e: &Ast,
     depth: usize,
-) -> Result<(pb::ValueExpr, Option<VType>), Status> {
+) -> Result<(pb::ValueExpr, Option<VType>), CelError> {
     use pb::value_expr::Expr as V;
 
     let (ce, ct) = compile_value_ast(c, depth + 1)?;

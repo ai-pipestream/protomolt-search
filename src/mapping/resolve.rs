@@ -1,7 +1,7 @@
 //! Structural resolution over the planned fields: the chunk scope, the
 //! vector, the document id, and the chunk id.
 
-use tonic::Status;
+use super::MappingError;
 
 use super::{refuse, refuse_at};
 use crate::pb;
@@ -15,7 +15,7 @@ fn paths(fields: &[&pb::MappedField]) -> String {
 }
 
 /// At most one CHUNKS scope per plan.
-pub(super) fn resolve_chunks(fields: &[pb::MappedField]) -> Result<Option<String>, Status> {
+pub(super) fn resolve_chunks(fields: &[pb::MappedField]) -> Result<Option<String>, MappingError> {
     let chunks: Vec<&pb::MappedField> = fields
         .iter()
         .filter(|f| f.role == pb::MappedRole::Chunks as i32)
@@ -41,7 +41,7 @@ pub(super) fn resolve_chunks(fields: &[pb::MappedField]) -> Result<Option<String
 pub(super) fn resolve_vector(
     fields: &mut [pb::MappedField],
     chunks_path: Option<&str>,
-) -> Result<String, Status> {
+) -> Result<String, MappingError> {
     let explicit: Vec<&pb::MappedField> = fields
         .iter()
         .filter(|f| f.kind == pb::MappedKind::Vector as i32)
@@ -112,7 +112,7 @@ pub(super) fn resolve_vector(
 pub(super) fn resolve_doc_id(
     fields: &mut [pb::MappedField],
     chunks_path: Option<&str>,
-) -> Result<String, Status> {
+) -> Result<String, MappingError> {
     let explicit: Vec<&pb::MappedField> = fields
         .iter()
         .filter(|f| f.role == pb::MappedRole::DocId as i32)
@@ -179,7 +179,7 @@ pub(super) fn resolve_doc_id(
 pub(super) fn resolve_chunk_id(
     fields: &[pb::MappedField],
     chunks_path: Option<&str>,
-) -> Result<Option<String>, Status> {
+) -> Result<Option<String>, MappingError> {
     let ids: Vec<&pb::MappedField> = fields
         .iter()
         .filter(|f| f.role == pb::MappedRole::ChunkId as i32)

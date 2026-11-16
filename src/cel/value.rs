@@ -1,7 +1,7 @@
 //! The value compiler: [`Ast`] to [`pb::ValueExpr`], typed as far as
 //! literals determine.
 
-use tonic::Status;
+use super::CelError;
 
 use super::ast::{Ast, VOp};
 use super::predicate::int_literal;
@@ -47,7 +47,7 @@ pub(super) fn value_of(expr: pb::value_expr::Expr) -> pb::ValueExpr {
 pub(super) fn compile_value_ast(
     ast: &Ast,
     depth: usize,
-) -> Result<(pb::ValueExpr, Option<VType>), Status> {
+) -> Result<(pb::ValueExpr, Option<VType>), CelError> {
     use pb::value_expr::Expr as V;
     if depth > VALUE_MAX_DEPTH {
         return Err(refuse(format!(
@@ -101,7 +101,7 @@ pub(super) fn compile_value_ast(
     }
 }
 
-fn compile_negate(inner: &Ast, depth: usize) -> Result<(pb::ValueExpr, Option<VType>), Status> {
+fn compile_negate(inner: &Ast, depth: usize) -> Result<(pb::ValueExpr, Option<VType>), CelError> {
     use pb::value_expr::Expr as V;
 
     let (expr, vt) = compile_value_ast(inner, depth + 1)?;
@@ -127,7 +127,7 @@ fn compile_arith(
     op: &VOp,
     r: &Ast,
     depth: usize,
-) -> Result<(pb::ValueExpr, Option<VType>), Status> {
+) -> Result<(pb::ValueExpr, Option<VType>), CelError> {
     use pb::value_expr::Expr as V;
 
     let (le, lt) = compile_value_ast(l, depth + 1)?;
@@ -189,7 +189,7 @@ fn compile_plain_call(
     name: &str,
     args: &[Ast],
     depth: usize,
-) -> Result<(pb::ValueExpr, Option<VType>), Status> {
+) -> Result<(pb::ValueExpr, Option<VType>), CelError> {
     use pb::value_expr::Expr as V;
     match name {
         "double" => {

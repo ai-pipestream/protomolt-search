@@ -2,9 +2,9 @@
 
 use std::collections::HashMap;
 
+use super::MappingError;
 use prost::Message as _;
 use prost_types::{DescriptorProto, FieldDescriptorProto, FileDescriptorSet};
-use tonic::Status;
 
 use super::type_index::MsgKey;
 use super::{refuse, HINT_EXTENSION_NAME, HINT_EXTENSION_NUMBER};
@@ -19,8 +19,8 @@ pub(super) type HintMap = HashMap<(MsgKey, usize), hints::FieldIndexHint>;
 /// such a set by name instead: the number is registered to the
 /// ProtoMolt hint vocabulary, and a modified indexing_hints.proto is
 /// exactly the drift the byte-identity check exists to catch.
-pub(super) fn check_extension_declarations(set: &FileDescriptorSet) -> Result<(), Status> {
-    fn check_list(extensions: &[FieldDescriptorProto]) -> Result<(), Status> {
+pub(super) fn check_extension_declarations(set: &FileDescriptorSet) -> Result<(), MappingError> {
+    fn check_list(extensions: &[FieldDescriptorProto]) -> Result<(), MappingError> {
         for extension in extensions {
             let extends_field_options = extension.extendee() == ".google.protobuf.FieldOptions";
             let claims_hint_number = extension.number() == HINT_EXTENSION_NUMBER as i32;
@@ -48,7 +48,7 @@ pub(super) fn check_extension_declarations(set: &FileDescriptorSet) -> Result<()
         }
         Ok(())
     }
-    fn check_message(message: &DescriptorProto) -> Result<(), Status> {
+    fn check_message(message: &DescriptorProto) -> Result<(), MappingError> {
         check_list(&message.extension)?;
         for nested in &message.nested_type {
             check_message(nested)?;
@@ -65,7 +65,7 @@ pub(super) fn check_extension_declarations(set: &FileDescriptorSet) -> Result<()
 }
 
 /// Read a varint at `*i`, advancing it.
-fn varint(b: &[u8], i: &mut usize) -> Result<u64, Status> {
+fn varint(b: &[u8], i: &mut usize) -> Result<u64, MappingError> {
     let mut value = 0u64;
     let mut shift = 0u32;
     loop {
@@ -85,7 +85,7 @@ fn varint(b: &[u8], i: &mut usize) -> Result<u64, Status> {
 }
 
 /// Skip one field body of the given wire type.
-fn skip_field(b: &[u8], i: &mut usize, wire: u64) -> Result<(), Status> {
+fn skip_field(b: &[u8], i: &mut usize, wire: u64) -> Result<(), MappingError> {
     match wire {
         0 => {
             varint(b, i)?;
@@ -123,8 +123,8 @@ fn skip_field(b: &[u8], i: &mut usize, wire: u64) -> Result<(), Status> {
 fn each_len_delimited(
     b: &[u8],
     field: u64,
-    mut visit: impl FnMut(&[u8]) -> Result<(), Status>,
-) -> Result<(), Status> {
+    mut visit: impl FnMut(&[u8]) -> Result<(), MappingError>,
+) -> Result<(), MappingError> {
     let mut i = 0;
     while i < b.len() {
         let tag = varint(b, &mut i)?;
@@ -151,7 +151,7 @@ fn each_len_delimited(
 /// for embedded messages.
 pub(super) fn extract_hints(
     bytes: &[u8],
-) -> Result<HashMap<(MsgKey, usize), hints::FieldIndexHint>, Status> {
+) -> Result<HashMap<(MsgKey, usize), hints::FieldIndexHint>, MappingError> {
     let mut raw: HashMap<(MsgKey, usize), Vec<u8>> = HashMap::new();
     let mut fi = 0usize;
     // FileDescriptorSet.file = 1
@@ -182,7 +182,7 @@ fn collect_message_hints(
     message: &[u8],
     key: MsgKey,
     out: &mut HashMap<(MsgKey, usize), Vec<u8>>,
-) -> Result<(), Status> {
+) -> Result<(), MappingError> {
     let mut field_idx = 0usize;
     // DescriptorProto.field = 2
     each_len_delimited(message, 2, |field| {

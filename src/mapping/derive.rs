@@ -3,10 +3,10 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::MappingError;
 use prost::Message as _;
 use prost_reflect::DescriptorPool;
 use prost_types::FileDescriptorSet;
-use tonic::Status;
 
 use super::fingerprint::{fingerprint, reachable_messages};
 use super::hint_bytes::{check_extension_declarations, extract_hints, HintMap};
@@ -21,7 +21,10 @@ use crate::sha256;
 /// Derive the plan for `message_type` inside `descriptor_set`. Every
 /// ambiguity and every unsupported hint is an error here, before any
 /// index exists.
-pub fn derive_plan(descriptor_set: &[u8], message_type: &str) -> Result<pb::MappedPlan, Status> {
+pub fn derive_plan(
+    descriptor_set: &[u8],
+    message_type: &str,
+) -> Result<pb::MappedPlan, MappingError> {
     derive_plan_with_definition(descriptor_set, message_type, None)
 }
 
@@ -30,7 +33,7 @@ pub fn derive_plan_with_definition(
     descriptor_set: &[u8],
     message_type: &str,
     definition: Option<&pb::IndexDefinition>,
-) -> Result<pb::MappedPlan, Status> {
+) -> Result<pb::MappedPlan, MappingError> {
     if message_type.is_empty() {
         return Err(refuse("message_type is required"));
     }
@@ -91,7 +94,8 @@ pub fn derive_plan_with_definition(
         index_definition: canonical_definition,
     };
     plan.fingerprint = fingerprint(&plan, &set, &pool);
-    plan.vector_binding = Some(crate::mapped_vector::from_plan(&plan)?);
+    plan.vector_binding =
+        Some(crate::mapped_vector::from_plan(&plan).map_err(MappingError::foreign)?);
     let skipped_fields = skipped_field_names(&index, &hint_map);
     plan.schema_report = Some(schema_report::build(&plan, &pool, &set, &skipped_fields)?);
     Ok(plan)
@@ -105,7 +109,7 @@ fn project_fields(
     index: &TypeIndex<'_>,
     hint_map: &HintMap,
     message_type: &str,
-) -> Result<(Vec<pb::MappedField>, Option<pb::IndexDefinition>), Status> {
+) -> Result<(Vec<pb::MappedField>, Option<pb::IndexDefinition>), MappingError> {
     let (fields, canonical_definition) = match definition {
         Some(definition) => {
             let (projected, canonical) = index_definition::derive(definition, root, index)?;
@@ -127,7 +131,7 @@ fn project_fields(
 
 /// Mapped ingest does not decode MessageSet wire format, so a reachable
 /// message that uses it refuses the plan.
-fn refuse_message_set(pool: &DescriptorPool, message_type: &str) -> Result<(), Status> {
+fn refuse_message_set(pool: &DescriptorPool, message_type: &str) -> Result<(), MappingError> {
     for message in reachable_messages(pool, message_type) {
         if message
             .descriptor_proto()
@@ -159,7 +163,7 @@ fn resolve_roles(
     fields: &mut [pb::MappedField],
     root: &MsgEntry<'_>,
     index: &TypeIndex<'_>,
-) -> Result<PlanRoles, Status> {
+) -> Result<PlanRoles, MappingError> {
     let chunks_path = resolve_chunks(fields)?;
     let vector_path = resolve_vector(fields, chunks_path.as_deref())?;
     let mut column_paths = HashMap::new();
@@ -245,27 +249,27 @@ fn skipped_field_names(index: &TypeIndex<'_>, hint_map: &HintMap) -> HashSet<Str
 pub fn describe_schema(
     descriptor_set: &[u8],
     message_type: &str,
-) -> Result<pb::DescribeSchemaResponse, Status> {
+) -> Result<pb::DescribeSchemaResponse, MappingError> {
     if descriptor_set.is_empty() || message_type.is_empty() {
-        return Err(Status::invalid_argument(
+        return Err(MappingError::invalid_argument(
             "schema: descriptor_set and message_type are required",
         ));
     }
     if message_type.starts_with('.') {
-        return Err(Status::invalid_argument(
+        return Err(MappingError::invalid_argument(
             "schema: message_type must not have a leading dot",
         ));
     }
     let set = FileDescriptorSet::decode(descriptor_set).map_err(|error| {
-        Status::invalid_argument(format!("schema: invalid descriptor set: {error}"))
+        MappingError::invalid_argument(format!("schema: invalid descriptor set: {error}"))
     })?;
     validate_descriptor_syntax(&set)
-        .map_err(|error| Status::invalid_argument(format!("schema: {error}")))?;
+        .map_err(|error| MappingError::invalid_argument(format!("schema: {error}")))?;
     let pool = DescriptorPool::decode(descriptor_set).map_err(|error| {
-        Status::invalid_argument(format!("schema: invalid descriptors: {error}"))
+        MappingError::invalid_argument(format!("schema: invalid descriptors: {error}"))
     })?;
     if pool.get_message_by_name(message_type).is_none() {
-        return Err(Status::invalid_argument(format!(
+        return Err(MappingError::invalid_argument(format!(
             "schema: message type {message_type:?} is absent from the descriptor set"
         )));
     }

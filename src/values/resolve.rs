@@ -1,7 +1,7 @@
 //! Resolution of a compiled expression against one shard's tables, which
 //! finishes the type check.
 
-use tonic::Status;
+use super::ValuesError;
 
 use super::lookup::ColumnLookup;
 use super::refuse;
@@ -17,7 +17,7 @@ use crate::pb;
 pub fn resolve(
     expr: &pb::ValueExpr,
     cols: &dyn ColumnLookup,
-) -> Result<(ResolvedValue, ValueType), Status> {
+) -> Result<(ResolvedValue, ValueType), ValuesError> {
     use pb::value_expr::Expr as V;
     match expr
         .expr
@@ -75,7 +75,7 @@ pub fn resolve(
 fn resolve_column(
     name: &str,
     cols: &dyn ColumnLookup,
-) -> Result<(ResolvedValue, ValueType), Status> {
+) -> Result<(ResolvedValue, ValueType), ValuesError> {
     let num = cols.numeric_index(name);
     let int = cols.integer_index(name);
     let uint = cols.unsigned_integer_index(name);
@@ -109,7 +109,7 @@ fn resolve_map(
     read: &pb::MapRead,
     typed: bool,
     cols: &dyn ColumnLookup,
-) -> Result<(ResolvedValue, ValueType), Status> {
+) -> Result<(ResolvedValue, ValueType), ValuesError> {
     let num = cols.map_numeric_index(&read.column);
     let facet = cols.map_facet_index(&read.column);
     let int = cols.map_integer_index(&read.column).filter(|_| typed);
@@ -188,7 +188,7 @@ fn resolve_map(
 fn resolve_to_double(
     inner: &pb::ValueExpr,
     cols: &dyn ColumnLookup,
-) -> Result<(ResolvedValue, ValueType), Status> {
+) -> Result<(ResolvedValue, ValueType), ValuesError> {
     let (rv, vt) = resolve(inner, cols)?;
     match vt {
         ValueType::Str => {
@@ -207,7 +207,7 @@ fn resolve_to_double(
 fn resolve_negate(
     inner: &pb::ValueExpr,
     cols: &dyn ColumnLookup,
-) -> Result<(ResolvedValue, ValueType), Status> {
+) -> Result<(ResolvedValue, ValueType), ValuesError> {
     let (rv, vt) = resolve(inner, cols)?;
     match vt {
         ValueType::Uint => return Err(refuse("unary minus over a uint")),
@@ -225,7 +225,7 @@ fn resolve_negate(
 fn resolve_arith(
     arith: &pb::ValueArith,
     cols: &dyn ColumnLookup,
-) -> Result<(ResolvedValue, ValueType), Status> {
+) -> Result<(ResolvedValue, ValueType), ValuesError> {
     let left = arith
         .left
         .as_ref()

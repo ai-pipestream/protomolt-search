@@ -225,5 +225,7 @@ pub(crate) fn apply_materialize(
     compiled: &[(String, crate::pb::ValueExpr, crate::pb::MaterializeKind)],
 ) -> Result<AddDocumentsRequest, Status> {
     let env = crate::derived::ingest_env(&doc, None)?;
-    crate::derived::materialize_into(doc, compiled, &env, false)
+    Ok(crate::derived::materialize_into(
+        doc, compiled, &env, false,
+    )?)
 }

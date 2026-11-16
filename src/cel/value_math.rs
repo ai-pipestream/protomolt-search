@@ -1,7 +1,7 @@
 //! The namespaced function vocabulary of the value compiler: `math.*`,
 //! `engine.*`, `hash.*`, and `calendar.*`.
 
-use tonic::Status;
+use super::CelError;
 
 use super::ast::Ast;
 use super::refuse;
@@ -15,7 +15,7 @@ pub(super) fn compile_math_call(
     name: &str,
     args: &[Ast],
     depth: usize,
-) -> Result<(pb::ValueExpr, Option<VType>), Status> {
+) -> Result<(pb::ValueExpr, Option<VType>), CelError> {
     let Some(f) = math_fn_of(ns, name) else {
         return Err(refuse(format!(
             "unknown function {ns}.{name}(); the function vocabulary is documented \
@@ -39,7 +39,7 @@ fn compile_string_hash(
     display: &str,
     args: &[Ast],
     depth: usize,
-) -> Result<(pb::ValueExpr, Option<VType>), Status> {
+) -> Result<(pb::ValueExpr, Option<VType>), CelError> {
     use pb::value_expr::Expr as V;
 
     let [arg] = args else {
@@ -89,7 +89,7 @@ fn compile_calendar_part(
     display: &str,
     args: &[Ast],
     depth: usize,
-) -> Result<(pb::ValueExpr, Option<VType>), Status> {
+) -> Result<(pb::ValueExpr, Option<VType>), CelError> {
     use pb::value_expr::Expr as V;
 
     let [arg] = args else {
@@ -123,7 +123,7 @@ fn compile_numeric_call(
     display: &str,
     args: &[Ast],
     depth: usize,
-) -> Result<(pb::ValueExpr, Option<VType>), Status> {
+) -> Result<(pb::ValueExpr, Option<VType>), CelError> {
     use pb::value_expr::Expr as V;
 
     let arity_ok = match f {

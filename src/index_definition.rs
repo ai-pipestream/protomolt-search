@@ -10,7 +10,7 @@ pub(super) fn derive(
     definition: &pb::IndexDefinition,
     root: &MsgEntry<'_>,
     index: &TypeIndex<'_>,
-) -> Result<(Vec<pb::MappedField>, pb::IndexDefinition), Status> {
+) -> Result<(Vec<pb::MappedField>, pb::IndexDefinition), MappingError> {
     let projections = collect_projections(definition)?;
     let mut fields = Vec::new();
     for (numbers, projection) in &projections {
@@ -26,12 +26,12 @@ pub(super) fn derive(
     let canonical = pb::IndexDefinition {
         projections: projections.into_values().cloned().collect(),
     };
-    crate::index_contract::validate_definition(&canonical)?;
+    crate::index_contract::validate_definition(&canonical).map_err(MappingError::foreign)?;
     Ok((fields, canonical))
 }
 
 /// Key every projection by its field-number path, refusing bad lengths and duplicates.
-fn collect_projections(definition: &pb::IndexDefinition) -> Result<Projections<'_>, Status> {
+fn collect_projections(definition: &pb::IndexDefinition) -> Result<Projections<'_>, MappingError> {
     let mut projections = BTreeMap::new();
     for projection in &definition.projections {
         let path = &projection.field_numbers;
@@ -55,7 +55,7 @@ fn project_path<'a>(
     projections: &Projections<'_>,
     (root, index): (&'a MsgEntry<'a>, &'a TypeIndex<'a>),
     fields: &mut Vec<pb::MappedField>,
-) -> Result<(), Status> {
+) -> Result<(), MappingError> {
     let mut entry = root;
     let mut names = Vec::new();
     for (depth, &number) in numbers.iter().enumerate() {
@@ -104,7 +104,7 @@ fn leaf_field(
     field: &prost_types::FieldDescriptorProto,
     field_shape: &Shape<'_>,
     path: &str,
-) -> Result<pb::MappedField, Status> {
+) -> Result<pb::MappedField, MappingError> {
     let kind = pb::MappedKind::try_from(projection.kind)
         .map_err(|_| refuse_at(path, "index definition has an unknown kind"))?;
     let role = pb::MappedRole::try_from(projection.role)
@@ -149,7 +149,7 @@ fn leaf_field(
     Ok(mapped)
 }
 
-fn require_one_doc_id_and_vector(fields: &[pb::MappedField]) -> Result<(), Status> {
+fn require_one_doc_id_and_vector(fields: &[pb::MappedField]) -> Result<(), MappingError> {
     if fields
         .iter()
         .filter(|f| f.role == pb::MappedRole::DocId as i32)

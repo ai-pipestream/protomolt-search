@@ -2,7 +2,7 @@
 //! unary < member. This file is the shared machinery and the predicate
 //! grammar.
 
-use tonic::Status;
+use super::CelError;
 
 use super::ast::{Ast, RelOp};
 use super::lex::Tok;
@@ -38,7 +38,7 @@ impl Parser {
         }
     }
 
-    pub(super) fn expect(&mut self, t: Tok, what: &str) -> Result<(), Status> {
+    pub(super) fn expect(&mut self, t: Tok, what: &str) -> Result<(), CelError> {
         if self.eat(&t) {
             Ok(())
         } else {
@@ -49,7 +49,7 @@ impl Parser {
         }
     }
 
-    pub(super) fn expect_end(&self) -> Result<(), Status> {
+    pub(super) fn expect_end(&self) -> Result<(), CelError> {
         if self.pos == self.toks.len() {
             Ok(())
         } else {
@@ -69,7 +69,7 @@ impl Parser {
 
     /// Subexpression entry for parentheses and call arguments: the
     /// grammar re-entered matches the front-end that is parsing.
-    fn expr_any(&mut self) -> Result<Ast, Status> {
+    fn expr_any(&mut self) -> Result<Ast, CelError> {
         if self.value_mode {
             self.value_expr()
         } else {
@@ -79,7 +79,7 @@ impl Parser {
 
     /// Top level: an `or`, then the refusals for what CEL would allow
     /// next but predicates cannot hold.
-    pub(super) fn expr(&mut self) -> Result<Ast, Status> {
+    pub(super) fn expr(&mut self) -> Result<Ast, CelError> {
         let e = self.or()?;
         if self.peek() == Some(&Tok::Question) {
             return Err(refuse(
@@ -90,7 +90,7 @@ impl Parser {
         Ok(e)
     }
 
-    fn or(&mut self) -> Result<Ast, Status> {
+    fn or(&mut self) -> Result<Ast, CelError> {
         let first = self.and()?;
         if self.peek() != Some(&Tok::OrOr) {
             return Ok(first);
@@ -102,7 +102,7 @@ impl Parser {
         Ok(Ast::Or(children))
     }
 
-    fn and(&mut self) -> Result<Ast, Status> {
+    fn and(&mut self) -> Result<Ast, CelError> {
         let first = self.relation()?;
         if self.peek() != Some(&Tok::AndAnd) {
             return Ok(first);
@@ -116,7 +116,7 @@ impl Parser {
 
     /// One (non-associative) relation, or a bare unary. Arithmetic
     /// operators are recognized here purely to refuse them by name.
-    fn relation(&mut self) -> Result<Ast, Status> {
+    fn relation(&mut self) -> Result<Ast, CelError> {
         let lhs = self.unary()?;
         self.refuse_arithmetic()?;
         let op = match self.peek() {
@@ -135,7 +135,7 @@ impl Parser {
         Ok(Ast::Rel(Box::new(lhs), op, Box::new(rhs)))
     }
 
-    fn refuse_arithmetic(&self) -> Result<(), Status> {
+    fn refuse_arithmetic(&self) -> Result<(), CelError> {
         let sym = match self.peek() {
             Some(Tok::Plus) => "+",
             Some(Tok::Minus) => "-",
@@ -150,7 +150,7 @@ impl Parser {
         )))
     }
 
-    fn unary(&mut self) -> Result<Ast, Status> {
+    fn unary(&mut self) -> Result<Ast, CelError> {
         if self.eat(&Tok::Bang) {
             return Ok(Ast::Not(Box::new(self.unary()?)));
         }
@@ -174,7 +174,7 @@ impl Parser {
     /// (dots are just characters in this engine's flat column
     /// namespace); bracket indexing is map access and needs a string
     /// literal key.
-    pub(super) fn member(&mut self) -> Result<Ast, Status> {
+    pub(super) fn member(&mut self) -> Result<Ast, CelError> {
         let mut e = self.primary()?;
         loop {
             if self.eat(&Tok::Dot) {
@@ -231,7 +231,7 @@ impl Parser {
         }
     }
 
-    fn primary(&mut self) -> Result<Ast, Status> {
+    fn primary(&mut self) -> Result<Ast, CelError> {
         match self.next() {
             Some(Tok::LParen) => {
                 let e = self.expr_any()?;

@@ -46,6 +46,7 @@ impl CoordinatorServiceImpl {
             let req = request.into_inner();
             crate::mapping::describe_schema(&req.descriptor_set, &req.message_type)
                 .map(Response::new)
+                .map_err(Status::from)
         })
         .await
     }

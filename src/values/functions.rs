@@ -1,7 +1,7 @@
 //! The function vocabulary: names, signatures, arity, and evaluation over
 //! present arguments.
 
-use tonic::Status;
+use super::ValuesError;
 
 use super::refuse;
 use super::types::Val;
@@ -86,7 +86,7 @@ pub fn civil_of_micros(micros: i64) -> (i64, u32, u32) {
 }
 
 /// Arity check, shared by both evaluation paths.
-pub(super) fn check_fn_arity(f: pb::ValueFn, n: usize) -> Result<(), Status> {
+pub(super) fn check_fn_arity(f: pb::ValueFn, n: usize) -> Result<(), ValuesError> {
     let ok = match f {
         pb::ValueFn::Greatest | pb::ValueFn::Least => n >= 1,
         pb::ValueFn::Pow => n == 2,

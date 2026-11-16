@@ -10,7 +10,7 @@ use super::*;
 pub fn ingest_env(
     doc: &AddDocumentsRequest,
     stable_key: Option<&[u8]>,
-) -> Result<IngestEnv, Status> {
+) -> Result<IngestEnv, DerivedError> {
     let mut env = IngestEnv::default();
     scalar_env(doc, &mut env)?;
     map_env(doc, &mut env)?;
@@ -18,13 +18,13 @@ pub fn ingest_env(
     Ok(env)
 }
 
-fn repeats(family: &str, field: &str) -> Status {
-    Status::invalid_argument(format!("{family} {field:?} repeats in one document"))
+fn repeats(family: &str, field: &str) -> DerivedError {
+    DerivedError::invalid_argument(format!("{family} {field:?} repeats in one document"))
 }
 
 /// Numerics, integers, timestamps (as epoch-micro integers), and
 /// unsigned integers.
-fn scalar_env(doc: &AddDocumentsRequest, env: &mut IngestEnv) -> Result<(), Status> {
+fn scalar_env(doc: &AddDocumentsRequest, env: &mut IngestEnv) -> Result<(), DerivedError> {
     for nv in &doc.numerics {
         if env.numerics.insert(nv.field.clone(), nv.value).is_some() {
             return Err(repeats("numeric field", &nv.field));
@@ -37,14 +37,15 @@ fn scalar_env(doc: &AddDocumentsRequest, env: &mut IngestEnv) -> Result<(), Stat
     }
     for tv in &doc.timestamps {
         let Some(instant) = tv.value.as_ref() else {
-            return Err(Status::invalid_argument(format!(
+            return Err(DerivedError::invalid_argument(format!(
                 "timestamp field {:?} carries no instant; omit the entry instead",
                 tv.field
             )));
         };
-        let micros = crate::node::timestamp_to_epoch_micros(&tv.field, instant)?;
+        let micros = crate::node::timestamp_to_epoch_micros(&tv.field, instant)
+            .map_err(DerivedError::foreign)?;
         if env.integers.insert(tv.field.clone(), micros).is_some() {
-            return Err(Status::invalid_argument(format!(
+            return Err(DerivedError::invalid_argument(format!(
                 "integer field {:?} repeats in one document (integers and timestamps name \
                  the same columns)",
                 tv.field
@@ -64,7 +65,7 @@ fn scalar_env(doc: &AddDocumentsRequest, env: &mut IngestEnv) -> Result<(), Stat
 }
 
 /// Map numerics, signed and unsigned integer maps, and facets.
-fn map_env(doc: &AddDocumentsRequest, env: &mut IngestEnv) -> Result<(), Status> {
+fn map_env(doc: &AddDocumentsRequest, env: &mut IngestEnv) -> Result<(), DerivedError> {
     for entry in &doc.map_numerics {
         env.map_numerics
             .insert((entry.field.clone(), entry.key.clone()), entry.value);
@@ -75,7 +76,7 @@ fn map_env(doc: &AddDocumentsRequest, env: &mut IngestEnv) -> Result<(), Status>
             .insert((entry.field.clone(), entry.key.clone()), entry.value)
             .is_some()
         {
-            return Err(Status::invalid_argument(format!(
+            return Err(DerivedError::invalid_argument(format!(
                 "signed map {:?}[{:?}] repeats in one document",
                 entry.field, entry.key
             )));
@@ -87,7 +88,7 @@ fn map_env(doc: &AddDocumentsRequest, env: &mut IngestEnv) -> Result<(), Status>
             .insert((entry.field.clone(), entry.key.clone()), entry.value)
             .is_some()
         {
-            return Err(Status::invalid_argument(format!(
+            return Err(DerivedError::invalid_argument(format!(
                 "unsigned map {:?}[{:?}] repeats in one document",
                 entry.field, entry.key
             )));
@@ -118,7 +119,7 @@ pub fn materialize_into(
     columns: &[(String, pb::ValueExpr, pb::MaterializeKind)],
     env: &IngestEnv,
     strict: bool,
-) -> Result<AddDocumentsRequest, Status> {
+) -> Result<AddDocumentsRequest, DerivedError> {
     for (name, expr, kind) in columns {
         let value = if strict {
             values::eval_ingest_derived(expr, env)
@@ -126,12 +127,12 @@ pub fn materialize_into(
             values::eval_ingest(expr, env)
         }
         .map_err(|e| {
-            Status::invalid_argument(format!("materialize: column {name:?}: {}", e.message()))
+            DerivedError::invalid_argument(format!("materialize: column {name:?}: {}", e.message()))
         })?;
         match value {
             None => {}
             Some(IngestVal::Bool(_)) => {
-                return Err(Status::invalid_argument(format!(
+                return Err(DerivedError::invalid_argument(format!(
                     "materialize: column {name:?} evaluated a boolean; a stored \
                      column holds numbers — wrap the expression in a ternary \
                      (`cond ? 1 : 0`)"
@@ -139,7 +140,7 @@ pub fn materialize_into(
             }
             Some(IngestVal::Double(v)) => {
                 if *kind != pb::MaterializeKind::F64 {
-                    return Err(Status::invalid_argument(format!(
+                    return Err(DerivedError::invalid_argument(format!(
                         "materialize: column {name:?} declares {kind:?} but its \
                          expression evaluated double on this document; stock CEL \
                          does not coerce — align the kind or the expression"
@@ -152,7 +153,7 @@ pub fn materialize_into(
             }
             Some(IngestVal::Int(v)) => {
                 if *kind != pb::MaterializeKind::I64 {
-                    return Err(Status::invalid_argument(format!(
+                    return Err(DerivedError::invalid_argument(format!(
                         "materialize: column {name:?} declares {kind:?} but its \
                          expression evaluated int on this document; write \
                          double(...) to land it in the f64 family"
@@ -165,7 +166,7 @@ pub fn materialize_into(
             }
             Some(IngestVal::Uint(v)) => {
                 if *kind != pb::MaterializeKind::U64 {
-                    return Err(Status::invalid_argument(format!(
+                    return Err(DerivedError::invalid_argument(format!(
                         "materialize: column {name:?} declares {kind:?} but evaluated uint; align the kind or convert explicitly with double()"
                     )));
                 }

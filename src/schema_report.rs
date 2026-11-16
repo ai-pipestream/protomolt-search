@@ -2,9 +2,9 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use super::MappingError;
 use prost_reflect::{DescriptorPool, FieldDescriptor, Kind, MessageDescriptor, Syntax};
 use prost_types::field_descriptor_proto::Type;
-use tonic::Status;
 
 use crate::pb::{self, ColumnFamily, MappedQueryRepresentation as Query, ProjectionUse as Use};
 
@@ -22,7 +22,7 @@ pub(super) fn build(
     pool: &DescriptorPool,
     set: &prost_types::FileDescriptorSet,
     skipped_fields: &HashSet<String>,
-) -> Result<pb::SchemaReport, Status> {
+) -> Result<pb::SchemaReport, MappingError> {
     let root = pool
         .get_message_by_name(&plan.message_type)
         .expect("validated root");
@@ -46,7 +46,7 @@ fn bind_mapped_path(
     mapped: &pb::MappedField,
     root: &MessageDescriptor,
     bindings: &mut Bindings,
-) -> Result<(), Status> {
+) -> Result<(), MappingError> {
     let mut message = root.clone();
     let mut numbers = Vec::new();
     let mut path = String::new();
@@ -54,7 +54,7 @@ fn bind_mapped_path(
     for (i, segment) in segments.iter().enumerate() {
         let field = message
             .get_field_by_name(segment)
-            .ok_or_else(|| Status::internal("plan path is absent from schema"))?;
+            .ok_or_else(|| MappingError::internal("plan path is absent from schema"))?;
         numbers.push(field.number());
         if !path.is_empty() {
             path.push('.');
@@ -78,7 +78,7 @@ fn bind_mapped_path(
                     });
             }
             let Kind::Message(child) = field.kind() else {
-                return Err(Status::internal("plan path crosses a scalar"));
+                return Err(MappingError::internal("plan path crosses a scalar"));
             };
             message = child;
         }
@@ -93,7 +93,7 @@ fn bind_leaf(
     field: &FieldDescriptor,
     at: (&String, &Vec<u32>),
     bindings: &mut Bindings,
-) -> Result<(), Status> {
+) -> Result<(), MappingError> {
     let (path, numbers) = at;
     if mapped.family != ColumnFamily::None as i32 {
         super::land_for(
@@ -179,7 +179,7 @@ fn bind_components(
 pub(super) fn describe(
     pool: &DescriptorPool,
     message_type: &str,
-) -> Result<pb::SchemaReport, Status> {
+) -> Result<pb::SchemaReport, MappingError> {
     inventory(message_type, pool, BTreeMap::new(), &HashSet::new(), false)
 }
 
@@ -309,7 +309,7 @@ fn inventory(
     bindings: Bindings,
     skipped_fields: &HashSet<String>,
     requires_index_rows_for_preservation: bool,
-) -> Result<pb::SchemaReport, Status> {
+) -> Result<pb::SchemaReport, MappingError> {
     let mut inventory = Inventory {
         enums: BTreeMap::new(),
         bindings,
@@ -321,7 +321,9 @@ fn inventory(
         messages.push(inventory.message(&message));
     }
     if !inventory.bindings.is_empty() {
-        return Err(Status::internal("schema report omitted a projected field"));
+        return Err(MappingError::internal(
+            "schema report omitted a projected field",
+        ));
     }
     Ok(pb::SchemaReport {
         report_version: 2,
