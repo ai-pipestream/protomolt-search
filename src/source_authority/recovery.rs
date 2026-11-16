@@ -2,6 +2,9 @@
 use super::*;
 
 mod control;
+mod operation;
+
+pub(super) use operation::operation;
 
 pub(super) fn header(
     value: &SourceAuthorityHeader,
@@ -46,142 +49,9 @@ pub(super) fn control_header(value: &ControlStoreHeader) -> Result<(), Status> {
     Ok(())
 }
 
-pub(super) fn operation(
-    key: &SourceAuthorityOperationKey,
-    value: &SourceAuthorityOperation,
-    header: &SourceAuthorityHeader,
-    policy: &AccessPolicy,
-) -> Result<(), Status> {
-    if key.format_version != 1 || value.format_version != 1 {
-        return Err(corrupt("unsupported operation format"));
-    }
-    contract::principal(&key.principal).map_err(corrupt)?;
-    contract::operation_id(&key.command_id).map_err(corrupt)?;
-    let command = value
-        .command
-        .as_ref()
-        .ok_or_else(|| missing("stored command"))?;
-    contract::command(
-        command,
-        header
-            .identity
-            .as_ref()
-            .ok_or_else(|| missing("identity"))?,
-        header.limits.as_ref().ok_or_else(|| missing("limits"))?,
-    )
-    .map_err(corrupt)?;
-    if key.key != command.key
-        || key.command_id != command.command_id
-        || value.request_sha256 != digest(command)
-    {
-        return Err(corrupt("operation key or request digest differs"));
-    }
-    let decision = value
-        .decision
-        .as_ref()
-        .ok_or_else(|| missing("stored decision"))?;
-    if decision.format_version != 1
-        || decision.control_revision == 0
-        || decision.control_revision > header.control_revision
-        || decision.policy_revision == 0
-        || decision.policy_revision > policy.revision
-        || ![0, 3, 5, 6, 7, 8, 9].contains(&decision.code)
-    {
-        return Err(corrupt("decision format, status or revision is invalid"));
-    }
-    if decision.code != 0 {
-        if decision.owner.is_some() || decision.message.is_empty() {
-            return Err(corrupt(
-                "rejected decision carries owner state or no reason",
-            ));
-        }
-        return Ok(());
-    }
-    if !decision.message.is_empty()
-        || command.expected_control_revision.checked_add(1) != Some(decision.control_revision)
-    {
-        return Err(corrupt(
-            "accepted decision has an invalid control revision or reason",
-        ));
-    }
-    let policy_changed = matches!(command.action, Some(Action::ReplaceGrants(_)));
-    let expected_policy = if policy_changed {
-        command.expected_policy_revision.checked_add(1)
-    } else {
-        Some(command.expected_policy_revision)
-    };
-    if expected_policy != Some(decision.policy_revision) {
-        return Err(corrupt("accepted decision policy revision differs"));
-    }
-    match command.action.as_ref().ok_or_else(|| missing("action"))? {
-        Action::ReplaceGrants(_) => {
-            if decision.owner.is_some() {
-                return Err(corrupt("policy decision carries owner state"));
-            }
-        }
-        action => {
-            let owner = decision
-                .owner
-                .as_ref()
-                .ok_or_else(|| missing("owner decision"))?;
-            contract::owner(owner).map_err(corrupt)?;
-            if owner.key != command.key
-                || owner.last_command.as_ref() != Some(key)
-                || owner.control_revision != decision.control_revision
-            {
-                return Err(corrupt("owner decision binding differs"));
-            }
-            match action {
-                Action::Prepare(request) => {
-                    if owner.target != request.target
-                        || owner.workflow_id != request.workflow_id
-                        || owner.phase != PreparedSourceOwnerPhase::Prepared as i32
-                        || command.expected_ownership_generation.checked_add(1)
-                            != Some(owner.ownership_generation)
-                    {
-                        return Err(corrupt("preparation decision differs from its command"));
-                    }
-                }
-                Action::Cancel(request) => {
-                    if owner.workflow_id != request.workflow_id
-                        || owner.phase != PreparedSourceOwnerPhase::Cancelled as i32
-                        || owner.ownership_generation != command.expected_ownership_generation
-                    {
-                        return Err(corrupt("cancellation decision differs from its command"));
-                    }
-                }
-                Action::ConfirmReady(request) => {
-                    if owner.workflow_id != request.workflow_id
-                        || owner.phase != PreparedSourceOwnerPhase::Ready as i32
-                        || owner.ownership_generation != command.expected_ownership_generation
-                        || owner.readiness.as_ref().and_then(|r| r.completion.as_ref())
-                            != request.completion.as_ref()
-                    {
-                        return Err(corrupt("readiness decision differs from its command"));
-                    }
-                }
-                Action::Activate(request) => {
-                    if owner.workflow_id != request.workflow_id
-                        || owner.phase != PreparedSourceOwnerPhase::Active as i32
-                        || owner.ownership_generation != command.expected_ownership_generation
-                        || owner
-                            .activation
-                            .as_ref()
-                            .map(|a| a.activated_control_revision)
-                            != Some(decision.control_revision)
-                    {
-                        return Err(corrupt("activation decision differs from its command"));
-                    }
-                }
-                Action::ReplaceGrants(_) => {
-                    return Err(corrupt("policy command cannot carry an owner transition"))
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
+/// The full audit an existing store passes before it serves: tables,
+/// metadata keys, headers, every retained decision and every row that a
+/// decision or a header accounts for. Nothing is repaired.
 pub(super) fn validate(
     database: &Database,
     identity: &SourceAuthorityIdentity,
@@ -193,27 +63,7 @@ pub(super) fn validate(
         return Err(corrupt("unexpected or missing control tables"));
     }
     let meta = tx.open_table(META).map_err(corrupt)?;
-    let raft = meta.get(RAFT_META).map_err(storage)?.is_some();
-    let member = meta.get(MEMBER_META).map_err(storage)?.is_some();
-    if meta.len().map_err(storage)? != 4 + u64::from(raft) + u64::from(member) {
-        return Err(corrupt("unexpected metadata keys"));
-    }
-    if member && raft {
-        return Err(corrupt(
-            "a prepared member store carries an applied position",
-        ));
-    }
-    if raft {
-        let applied: RaftApplied = contract::decode(
-            meta.get(RAFT_META)
-                .map_err(storage)?
-                .ok_or_else(|| missing("raft applied position"))?
-                .value(),
-        )?;
-        if applied.format_version != 1 || applied.last_applied.is_none() {
-            return Err(corrupt("raft applied position format or log id is invalid"));
-        }
-    }
+    audit_meta_keys(&meta)?;
     let control: ControlStoreHeader = contract::decode(
         meta.get(super::control::CONTROL_HEADER)
             .map_err(storage)?
@@ -244,26 +94,8 @@ pub(super) fn validate(
     {
         return Err(corrupt("table counts differ from committed header"));
     }
-    let mut payload = policy.encoded_len() as u64;
-    let mut accepted = 0u64;
-    for entry in decisions.iter().map_err(storage)? {
-        let (key_bytes, value_bytes) = entry.map_err(storage)?;
-        let key: SourceAuthorityOperationKey = contract::decode(key_bytes.value())?;
-        let value: SourceAuthorityOperation = contract::decode(value_bytes.value())?;
-        operation(&key, &value, &state, &policy)?;
-        if value
-            .decision
-            .as_ref()
-            .is_some_and(|decision| decision.code == 0)
-        {
-            accepted += 1;
-        }
-        payload = payload_change(
-            payload,
-            0,
-            key_bytes.value().len() + value_bytes.value().len(),
-        )?;
-    }
+    let payload = policy.encoded_len() as u64;
+    let (accepted, mut payload) = audit_decisions(&decisions, &state, &policy, payload)?;
     let (accepted_installs, control_payload) =
         control::validate(&tx, &state, &control, &policy, &decisions)?;
     payload = payload_change(payload, 0, control_payload)?;
@@ -280,6 +112,80 @@ pub(super) fn validate(
             "control revision differs from accepted decision count",
         ));
     }
+    payload = audit_workflows(&workflows, &decisions, payload)?;
+    payload = audit_owners(&owners, &decisions, &workflows, (&state, &policy), payload)?;
+    if payload != state.payload_bytes {
+        return Err(corrupt("payload bytes differ from committed header"));
+    }
+    Ok(())
+}
+
+type ReadTable = redb::ReadOnlyTable<&'static [u8], &'static [u8]>;
+
+/// The metadata keys of a store: the three headers and the policy, an applied
+/// Raft position, or the pending marker of a prepared member.
+fn audit_meta_keys(meta: &redb::ReadOnlyTable<&'static str, &'static [u8]>) -> Result<(), Status> {
+    let raft = meta.get(RAFT_META).map_err(storage)?.is_some();
+    let member = meta.get(MEMBER_META).map_err(storage)?.is_some();
+    if meta.len().map_err(storage)? != 4 + u64::from(raft) + u64::from(member) {
+        return Err(corrupt("unexpected metadata keys"));
+    }
+    if member && raft {
+        return Err(corrupt(
+            "a prepared member store carries an applied position",
+        ));
+    }
+    if raft {
+        let applied: RaftApplied = contract::decode(
+            meta.get(RAFT_META)
+                .map_err(storage)?
+                .ok_or_else(|| missing("raft applied position"))?
+                .value(),
+        )?;
+        if applied.format_version != 1 || applied.last_applied.is_none() {
+            return Err(corrupt("raft applied position format or log id is invalid"));
+        }
+    }
+    Ok(())
+}
+
+/// Audit every retained decision. Returns the accepted count and `payload`
+/// with the bytes of the decision table added.
+fn audit_decisions(
+    decisions: &ReadTable,
+    state: &SourceAuthorityHeader,
+    policy: &AccessPolicy,
+    mut payload: u64,
+) -> Result<(u64, u64), Status> {
+    let mut accepted = 0u64;
+    for entry in decisions.iter().map_err(storage)? {
+        let (key_bytes, value_bytes) = entry.map_err(storage)?;
+        let key: SourceAuthorityOperationKey = contract::decode(key_bytes.value())?;
+        let value: SourceAuthorityOperation = contract::decode(value_bytes.value())?;
+        operation(&key, &value, state, policy)?;
+        if value
+            .decision
+            .as_ref()
+            .is_some_and(|decision| decision.code == 0)
+        {
+            accepted += 1;
+        }
+        payload = payload_change(
+            payload,
+            0,
+            key_bytes.value().len() + value_bytes.value().len(),
+        )?;
+    }
+    Ok((accepted, payload))
+}
+
+/// Audit every workflow reservation against its preparation decision.
+/// Returns `payload` with the bytes of the workflow table added.
+fn audit_workflows(
+    workflows: &ReadTable,
+    decisions: &ReadTable,
+    mut payload: u64,
+) -> Result<u64, Status> {
     for entry in workflows.iter().map_err(storage)? {
         let (key_bytes, value_bytes) = entry.map_err(storage)?;
         let key: SourceAuthorityWorkflowKey = contract::decode(key_bytes.value())?;
@@ -324,6 +230,18 @@ pub(super) fn validate(
             key_bytes.value().len() + value_bytes.value().len(),
         )?;
     }
+    Ok(payload)
+}
+
+/// Audit every owner row against its last decision and its workflow
+/// reservation. Returns `payload` with the bytes of the owner table added.
+fn audit_owners(
+    owners: &ReadTable,
+    decisions: &ReadTable,
+    workflows: &ReadTable,
+    (state, policy): (&SourceAuthorityHeader, &AccessPolicy),
+    mut payload: u64,
+) -> Result<u64, Status> {
     for entry in owners.iter().map_err(storage)? {
         let (key_bytes, value_bytes) = entry.map_err(storage)?;
         let key: LogicalSourceOwner = contract::decode(key_bytes.value())?;
@@ -373,8 +291,5 @@ pub(super) fn validate(
             key_bytes.value().len() + value_bytes.value().len(),
         )?;
     }
-    if payload != state.payload_bytes {
-        return Err(corrupt("payload bytes differ from committed header"));
-    }
-    Ok(())
+    Ok(payload)
 }

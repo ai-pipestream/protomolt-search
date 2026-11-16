@@ -31,6 +31,11 @@ fn decision_ok(
     Ok(())
 }
 
+type ReadTable = redb::ReadOnlyTable<&'static [u8], &'static [u8]>;
+
+/// The receipt of each accepted install, by its resource key bytes.
+type Installed = BTreeMap<Vec<u8>, ControlInstallReceipt>;
+
 /// Returns the accepted install count and the bytes held by every control
 /// table (keys and values), for the header reconciliation.
 pub(super) fn validate(
@@ -40,16 +45,29 @@ pub(super) fn validate(
     policy: &AccessPolicy,
     regular: &impl ReadableTable<&'static [u8], &'static [u8]>,
 ) -> Result<(u64, usize), Status> {
+    let (installed, mut payload) = audit_installs(tx, header, control, policy, regular)?;
+    payload += audit_states(tx, header, control, &installed)?;
+    payload += audit_facts(tx, control, &installed)?;
+    Ok((installed.len() as u64, payload))
+}
+
+/// Install operations: the retained retry history, one record per command.
+/// Returns the accepted receipts and the bytes of the operation table.
+fn audit_installs(
+    tx: &redb::ReadTransaction,
+    header: &SourceAuthorityHeader,
+    control: &ControlStoreHeader,
+    policy: &AccessPolicy,
+    regular: &impl ReadableTable<&'static [u8], &'static [u8]>,
+) -> Result<(Installed, usize), Status> {
     let identity = header
         .identity
         .as_ref()
         .ok_or_else(|| missing("identity"))?;
     let limits = header.limits.as_ref().ok_or_else(|| missing("limits"))?;
     let mut payload = 0usize;
-
-    // Install operations: the retained retry history, one record per command.
     let operations = tx.open_table(INSTALL_OPERATIONS).map_err(corrupt)?;
-    let mut installed: BTreeMap<Vec<u8>, ControlInstallReceipt> = BTreeMap::new();
+    let mut installed: Installed = BTreeMap::new();
     for entry in operations.iter().map_err(storage)? {
         let (k, v) = entry.map_err(storage)?;
         let key: SourceAuthorityOperationKey = contract::decode(k.value())?;
@@ -100,8 +118,18 @@ pub(super) fn validate(
             "install decision count differs from the control header",
         ));
     }
+    Ok((installed, payload))
+}
 
-    // Installed state: one control row per accepted install, its rows exact.
+/// Installed state: one control row per accepted install, its rows exact.
+/// Returns the bytes of the control and topology tables.
+fn audit_states(
+    tx: &redb::ReadTransaction,
+    header: &SourceAuthorityHeader,
+    control: &ControlStoreHeader,
+    installed: &Installed,
+) -> Result<usize, Status> {
+    let mut payload = 0usize;
     let control_table = tx.open_table(CONTROL).map_err(corrupt)?;
     let mut control_count = 0u64;
     let topologies = tx.open_table(TOPOLOGIES).map_err(corrupt)?;
@@ -128,36 +156,7 @@ pub(super) fn validate(
                 "installed control state differs from its accepted install",
             ));
         }
-        let mut generations = vec![state.topology_generation];
-        generations.extend(&state.history_generations);
-        for (index, generation) in generations.iter().enumerate() {
-            let topology_key = ControlTopologyKey {
-                key: Some(key.clone()),
-                generation: *generation,
-            }
-            .encode_to_vec();
-            let row: ControlTopology = contract::decode(
-                topologies
-                    .get(topology_key.as_slice())
-                    .map_err(storage)?
-                    .ok_or_else(|| corrupt("installed topology row is missing"))?
-                    .value(),
-            )?;
-            let current = index == 0;
-            if row.format_version != 1
-                || row.generation != *generation
-                || row.current != current
-                || (current && row.routes.len() as u64 != receipt.routes)
-                || (!current
-                    && (row.codes_available
-                        || !row.codes.is_empty()
-                        || row.history_index as usize != index - 1))
-                || (row.codes_available != !row.codes.is_empty())
-                || (row.codes_available && row.codes.len() != row.routes.len())
-            {
-                return Err(corrupt("installed topology row differs from its state"));
-            }
-        }
+        audit_topologies(&topologies, &key, &state, receipt)?;
     }
     if control_count != control.control_count || control_count != installed.len() as u64 {
         return Err(corrupt(
@@ -174,8 +173,57 @@ pub(super) fn validate(
     if topology_rows != control.topology_count || topology_rows != expected_topologies {
         return Err(corrupt("topology row count differs from accepted installs"));
     }
+    Ok(payload)
+}
 
-    // Per-resource fact counts must equal the receipts.
+/// The current topology row and every history row of one installed state.
+fn audit_topologies(
+    topologies: &ReadTable,
+    key: &LogicalSourceOwner,
+    state: &ControlCollectionState,
+    receipt: &ControlInstallReceipt,
+) -> Result<(), Status> {
+    let mut generations = vec![state.topology_generation];
+    generations.extend(&state.history_generations);
+    for (index, generation) in generations.iter().enumerate() {
+        let topology_key = ControlTopologyKey {
+            key: Some(key.clone()),
+            generation: *generation,
+        }
+        .encode_to_vec();
+        let row: ControlTopology = contract::decode(
+            topologies
+                .get(topology_key.as_slice())
+                .map_err(storage)?
+                .ok_or_else(|| corrupt("installed topology row is missing"))?
+                .value(),
+        )?;
+        let current = index == 0;
+        if row.format_version != 1
+            || row.generation != *generation
+            || row.current != current
+            || (current && row.routes.len() as u64 != receipt.routes)
+            || (!current
+                && (row.codes_available
+                    || !row.codes.is_empty()
+                    || row.history_index as usize != index - 1))
+            || (row.codes_available != !row.codes.is_empty())
+            || (row.codes_available && row.codes.len() != row.routes.len())
+        {
+            return Err(corrupt("installed topology row differs from its state"));
+        }
+    }
+    Ok(())
+}
+
+/// Per-resource fact counts must equal the receipts. Returns the bytes of
+/// the node, replica, action and completed-action tables.
+fn audit_facts(
+    tx: &redb::ReadTransaction,
+    control: &ControlStoreHeader,
+    installed: &Installed,
+) -> Result<usize, Status> {
+    let mut payload = 0usize;
     let mut counts: BTreeMap<Vec<u8>, [u64; 4]> = BTreeMap::new();
     let mut totals = [0u64; 4];
     for (slot, definition) in [(0usize, NODES), (1, REPLICAS), (2, ACTIONS), (3, COMPLETED)] {
@@ -184,37 +232,11 @@ pub(super) fn validate(
             let (k, v) = entry.map_err(storage)?;
             payload += k.value().len() + v.value().len();
             totals[slot] += 1;
-            let resource = match slot {
-                0 => contract::decode::<ControlNodeKey>(k.value())?.key,
-                1 => contract::decode::<ControlReplicaKey>(k.value())?.key,
-                _ => contract::decode::<ControlActionKey>(k.value())?.key,
-            }
-            .ok_or_else(|| missing("fact resource"))?
-            .encode_to_vec();
-            let valid = match slot {
-                0 => {
-                    let row: ControlNode = contract::decode(v.value())?;
-                    row.format_version == 1 && row.node.is_some()
-                }
-                1 => {
-                    let row: ControlReplica = contract::decode(v.value())?;
-                    row.format_version == 1 && row.replica.is_some()
-                }
-                2 => {
-                    let row: ControlAction = contract::decode(v.value())?;
-                    row.format_version == 1
-                        && row.action.is_some()
-                        && row.state == ControlActionState::Unreconciled as i32
-                }
-                _ => contract::decode::<ControlCompletedAction>(v.value())?.format_version == 1,
-            };
-            if !valid {
-                return Err(corrupt("installed fact row is invalid"));
-            }
+            let resource = fact_row(slot, k.value(), v.value())?;
             counts.entry(resource).or_default()[slot] += 1;
         }
     }
-    for (resource, receipt) in &installed {
+    for (resource, receipt) in installed {
         let have = counts.get(resource).copied().unwrap_or_default();
         if have
             != [
@@ -247,5 +269,37 @@ pub(super) fn validate(
             "installed fact counts differ from the control header",
         ));
     }
-    Ok((installed.len() as u64, payload))
+    Ok(payload)
+}
+
+/// Decode one fact row of table `slot` and return its resource key bytes.
+fn fact_row(slot: usize, key: &[u8], value: &[u8]) -> Result<Vec<u8>, Status> {
+    let resource = match slot {
+        0 => contract::decode::<ControlNodeKey>(key)?.key,
+        1 => contract::decode::<ControlReplicaKey>(key)?.key,
+        _ => contract::decode::<ControlActionKey>(key)?.key,
+    }
+    .ok_or_else(|| missing("fact resource"))?
+    .encode_to_vec();
+    let valid = match slot {
+        0 => {
+            let row: ControlNode = contract::decode(value)?;
+            row.format_version == 1 && row.node.is_some()
+        }
+        1 => {
+            let row: ControlReplica = contract::decode(value)?;
+            row.format_version == 1 && row.replica.is_some()
+        }
+        2 => {
+            let row: ControlAction = contract::decode(value)?;
+            row.format_version == 1
+                && row.action.is_some()
+                && row.state == ControlActionState::Unreconciled as i32
+        }
+        _ => contract::decode::<ControlCompletedAction>(value)?.format_version == 1,
+    };
+    if !valid {
+        return Err(corrupt("installed fact row is invalid"));
+    }
+    Ok(resource)
 }

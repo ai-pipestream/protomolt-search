@@ -61,27 +61,7 @@ fn the_map_is_produced_from_committed_rows_and_the_feed_wakes_per_revision() {
             .code(),
         Code::NotFound
     );
-    let map = store.published_map("alice", &key("books")).unwrap();
-    assert_eq!(map.control_revision, revision);
-    assert_eq!(map.topology_generation, 3);
-    assert_eq!(map.routes.len(), 2);
-    assert!(map.codes_available);
-    assert_eq!(map.codes.len(), 2);
-    assert_eq!(map.tree, Some(tree()));
-    assert_eq!(map.history_generations, [1, 2]);
-    assert_eq!(map.replicas.len(), 2);
-    assert_eq!(
-        map.nodes
-            .iter()
-            .map(|n| n.node_id.as_str())
-            .collect::<Vec<_>>(),
-        ["node z", "node/α"]
-    );
-    assert_eq!(map.nodes[0].residency, SourceResidency::DeviceLocal as i32);
-    assert_eq!(map.nodes[0].failure_domain, "rack/ß");
-    assert!(map.owners.is_empty());
-    assert_eq!(map.digest.len(), 32);
-    assert_eq!(store.published_map("alice", &key("books")).unwrap(), map);
+    let map = the_installed_map_carries_every_committed_row(&store, revision);
     // An owner preparation advances the revision, not the generation, and
     // the feed wakes; the owner appears without a fence.
     assert_eq!(
@@ -135,6 +115,34 @@ fn the_map_is_produced_from_committed_rows_and_the_feed_wakes_per_revision() {
         reopened.published_map("alice", &key("books")).unwrap(),
         next
     );
+}
+
+fn the_installed_map_carries_every_committed_row(
+    store: &SourceAuthorityStore,
+    revision: u64,
+) -> PublishedMap {
+    let map = store.published_map("alice", &key("books")).unwrap();
+    assert_eq!(map.control_revision, revision);
+    assert_eq!(map.topology_generation, 3);
+    assert_eq!(map.routes.len(), 2);
+    assert!(map.codes_available);
+    assert_eq!(map.codes.len(), 2);
+    assert_eq!(map.tree, Some(tree()));
+    assert_eq!(map.history_generations, [1, 2]);
+    assert_eq!(map.replicas.len(), 2);
+    assert_eq!(
+        map.nodes
+            .iter()
+            .map(|n| n.node_id.as_str())
+            .collect::<Vec<_>>(),
+        ["node z", "node/α"]
+    );
+    assert_eq!(map.nodes[0].residency, SourceResidency::DeviceLocal as i32);
+    assert_eq!(map.nodes[0].failure_domain, "rack/ß");
+    assert!(map.owners.is_empty());
+    assert_eq!(map.digest.len(), 32);
+    assert_eq!(store.published_map("alice", &key("books")).unwrap(), map);
+    map
 }
 
 #[test]
