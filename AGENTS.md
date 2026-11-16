@@ -20,6 +20,9 @@ host coordination, and the complete gate matrix. Broader workspace policy is in
 
 - Wrap every Cargo command, including scripts that invoke Cargo, in
   `flock /tmp/psearch-import-evidence/GATE-LOCK`; create its parent directory first.
+- Build hosts run every rustc through `scripts/rustc-slot.sh` (a host-wide cap on
+  concurrent compiles and links, shared with Forgejo CI through `/tmp/rustc-slots`).
+  Do not override `RUSTC_WRAPPER` or `build.rustc-wrapper` to get around it.
 - Use an isolated `CARGO_TARGET_DIR=/tmp/target-<agent>-<task>` and
   `CARGO_BUILD_JOBS=2`. Honor the task's exact target path when one is supplied.
 - Pass `-- --test-threads=2` to tests. Use workspace/library and targeted integration

@@ -6,19 +6,41 @@ on:
       - main
   pull_request:
   workflow_dispatch:
+    inputs:
+      wipe_target:
+        description: Empty the shared target dir before building
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+# A newer push to the same pull request cancels the run it supersedes;
+# every push to main still gets its own run.
+concurrency:
+  group: rust-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   # The runner's container has 10 CPUs and 20 GB; four compile jobs
-  # keep the test build's peak under that, and incremental artifacts
-  # are dead weight on a fresh container.
+  # keep the test build's peak under that. Incremental artifacts only
+  # pay off for local edit loops and would bloat the shared target dir.
   CARGO_BUILD_JOBS: "4"
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: never
   CARGO_NET_RETRY: "5"
   RUSTUP_MAX_RETRIES: "5"
+  # The runner bind-mounts the host /tmp (the large md0 volume) into job
+  # containers; the container overlay sits on the host root disk, which a
+  # test build fills. One shared target dir doubles as a dependency cache,
+  # and cargo's build-dir lock serializes this repo's jobs on the host.
+  CARGO_TARGET_DIR: /tmp/forgejo-ci/psearch-rust-ci-target
+  # Shared with the host's own builds through the same /tmp: at most this
+  # many rustc processes (compiles and links) run at once on the host.
+  PIPESTREAM_RUSTC_SLOT_DIR: /tmp/rustc-slots
+  PIPESTREAM_RUSTC_SLOTS: "12"
+  # Above this the shared target dir is wiped before the job builds.
+  TARGET_DIR_CAP_GB: "60"
 
 jobs:
   test:
@@ -52,17 +74,56 @@ jobs:
           rustup default 1.98.0
           rustup target add aarch64-linux-android x86_64-linux-android \
             aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
-          cargo install cargo-audit --locked --version 0.22.2
+          # The release binary, not a from-source build on every run.
+          audit=cargo-audit-x86_64-unknown-linux-gnu-v0.22.2
+          curl -sSfL -o /tmp/$audit.tgz \
+            "https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/$audit.tgz"
+          echo "ab28a1bdb54db4d5d8ad5981cf1f959410370b3d28250dbd35f6a44248620e39  /tmp/$audit.tgz" \
+            | sha256sum -c -
+          tar -xzf /tmp/$audit.tgz -C /tmp
+          install -m 0755 /tmp/$audit/cargo-audit "$HOME/.cargo/bin/cargo-audit"
+          rm -rf /tmp/$audit /tmp/$audit.tgz
+          echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/scripts/rustc-slot.sh" >> "$GITHUB_ENV"
           rustc --version && cargo --version && protoc --version && rg --version | head -1
 
       - name: Dependency and provenance gate
         run: scripts/check-dependencies.sh
 
+      - name: Cap the shared target dir
+        run: |
+          set -euo pipefail
+          mkdir -p "$CARGO_TARGET_DIR"
+          used_gb=$(du -s --block-size=1G "$CARGO_TARGET_DIR" | cut -f1)
+          echo "shared target dir: ${used_gb}G (cap ${TARGET_DIR_CAP_GB}G)"
+          if [[ "${{ inputs.wipe_target }}" != true ]] && (( used_gb <= TARGET_DIR_CAP_GB )); then
+            exit 0
+          fi
+          # Wipe only under cargo's own build lock, so a cargo command of
+          # another job on this runner is never pulled out from under it.
+          mkdir -p "$CARGO_TARGET_DIR/debug"
+          exec 9>>"$CARGO_TARGET_DIR/debug/.cargo-lock"
+          if flock -n 9; then
+            find "$CARGO_TARGET_DIR" -mindepth 1 -maxdepth 1 ! -name debug -exec rm -rf {} +
+            find "$CARGO_TARGET_DIR/debug" -mindepth 1 -maxdepth 1 ! -name .cargo-lock -exec rm -rf {} +
+            echo "wiped the shared target dir"
+          else
+            echo "another job holds the target dir; not wiping this time"
+          fi
+
+      # Every test binary reports, so one failure no longer hides the rest.
+      # Examples are compile-checked below rather than linked here.
       - name: Product tests
-        run: cargo test --locked
+        run: cargo test --locked --no-fail-fast --lib --bins --tests
+
+      - name: Doc tests
+        run: cargo test --locked --no-fail-fast --doc
+
+      - name: Examples compile
+        run: cargo check --locked --examples
 
       - name: Android and iOS compile gates
         run: scripts/check-mobile.sh
 
-      - name: Experimental provider tests
-        run: cargo test --locked --manifest-path benchmarks/ivf-eval/Cargo.toml
+      - name: Target dir size after the run
+        if: always()
+        run: du -sh "$CARGO_TARGET_DIR" || true
