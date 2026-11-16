@@ -56,15 +56,12 @@ impl Bm25Shard {
                     .map_facet_index(&p.column)
                     .and_then(|ci| self.map_facet_key_ord(ci, &p.key))
                     .is_some(),
-                LeafRef::MapNumber(p) | LeafRef::TypedMapNumber(p) => {
-                    let typed = matches!(leaf, LeafRef::TypedMapNumber(_));
+                LeafRef::MapNumber(p) => {
                     self.map_integer_index(&p.column)
-                        .filter(|_| typed)
                         .and_then(|ci| self.map_integer_key_ord(ci, &p.key))
                         .is_some()
                         || self
                             .map_unsigned_integer_index(&p.column)
-                            .filter(|_| typed)
                             .and_then(|ci| self.map_unsigned_integer_key_ord(ci, &p.key))
                             .is_some()
                         || self
@@ -72,18 +69,11 @@ impl Bm25Shard {
                             .and_then(|ci| self.map_numeric_key_ord(ci, &p.key))
                             .is_some()
                 }
-                LeafRef::MapHasKey(p) | LeafRef::TypedMapHasKey(p) => {
-                    let typed = matches!(leaf, LeafRef::TypedMapHasKey(_));
+                LeafRef::MapHasKey(p) => {
                     self.map_facet_index(&p.column).is_some()
                         || self.map_numeric_index(&p.column).is_some()
-                        || self
-                            .map_integer_index(&p.column)
-                            .filter(|_| typed)
-                            .is_some()
-                        || self
-                            .map_unsigned_integer_index(&p.column)
-                            .filter(|_| typed)
-                            .is_some()
+                        || self.map_integer_index(&p.column).is_some()
+                        || self.map_unsigned_integer_index(&p.column).is_some()
                 }
                 LeafRef::Has(p) => {
                     self.facet_index(&p.column).is_some()
@@ -93,12 +83,12 @@ impl Bm25Shard {
                         || self.geo_index(&p.column).is_some()
                 }
                 LeafRef::Geo(g) => self.geo_index(&g.column).is_some(),
-                LeafRef::StringRange(p) => self
-                    .string_target_known(&p.column, (!p.key.is_empty()).then_some(p.key.as_str())),
-                LeafRef::MapStringRange(p) => self.string_target_known(&p.column, Some(&p.key)),
-                LeafRef::StringPrefix(p) => self
-                    .string_target_known(&p.column, (!p.key.is_empty()).then_some(p.key.as_str())),
-                LeafRef::MapStringPrefix(p) => self.string_target_known(&p.column, Some(&p.key)),
+                LeafRef::StringRange(p) => {
+                    self.string_target_known(&p.column, p.map_key.as_deref())
+                }
+                LeafRef::StringPrefix(p) => {
+                    self.string_target_known(&p.column, p.map_key.as_deref())
+                }
             });
         });
         known

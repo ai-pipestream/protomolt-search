@@ -332,9 +332,7 @@ async fn candidate_fetch_enforces_authority_fields_and_documents_before_disclosu
     };
     let stages = vec![ScoreStage {
         column: "boost".into(),
-        operation: Some(crate::pb::score_stage::Operation::Op(
-            ScoreOp::AddLinear as i32,
-        )),
+        op: ScoreOp::AddLinear as i32,
         weight: 1.0,
         ..Default::default()
     }];

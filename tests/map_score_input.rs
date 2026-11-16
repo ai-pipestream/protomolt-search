@@ -5,36 +5,14 @@ use pipestream_search::{
     pb::{self, node_service_server::NodeService},
     postings::{AnalyzedDoc, Bm25Store, ColumnKind::*},
 };
-use prost::Message;
-
-// The explicit-map wire operation being added. Keeping this independent
-// fixture also exercises the new contract through an actual encode/decode.
-#[derive(Clone, PartialEq, Message)]
-struct MapOperationWire {
-    #[prost(enumeration = "pb::ScoreOp", tag = "1")]
-    op: i32,
-    #[prost(string, tag = "2")]
-    key: String,
-}
-#[derive(Clone, PartialEq, Message)]
-struct MapStageWire {
-    #[prost(string, tag = "2")]
-    column: String,
-    #[prost(double, tag = "3")]
-    weight: f64,
-    #[prost(message, optional, tag = "9")]
-    map_op: Option<MapOperationWire>,
-}
 fn map_stage(key: &str) -> pb::ScoreStage {
-    let wire = MapStageWire {
+    pb::ScoreStage {
+        op: pb::ScoreOp::AddLinear as i32,
         column: "metrics".into(),
+        map_key: Some(key.into()),
         weight: 2.0,
-        map_op: Some(MapOperationWire {
-            op: pb::ScoreOp::AddLinear as i32,
-            key: key.into(),
-        }),
-    };
-    pb::ScoreStage::decode(wire.encode_to_vec().as_slice()).unwrap()
+        ..Default::default()
+    }
 }
 fn store() -> Bm25Store {
     let mut store = Bm25Store::new().with_columns(MapNumeric, &["metrics"]);
@@ -83,78 +61,10 @@ async fn explicit_map_score_input_preserves_empty_key_zero_and_absence() {
     );
 }
 
-// The complete preceding ScoreStage wire shape, before operation became a
-// oneof. These bytes also determine the floor-sharing scoring fingerprint.
-#[derive(Clone, PartialEq, Message)]
-struct LegacyStageWire {
-    #[prost(enumeration = "pb::ScoreOp", tag = "1")]
-    op: i32,
-    #[prost(string, tag = "2")]
-    column: String,
-    #[prost(double, tag = "3")]
-    weight: f64,
-    #[prost(double, tag = "4")]
-    origin: f64,
-    #[prost(double, tag = "5")]
-    scale: f64,
-    #[prost(string, tag = "6")]
-    key: String,
-    #[prost(double, tag = "7")]
-    origin_lat: f64,
-    #[prost(double, tag = "8")]
-    origin_lon: f64,
-}
 #[tokio::test]
-async fn legacy_wire_stays_identical_and_unknown_map_operations_refuse() {
-    for op in 1..=5 {
-        for key in ["", "named"] {
-            let old = LegacyStageWire {
-                op,
-                column: "metrics".into(),
-                weight: 0.5,
-                origin: 2.0,
-                scale: 10.0,
-                key: key.into(),
-                origin_lat: 4.0,
-                origin_lon: 5.0,
-            };
-            let bytes = old.encode_to_vec();
-            let new = pb::ScoreStage::decode(bytes.as_slice()).unwrap();
-            assert_eq!(new.operation, Some(pb::score_stage::Operation::Op(op)));
-            assert_eq!(
-                new.encode_to_vec(),
-                bytes,
-                "legacy byte identity includes field order"
-            );
-        }
-    }
-    let explicit = map_stage("");
-    let old = LegacyStageWire::decode(explicit.encode_to_vec().as_slice()).unwrap();
-    assert_eq!(
-        old.op, 0,
-        "an old peer must not see an executable scalar operation"
-    );
-    let discarded = pb::ScoreStage::decode(old.encode_to_vec().as_slice()).unwrap();
-    assert!(discarded.operation.is_none());
-    let node = NodeServiceImpl::new(None, NodeConfig::default());
-    let err = node
-        .fetch_values(tonic::Request::new(pb::FetchValuesRequest {
-            stages: vec![discarded],
-            ..Default::default()
-        }))
-        .await
-        .unwrap_err();
-    assert_eq!(err.code(), tonic::Code::InvalidArgument);
-    assert!(err.message().contains("unknown op 0"));
-}
-
-#[tokio::test]
-async fn ambiguous_and_invalid_map_score_operations_refuse_before_reading() {
+async fn invalid_map_score_operations_refuse_before_reading() {
     let node = NodeServiceImpl::new(None, NodeConfig::default());
     let mut cases = Vec::new();
-    let mut ambiguous = map_stage("");
-    ambiguous.key = "legacy".into();
-    cases.push(ambiguous);
     for op in [
         0,
         99,
@@ -162,10 +72,7 @@ async fn ambiguous_and_invalid_map_score_operations_refuse_before_reading() {
         pb::ScoreOp::MultGeoDecayManhattan as i32,
     ] {
         let mut stage = map_stage("");
-        stage.operation = Some(pb::score_stage::Operation::MapOp(pb::MapScoreOperation {
-            op,
-            key: String::new(),
-        }));
+        stage.op = op;
         stage.scale = 1.0;
         cases.push(stage);
     }
@@ -173,10 +80,7 @@ async fn ambiguous_and_invalid_map_score_operations_refuse_before_reading() {
     nonfinite.weight = f64::INFINITY;
     cases.push(nonfinite);
     let mut negative_log = map_stage("");
-    negative_log.operation = Some(pb::score_stage::Operation::MapOp(pb::MapScoreOperation {
-        op: pb::ScoreOp::MultLog as i32,
-        key: String::new(),
-    }));
+    negative_log.op = pb::ScoreOp::MultLog as i32;
     negative_log.weight = -1.0;
     cases.push(negative_log);
     for stage in cases {
@@ -196,10 +100,8 @@ fn value(id: u64) -> Option<f64> {
     (!id.is_multiple_of(5)).then_some((id % 101) as f64 - 50.0)
 }
 fn effect(stage: &pb::ScoreStage, x: f64) -> (bool, f64) {
-    let Some(pb::score_stage::Operation::MapOp(map)) = &stage.operation else {
-        panic!("expected map op")
-    };
-    match pb::ScoreOp::try_from(map.op).unwrap() {
+    assert!(stage.map_key.is_some(), "expected map stage");
+    match pb::ScoreOp::try_from(stage.op).unwrap() {
         pb::ScoreOp::AddLinear => (true, stage.weight * x),
         pb::ScoreOp::MultLog => (false, 1.0 + stage.weight * (1.0 + x.max(0.0)).ln()),
         pb::ScoreOp::MultExpDecay => (false, (-((x - stage.origin).abs()) / stage.scale).exp()),
@@ -271,10 +173,8 @@ async fn map_score_bounds_explanations_and_fetches_agree_through_relays() {
         (pb::ScoreOp::MultExpDecay, 0.0),
     ] {
         chains.push(vec![pb::ScoreStage {
-            operation: Some(pb::score_stage::Operation::MapOp(pb::MapScoreOperation {
-                op: op as i32,
-                key: String::new(),
-            })),
+            op: op as i32,
+            map_key: Some(String::new()),
             column: "metrics".into(),
             weight,
             scale: 10.0,
@@ -355,7 +255,6 @@ async fn map_score_bounds_explanations_and_fetches_agree_through_relays() {
                 let explanation = hit.explain.as_ref().unwrap();
                 for row in &explanation.stages {
                     assert_eq!(row.map_key.as_deref(), Some(""));
-                    assert_eq!(row.key, "");
                     assert_eq!(row.present, value(hit.doc_id).is_some());
                     if let Some(x) = value(hit.doc_id) {
                         assert_eq!(row.input, x);

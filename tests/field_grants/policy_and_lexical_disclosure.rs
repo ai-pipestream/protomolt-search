@@ -244,19 +244,15 @@ async fn every_field_read_is_checked_before_statistics_and_user_aliases_cannot_b
     let mut q = query();
     q.range_facet_fields = vec![RangeFacetField {
         column: "boost".into(),
-        edges: vec![0., 2.],
+        edges: vec![FilterBound::num(0.), FilterBound::num(2.)],
         ..Default::default()
     }];
     requests.push(q);
     let mut q = query();
     q.range_facet_fields = vec![RangeFacetField {
         column: "metrics".into(),
-        map: Some(MapRangeFacet {
-            key: String::new(),
-            edges: vec![0.0, 1.0],
-            ..Default::default()
-        }),
-        ..Default::default()
+        map_key: Some(String::new()),
+        edges: vec![FilterBound::num(0.0), FilterBound::num(1.0)],
     }];
     requests.push(q);
     let mut q = query();
@@ -269,9 +265,7 @@ async fn every_field_read_is_checked_before_statistics_and_user_aliases_cannot_b
     let mut q = query();
     q.score_stages = vec![ScoreStage {
         column: "boost".into(),
-        operation: Some(pipestream_search::pb::score_stage::Operation::Op(
-            ScoreOp::AddLinear as i32,
-        )),
+        op: ScoreOp::AddLinear as i32,
         weight: 1.,
         ..Default::default()
     }];
@@ -279,12 +273,8 @@ async fn every_field_read_is_checked_before_statistics_and_user_aliases_cannot_b
     let mut q = query();
     q.score_stages = vec![ScoreStage {
         column: "metrics".into(),
-        operation: Some(pipestream_search::pb::score_stage::Operation::MapOp(
-            MapScoreOperation {
-                op: ScoreOp::AddLinear as i32,
-                key: String::new(),
-            },
-        )),
+        op: ScoreOp::AddLinear as i32,
+        map_key: Some(String::new()),
         weight: 1.0,
         ..Default::default()
     }];

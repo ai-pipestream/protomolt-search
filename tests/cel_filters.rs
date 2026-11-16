@@ -628,8 +628,9 @@ async fn filters_narrow_facet_counts() {
             }],
             range_facet_fields: vec![pipestream_search::pb::RangeFacetField {
                 column: "year".into(),
-                key: String::new(),
-                edges: vec![1990.0, 2000.0, 2030.0],
+                edges: [1990.0, 2000.0, 2030.0]
+                    .map(pipestream_search::pb::FilterBound::num)
+                    .to_vec(),
                 ..Default::default()
             }],
             filter: r#"court == "scotus""#.into(),

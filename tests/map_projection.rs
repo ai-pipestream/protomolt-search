@@ -807,12 +807,8 @@ async fn assert_query(address: String, expected_ids: &[u64]) {
                 }],
                 range_facet_fields: vec![pb::RangeFacetField {
                     column: "weights".into(),
-                    map: Some(pb::MapRangeFacet {
-                        key: u64::MAX.to_string(),
-                        edges: vec![-1.0, 1.0],
-                        ..Default::default()
-                    }),
-                    ..Default::default()
+                    map_key: Some(u64::MAX.to_string()),
+                    edges: vec![pb::FilterBound::num(-1.0), pb::FilterBound::num(1.0)],
                 }],
                 ..Default::default()
             }))

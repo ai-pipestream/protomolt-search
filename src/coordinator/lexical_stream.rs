@@ -123,12 +123,6 @@ impl LexicalStream {
                 Some(Payload::FloorUpdate(update)) => self.raise(update.floor),
                 Some(Payload::CandidateBatch(batch)) => self.candidates(&batch.candidates)?,
                 Some(Payload::Completion(completion)) => return self.complete(completion),
-                Some(Payload::Done(_)) => {
-                    return Err(Status::failed_precondition(format!(
-                        "shard {}: BM25 stream used the obsolete uncertified terminal response",
-                        self.shard
-                    )))
-                }
                 None => {}
             }
         }

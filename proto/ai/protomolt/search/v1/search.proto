@@ -390,7 +390,7 @@ service NodeService {
   // lock. Unary and long-running — the build reads the whole log and
   // re-analyzes every live document — so clients set a deadline in
   // minutes, not seconds. Refuses by name when the shard has no WAL, the
-  // log carries legacy unclocked records, a compaction or bulk BM25 build
+  // log carries unclocked records, a compaction or bulk BM25 build
   // is already running, or the work directory is not empty.
   rpc CompactShard(CompactShardRequest) returns (CompactShardResponse);
 
@@ -921,8 +921,8 @@ message BrowseShardRequest {
   // ResolveLexicalBitmap rule). Empty = no lexical predicate.
   repeated string lexical_terms = 9;
   // Analyzer identity when lexical_terms is nonempty; unused for plain browse.
-  // Explicit mapped bindings require a matching nonzero value. On legacy
-  // bindings zero retains the unknown-analyzer behavior.
+  // Explicit mapped bindings require a matching nonzero value. On shards
+  // without a mapped analysis binding, zero means the analyzer is unknown.
   uint64 analysis_fingerprint = 10;
   // Authority-owned document view, separate from the user filter.
   DocumentVisibility visibility = 11;
@@ -1057,8 +1057,8 @@ message LexicalBitmapRequest {
   // when at least one term has a posting, matching BM25's positive-score set.
   repeated string terms = 1;
   // Analyzer identity of the body terms (analyzer::analysis_fingerprint).
-  // Explicit mapped bindings require a matching nonzero value. On legacy
-  // bindings zero retains the unknown-analyzer behavior.
+  // Explicit mapped bindings require a matching nonzero value. On shards
+  // without a mapped analysis binding, zero means the analyzer is unknown.
   uint64 analysis_fingerprint = 2;
   // Applied before membership leaves the node, independently of query terms.
   DocumentVisibility visibility = 3;
@@ -1068,8 +1068,9 @@ message VectorBitmapRequest {
   // Restricted membership requires document metadata satisfying this predicate.
   // Unrestricted membership retains vector-only rows.
   DocumentVisibility visibility = 1;
-  // Exact indexed vector name. Empty retains unrestricted legacy selection.
-  // A named request requires the node's durable mapped vector declaration.
+  // Exact indexed vector name. Empty selects the shard's single vector index
+  // without a field restriction. A named request requires the node's durable
+  // mapped vector declaration.
   string field = 2;
 }
 
@@ -1091,12 +1092,12 @@ message MembershipBitmapResponse {
   bytes visibility_fingerprint = 8;
   repeated bool visibility_columns_known = 9;
   // Durable vector identity actually used by ResolveVectorBitmap. Absent on
-  // lexical membership and on legacy unnamed vector generations.
+  // lexical membership and on vector generations without a mapped binding.
   MappedVectorBinding vector_binding = 10;
 }
 
 // One column's aggregate over a filtered match set (docs/facets.md).
-// Integer columns carry exact extrema and a 128-bit sum alongside legacy
+// Integer columns carry exact extrema and a 128-bit sum alongside the
 // double summaries. Divide the exact sum by count for an exact rational mean.
 // Matching node/client builds are required; concrete column types must agree
 // across shards, including shards with no matching values.
@@ -1116,8 +1117,8 @@ message ColumnStats {
   // INTEGER, UNSIGNED_INTEGER or NUMBER when known; UNSPECIFIED otherwise.
   ScalarValueType value_type = 8;
   // Authoritative integer summary, present even at count=0 for a declared
-  // integer column. Absent for doubles and unknown columns. Legacy min/max/
-  // sum/mean remain double approximations, with sum folded in shard order.
+  // integer column. Absent for doubles and unknown columns. The double
+  // min/max/sum/mean are approximations, with sum folded in shard order.
   oneof exact_integer {
     SignedColumnStats signed = 9;
     UnsignedColumnStats unsigned = 10;
@@ -1192,11 +1193,13 @@ message ApplyWalBindingRequest {
   // The collection the binding belongs to; a node of another
   // collection refuses (docs/collections.md).
   string collection = 4;
-  // Empty for legacy bindings, otherwise 64 lowercase hex SHA-256 characters.
+  // Empty for bindings without explicit analysis, otherwise 64 lowercase hex
+  // SHA-256 characters.
   string analysis_sha = 5;
   // Canonical serialized MappedAnalysisContract; required with analysis_sha.
   bytes analysis_contract = 6;
-  // Canonical MappedVectorBinding; empty only for legacy bindings.
+  // Canonical MappedVectorBinding; empty only for bindings without a vector
+  // declaration.
   bytes vector_binding = 7;
   // Canonical MappedIndexContract, empty for inferred-policy bindings.
   bytes index_contract = 8;
@@ -1205,7 +1208,7 @@ message ApplyWalBindingRequest {
 message ApplyWalBindingResponse {
   bool already_bound = 1;
   // Echo of the installed analysis contract. Explicit bindings require this
-  // acknowledgement; an older receiver cannot acknowledge the new contract.
+  // acknowledgement.
   string analysis_sha = 2;
   // Exact installed vector binding. A sender requires this acknowledgement.
   bytes vector_binding = 3;
@@ -1268,9 +1271,6 @@ message CompactShardResponse {
   // catalog without a WAL): the post-cutoff rows the catch-up sealed
   // into the live catalog, which the cutover carried over.
   uint64 tail_records_applied = 4;
-  // Records applied inside the write-locked cutover. Always zero with
-  // unlocked tail preparation; retained for older server responses.
-  uint64 locked_tail_records = 5;
   // Wall time the cutover held the shard's write lock, in milliseconds:
   // the WAL fence, the marker, the renames, and the state swap.
   uint64 write_lock_ms = 6;
@@ -1452,7 +1452,7 @@ message VectorReadContext {
 
 // Resolved under the same read guard as the entire scan. A consumer requesting
 // a context must validate this receipt before using any subsequent scan data;
-// a legacy stream without it does not establish support for scoped reads.
+// a stream without it does not establish support for scoped reads.
 message VectorReadReceipt {
   MappedVectorBinding vector_binding = 1;
   uint64 stats_epoch = 2;
@@ -1726,7 +1726,7 @@ message StartStreamSearch {
   FilterExpr filter = 7;
   // Opt in to snapshot-bound identity resolution after the candidate scan.
   // Absent preserves the Batch -> Summary protocol. A requesting client
-  // must require IdentityReady; a legacy Summary is not identity support.
+  // must require IdentityReady; a Summary alone is not identity support.
   StreamIdentityLimits identity_limits = 8;
   // Opt-in field, authority-view and generation handshake before scan output.
   VectorReadContext read_context = 9;
@@ -2120,7 +2120,7 @@ message SnapshotManifest {
   // Total .bm25 bytes following the provider bytes; 0 for a vector-only image.
   uint64 bm25_bytes = 2;
   // Total product-owned FP32 sidecar bytes between provider and BM25 bytes.
-  // 0 is accepted for legacy/native-only generations; FP32 rerank then
+  // 0 is accepted for native-only generations; FP32 rerank then
   // refuses until that generation is rebuilt or backfilled.
   uint64 exact_vector_bytes = 3;
   // Tombstone overlay after BM25 bytes. Zero means all rows are live.
@@ -2262,8 +2262,9 @@ message SearchRequest {
   // and no default is configured, refuses by name.
   string collection = 7;
   // Exact indexed vector name. A named read requires a durable mapped binding
-  // and compatible read receipts from every product shard. Empty preserves
-  // legacy unrestricted selection; it cannot satisfy a field-restricted grant.
+  // and compatible read receipts from every product shard. Empty selects the
+  // shard's single vector index without a field restriction; it cannot
+  // satisfy a field-restricted grant.
   string field = 8;
   // The enumerate threshold the shards answer the filter under, as
   // `StartShardSearch.enumerate_max_rows`. Absent = each provider's own.
@@ -2699,8 +2700,8 @@ message AddDocumentsRequest {
   // Present for a chunk row, including ordinal zero. It is independent of
   // the generation-local physical row id.
   optional uint32 source_chunk_ordinal = 24;
-  // Logical source metadata retained with the row. The legacy AddDocuments
-  // route does not itself enforce version preconditions or persistent retries.
+  // Logical source metadata retained with the row. The AddDocuments route
+  // does not itself enforce version preconditions or persistent retries.
   // Requires original_source and the same chunk ordinal as above.
   DocumentIdentity identity = 25;
   // Exact unsigned values, one entry per declared u64 column. The WAL retains
@@ -2932,7 +2933,8 @@ message TermStatsResponse {
   // DocumentVisibility encoding defined in docs/document-visibility.md:
   // ascending active field numbers recursively, repeated order retained,
   // implicit defaults omitted. A consumer must verify this before
-  // using or caching shares: older nodes can silently ignore request field 3.
+  // using or caching shares: a node that ignored request field 3 cannot
+  // produce it.
   bytes visibility_fingerprint = 6;
   // Known-column handshake in filter walk_leaves order, including empty
   // results. Relays OR these flags over children. A column unknown everywhere
@@ -3079,8 +3081,8 @@ message Bm25QueryRequest {
   bool explain = 22;
   // Analyzer identity of the flat body terms (analyzer::analysis_fingerprint).
   // Fused queries use Bm25FieldLeg.analysis_fingerprint instead.
-  // Explicit mapped bindings require a matching nonzero value. On legacy
-  // bindings zero retains the unknown-analyzer behavior.
+  // Explicit mapped bindings require a matching nonzero value. On shards
+  // without a mapped analysis binding, zero means the analyzer is unknown.
   uint64 analysis_fingerprint = 23;
   // 32-byte opaque lifetime identity, paired with the statistics epoch.
   // Nonzero claims require both; replacements generate a fresh identity.
@@ -3211,10 +3213,6 @@ message FilterExpr {
     NumberPredicate number = 5;
     // String equality/membership on one key of a map-facet column.
     MapFacetPredicate map_facet = 6;
-    // Legacy range or equality on one key of an f64 map column.
-    MapNumberPredicate map_number = 7;
-    // Legacy presence in string/f64 maps only.
-    MapKeyPredicate map_has_key = 8;
     // Value presence under this name in ANY column family (CEL
     // `has(col)`).
     HasPredicate has = 9;
@@ -3222,27 +3220,21 @@ message FilterExpr {
     // expression can mix regions with scalar predicates.
     GeoFilter geo = 10;
     // String ordering on a facet column or one key of a map-facet
-    // column (docs/prefix-terms.md): CEL `court < "b"`, `>=`, and both
-    // bounds ANDed. Resolves per shard to ONE ordinal range over a
-    // dictionary written in byte order; a shard whose dictionary is in
-    // the older first-seen order refuses by name.
+    // column: CEL `court < "b"`, `>=`, and both bounds ANDed. Resolves
+    // per shard to ONE ordinal range over a dictionary written in byte
+    // order; a shard whose dictionary is not byte-ordered refuses by name.
     StringRangePredicate string_range = 11;
     // Prefix on a facet column or map-facet value (CEL
     // `court.startsWith("ca")`): the ordinal range of the dictionary
     // entries sharing the prefix, same resolution and refusal rules.
     StringPrefixPredicate string_prefix = 12;
-    // Explicit map context: key is a literal map key, including empty.
-    // Unlike string_range, an empty key never selects a plain column.
-    // Older servers see an unset expression and must reject the filter.
-    StringRangePredicate map_string_range = 13;
-    // Explicit map context, with the same key rule as map_string_range.
-    StringPrefixPredicate map_string_prefix = 14;
-    // Numeric map comparison across i64, u64 and f64 planes. Older decoders
-    // see an unset expression and reject instead of skipping integer columns.
-    MapNumberPredicate typed_map_number = 15;
-    // Presence across all string and numeric map planes, including integer maps.
-    MapKeyPredicate typed_map_has_key = 16;
+    // Range or equality on one key of an f64, i64 or u64 map column.
+    MapNumberPredicate map_number = 15;
+    // Key presence across all string and numeric map planes.
+    MapKeyPredicate map_has_key = 16;
   }
+  reserved 7, 8, 13, 14;
+  reserved "map_string_range", "map_string_prefix", "typed_map_number", "typed_map_has_key";
 }
 
 // The children of an and/or node. At least one is required: a
@@ -3358,19 +3350,20 @@ message StringBound {
   bool exclusive = 2;
 }
 
-// String ordering on a facet column (`key` empty) or on one key of a
-// map-facet column (`key` set): TRUE when the document's value lies in
+// String ordering on a facet column (`map_key` absent) or on one key of a
+// map-facet column (`map_key` present): TRUE when the document's value lies in
 // the range, FALSE when it holds some other value, UNKNOWN when it
 // holds none. At least one bound is required. Known = the facet table
 // has the column (and, for a map entry, its key dictionary has the
 // key), like FacetPredicate / MapFacetPredicate.
 message StringRangePredicate {
+  reserved 2;
+  reserved "key";
   // Column name.
   string column = 1;
-  // For a map-facet column, the key whose value is tested; empty for
-  // a plain facet column. In FilterExpr.map_string_range or
-  // map_string_prefix this always selects a map entry, including empty.
-  string key = 2;
+  // Literal map-facet key whose value is tested, including empty.
+  // Absent for a plain facet column.
+  optional string map_key = 5;
   // Lower bound, absent = unbounded below.
   StringBound min = 3;
   // Upper bound, absent = unbounded above.
@@ -3382,12 +3375,13 @@ message StringRangePredicate {
 // as StringRangePredicate. The prefix must be non-empty (an empty
 // prefix is presence, which is has()).
 message StringPrefixPredicate {
+  reserved 2;
+  reserved "key";
   // Column name.
   string column = 1;
-  // For a map-facet column, the key whose value is tested; empty for
-  // a plain facet column. In FilterExpr.map_string_range or
-  // map_string_prefix this always selects a map entry, including empty.
-  string key = 2;
+  // Literal map-facet key whose value is tested, including empty.
+  // Absent for a plain facet column.
+  optional string map_key = 4;
   // The prefix, compared in bytes.
   string prefix = 3;
 }
@@ -3403,75 +3397,48 @@ message HasPredicate {
   string column = 1;
 }
 
-// One range-facet count request: a numeric-ish column plus the bucket
-// edges to count into.
+// One range-facet count request: a numeric column, or one entry of a
+// numeric map column, plus the bucket edges to count into.
 message RangeFacetField {
-  // The column to read: f64, i64 or u64 when `key` is empty;
-  // map<string, f64> when `key` is set. Numeric values compare exactly
-  // across domains; integer values are never rounded through double.
+  reserved 2, 3, 4, 5, 6;
+  reserved "key", "typed_edges", "map", "typed_map";
+  // The column to read: f64, i64 or u64 when `map_key` is absent; an f64,
+  // i64 or u64 map column when it is present. Numeric values compare
+  // exactly across domains; integer values are never rounded through double.
   string column = 1;
-  // For a map-numeric column, the key whose values are bucketed. Empty
-  // selects a plain (f64, i64 or u64) column.
-  string key = 2;
-  // Bucket boundaries: at least 2, all finite, STRICTLY ascending —
-  // anything else is INVALID_ARGUMENT naming the column, because a
-  // silently repaired edge list answers a question nobody asked.
-  // Buckets are half-open [edges[i], edges[i+1]), so a value sitting
-  // exactly on an interior edge lands in the UPPER bucket. There are
-  // no implicit underflow/overflow buckets: a value below edges[0] or
-  // at/above the last edge is counted in NO bucket. Explicit edges
-  // only — if you want the tails, ask for them.
-  repeated double edges = 3;
-  // Alternative exact numeric boundaries. Supply either edges or typed_edges,
-  // never both. At least two finite, strictly numerically ascending values
-  // are required. Every value must be set and exclusive must be false:
-  // intervals are always [lower, upper). Signed, unsigned and double edges
-  // may mix. For the full u64 domain use uint(0) through num(2^64), which
-  // is exactly representable. Requires matching server and client builds.
-  repeated FilterBound typed_edges = 4;
-  // Explicit map input, including an empty key. All legacy key/edge fields
-  // must be empty. An older server drops this field and refuses its resulting
-  // empty edge list rather than counting a plain column.
-  MapRangeFacet map = 5;
-  // Explicit f64/i64/u64 map entry with exact numeric comparison. Supply
-  // only this field and column; map and the legacy key/edge fields must
-  // be empty. Older servers drop this field and refuse the empty edge list.
-  // The map field at tag 5 and the legacy key remain f64-only.
-  MapRangeFacet typed_map = 6;
-}
-
-// Numeric map entry and requested intervals. The containing RangeFacetField
-// supplies the column. Edge validation and exact comparison rules are shared
-// with the legacy range-facet form.
-message MapRangeFacet {
-  // Literal key, including empty.
-  string key = 1;
-  // Supply either edges or typed_edges, never both.
-  repeated double edges = 2;
-  repeated FilterBound typed_edges = 3;
+  // Literal map key, including empty. Presence selects a map entry;
+  // absence selects a plain column.
+  optional string map_key = 7;
+  // Bucket boundaries: at least 2 set, finite, STRICTLY numerically
+  // ascending values, each with exclusive=false. Anything else is
+  // INVALID_ARGUMENT naming the column, because a silently repaired edge
+  // list answers a question nobody asked. Buckets are half-open
+  // [edges[i], edges[i+1]), so a value sitting exactly on an interior edge
+  // lands in the UPPER bucket. There are no implicit underflow/overflow
+  // buckets: a value below edges[0] or at/above the last edge is counted in
+  // NO bucket. Signed, unsigned and double edges may mix; for the full u64
+  // domain use uint(0) through num(2^64), which is exactly representable.
+  repeated FilterBound edges = 8;
 }
 
 // One bucket's count within one range facet.
 message RangeBucket {
-  // Inclusive lower edge.
-  double from = 1;
-  // Exclusive upper edge.
-  double to = 2;
+  reserved 1, 2, 4, 5;
+  reserved "typed_from", "typed_to";
   // Matching documents whose value falls in [from, to).
   uint64 count = 3;
-  // Exact edges when typed_edges was requested; both are absent for legacy
-  // double edges. These are authoritative; from/to are rounded display
-  // values for typed integer edges and may coincide for a nonempty interval.
-  FilterBound typed_from = 4;
-  FilterBound typed_to = 5;
+  // Inclusive lower edge, exactly as requested.
+  FilterBound from = 6;
+  // Exclusive upper edge, exactly as requested.
+  FilterBound to = 7;
 }
 
 // One requested range facet's counts, from one shard or merged.
 message RangeFacetCounts {
+  reserved 2;
+  reserved "key";
   // The column name, echoed from the request.
   string column = 1;
-  // The map key, echoed from the request (empty for plain columns).
-  string key = 2;
   // Whether this shard can resolve the column (and, for a map entry,
   // the key). A shard without it answers known=false and no buckets —
   // legitimate for a heterogeneous fleet — but the coordinator REFUSES
@@ -3533,28 +3500,23 @@ enum ScoreOp {
 // for scoring only. Adjacent integers above 2^53 can have identical scores.
 // Use typed projections, filters or sorting when integer distinctions matter.
 message ScoreStage {
-  // Exactly one operation is required. Unspecified/unknown transforms refuse.
-  oneof operation {
-    // Legacy selector: an empty key selects a plain column.
-    ScoreOp op = 1;
-    // Explicit map input, including the empty key. Older servers discard this
-    // unknown operation and reject their resulting unspecified op.
-    MapScoreOperation map_op = 9;
-    // Explicit f64/i64/u64 map input. Integer values and per-key extrema
-    // convert to double for scoring only; missing entries are identity.
-    // The older map_op and legacy key selector remain f64-only. Older
-    // servers discard this operation and refuse the unspecified operation.
-    MapScoreOperation typed_map_op = 10;
-  }
-  // The f64, i64 or u64 column the stage reads — or, when
-  // `key` is set, the map-numeric column (--map-numeric-fields) whose
-  // entry under that key it reads. A document without a value passes
-  // through unchanged (identity) — exact, not degraded, and the same
-  // rule makes a shard that lacks the column entirely correct. A
-  // column (or, for map stages, a (column, key) pair) NO shard knows
-  // is refused by the coordinator (the typo rule, as for fields and
-  // facets).
+  reserved 6, 9, 10;
+  reserved "key", "map_op", "typed_map_op";
+  // The transform. Unspecified/unknown transforms refuse.
+  ScoreOp op = 1;
+  // The f64, i64 or u64 column the stage reads — or, when `map_key` is
+  // present, the f64, i64 or u64 map column whose entry under that key it
+  // reads. A document without a value passes through unchanged (identity)
+  // — exact, not degraded, and the same rule makes a shard that lacks the
+  // column entirely correct. A column (or, for map stages, a (column, key)
+  // pair) NO shard knows is refused by the coordinator (the typo rule, as
+  // for fields and facets).
   string column = 2;
+  // Literal map key, including empty. Presence selects a map entry whose
+  // bounds lift from that key's min/max metadata; integer values and
+  // per-key extrema convert to double for scoring only. Geo transforms read
+  // a geo-point column and refuse a map key.
+  optional string map_key = 11;
   // Weight; used by MULT_LOG (>= 0) and ADD_LINEAR (any finite).
   double weight = 3;
   // Decay origin (MULT_EXP_DECAY): the value where the factor is 1.
@@ -3562,11 +3524,6 @@ message ScoreStage {
   // Decay scale: > 0, finite. Value units for MULT_EXP_DECAY; METERS
   // for the two MULT_GEO_DECAY_* ops.
   double scale = 5;
-  // When set, `column` names a map-numeric column and the stage reads
-  // its entry under this key (docs/map-columns.md); bounds lift from
-  // that key's min/max metadata. Empty = plain numeric column for `op`.
-  // Leave this legacy selector empty when using either explicit map operation.
-  string key = 6;
   // Decay origin latitude in degrees (MULT_GEO_DECAY_*): finite,
   // within [-90, 90]. `column` then names a geo-point column
   // (--geo-fields). Geo ops resolve only against the geo table.
@@ -3574,15 +3531,6 @@ message ScoreStage {
   // Decay origin longitude in degrees (MULT_GEO_DECAY_*): finite,
   // within [-180, 180].
   double origin_lon = 8;
-}
-
-// Numeric scoring of a literal map entry. The containing ScoreStage supplies
-// column, weight, origin and scale. Geo transforms are not map operations.
-message MapScoreOperation {
-  // MULT_EXP_DECAY, MULT_LOG or ADD_LINEAR; unspecified/unknown refuses.
-  ScoreOp op = 1;
-  // Literal key, including the protobuf default empty string.
-  string key = 2;
 }
 
 // One field's leg of a fused multi-field BM25 query.
@@ -3607,9 +3555,9 @@ message Bm25FieldLeg {
   // the query when this disagrees with the analyzer its column was built
   // under, because the two would score different term identities against
   // one idf and report a confident wrong ranking rather than an error.
-  // Explicit mapped bindings require a matching nonzero identity. For legacy
-  // bindings, 0 means unknown and disables the check; a column predating
-  // fingerprints also does not enforce.
+  // Explicit mapped bindings require a matching nonzero identity. Without a
+  // mapped analysis binding, 0 means unknown and disables the check, as does
+  // a column built without a recorded fingerprint.
   uint64 analysis_fingerprint = 8;
   // Positional phrase constraint over `terms` (docs/phrase-proximity.md),
   // applied by the shard at the heap gate: a document enters the heap
@@ -3745,7 +3693,7 @@ message Bm25Hit {
   // (docs/explain.md).
   Bm25Explain explain = 6;
   // Logical source version and chunk, read with the scored row. Absent
-  // for legacy rows without an explicitly imported logical identity.
+  // for rows without an explicitly imported logical identity.
   DocumentIdentity identity = 7;
 }
 
@@ -3802,11 +3750,12 @@ message Bm25TermExplain {
 
 // One score stage's effect on a document (docs/score-functions.md).
 message ScoreStageExplain {
+  reserved 3;
+  reserved "key";
   // Index into the request's score_stages.
   uint32 stage = 1;
-  // The stage's column (and map key, when one).
+  // The stage's column.
   string column = 2;
-  string key = 3;
   // False when the document has no value for the column (or the shard
   // lacks it): the stage is identity and `input` is unset.
   bool present = 4;
@@ -3817,8 +3766,7 @@ message ScoreStageExplain {
   double contribution = 6;
   // The score after this stage.
   double output = 7;
-  // Present for explicit map operations, even when the key is empty. The
-  // legacy key above is also echoed. Absence retains the legacy key rule.
+  // The stage's literal map key, including empty; absent for plain columns.
   optional string map_key = 8;
 }
 
@@ -3946,14 +3894,13 @@ message Bm25QueryStreamResponse {
     // The shard's running k-th best, one f32 ULP down (`floor_seed`),
     // emitted as the local heap rises. Monotone within a stream.
     FloorUpdate floor_update = 1;
-    // Deprecated pre-certificate terminal shape. New servers never emit it;
-    // new coordinators reject it because it cannot prove scan completion.
-    Bm25QueryResponse done = 2;
     // Compact scored candidates as the scan progresses.
     Bm25CandidateBatch candidate_batch = 3;
     // Terminal message, exactly one per stream.
     Bm25StreamCompletion completion = 4;
   }
+  reserved 2;
+  reserved "done";
 }
 
 // One facet value's count within one facet field.
@@ -3966,8 +3913,10 @@ message FacetCount {
 
 // One requested facet field's counts, from one shard or merged.
 message FacetFieldCounts {
+  reserved 4;
+  reserved "key";
   // The facet field name — a plain facet column, or a map column when
-  // `key` is set.
+  // `map_key` is set.
   string field = 1;
   // Whether this shard has the field in its facet table. A shard
   // without it answers known=false and no counts — legitimate for a
@@ -3981,14 +3930,12 @@ message FacetFieldCounts {
   // descending, ties by value ascending. Values matched by no document
   // are omitted.
   repeated FacetCount counts = 3;
-  // For a map-facet entry (docs/map-columns.md): the key within the
-  // map column these counts are for. Empty for plain facet fields.
+  // For a map-facet entry: the literal key within the map column these
+  // counts are for, including empty. Absent for plain facet fields.
   // `known` then means "this shard's column has this key in its key
   // dictionary" — the same partial-knowledge rule, applied per key so
-  // a typo'd key cannot read as zero results everywhere.
-  string key = 4;
-  // Map context with explicit key presence, including empty. Nodes echo this
-  // on map responses even when known=false; plain columns leave it absent.
+  // a typo'd key cannot read as zero results everywhere. Nodes echo it
+  // on map responses even when known=false.
   optional string map_key = 5;
 }
 
@@ -4018,8 +3965,8 @@ message GetDocumentsResponse {
   repeated StoredDocument documents = 1;
 }
 
-// Candidate lineage read. An empty field list preserves the legacy request
-// meaning: both keys. Explicit projections disclose only the selected keys.
+// Candidate lineage read. An empty field list reads both keys. Explicit
+// projections disclose only the selected keys.
 message ResolveParentsRequest {
   repeated uint64 doc_ids = 1;
   DocumentVisibility visibility = 2;
@@ -4730,8 +4677,8 @@ message HybridShardRequest {
   // when both are set. Absent = no filter.
   FilterExpr filter = 15;
   // Analyzer identity of the body terms (analyzer::analysis_fingerprint).
-  // Explicit mapped bindings require a matching nonzero value. On legacy
-  // bindings zero retains the unknown-analyzer behavior.
+  // Explicit mapped bindings require a matching nonzero value. On shards
+  // without a mapped analysis binding, zero means the analyzer is unknown.
   uint64 analysis_fingerprint = 16;
   // 32-byte opaque lifetime identity, paired with the statistics epoch.
   // Nonzero claims require both; replacements generate a fresh identity.
@@ -4999,8 +4946,8 @@ message ShardLegsRequest {
   // when both are set. Absent = no filter.
   FilterExpr filter = 12;
   // Analyzer identity of the body terms (analyzer::analysis_fingerprint).
-  // Explicit mapped bindings require a matching nonzero value. On legacy
-  // bindings zero retains the unknown-analyzer behavior.
+  // Explicit mapped bindings require a matching nonzero value. On shards
+  // without a mapped analysis binding, zero means the analyzer is unknown.
   uint64 analysis_fingerprint = 13;
   // 32-byte opaque lifetime identity, paired with the statistics epoch.
   // Nonzero claims require both; replacements generate a fresh identity.
@@ -5091,8 +5038,8 @@ message Bm25RescoreRequest {
   // final f32 conversion exactly as on the ordinary BM25 route.
   repeated ScoreStage score_stages = 9;
   // Analyzer identity of the body terms (analyzer::analysis_fingerprint).
-  // Explicit mapped bindings require a matching nonzero value. On legacy
-  // bindings zero retains the unknown-analyzer behavior.
+  // Explicit mapped bindings require a matching nonzero value. On shards
+  // without a mapped analysis binding, zero means the analyzer is unknown.
   uint64 analysis_fingerprint = 10;
   // 32-byte opaque lifetime identity, paired with the statistics epoch.
   // Nonzero claims require both; replacements generate a fresh identity.
@@ -5154,7 +5101,8 @@ message FetchedRow {
   repeated ProjectedValue stage_values = 3;
 }
 
-// An evaluated identity, including explicit absence for a legacy/vector-only row.
+// An evaluated identity, including explicit absence for an unkeyed or
+// vector-only row.
 message CandidateIdentity {
   uint64 doc_id = 1;
   DocumentIdentity identity = 2;
@@ -5189,9 +5137,8 @@ message FetchValuesResponse {
   // One per owned live visible requested row, including rows without column
   // tables. Bound to the response view/version; independent of projected rows.
   repeated CandidateIdentity identities = 10;
-  // Version 1 validates typed map expressions and reports declared types even
-  // without a document store. Every child must acknowledge typed map fetches.
-  uint32 typed_map_contract_version = 11;
+  reserved 11;
+  reserved "typed_map_contract_version";
 }
 
 // Candidate-scoped vector scoring (see NodeService.VectorRescore).
@@ -5201,8 +5148,8 @@ message VectorRescoreRequest {
   // Global candidate doc ids to score. Ids outside this shard's range,
   // or beyond its live slots, are ignored.
   repeated uint64 candidate_ids = 2;
-  // Exact indexed name, checked against the generation binding. Empty keeps
-  // legacy unrestricted behavior and cannot establish a field permission.
+  // Exact indexed name, checked against the generation binding. Empty reads
+  // without a field restriction and cannot establish a field permission.
   string field = 3;
   // Authority predicate supplied by a trusted planner, not a credential.
   DocumentVisibility visibility = 4;
@@ -5632,8 +5579,8 @@ message SelectionQuery {
 
 // Recursive boolean selection. Search, filter, and nested BooleanQuery nodes
 // may appear in any clause list. Dense and lexical search clauses provide the
-// hybrid signal set; legacy CompositeSearchStrategy stays a top-level
-// compatibility shape. Membership follows
+// hybrid signal set; CompositeSearchStrategy carries the fused RRF, blend,
+// decomposed and cascade scoring strategies. Membership follows
 // must/should/must_not/minimum_should_match; relevance is the sum of matching
 // positive scoring clauses unless QueryRequest.scorer explicitly replaces the
 // combination. Evaluation resolves exact shard membership bitmaps, applies
@@ -5670,8 +5617,8 @@ message LexicalQuery {
   AnalysisSpec analysis = 2;
   // Bounded score-function chain over stored columns
   // (docs/score-functions.md). Served by a single lexical leaf and by
-  // candidate-scoped lexical leaves in recursive BooleanQuery. Legacy
-  // CompositeSearchStrategy still refuses stages on hybrid legs.
+  // candidate-scoped lexical leaves in recursive BooleanQuery.
+  // CompositeSearchStrategy refuses stages on hybrid legs.
   repeated ScoreStage score_stages = 3;
   // Ordered-window constraint over the analyzed terms
   // (docs/phrase-proximity.md); served on the single lexical leaf through
@@ -5732,8 +5679,9 @@ message DenseQuery {
   // behavior; AUTO must be requested explicitly.
   DenseExecutionMode execution_mode = 4;
   // Exact indexed vector name. A named read requires a durable mapped binding
-  // and compatible read receipts from every product shard. Empty preserves
-  // legacy unrestricted selection; it cannot satisfy a field-restricted grant.
+  // and compatible read receipts from every product shard. Empty selects the
+  // shard's single vector index without a field restriction; it cannot
+  // satisfy a field-restricted grant.
   string field = 5;
 }
 
@@ -6048,7 +5996,7 @@ message QueryGroup {
 }
 
 // Describes the evidence used to choose a depth, not a per-query recall
-// guarantee. Older servers omit this field and make no explicit scope claim.
+// guarantee. UNSPECIFIED makes no scope claim.
 enum DenseEvidenceScope {
   DENSE_EVIDENCE_SCOPE_UNSPECIFIED = 0;
   DENSE_EVIDENCE_SCOPE_NOT_APPLICABLE = 1;
@@ -6193,7 +6141,7 @@ message QueryStreamHit {
 }
 
 enum QueryStreamIdentityState {
-  // An older peer made no identity claim, or no selection has been admitted.
+  // No identity claim was made, or no selection has been admitted.
   QUERY_STREAM_IDENTITY_STATE_UNSPECIFIED = 0;
   // Every hit's identity was evaluated; absent identity means an unkeyed row.
   QUERY_STREAM_IDENTITY_STATE_RESOLVED = 1;
@@ -6202,24 +6150,24 @@ enum QueryStreamIdentityState {
 }
 
 // A complete replacement snapshot. Clients apply the greatest revision they
-// have seen and discard older ones; no patch replay or arrival-order merge is
-// required. `content_fingerprint` identifies the disclosed phase and ordered
-// rows; its explicit version defines whether identities participate.
+// have seen and discard lower ones; no patch replay or arrival-order merge is
+// required.
 message QueryStreamRevision {
+  reserved 7;
+  reserved "content_fingerprint_version";
   uint64 revision = 1;
   QueryStreamPhase phase = 2;
   repeated QueryStreamHit hits = 3;
+  // SHA-256 over the disclosed phase and ordered rows: each hit's rank, id
+  // and score bits, identity_state and each disclosed key/version/chunk
+  // presence. Either signed zero hashes as +0, matching this float field's
+  // implicit-default protobuf encoding. Revision number and
+  // scoring_fingerprint do not participate.
   string content_fingerprint = 4;
   // Score-space identity when the collector has certified it. Empty on the
   // accepted revision and on a provisional collector awaiting completions.
   string scoring_fingerprint = 5;
   QueryStreamIdentityState identity_state = 6;
-  // 0 denotes the legacy v1 phase/id/score-bits hash. Version 2 additionally
-  // binds rank, identity_state and each disclosed key/version/chunk presence.
-  // Version 2 hashes either signed zero as +0, matching this float field's
-  // implicit-default protobuf encoding.
-  // Revision number and scoring_fingerprint do not participate in either hash.
-  uint32 content_fingerprint_version = 7;
 }
 
 // The only terminal shape. `response` is present exactly on success.
@@ -6238,7 +6186,7 @@ message QueryStreamCompletion {
   uint32 error_code = 5;
   string error_message = 6;
   // Present when the failure carries a structured disclosure decision. Absent
-  // on success and on legacy/unrestricted failures without such a decision.
+  // on success and on unrestricted failures without such a decision.
   ErrorDisclosure error_disclosure = 7;
 }
 
@@ -6620,7 +6568,7 @@ message MappedPlan {
   // the fingerprinted plan, not a credential or a runtime read-version claim.
   MappedVectorBinding vector_binding = 11;
   // Canonical acknowledgment of explicit policy, sorted by field-number path.
-  // Absent for legacy inferred plans. Explicit plans use a distinct fingerprint
+  // Absent for inferred plans. Explicit plans use a distinct fingerprint
   // domain so a peer that ignores the policy cannot accept its bind.
   IndexDefinition index_definition = 12;
 }
@@ -6703,7 +6651,7 @@ message MappedBind {
   // require nonempty normalizer chains. Server defaults are refused.
   // Order does not matter. The complete contract is bound even on an empty
   // stream; Flush makes it durable. Changing it requires rebuilding from sources.
-  // Empty retains the legacy body-only analysis behavior.
+  // Empty selects body-only analysis.
   repeated MappedFieldAnalysis field_analysis = 8;
   // The same explicit policy reviewed through PlanIndex. The node re-derives
   // it and verifies expected_fingerprint before accepting any source rows.
@@ -6898,8 +6846,7 @@ message NodeCapacity {
 }
 
 enum NodeResidency {
-  // Treated as SERVER by plans that predate the field, except that an
-  // unspecified residency is reported and never assumed movable by a
+  // Reported as residency-unspecified and never assumed movable by a
   // balancer.
   NODE_RESIDENCY_UNSPECIFIED = 0;
   NODE_RESIDENCY_SERVER = 1;
@@ -7162,9 +7109,6 @@ message ValueExpr {
     // column's. Absent value = absent result.
     string column = 1;
 
-    // Legacy string/f64 map entry read. Integer maps require typed_map.
-    MapRead map = 2;
-
     // Integer literal (CEL int, i64).
     sint64 int_literal = 3;
 
@@ -7223,14 +7167,15 @@ message ValueExpr {
     uint64 uint_literal = 15;
 
     // String, f64, i64 or u64 map entry. The column determines its exact type.
-    // Older decoders reject the unset expression rather than reading absence.
-    MapRead typed_map = 16;
+    MapRead map = 16;
     // `hash.fnv64(stable_key())`: FNV-1a 64 over the document's opaque
     // stable routing key bytes, the coordinator's routing hash
     // (docs/derived-columns.md). A uint. Ingest-only: the key is not a
     // stored column, so a query-time expression is refused by name.
     StableKeyHash stable_key_hash = 17;
   }
+  reserved 2;
+  reserved "typed_map";
 }
 
 // The `hash.fnv64(stable_key())` leaf; carries nothing.
@@ -8188,7 +8133,7 @@ message BooleanPlanLexical {
 // A dense clause: the universe of rows with a vector. Scored with the
 // provider's calibrated products, or the FP32 rows when `exact_fp32`.
 message BooleanPlanDense {
-  // Exact indexed vector field; empty keeps the legacy unnamed selection.
+  // Exact indexed vector field; empty selects the shard's single vector index.
   string field = 3;
   repeated float vector = 1;
   bool exact_fp32 = 2;

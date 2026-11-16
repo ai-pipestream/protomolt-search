@@ -458,9 +458,7 @@ async fn coordinator_refuses_old_or_inconsistent_fetch_peers_before_publishing_v
     *response.lock().unwrap() = malformed_stage;
     let stages = vec![ScoreStage {
         column: "boost".into(),
-        operation: Some(pipestream_search::pb::score_stage::Operation::Op(
-            ScoreOp::AddLinear as i32,
-        )),
+        op: ScoreOp::AddLinear as i32,
         weight: 1.0,
         ..Default::default()
     }];
@@ -552,10 +550,9 @@ async fn coordinator_refuses_old_or_inconsistent_fetch_peers_before_publishing_v
 }
 
 #[tokio::test]
-async fn typed_map_fetch_requires_empty_peers_to_acknowledge_declared_types() {
+async fn integer_map_fetch_requires_peers_to_agree_on_declared_types() {
     let projections = vec![projection("values['']")];
     let current = FetchValuesResponse {
-        typed_map_contract_version: 1,
         rows: vec![FetchedRow {
             doc_id: 0,
             values: vec![ProjectedValue {
@@ -591,16 +588,6 @@ async fn typed_map_fetch_requires_empty_peers_to_acknowledge_declared_types() {
         responses.push(response);
     }
     let coordinator = CoordinatorServiceImpl::new(addresses);
-    let error = coordinator
-        .fetch_values(&[0], &projections, &[])
-        .await
-        .err()
-        .unwrap();
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert!(error
-        .message()
-        .contains("typed map fetch contract acknowledgement"));
-    responses[1].lock().unwrap().typed_map_contract_version = 1;
     let result = coordinator
         .fetch_values(&[0], &projections, &[])
         .await

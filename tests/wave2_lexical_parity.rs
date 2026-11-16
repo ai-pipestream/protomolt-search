@@ -368,9 +368,7 @@ async fn negative_score_chains_preserve_unary_streamed_winners() {
             req.min_score = floor;
             req.score_stages = vec![ScoreStage {
                 column: "adjustment".into(),
-                operation: Some(pipestream_search::pb::score_stage::Operation::Op(
-                    ScoreOp::AddLinear as i32,
-                )),
+                op: ScoreOp::AddLinear as i32,
                 weight: 1.0,
                 ..Default::default()
             }];
@@ -413,9 +411,7 @@ async fn negative_node_stream_publishes_signed_floors() {
         analysis_fingerprint: analysis_fingerprint(Some(&body_spec())),
         score_stages: vec![ScoreStage {
             column: "adjustment".into(),
-            operation: Some(pipestream_search::pb::score_stage::Operation::Op(
-                ScoreOp::AddLinear as i32,
-            )),
+            op: ScoreOp::AddLinear as i32,
             weight: 1.0,
             ..Default::default()
         }],

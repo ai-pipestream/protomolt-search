@@ -204,7 +204,6 @@ fn fetch_values(
     guard.check_stats_epoch(req.expected_stats_epoch, &req.expected_stats_incarnation)?;
     let (_, visibility_columns_known) = filter_known_flags(guard.bm25.as_ref(), &[], visibility);
     let mut response = crate::pb::FetchValuesResponse {
-        typed_map_contract_version: crate::values::TYPED_MAP_FETCH_VERSION,
         stats_epoch: guard.stats_epoch,
         stats_incarnation: guard.stats_incarnation.bytes()?,
         visibility_fingerprint: scope.fingerprint().to_vec(),

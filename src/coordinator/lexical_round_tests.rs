@@ -82,7 +82,10 @@ fn malformed_facets_are_rejected_before_empty_query_or_analysis_backend() {
     let request = Bm25SearchRequest {
         range_facet_fields: vec![crate::pb::RangeFacetField {
             column: "price".into(),
-            edges: vec![2.0, 1.0],
+            edges: vec![
+                crate::pb::FilterBound::num(2.0),
+                crate::pb::FilterBound::num(1.0),
+            ],
             ..Default::default()
         }],
         ..Default::default()

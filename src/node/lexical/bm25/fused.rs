@@ -190,7 +190,6 @@ fn unknown_fused_response(req: &Bm25QueryRequest) -> Bm25QueryResponse {
                 field,
                 known: false,
                 counts: Vec::new(),
-                key: key.clone().unwrap_or_default(),
                 map_key: key,
             })
             .collect(),

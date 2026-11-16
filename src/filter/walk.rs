@@ -16,14 +16,10 @@ pub enum LeafRef<'a> {
     Number(&'a crate::pb::NumberPredicate),
     /// A map-facet predicate.
     MapFacet(&'a crate::pb::MapFacetPredicate),
-    /// A map-number predicate.
+    /// Numeric map comparison across f64, i64 and u64 map columns.
     MapNumber(&'a crate::pb::MapNumberPredicate),
-    /// Numeric map comparison including exact integer columns.
-    TypedMapNumber(&'a crate::pb::MapNumberPredicate),
-    /// A map-key presence test.
+    /// Key presence across all string and numeric map columns.
     MapHasKey(&'a crate::pb::MapKeyPredicate),
-    /// Presence including exact integer columns.
-    TypedMapHasKey(&'a crate::pb::MapKeyPredicate),
     /// A column presence test.
     Has(&'a crate::pb::HasPredicate),
     /// A geo leaf.
@@ -32,10 +28,6 @@ pub enum LeafRef<'a> {
     StringRange(&'a crate::pb::StringRangePredicate),
     /// A string prefix on a facet column or map-facet value.
     StringPrefix(&'a crate::pb::StringPrefixPredicate),
-    /// A string range with explicit map context, including the empty key.
-    MapStringRange(&'a crate::pb::StringRangePredicate),
-    /// A string prefix with explicit map context, including the empty key.
-    MapStringPrefix(&'a crate::pb::StringPrefixPredicate),
 }
 
 impl LeafRef<'_> {
@@ -46,31 +38,22 @@ impl LeafRef<'_> {
             LeafRef::Facet(p) => format!("facet column {:?}", p.column),
             LeafRef::Number(p) => format!("numeric column {:?}", p.column),
             LeafRef::MapFacet(p) => format!("map-facet column {:?} key {:?}", p.column, p.key),
-            LeafRef::MapNumber(p) | LeafRef::TypedMapNumber(p) => {
+            LeafRef::MapNumber(p) => {
                 format!("numeric map column {:?} key {:?}", p.column, p.key)
             }
-            LeafRef::MapHasKey(p) | LeafRef::TypedMapHasKey(p) => {
-                format!("map column {:?}", p.column)
-            }
+            LeafRef::MapHasKey(p) => format!("map column {:?}", p.column),
             LeafRef::Has(p) => format!("column {:?}", p.column),
             LeafRef::Geo(g) => format!("geo column {:?}", g.column),
-            LeafRef::StringRange(p) => describe_string_target(&p.column, &p.key),
-            LeafRef::StringPrefix(p) => describe_string_target(&p.column, &p.key),
-            LeafRef::MapStringRange(p) => {
-                format!("map-facet column {:?} key {:?}", p.column, p.key)
-            }
-            LeafRef::MapStringPrefix(p) => {
-                format!("map-facet column {:?} key {:?}", p.column, p.key)
-            }
+            LeafRef::StringRange(p) => describe_string_target(&p.column, p.map_key.as_deref()),
+            LeafRef::StringPrefix(p) => describe_string_target(&p.column, p.map_key.as_deref()),
         }
     }
 }
 
-fn describe_string_target(column: &str, key: &str) -> String {
-    if key.is_empty() {
-        format!("facet column {column:?}")
-    } else {
-        format!("map-facet column {column:?} key {key:?}")
+fn describe_string_target(column: &str, key: Option<&str>) -> String {
+    match key {
+        None => format!("facet column {column:?}"),
+        Some(key) => format!("map-facet column {column:?} key {key:?}"),
     }
 }
 
@@ -90,15 +73,11 @@ pub fn walk_leaves<'a>(expr: &'a crate::pb::FilterExpr, visit: &mut dyn FnMut(Le
         Some(Expr::Number(p)) => visit(LeafRef::Number(p)),
         Some(Expr::MapFacet(p)) => visit(LeafRef::MapFacet(p)),
         Some(Expr::MapNumber(p)) => visit(LeafRef::MapNumber(p)),
-        Some(Expr::TypedMapNumber(p)) => visit(LeafRef::TypedMapNumber(p)),
         Some(Expr::MapHasKey(p)) => visit(LeafRef::MapHasKey(p)),
-        Some(Expr::TypedMapHasKey(p)) => visit(LeafRef::TypedMapHasKey(p)),
         Some(Expr::Has(p)) => visit(LeafRef::Has(p)),
         Some(Expr::Geo(g)) => visit(LeafRef::Geo(g)),
         Some(Expr::StringRange(p)) => visit(LeafRef::StringRange(p)),
         Some(Expr::StringPrefix(p)) => visit(LeafRef::StringPrefix(p)),
-        Some(Expr::MapStringRange(p)) => visit(LeafRef::MapStringRange(p)),
-        Some(Expr::MapStringPrefix(p)) => visit(LeafRef::MapStringPrefix(p)),
         None => {}
     }
 }

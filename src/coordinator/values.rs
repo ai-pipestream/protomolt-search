@@ -248,7 +248,6 @@ impl<'a> ValuesFold<'a> {
             include_identities,
             ..
         } = self.fetch;
-        crate::values::validate_map_fetch_contract(projections, resp.typed_map_contract_version)?;
         self.scope
             .validate_echo(&resp.visibility_fingerprint, &resp.visibility_columns_known)?;
         let claim = StatsClaim::required(resp.stats_epoch, &resp.stats_incarnation)?;

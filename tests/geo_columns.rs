@@ -190,14 +190,14 @@ fn radius_filter(column: &str, lat: f64, lon: f64, meters: f64, metric: GeoMetri
 
 fn geo_stage(column: &str, op: ScoreOp, lat: f64, lon: f64, scale: f64) -> ScoreStage {
     ScoreStage {
-        operation: Some(pipestream_search::pb::score_stage::Operation::Op(op as i32)),
+        op: op as i32,
         column: column.to_string(),
-        key: String::new(),
         weight: 0.0,
         origin: 0.0,
         scale,
         origin_lat: lat,
         origin_lon: lon,
+        map_key: None,
     }
 }
 

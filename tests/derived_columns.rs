@@ -1321,9 +1321,7 @@ async fn the_serving_routes_enforce_the_inputs_rule() {
     // stage over the derived column needs Disclose on its input.
     let stage = || pipestream_search::pb::ScoreStage {
         column: "court_hash".into(),
-        operation: Some(pipestream_search::pb::score_stage::Operation::Op(
-            pipestream_search::pb::ScoreOp::AddLinear as i32,
-        )),
+        op: pipestream_search::pb::ScoreOp::AddLinear as i32,
         weight: 1.0,
         ..Default::default()
     };

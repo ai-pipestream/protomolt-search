@@ -185,15 +185,7 @@ pub fn eval_document(expr: &pb::FilterExpr, doc: &DocColumns<'_>) -> Tri {
             None => Tri::Unknown,
             Some(value) => Tri::from(p.values.iter().any(|v| v == value)),
         },
-        Some(Expr::MapNumber(p)) => match doc.map_numeric(&p.column, &p.key) {
-            None => Tri::Unknown,
-            Some(v) => Tri::from(in_number_range(
-                NumberValue::Float(v),
-                p.min.as_ref().and_then(edge_of),
-                p.max.as_ref().and_then(edge_of),
-            )),
-        },
-        Some(Expr::TypedMapNumber(p)) => match doc.map_number(&p.column, &p.key) {
+        Some(Expr::MapNumber(p)) => match doc.map_number(&p.column, &p.key) {
             None => Tri::Unknown,
             Some(v) => Tri::from(in_number_range(
                 v,
@@ -202,10 +194,6 @@ pub fn eval_document(expr: &pb::FilterExpr, doc: &DocColumns<'_>) -> Tri {
             )),
         },
         Some(Expr::MapHasKey(p)) => Tri::from(
-            doc.map_facet(&p.column, &p.key).is_some()
-                || doc.map_numeric(&p.column, &p.key).is_some(),
-        ),
-        Some(Expr::TypedMapHasKey(p)) => Tri::from(
             doc.map_facet(&p.column, &p.key).is_some()
                 || doc.map_number(&p.column, &p.key).is_some(),
         ),
@@ -218,20 +206,14 @@ pub fn eval_document(expr: &pb::FilterExpr, doc: &DocColumns<'_>) -> Tri {
             },
         },
 
-        Some(Expr::StringRange(p)) | Some(Expr::MapStringRange(p)) => {
-            let map = matches!(expr.expr, Some(Expr::MapStringRange(_)));
-            match string_operand(doc, &p.column, &p.key, map) {
-                None => Tri::Unknown,
-                Some(v) => Tri::from(string_in_range(v, p.min.as_ref(), p.max.as_ref())),
-            }
-        }
-        Some(Expr::StringPrefix(p)) | Some(Expr::MapStringPrefix(p)) => {
-            let map = matches!(expr.expr, Some(Expr::MapStringPrefix(_)));
-            match string_operand(doc, &p.column, &p.key, map) {
-                None => Tri::Unknown,
-                Some(v) => Tri::from(v.as_bytes().starts_with(p.prefix.as_bytes())),
-            }
-        }
+        Some(Expr::StringRange(p)) => match string_operand(doc, &p.column, p.map_key.as_deref()) {
+            None => Tri::Unknown,
+            Some(v) => Tri::from(string_in_range(v, p.min.as_ref(), p.max.as_ref())),
+        },
+        Some(Expr::StringPrefix(p)) => match string_operand(doc, &p.column, p.map_key.as_deref()) {
+            None => Tri::Unknown,
+            Some(v) => Tri::from(v.as_bytes().starts_with(p.prefix.as_bytes())),
+        },
 
         None => Tri::Unknown,
     }
@@ -254,15 +236,9 @@ fn number_tri(p: &pb::NumberPredicate, doc: &DocColumns<'_>) -> Tri {
 
 /// The string a range or prefix predicate reads: the facet, unless the
 /// predicate is the map variant or names a key.
-fn string_operand<'d>(
-    doc: &'d DocColumns<'_>,
-    column: &str,
-    key: &str,
-    map: bool,
-) -> Option<&'d str> {
-    if !map && key.is_empty() {
-        doc.facet(column)
-    } else {
-        doc.map_facet(column, key)
+fn string_operand<'d>(doc: &'d DocColumns<'_>, column: &str, key: Option<&str>) -> Option<&'d str> {
+    match key {
+        None => doc.facet(column),
+        Some(key) => doc.map_facet(column, key),
     }
 }

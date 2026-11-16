@@ -40,10 +40,7 @@ fn assert_first_compaction_postconditions(
     assert_eq!(first.layout, "segments");
     assert!(first.rows_before >= (N + 5) as u64);
     assert!(first.tombstones_reclaimed >= (N.div_ceil(7) + 5) as u64);
-    assert!(
-        first.tail_records_applied > 0 && first.locked_tail_records == 0,
-        "{first:?}"
-    );
+    assert!(first.tail_records_applied > 0, "{first:?}");
     assert!(first.write_lock_ms < 500, "lock {} ms", first.write_lock_ms);
     assert!(!default_work_dir(index_path).exists() && !marker_path(index_path).exists());
     assert!(wal_gen(index_path, 0).exists() && wal_gen(index_path, 1).exists());

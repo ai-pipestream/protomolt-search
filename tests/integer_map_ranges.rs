@@ -7,7 +7,6 @@ use pipestream_search::{
     postings::{AnalyzedDoc, Bm25Store},
     relay::merge_bm25_responses,
 };
-use prost::Message;
 use tonic::Request;
 const I: [Option<i64>; 10] = [
     None,
@@ -34,13 +33,6 @@ const U: [Option<u64>; 10] = [
     Some(0),
 ];
 const KEY: &str = "zz'\\\"雪";
-#[derive(Clone, PartialEq, Message)]
-struct WireRange {
-    #[prost(string, tag = "1")]
-    column: String,
-    #[prost(message, optional, tag = "6")]
-    typed_map: Option<pb::MapRangeFacet>,
-}
 fn edges() -> Vec<pb::FilterBound> {
     use pb::filter_bound::Value::*;
     [
@@ -65,19 +57,11 @@ fn edges() -> Vec<pb::FilterBound> {
     .collect()
 }
 fn range(column: &str, key: &str) -> pb::RangeFacetField {
-    pb::RangeFacetField::decode(
-        WireRange {
-            column: column.into(),
-            typed_map: Some(pb::MapRangeFacet {
-                key: key.into(),
-                typed_edges: edges(),
-                ..Default::default()
-            }),
-        }
-        .encode_to_vec()
-        .as_slice(),
-    )
-    .unwrap()
+    pb::RangeFacetField {
+        column: column.into(),
+        map_key: Some(key.into()),
+        edges: edges(),
+    }
 }
 fn expected(column: &str, rows: std::ops::Range<usize>) -> Vec<u64> {
     // All fixture edges are integers or half-integers. Doubling them permits
@@ -116,8 +100,8 @@ fn check(counts: &pb::RangeFacetCounts, column: &str, key: &str, rows: std::ops:
     );
     let edges = edges();
     for (i, b) in counts.buckets.iter().enumerate() {
-        assert_eq!(b.typed_from.as_ref(), Some(&edges[i]));
-        assert_eq!(b.typed_to.as_ref(), Some(&edges[i + 1]));
+        assert_eq!(b.from.as_ref(), Some(&edges[i]));
+        assert_eq!(b.to.as_ref(), Some(&edges[i + 1]));
     }
 }
 fn raw_request(column: &str, key: &str) -> pb::Bm25QueryRequest {
@@ -193,17 +177,6 @@ async fn integer_map_ranges_keep_adjacent_large_values_in_distinct_buckets() {
                 check(&response.range_facets[0], column, key, 0..10);
                 let merged = merge_bm25_responses(&req, vec![response.clone()]).unwrap();
                 check(&merged.range_facets[0], column, key, 0..10);
-                let mut legacy = req.clone();
-                legacy.range_facet_fields[0].map = legacy.range_facet_fields[0].typed_map.take();
-                let legacy = node
-                    .bm25_query(Request::new(legacy))
-                    .await
-                    .unwrap()
-                    .into_inner();
-                assert!(
-                    !legacy.range_facets[0].known,
-                    "legacy map ranges remain f64-only"
-                );
             }
         }
     }
@@ -422,37 +395,21 @@ async fn integer_map_ranges_compose_through_relays_and_compaction() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-#[derive(Clone, PartialEq, Message)]
-struct OldRange {
-    #[prost(string, tag = "1")]
-    column: String,
-    #[prost(string, tag = "2")]
-    key: String,
-    #[prost(double, repeated, tag = "3")]
-    edges: Vec<f64>,
-    #[prost(message, repeated, tag = "4")]
-    typed_edges: Vec<pb::FilterBound>,
-    #[prost(message, optional, tag = "5")]
-    map: Option<pb::MapRangeFacet>,
-}
 #[tokio::test]
-async fn typed_map_ranges_refuse_unsupported_or_ambiguous_requests_before_empty_reads() {
+async fn integer_map_ranges_refuse_malformed_requests_before_empty_reads() {
     let node = NodeServiceImpl::new(None, NodeConfig::default());
     let request = range("signed", "");
-    let old = OldRange::decode(request.encode_to_vec().as_slice()).unwrap();
-    assert!(old.map.is_none() && old.edges.is_empty() && old.typed_edges.is_empty());
-    let lost = pb::RangeFacetField::decode(old.encode_to_vec().as_slice()).unwrap();
-    let mut both = request.clone();
-    both.map = both.typed_map.clone();
-    let mut legacy = request.clone();
-    legacy.edges = vec![0., 1.];
-    let mut wrong_key = request.clone();
-    wrong_key.key = "other".into();
+    let mut exclusive = request.clone();
+    exclusive.edges[0].exclusive = true;
+    let mut unset = request.clone();
+    unset.edges[1].value = None;
+    let mut unnamed = request.clone();
+    unnamed.column.clear();
     let mut empty = request.clone();
-    empty.typed_map.as_mut().unwrap().typed_edges.clear();
+    empty.edges.clear();
     let mut reversed = request.clone();
-    reversed.typed_map.as_mut().unwrap().typed_edges.reverse();
-    for field in [lost, both, legacy, wrong_key, empty, reversed] {
+    reversed.edges.reverse();
+    for field in [exclusive, unset, unnamed, empty, reversed] {
         assert_eq!(
             node.bm25_query(Request::new(pb::Bm25QueryRequest {
                 range_facet_fields: vec![field],

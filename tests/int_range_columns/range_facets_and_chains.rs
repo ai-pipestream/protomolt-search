@@ -355,16 +355,10 @@ async fn distributed_integer_chain_matches_monolith() {
         .with_bm25(Some(analysis.clone()), Default::default());
 
     let stages = [ScoreStage {
-        operation: Some(pipestream_search::pb::score_stage::Operation::Op(
-            ScoreOp::MultLog as i32,
-        )),
+        op: ScoreOp::MultLog as i32,
         column: "citations".to_string(),
-        key: String::new(),
         weight: 1.0,
-        origin: 0.0,
-        scale: 0.0,
-        origin_lat: 0.0,
-        origin_lon: 0.0,
+        ..Default::default()
     }];
     for text in ["rust", "search rust", "vector"] {
         let (got, _, _) = common::fanout::bm25_stages(&distributed, text, 10, &stages, None)

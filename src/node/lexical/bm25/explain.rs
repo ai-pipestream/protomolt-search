@@ -70,15 +70,7 @@ pub(super) fn explain_stages(
         let mut row = crate::pb::ScoreStageExplain {
             stage: i as u32,
             column: spec.column.clone(),
-            key: spec.map_key().unwrap_or_default().to_owned(),
-            map_key: matches!(
-                spec.operation,
-                Some(
-                    crate::pb::score_stage::Operation::MapOp(_)
-                        | crate::pb::score_stage::Operation::TypedMapOp(_)
-                )
-            )
-            .then(|| spec.map_key().expect("explicit map selector").to_owned()),
+            map_key: spec.map_key.clone(),
             present: false,
             input: 0.0,
             contribution: 0.0,

@@ -15,7 +15,6 @@ fn relay_requires_map_context_even_when_the_map_key_is_empty() {
     let response = pb::Bm25QueryResponse {
         facets: vec![pb::FacetFieldCounts {
             field: "meta".into(),
-            key: String::new(),
             known: true,
             counts: vec![pb::FacetCount {
                 value: "x".into(),
@@ -44,7 +43,6 @@ fn facet_merging_checks_names_keys_unknown_counts_and_overflow() {
     };
     let good = pb::FacetFieldCounts {
         field: "meta".into(),
-        key: String::new(),
         map_key: Some(String::new()),
         known: true,
         counts: vec![pb::FacetCount {
@@ -60,11 +58,9 @@ fn facet_merging_checks_names_keys_unknown_counts_and_overflow() {
     wrong_name.field = "different".into();
     let mut wrong_key = good.clone();
     wrong_key.map_key = Some("different".into());
-    let mut wrong_legacy_key = good.clone();
-    wrong_legacy_key.key = "different".into();
     let mut unknown_counts = good.clone();
     unknown_counts.known = false;
-    for bad in [wrong_name, wrong_key, wrong_legacy_key, unknown_counts] {
+    for bad in [wrong_name, wrong_key, unknown_counts] {
         assert_eq!(
             merge_bm25_responses(&req, vec![wrap(bad)])
                 .unwrap_err()
@@ -91,28 +87,24 @@ fn map_range() -> pb::RangeFacetField {
     use pb::filter_bound::Value;
     pb::RangeFacetField {
         column: "metrics".into(),
-        map: Some(pb::MapRangeFacet {
-            key: String::new(),
-            typed_edges: vec![
-                Value::Int(-1),
-                Value::Uint(0),
-                Value::Int(3),
-                Value::Num(6.0),
-            ]
-            .into_iter()
-            .map(|value| pb::FilterBound {
-                value: Some(value),
-                exclusive: false,
-            })
-            .collect(),
-            ..Default::default()
-        }),
-        ..Default::default()
+        map_key: Some(String::new()),
+        edges: vec![
+            Value::Int(-1),
+            Value::Uint(0),
+            Value::Int(3),
+            Value::Num(6.0),
+        ]
+        .into_iter()
+        .map(|value| pb::FilterBound {
+            value: Some(value),
+            exclusive: false,
+        })
+        .collect(),
     }
 }
 
 #[tokio::test]
-async fn explicit_map_ranges_preserve_typed_edges_and_refuse_lost_context() {
+async fn map_ranges_preserve_edges_and_refuse_lost_context() {
     use pipestream_search::{
         node::{Bm25Shard, NodeConfig, NodeServiceImpl},
         pb::node_service_server::NodeService,
@@ -156,16 +148,15 @@ async fn explicit_map_ranges_preserve_typed_edges_and_refuse_lost_context() {
         .into_inner();
     let counts = &response.range_facets[0];
     assert_eq!(counts.map_key.as_deref(), Some(""));
-    assert_eq!(counts.key, "");
     assert!(counts.known);
     assert_eq!(
         counts.buckets.iter().map(|b| b.count).collect::<Vec<_>>(),
         vec![1, 2, 1]
     );
-    let edges = &range.map.as_ref().unwrap().typed_edges;
+    let edges = &range.edges;
     for (i, bucket) in counts.buckets.iter().enumerate() {
-        assert_eq!(bucket.typed_from.as_ref(), Some(&edges[i]));
-        assert_eq!(bucket.typed_to.as_ref(), Some(&edges[i + 1]));
+        assert_eq!(bucket.from.as_ref(), Some(&edges[i]));
+        assert_eq!(bucket.to.as_ref(), Some(&edges[i + 1]));
     }
     let merged = merge_bm25_responses(&req, vec![response.clone()]).unwrap();
     assert_eq!(merged.range_facets, response.range_facets);
@@ -181,13 +172,12 @@ async fn explicit_map_ranges_preserve_typed_edges_and_refuse_lost_context() {
             tonic::Code::FailedPrecondition
         );
     }
-    // The legacy empty-key form still addresses a plain numeric column.
+    // An absent map key addresses a plain numeric column, which this shard lacks.
     let plain = node
         .bm25_query(tonic::Request::new(pb::Bm25QueryRequest {
             range_facet_fields: vec![pb::RangeFacetField {
-                column: "metrics".into(),
-                edges: vec![-1.0, 0.0, 3.0, 6.0],
-                ..Default::default()
+                map_key: None,
+                ..range
             }],
             ..req
         }))
@@ -199,43 +189,25 @@ async fn explicit_map_ranges_preserve_typed_edges_and_refuse_lost_context() {
 }
 
 #[tokio::test]
-async fn map_range_validation_rejects_ambiguous_shapes_and_old_decoding() {
+async fn map_range_validation_rejects_malformed_edges() {
     use pipestream_search::{
         node::{NodeConfig, NodeServiceImpl},
         pb::node_service_server::NodeService,
     };
-    use prost::Message;
-    #[derive(Clone, PartialEq, Message)]
-    struct OldRange {
-        #[prost(string, tag = "1")]
-        column: String,
-        #[prost(string, tag = "2")]
-        key: String,
-        #[prost(double, repeated, tag = "3")]
-        edges: Vec<f64>,
-        #[prost(message, repeated, tag = "4")]
-        typed_edges: Vec<pb::FilterBound>,
-    }
     let request = map_range();
-    let old = OldRange::decode(request.encode_to_vec().as_slice()).unwrap();
-    assert!(old.edges.is_empty() && old.typed_edges.is_empty());
-    let discarded = pb::RangeFacetField::decode(old.encode_to_vec().as_slice()).unwrap();
-    let mut bad = vec![discarded];
-    let mut key = request.clone();
-    key.key = "legacy".into();
-    bad.push(key);
-    let mut edges = request.clone();
-    edges.edges = vec![0.0, 1.0];
-    bad.push(edges);
-    let mut both = request.clone();
-    both.map.as_mut().unwrap().edges = vec![0.0, 1.0];
-    bad.push(both);
+    let mut bad = Vec::new();
     let mut empty = request.clone();
-    empty.map.as_mut().unwrap().typed_edges.clear();
+    empty.edges.clear();
     bad.push(empty);
     let mut unordered = request.clone();
-    unordered.map.as_mut().unwrap().typed_edges.reverse();
+    unordered.edges.reverse();
     bad.push(unordered);
+    let mut exclusive = request.clone();
+    exclusive.edges[1].exclusive = true;
+    bad.push(exclusive);
+    let mut unset = request.clone();
+    unset.edges[2].value = None;
+    bad.push(unset);
     let node = NodeServiceImpl::new(None, NodeConfig::default());
     for range in bad {
         let err = node

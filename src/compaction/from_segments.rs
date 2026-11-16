@@ -122,7 +122,6 @@ impl NodeServiceImpl {
             rows_after,
             tombstones_reclaimed: build.tombstones,
             tail_records_applied: carried_rows,
-            locked_tail_records: 0,
             write_lock_ms,
             wal_generation: 0,
             cutoff_clock: 0,

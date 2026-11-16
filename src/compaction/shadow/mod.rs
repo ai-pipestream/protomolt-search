@@ -191,7 +191,7 @@ impl NodeServiceImpl {
         let mut shadow = self.open_segmented_shadow(pre, &build, new_wal)?;
         shadow.id_map = build.id_map;
         match self.tail_and_cut_over(pre, &mut shadow, tail_bound, analyze, flush_shadow) {
-            Ok((locked_records, write_lock_ms, tail_passes)) => {
+            Ok((write_lock_ms, tail_passes)) => {
                 let closing = Instant::now();
                 self.closing_flush()?;
                 let closing_flush_ms = closing.elapsed().as_millis() as u64;
@@ -204,7 +204,6 @@ impl NodeServiceImpl {
                     rows_after,
                     tombstones_reclaimed: build.tombstones,
                     tail_records_applied: shadow.tail_records,
-                    locked_tail_records: locked_records,
                     write_lock_ms,
                     wal_generation: pre.cutoff_generation + 1,
                     cutoff_clock: pre.cutoff_clock,

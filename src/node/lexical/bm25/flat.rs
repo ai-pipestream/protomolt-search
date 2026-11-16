@@ -167,7 +167,6 @@ impl FlatRun<'_> {
                 )
                 .map(|(field, key)| crate::pb::FacetFieldCounts {
                     field,
-                    key: key.clone().unwrap_or_default(),
                     map_key: key,
                     ..Default::default()
                 })

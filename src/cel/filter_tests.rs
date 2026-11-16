@@ -128,23 +128,21 @@ fn compiles_map_and_presence_predicates() {
     assert_eq!(
         compiled("cites[\"410 U.S. 113\"] >= 3"),
         pb::FilterExpr {
-            expr: Some(pb::filter_expr::Expr::TypedMapNumber(
-                pb::MapNumberPredicate {
-                    column: "cites".into(),
-                    key: "410 U.S. 113".into(),
-                    min: Some(pb::FilterBound {
-                        value: Some(pb::filter_bound::Value::Int(3)),
-                        exclusive: false,
-                    }),
-                    max: None,
-                }
-            )),
+            expr: Some(pb::filter_expr::Expr::MapNumber(pb::MapNumberPredicate {
+                column: "cites".into(),
+                key: "410 U.S. 113".into(),
+                min: Some(pb::FilterBound {
+                    value: Some(pb::filter_bound::Value::Int(3)),
+                    exclusive: false,
+                }),
+                max: None,
+            })),
         }
     );
     assert_eq!(
         compiled("\"color\" in tags"),
         pb::FilterExpr {
-            expr: Some(pb::filter_expr::Expr::TypedMapHasKey(pb::MapKeyPredicate {
+            expr: Some(pb::filter_expr::Expr::MapHasKey(pb::MapKeyPredicate {
                 column: "tags".into(),
                 key: "color".into(),
             })),
@@ -246,7 +244,7 @@ fn precedence_matches_cel() {
 
 fn string_range(
     column: &str,
-    key: &str,
+    key: Option<&str>,
     min: Option<(&str, bool)>,
     max: Option<(&str, bool)>,
 ) -> pb::FilterExpr {
@@ -260,7 +258,7 @@ fn string_range(
         expr: Some(pb::filter_expr::Expr::StringRange(
             pb::StringRangePredicate {
                 column: column.into(),
-                key: key.into(),
+                map_key: key.map(str::to_owned),
                 min: bound(min),
                 max: bound(max),
             },
@@ -273,23 +271,23 @@ fn string_range(
 fn string_ordering_and_prefixes_compile_to_dictionary_ranges() {
     assert_eq!(
         compiled("court < \"b\""),
-        string_range("court", "", None, Some(("b", true)))
+        string_range("court", None, None, Some(("b", true)))
     );
     assert_eq!(
         compiled("court <= \"b\""),
-        string_range("court", "", None, Some(("b", false)))
+        string_range("court", None, None, Some(("b", false)))
     );
     assert_eq!(
         compiled("court > \"b\""),
-        string_range("court", "", Some(("b", true)), None)
+        string_range("court", None, Some(("b", true)), None)
     );
     assert_eq!(
         compiled("\"b\" <= court"),
-        string_range("court", "", Some(("b", false)), None)
+        string_range("court", None, Some(("b", false)), None)
     );
     assert_eq!(
         compiled("tags[\"color\"] >= \"m\""),
-        string_range("tags", "color", Some(("m", false)), None)
+        string_range("tags", Some("color"), Some(("m", false)), None)
     );
     assert_eq!(
         compiled("court.startsWith(\"ca\")"),
@@ -297,7 +295,7 @@ fn string_ordering_and_prefixes_compile_to_dictionary_ranges() {
             expr: Some(pb::filter_expr::Expr::StringPrefix(
                 pb::StringPrefixPredicate {
                     column: "court".into(),
-                    key: String::new(),
+                    map_key: None,
                     prefix: "ca".into(),
                 }
             )),
@@ -309,7 +307,7 @@ fn string_ordering_and_prefixes_compile_to_dictionary_ranges() {
             expr: Some(pb::filter_expr::Expr::StringPrefix(
                 pb::StringPrefixPredicate {
                     column: "tags".into(),
-                    key: "color".into(),
+                    map_key: Some("color".into()),
                     prefix: "re".into(),
                 }
             )),
