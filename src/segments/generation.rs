@@ -205,7 +205,7 @@ pub(crate) fn from_reader(
     describe!(store, backend)
 }
 
-/// Source writes may establish previously unset semantics. Rewrites must use
+/// Source writes may establish semantics not yet set. Rewrites must use
 /// strict equality instead: they are never an opportunity to rebind a schema.
 pub(crate) fn check_upgrade(
     before: &IndexGenerationDeclaration,

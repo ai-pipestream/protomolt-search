@@ -1,4 +1,4 @@
-//! The vector side of a segmented shard (`docs/immutable-segments.md`):
+//! The vector side of a segmented shard:
 //! one [`VectorProvider`] over the sealed segments' images plus a tail
 //! image the node adds rows to. Rows are one positional space, the
 //! same one the segmented BM25 shard uses: segment `i` covers
