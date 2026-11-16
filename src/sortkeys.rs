@@ -1,4 +1,4 @@
-//! Sort keys (`docs/query-api.md`, "Sorting"): the one comparison a
+//! Sort keys: the one comparison a
 //! sorted row is ordered by on the node's heap, in the coordinator's
 //! merge, and at a cursor boundary.
 //!

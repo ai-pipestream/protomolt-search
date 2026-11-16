@@ -32,8 +32,8 @@ use tonic::Status;
 struct FieldShare {
     total_len: u64,
     known: bool,
-    /// Whether the node's field carries token positions
-    /// (docs/phrase-proximity.md); a store property like `known`.
+    /// Whether the node's field carries token positions; a store
+    /// property like `known`.
     positions: bool,
     dfs: HashMap<String, u32>,
 }

@@ -61,7 +61,7 @@ impl PartialOrd for LexicalHeapEntry {
 /// `shard_hits` yields `(shard_index, hits)` pairs where each hit is
 /// `(global_vector_id, score)`. A shard contributing more than k hits is
 /// fine — the merge is order-insensitive because the final ranking is a
-/// total order ([`cmp_hits`]), so equal inputs always merge identically
+/// total order (`cmp_hits`), so equal inputs always merge identically
 /// regardless of arrival order.
 pub fn merge_topk<I>(shard_hits: I, k: usize) -> Vec<MergedHit>
 where

@@ -140,11 +140,9 @@ impl LiveDocs {
         self.has_deletes().then(|| Arc::clone(&self.deleted))
     }
 
-    /// Idempotently tombstone one local slot. Returns true only on the first
-    /// transition from live to deleted.
     /// The bitmap of slots `[from, from + rows)` renumbered from 0: the
-    /// live-document artifact of a segment sealed from that range
-    /// (`docs/immutable-segments.md`). The revision is copied; the
+    /// live-document artifact of a segment sealed from that range.
+    /// The revision is copied; the
     /// persisted row count is `rows` once written.
     pub fn slice(&self, from: usize, rows: usize) -> LiveDocs {
         let mut out = LiveDocs::default();
@@ -158,6 +156,8 @@ impl LiveDocs {
         out
     }
 
+    /// Idempotently tombstone one local slot. Returns true only on the first
+    /// transition from live to deleted.
     pub fn delete(&mut self, slot: usize) -> bool {
         let words = Arc::make_mut(&mut self.deleted);
         let word_index = slot / 64;

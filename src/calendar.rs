@@ -1,5 +1,5 @@
-//! Calendar bucketing for date histograms (`docs/aggregations.md`,
-//! "Date histograms"): proleptic Gregorian civil-date arithmetic over
+//! Calendar bucketing for date histograms: proleptic Gregorian civil-date
+//! arithmetic over
 //! epoch microseconds, the unit the timestamp column stores
 //! (`TimestampValue`). Hand-rolled from Howard Hinnant's
 //! `days_from_civil` / `civil_from_days`, so the engine carries no
