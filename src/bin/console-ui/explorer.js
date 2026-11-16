@@ -3,8 +3,8 @@
 // field fills in, and the call itself through /api/rpc or /api/stream.
 import {
   api, el, clear, fmtMs, loadConfig, grpcurlFor, mountHeader, copyText, errorText,
-} from '/common.js';
-import { defaultValue, insertAt } from '/query-state.js';
+} from './common.js';
+import { defaultValue, insertAt } from './query-state.js';
 
 const $ = (id) => document.getElementById(id);
 // A stream shows its newest messages first, as many as fit this many

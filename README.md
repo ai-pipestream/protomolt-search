@@ -43,10 +43,9 @@ The proposed [device-shard contract](docs/device-shards.md) describes shared
 searches with indexes retained on iOS and Android phones and the remaining
 transport, embedding, and availability work.
 
-Exact signed and unsigned map storage and document transport are being built
-on `feat/integer-map-storage-2026-09`. The branch supports typed document
-entries, descriptor-driven integer map projection, WAL replay and segment
-transplant. Exact map filters, typed expressions, expression-based aggregates
+Exact signed and unsigned map storage and document transport support typed
+document entries, descriptor-driven integer map projection, WAL replay and
+segment transplant. Exact map filters, typed expressions, expression-based aggregates
 and [map sorting/collapse](docs/integer-map-order.md) are supported.
 [Bounded map scoring](docs/score-functions.md#signed-and-unsigned-map-scoring-2026-09-07)
 uses explicit double conversion. [Integer map range facets](docs/range-facets.md#integer-map-entries-2026-09-07)
@@ -54,8 +53,8 @@ preserve exact values and typed edges; column statistics remain incomplete. See
 [integer map queries](docs/integer-map-queries.md) and
 [integer map storage](docs/integer-map-storage.md) for the compatibility gates
 and current validation scope.
-The derived-column implementation is reconciled on this branch; its
-[reconciliation note](docs/derived-column-reconciliation.md) covering durable
+The derived-column implementation is reconciled with this storage; its
+[reconciliation note](docs/derived-column-reconciliation.md) covers durable
 metadata, evaluator semantics and reserved wire/storage allocations.
 
 The current embedded adapter pins the fork branch recorded in `Cargo.toml` and
@@ -392,8 +391,8 @@ specs, while [`turboembed`](https://github.com/ai-pipestream/turboembed)
 SPLADE postings (`COLUMN_KIND_SPLADE = 19`), embeddings, and model-backed NLP
 projections. Both providers emit aligned `ViewId::SOURCE` original-text
 UTF-16, UTF-8, and Unicode code-point coordinates; Protomolt Search persists
-UTF-16 offsets in postings so one index generation cannot mix coordinate
-systems.
+the canonical UTF-8 byte offsets in postings so one index generation cannot
+mix coordinate systems.
 
 Glossary-backed phrase and entity search is an additive product capability:
 ordinary body terms preserve recall, a dedicated phrase field stores only
@@ -431,7 +430,7 @@ Server-side highlighting (`HighlightSpec` on `Bm25Search` and on the
 lexical `Query` leaf) returns sentence-bounded snippets per hit with the
 occurrence spans merged, cut by the shard from the stored text and the
 sentence spans it kept at ingest (`--sentence-fields=body`); no analyzer
-runs on the query path, offsets are UTF-16 units of the original text,
+runs on the query path, offsets are UTF-8 byte offsets into the original text,
 and a field without spans refuses sentence mode by name (window mode
 cuts at whitespace instead). See [`docs/highlighting.md`](docs/highlighting.md).
 

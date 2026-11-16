@@ -1,5 +1,5 @@
 //! The UI's convenience routes: health, stored documents by slot range,
-//! and the sidecar's embedding.
+//! and the analysis endpoint's embedding.
 
 use super::*;
 
@@ -104,12 +104,12 @@ fn parse_doc_ids(values: &[Value]) -> Result<Vec<u64>, Reply> {
     Ok(ids)
 }
 
-type ShardIds = HashMap<u32, (String, Vec<u64>)>;
+type ShardIds = BTreeMap<u32, (String, Vec<u64>)>;
 
 /// The ids grouped by the shard whose slot range holds each, and the
 /// ids no shard holds.
 fn route_doc_ids(ranges: &[ShardRange], ids: Vec<u64>) -> (ShardIds, Vec<u64>) {
-    let mut by_shard: ShardIds = HashMap::new();
+    let mut by_shard: ShardIds = BTreeMap::new();
     let mut unrouted = Vec::new();
     for id in ids {
         match ranges
@@ -167,8 +167,10 @@ async fn shard_documents(
 }
 
 /// Stored text for global document ids, from the owning nodes: an id
-/// belongs to the shard whose slot range holds it.
-pub(super) async fn documents(ctx: &Ctx, body: &[u8]) -> Reply {
+/// belongs to the shard whose slot range holds it. The shards are read
+/// concurrently and their rows returned in shard order; the first shard
+/// to fail answers for the call and the other reads are cancelled.
+pub(super) async fn documents(ctx: &Arc<Ctx>, body: &[u8]) -> Reply {
     let parsed: DocumentsBody = match serde_json::from_slice(body) {
         Ok(b) => b,
         Err(e) => return Reply::error(400, "INVALID_ARGUMENT", format!("bad request: {e}")),
@@ -182,13 +184,24 @@ pub(super) async fn documents(ctx: &Ctx, body: &[u8]) -> Reply {
         Err(e) => return Reply::error(502, "UNAVAILABLE", e),
     };
     let (by_shard, unrouted) = route_doc_ids(&ranges, ids);
-    let mut documents = Vec::new();
+    let mut reads = tokio::task::JoinSet::new();
     for (shard, (addr, doc_ids)) in by_shard {
-        match shard_documents(ctx, shard, &addr, doc_ids).await {
-            Ok(rows) => documents.extend(rows),
-            Err(reply) => return reply,
+        let ctx = Arc::clone(ctx);
+        reads.spawn(async move {
+            let rows = shard_documents(&ctx, shard, &addr, doc_ids).await;
+            rows.map(|rows| (shard, rows))
+        });
+    }
+    let mut per_shard = Vec::new();
+    while let Some(joined) = reads.join_next().await {
+        match joined {
+            Ok(Ok(rows)) => per_shard.push(rows),
+            Ok(Err(reply)) => return reply,
+            Err(e) => return Reply::error(500, "INTERNAL", format!("shard read: {e}")),
         }
     }
+    per_shard.sort_by_key(|(shard, _)| *shard);
+    let documents: Vec<Value> = per_shard.into_iter().flat_map(|(_, rows)| rows).collect();
     Reply::json(
         200,
         json!({
@@ -204,6 +217,8 @@ pub(super) struct EmbedBody {
     pub(super) text: String,
 }
 
+/// One query text embedded by the `--analysis` endpoint, dialed with the
+/// console's client TLS material and bearer token (see `embed_options`).
 pub(super) async fn embed(ctx: &Ctx, body: &[u8]) -> Reply {
     let Some(addr) = ctx.analysis.as_deref() else {
         return Reply::error(
@@ -220,7 +235,7 @@ pub(super) async fn embed(ctx: &Ctx, body: &[u8]) -> Reply {
         return Reply::error(400, "INVALID_ARGUMENT", "text is required");
     }
     let started = Instant::now();
-    match crate::analyzer::embed_text(addr, &parsed.text).await {
+    match crate::analyzer::embed_text_with_options(addr, &parsed.text, &ctx.embed).await {
         Ok(vector) => Reply::json(
             200,
             json!({

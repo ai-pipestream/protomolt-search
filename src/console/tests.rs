@@ -85,6 +85,7 @@ fn scalar_query_parameters_become_top_level_fields() {
         path: "/api/stream/DiagnosticsService/StreamMetrics".into(),
         query: parse_query("interval_ms=250&target=node0&verbose=true"),
         body: Vec::new(),
+        keep_alive: true,
     };
     let json: Value = serde_json::from_slice(&streaming_request_json(&request)).unwrap();
     assert_eq!(json["interval_ms"], 250);
