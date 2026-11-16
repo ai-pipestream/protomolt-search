@@ -43,12 +43,14 @@ pub struct Interleaved {
 
 impl Interleaved {
     /// The team that contributed `id`, if it is in the list.
+    #[cfg(test)]
     pub fn team_of(&self, id: u64) -> Option<Team> {
         self.ids.iter().position(|x| *x == id).map(|i| self.team[i])
     }
 }
 
 /// Credits from a set of selected results.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Outcome {
     /// Selections credited to ranking A.
@@ -59,6 +61,7 @@ pub struct Outcome {
     pub unattributed: usize,
 }
 
+#[cfg(test)]
 impl Outcome {
     /// The preferred team, or `None` for a tie (including no selections).
     ///
@@ -146,6 +149,7 @@ pub fn team_draft(a: &[u64], b: &[u64], k: usize, seed: u64) -> Interleaved {
 /// `selected` is whatever counts as a positive signal: clicks, an
 /// explicit relevance mark, a document the user went on to cite. The
 /// measure does not care which, only that it was chosen from THIS list.
+#[cfg(test)]
 pub fn credit(interleaved: &Interleaved, selected: &[u64]) -> Outcome {
     let mut outcome = Outcome::default();
     for id in selected {

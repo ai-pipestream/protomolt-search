@@ -174,6 +174,7 @@ impl SourceArchiveReader {
         }
     }
 
+    #[cfg(test)]
     pub fn verify(&self, bytes: &[u8]) -> io::Result<()> {
         for descriptor in &self.index.descriptors {
             self.blob(bytes, descriptor)?;
