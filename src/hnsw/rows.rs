@@ -1,12 +1,12 @@
 //! The FP32 rows the graph traverses and scores, behind a trait that carries
 //! the identity a shared row store must match.
 //!
-//! In this milestone the provider owns its rows: [`OwnedRows`] on the heap,
-//! [`MappedRows`] over the image's row section when the index is served from
-//! a memory map. #71 binds the trait to the product's `.exact` sidecar, which
-//! keeps the same rows; the identity here is what that binding checks: the
-//! dimension, the row count, and the SHA-256 of the rows' little-endian
-//! bytes in row order, the digest `ExactVectorStore` keeps over its payload.
+//! The provider owns its rows: [`OwnedRows`] on the heap, [`MappedRows`] over
+//! the image's row section when the index is served from a memory map. The
+//! product's `.exact` sidecar keeps the same rows; the identity here is what
+//! a binding of the trait to that sidecar checks: the dimension, the row
+//! count, and the SHA-256 of the rows' little-endian bytes in row order, the
+//! digest `ExactVectorStore` keeps over its payload.
 
 use crate::sha256::Sha256;
 

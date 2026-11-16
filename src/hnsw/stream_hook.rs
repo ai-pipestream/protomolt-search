@@ -5,7 +5,7 @@ use crate::vector::{VectorStreamBatch, VectorStreamControl, VectorStreamEndReaso
 use super::graph::Hook;
 
 /// Streaming emission batch: rows scored before the sink is called.
-pub(super) const STREAM_BATCH_ROWS: usize = 64;
+const STREAM_BATCH_ROWS: usize = 64;
 /// Hops before `StreamHook` emits its early first-flush batch so the
 /// coordinator establishes a global floor without waiting for 64 rows.
 const STREAM_FIRST_FLUSH_HOPS: usize = 2;
@@ -34,7 +34,35 @@ pub(super) struct StreamHook<'a> {
     pub(super) emitted: usize,
 }
 
-impl StreamHook<'_> {
+impl<'a> StreamHook<'a> {
+    /// The hook of query `query_index` of a stream, with nothing buffered.
+    pub(super) fn new(
+        query_index: usize,
+        query: &'a [f32],
+        node_to_row: Option<&'a [u32]>,
+        floor: &'a mut f32,
+        allow_early_finish: bool,
+        sink: &'a mut dyn FnMut(&VectorStreamBatch<'_>) -> VectorStreamControl,
+        control: &'a mut dyn FnMut() -> VectorStreamControl,
+    ) -> Self {
+        Self {
+            query_index,
+            query,
+            node_to_row,
+            floor,
+            allow_early_finish,
+            hops: 0,
+            flushed_once: false,
+            scores: Vec::with_capacity(STREAM_BATCH_ROWS),
+            slots: Vec::with_capacity(STREAM_BATCH_ROWS),
+            sink,
+            control,
+            stopped: false,
+            finish_reason: None,
+            emitted: 0,
+        }
+    }
+
     pub(super) fn apply(&mut self, decision: VectorStreamControl) {
         match decision {
             VectorStreamControl::Continue => {}

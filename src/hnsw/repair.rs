@@ -7,8 +7,8 @@ use crate::boolean_bits::Bits;
 use crate::vector::Mask;
 
 use super::graph::{
-    with_scratch, FloorPrune, LinkBuilder, NoHook, Patience, Scored, Scratch, SearchStats, View,
-    NO_NODE,
+    with_scratch, FloorPrune, LayerSearch, LinkBuilder, NoHook, Patience, Scored, Scratch,
+    SearchStats, View, NO_NODE,
 };
 use super::merge::{force_incoming_from_visited, try_connect_visited_to_island};
 
@@ -339,19 +339,16 @@ fn bridge_isolated_island(
     let q = view.row(w);
     let ep = descend_visited_anchor(view, q, entry, top, &state.visited);
     let mut stats = SearchStats::default();
-    view.search_layer(
+    let search = LayerSearch {
         q,
-        &[ep],
-        builder.ef_construction.max(view.m0),
-        0,
-        Some(Mask::Bits(&state.visited)),
-        Patience::OFF,
-        FloorPrune::OFF,
-        None,
-        scratch,
-        &mut NoHook,
-        &mut stats,
-    );
+        ef: builder.ef_construction.max(view.m0),
+        layer: 0,
+        allow: Some(Mask::Bits(&state.visited)),
+        patience: Patience::OFF,
+        floor_prune: FloorPrune::OFF,
+        locks: None,
+    };
+    view.search_layer(&search, &[ep], scratch, &mut NoHook, &mut stats);
     let mut pv = scratch.drain_results();
     if pv.is_empty() {
         pv.push(Scored {
@@ -435,7 +432,7 @@ fn bridge_upper_layers(
             let mut cb_pool = Vec::new();
             for &r in &up_sel {
                 if visited.test(r as usize) {
-                    builder.connect_back(r, w, layer, view.m, None, &mut cb_pool, scratch);
+                    builder.connect_back(r, w, layer, None, &mut cb_pool, scratch);
                 }
             }
         }
