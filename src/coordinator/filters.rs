@@ -33,6 +33,8 @@ pub struct RequestFilters {
     /// (`StartShardSearch.filter_strategy` / `enumerate_all`).
     pub filter_strategy: i32,
     pub enumerate_all: bool,
+    /// Staged top-k selection (`StartShardSearch.staged_selection`).
+    pub staged_selection: bool,
     /// Score every admitted row from the shard-local FP32 sidecar.
     pub exact_fp32_scan: bool,
 }
@@ -101,6 +103,7 @@ impl RequestFilters {
             enumerate_max_rows: None,
             filter_strategy: 0,
             enumerate_all: false,
+            staged_selection: false,
             patience_saturation_ppm: None,
             patience_hops: None,
             finish_settle_us: None,

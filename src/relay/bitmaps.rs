@@ -148,20 +148,7 @@ fn bitmap_filters(req: &crate::pb::FilterBitmapRequest) -> RequestFilters {
     RequestFilters {
         geo: req.geo_filters.clone(),
         tree: req.filter.clone(),
-        enumerate_max_rows: None,
-        filter_strategy: 0,
-        enumerate_all: false,
-        exact_fp32_scan: false,
-        patience_saturation_ppm: None,
-        patience_hops: None,
-        finish_settle_us: None,
-        finish_deadline_us: None,
-        floor_prune: None,
-        floor_k: None,
-        parent_floor_share_ppm: None,
-        floor_greediness_ppm: None,
-        floor_clamp_min: None,
-        include_rerank_candidate: false,
+        ..Default::default()
     }
 }
 

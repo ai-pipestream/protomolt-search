@@ -25,17 +25,30 @@ pub(super) struct PolicyKnobs {
     /// `DenseFilterStrategy` and whole-set enumeration for the shards.
     pub(super) filter_strategy: i32,
     pub(super) enumerate_all: bool,
+    pub(super) staged_selection: bool,
 }
 
 impl PolicyKnobs {
-    fn from_plan(plan: &ResolvedDensePlan) -> Self {
-        let patience = plan.preset.and_then(|preset| preset.patience);
+    /// A measured point's controls when one qualified the plan, else the
+    /// built-in preset's.
+    fn from_plan(plan: &ResolvedDensePlan, point: Option<&crate::pb::DensePolicyPoint>) -> Self {
+        let preset_patience = plan.preset.and_then(|preset| preset.patience);
+        let patience = match point {
+            Some(point) => point.patience_saturation_ppm.zip(point.patience_hops),
+            None => preset_patience,
+        };
         PolicyKnobs {
+            enumerate_max_rows: point.and_then(|p| p.enumerate_max_rows),
+            finish_settle_us: point.and_then(|p| p.finish_settle_us),
+            floor_prune: point.and_then(|p| p.floor_greediness_ppm.map(|_| true)),
+            floor_greediness_ppm: point.and_then(|p| p.floor_greediness_ppm),
+            floor_clamp_min: point.and_then(|p| p.floor_clamp_min),
             patience_saturation_ppm: patience.map(|(ppm, _)| ppm),
             patience_hops: patience.map(|(_, hops)| hops),
             filter_strategy: plan.filter_strategy as i32,
             enumerate_all: plan.route == Route::EnumerateAll,
-            ..Default::default()
+            staged_selection: plan.route == Route::Staged
+                || plan.pool_selection == crate::pb::DenseTechnique::BitplaneStaged,
         }
     }
 }
@@ -45,6 +58,9 @@ impl PolicyKnobs {
 pub(super) struct DensePlan {
     pub(super) execution: Option<DenseExecutionOutcome>,
     pub(super) plan: Option<ResolvedDensePlan>,
+    /// A qualifying policy point fixes the candidate depth AUTO runs at: the
+    /// depth that was measured, reported back, and never widened.
+    pub(super) policy_depth: Option<u32>,
     /// Physical rows across the fleet, the depth an FP32 row scan fetches.
     pub(super) rows: u64,
     pub(super) knobs: PolicyKnobs,
@@ -63,12 +79,16 @@ impl DensePlan {
     }
 }
 
-/// Resolve the dense leaf's execution plan against the live provider.
-pub(super) async fn resolve_dense(base: &Base<'_>) -> Result<DensePlan, Status> {
+/// Resolve the dense leaf's execution plan against the live provider. The
+/// policy key AUTO is judged on is k as sent, the named candidate depth,
+/// and the request's filters (their live selectivity is measured only when
+/// a policy is consulted).
+pub(super) async fn resolve_dense(base: &Base<'_>, filter: &str) -> Result<DensePlan, Status> {
     let Some(query) = base.plan.dense_query() else {
         return Ok(DensePlan {
             execution: None,
             plan: None,
+            policy_depth: None,
             rows: 0,
             knobs: PolicyKnobs::default(),
             fp32_pool: false,
@@ -78,12 +98,23 @@ pub(super) async fn resolve_dense(base: &Base<'_>) -> Result<DensePlan, Status> 
     };
     let request =
         crate::dense_execution::parse_request(query).map_err(crate::coordinator::dense_status)?;
+    let geo_filters = &base.plan.geo_filters;
+    let filters = (!geo_filters.is_empty() || !filter.is_empty())
+        .then(|| crate::coordinator::RequestFilters::compile(geo_filters, filter))
+        .transpose()?;
+    let key = crate::coordinator::DenseRequestKey {
+        k: base.req.k,
+        candidate_depth: base.req.selection_k,
+        filters: filters.as_ref(),
+    };
     let planned = base
         .coordinator
-        .resolve_dense_execution(request, query.vector.len())
+        .resolve_dense_execution(request, query.vector.len(), key)
         .await?;
+    let point = planned.outcome.policy_point;
     Ok(DensePlan {
-        knobs: PolicyKnobs::from_plan(&planned.plan),
+        knobs: PolicyKnobs::from_plan(&planned.plan, point.as_ref()),
+        policy_depth: point.map(|p| p.candidates),
         execution: Some(planned.outcome),
         rows: planned.rows,
         fp32_pool: false,
@@ -119,6 +150,12 @@ pub(super) fn fp32_pool(shape: &Shape<'_>, dense: &DensePlan) -> Result<bool, St
                 return Err(refuse(
                     "FP32 precision on a quantized provider is served on a single dense \
                      selection only; composite fusion consumes provider-native dense scores",
+                ));
+            }
+            if dense.knobs.finish_settle_us.is_some() {
+                return Err(refuse(
+                    "composite fusion runs non-streaming leg rounds and cannot serve \
+                     finish_settle_us",
                 ));
             }
             Ok(false)

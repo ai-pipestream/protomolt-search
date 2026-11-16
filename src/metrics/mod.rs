@@ -45,8 +45,8 @@ pub use gauges::{
     GaugeProvider, MemberGaugeProvider, MemberGauges, PeerRejectionGauges, ShardGauges,
 };
 pub use registry::{
-    add_ingested, read, read_with_member, record_scan, record_scan_pass, scan_pass_totals,
-    HistogramReading, Reading,
+    add_ingested, dense_policy_drift_total, read, read_with_member, record_dense_policy_drift,
+    record_scan, record_scan_pass, scan_pass_totals, HistogramReading, Reading,
 };
 pub use render::{render, render_reading, render_with_member, write_metric, write_metric_seconds};
 pub use routes::Route;

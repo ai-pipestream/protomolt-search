@@ -36,6 +36,9 @@ impl FilterRouting {
 pub struct SelectionControls {
     pub filter_routing: FilterRouting,
     pub enumerate_all: bool,
+    /// Select by staged top-k on a provider that advertises
+    /// `VectorCapability::StagedTopK`; every other provider refuses it.
+    pub staged: bool,
 }
 
 /// How a provider that can steer its search by the mask answers a filtered

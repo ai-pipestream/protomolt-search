@@ -239,6 +239,15 @@ pub struct FleetVectorIdentity {
     pub rows: u64,
 }
 
+/// Request-side key for dense execution policy lookup: raw `k`, optional
+/// `candidate_depth` (`selection_k`), and compiled filters for live selectivity.
+#[derive(Debug, Clone, Copy)]
+pub struct DenseRequestKey<'a> {
+    pub k: u32,
+    pub candidate_depth: u32,
+    pub filters: Option<&'a RequestFilters>,
+}
+
 /// Hold `actual` as the fleet-wide value on first sight, and refuse with
 /// `mismatch` when a later shard reports a different one.
 fn hold_uniform<T: PartialEq>(

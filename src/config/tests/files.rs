@@ -244,22 +244,20 @@ nodes = ["host-b:50051"]
 }
 
 #[test]
-fn dense_execution_policy_is_refused_in_file_collections_and_cli() {
+fn dense_execution_policy_parses_v2_paths_and_refuses_v1_toml_at_load() {
     let top_file = temp_file(
         "pipestream_search_dense_policy_top",
         r#"
 role = "coordinator"
 nodes = ["host-a:50051"]
-dense_execution_policy = "/etc/pipestream/policy.toml"
+dense_execution_policy = "/etc/pipestream/policy.binpb"
 "#,
     );
-    let top_err = parse(&args(&[&config_flag(&top_file)])).unwrap_err();
+    let top_cfg = parse(&args(&[&config_flag(&top_file)])).unwrap();
     let _ = std::fs::remove_file(&top_file);
-    assert!(
-        top_err.contains("dense_execution_policy")
-            && top_err.contains("not supported on this build")
-            && top_err.contains("version-1 TOML"),
-        "{top_err}"
+    assert_eq!(
+        top_cfg.dense_execution_policy.as_deref(),
+        Some(std::path::Path::new("/etc/pipestream/policy.binpb"))
     );
 
     let col_file = temp_file(
@@ -270,36 +268,37 @@ role = "coordinator"
 [[collections]]
 name = "books"
 nodes = ["host-a:50051"]
-dense_execution_policy = "/etc/pipestream/books-policy.toml"
+dense_execution_policy = "/etc/pipestream/books-policy.binpb"
 "#,
     );
-    let col_err = parse(&args(&[&config_flag(&col_file)])).unwrap_err();
+    let col_cfg = parse(&args(&[&config_flag(&col_file)])).unwrap();
     let _ = std::fs::remove_file(&col_file);
-    assert!(
-        col_err.contains("collections[0]")
-            && col_err.contains("dense_execution_policy")
-            && col_err.contains("not supported on this build"),
-        "{col_err}"
+    assert_eq!(
+        col_cfg.collections[0].dense_execution_policy.as_deref(),
+        Some(std::path::Path::new("/etc/pipestream/books-policy.binpb"))
     );
 
-    let cli_err = parse(&args(&[
+    let v1_toml = temp_file(
+        "pipestream_search_dense_policy_v1_toml",
+        "format_version = 1\npolicy_id = \"retired-v1\"\n",
+    );
+    let cli_cfg = parse(&args(&[
         "--role=coordinator",
         "--nodes=host-a:50051",
-        "--dense-execution-policy=/etc/pipestream/policy.toml",
+        &format!("--dense-execution-policy={}", v1_toml.display()),
     ]))
+    .unwrap();
+    let load_err = crate::dense_policy::DenseExecutionPolicy::load(
+        cli_cfg.dense_execution_policy.as_deref().unwrap(),
+    )
     .unwrap_err();
-    assert!(
-        cli_err.contains("dense_execution_policy")
-            && cli_err.contains("not supported on this build"),
-        "{cli_err}"
-    );
+    let _ = std::fs::remove_file(&v1_toml);
+    assert!(load_err.contains("version-2"), "{load_err}");
 }
 
 #[test]
 fn a_blank_dense_execution_policy_is_refused_everywhere() {
-    let refused = |err: &str| {
-        err.contains("dense_execution_policy") && err.contains("not supported on this build")
-    };
+    let refused = |err: &str| err.contains("`dense_execution_policy` is blank");
     for (tag, body) in [
         (
             "top",

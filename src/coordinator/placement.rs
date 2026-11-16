@@ -124,6 +124,7 @@ impl PlanCounter<'_> {
                 ))
             })?;
         }
+        // A predicate count reads no scan knobs.
         let filters = RequestFilters {
             tree,
             ..Default::default()

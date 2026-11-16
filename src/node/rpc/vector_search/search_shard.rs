@@ -226,7 +226,12 @@ fn run_solo_blocking(mut exec: SearchShardExec) -> Result<ScanOutcome, Status> {
         keep_ties: exec.start.tie_complete,
         allow: filters.allow.as_ref().map(crate::vector::Mask::Bits),
         enumerate_max_rows: exec.start.enumerate_max_rows.map(|r| r as usize),
-        controls: selection_controls(index, exec.start.filter_strategy, exec.start.enumerate_all)?,
+        controls: selection_controls(
+            index,
+            exec.start.filter_strategy,
+            exec.start.enumerate_all,
+            exec.start.staged_selection,
+        )?,
         patience,
         floor_prune,
     }];
@@ -289,6 +294,7 @@ async fn enqueue_coalesced_scan(
         enumerate_max_rows: exec.start.enumerate_max_rows,
         filter_strategy: exec.start.filter_strategy,
         enumerate_all: exec.start.enumerate_all,
+        staged_selection: exec.start.staged_selection,
         patience_saturation_ppm: exec.start.patience_saturation_ppm,
         patience_hops: exec.start.patience_hops,
         floor_prune: exec.start.floor_prune,

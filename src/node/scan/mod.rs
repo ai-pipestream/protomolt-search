@@ -209,6 +209,7 @@ pub(in crate::node) struct ScanJob {
     /// The plan's filter routing and whole-set enumeration (`StartShardSearch`).
     pub(in crate::node) filter_strategy: i32,
     pub(in crate::node) enumerate_all: bool,
+    pub(in crate::node) staged_selection: bool,
     /// The request's patience early-stop parameters (`StartShardSearch`).
     pub(in crate::node) patience_saturation_ppm: Option<u32>,
     pub(in crate::node) patience_hops: Option<u32>,
@@ -354,7 +355,12 @@ impl NodeServiceImpl {
             )));
         }
         check_enumerate_threshold(index, start.enumerate_max_rows)?;
-        selection_controls(index, start.filter_strategy, start.enumerate_all)?;
+        selection_controls(
+            index,
+            start.filter_strategy,
+            start.enumerate_all,
+            start.staged_selection,
+        )?;
         check_patience_options(index, start.patience_saturation_ppm, start.patience_hops)?;
         check_floor_prune_options(
             index,
