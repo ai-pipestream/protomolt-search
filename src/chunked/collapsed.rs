@@ -1,6 +1,5 @@
 //! Collapse-by-parent chunked scan.
 
-use super::batch::fill_mask;
 use super::*;
 
 /// One collapsed candidate: a parent document represented by its best
@@ -15,8 +14,8 @@ pub struct CollapsedHit {
     pub score: f32,
 }
 
-/// Collapse-by-parent chunked scan: the top-`k` DISTINCT parents of
-/// `query`, each represented by its best chunk. `parents[slot]` maps
+/// Collapse-by-parent chunked scan: the top-`k` DISTINCT parents of the
+/// scan's query, each represented by its best chunk. `parents[slot]` maps
 /// every slot to its parent id (length must equal the index length).
 ///
 /// Collection keeps ONE running entry per parent (max score, ties to the
@@ -37,17 +36,19 @@ pub struct CollapsedHit {
 /// until unsaturated; the final call provably returned every slot at or
 /// above the floor in that chunk. Escalations count in
 /// [`ScanStats::chunk_calls`].
-#[allow(clippy::too_many_arguments)]
 pub fn chunked_topk_collapsed(
-    index: &VectorIndex,
-    query: &[f32],
-    k: usize,
-    chunk_blocks: usize,
+    scan: ChunkedScan<'_>,
     parents: &[u64],
     external_floor: &mut dyn FnMut() -> Option<f32>,
     publish_floor: &mut dyn FnMut(f32) -> bool,
-    allow: Option<&[bool]>,
 ) -> (Vec<CollapsedHit>, ScanStats) {
+    let ChunkedScan {
+        index,
+        query,
+        k,
+        chunk_blocks,
+        allow,
+    } = scan;
     let n = index.len();
     assert_eq!(parents.len(), n, "parents must map every slot of the index");
     if let Some(a) = allow {

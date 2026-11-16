@@ -55,7 +55,9 @@ impl FilterRegime {
 /// shape the caller holds. The scan kernel masks with one byte per row; a
 /// graph walk tests single rows and counts and lists the set ones, which
 /// a bitmap does a word at a time. A provider takes its own shape as it
-/// is and converts the other once per search.
+/// is and converts the other once per search; the chunked scan reads a
+/// bitmap one chunk at a time ([`Mask::any_in`], [`Mask::for_each_in`])
+/// and never expands it to a byte per row of the index.
 #[derive(Debug, Clone, Copy)]
 pub enum Mask<'a> {
     Bools(&'a [bool]),
@@ -117,6 +119,32 @@ impl<'a> Mask<'a> {
                 }
                 ControlFlow::Continue(())
             }
+        }
+    }
+
+    /// Whether any row of `[start, end)` is allowed. A bitmap answers a
+    /// word at a time, so a span the mask leaves empty costs its words.
+    pub fn any_in(&self, start: usize, end: usize) -> bool {
+        match self {
+            Mask::Bools(allow) => allow[start..end].iter().any(|&on| on),
+            Mask::Bits(bits) => bits.count_range(start, end) > 0,
+            Mask::All(len) => start < end.min(*len),
+        }
+    }
+
+    /// The allowed rows of `[start, end)` ascending, read from the mask in
+    /// the shape it is held in: no flag buffer is built for the span.
+    pub fn for_each_in(&self, start: usize, end: usize, mut each: impl FnMut(usize)) {
+        match self {
+            Mask::Bools(allow) => {
+                for (offset, &on) in allow[start..end].iter().enumerate() {
+                    if on {
+                        each(start + offset);
+                    }
+                }
+            }
+            Mask::Bits(bits) => bits.iter_range(start, end).for_each(each),
+            Mask::All(len) => (start..end.min(*len)).for_each(each),
         }
     }
 

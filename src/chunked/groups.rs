@@ -16,7 +16,9 @@ use super::*;
 /// argument unchanged. Unfiltered queries all share the `None` group.
 pub(super) struct KernelGroup<'q> {
     pub(super) members: Vec<usize>,
-    pub(super) allow: Option<std::borrow::Cow<'q, [bool]>>,
+    /// The group's allowlist as its queries hold it; the scan reads it a
+    /// chunk at a time.
+    pub(super) allow: Option<Mask<'q>>,
     pub(super) flat: Vec<f32>,
 }
 
@@ -25,7 +27,7 @@ impl<'q> KernelGroup<'q> {
         group_by_allow(queries)
             .into_iter()
             .map(|members| {
-                let allow = queries[members[0]].allow.map(|mask| mask.bools());
+                let allow = queries[members[0]].allow;
                 let mut flat: Vec<f32> =
                     Vec::with_capacity(members.iter().map(|&qi| queries[qi].vector.len()).sum());
                 for &qi in &members {
