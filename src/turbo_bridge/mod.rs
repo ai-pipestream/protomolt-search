@@ -21,6 +21,7 @@ mod nlp_columns;
 pub mod query_plan;
 pub mod rerank;
 pub mod splade;
+pub mod tensor;
 
 pub use call_policy::{remaining_deadline_duration, KserveCallPolicy, MtlsClientMaterial};
 pub use materialize::materialize_nlp_columns;

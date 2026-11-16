@@ -22,12 +22,14 @@
 //! text, the unit every persisted span uses; a snippet's `text` is the
 //! UTF-8 slice at those offsets.
 
+#![deny(clippy::result_large_err)]
+
+use std::sync::{Mutex, OnceLock};
+
 mod boundary;
 mod cut;
 #[cfg(test)]
 mod tests;
-
-use tonic::Status;
 
 pub use cut::snippets;
 
@@ -42,6 +44,125 @@ pub const MIN_MAX_CHARS: u32 = 16;
 pub const MAX_SNIPPETS: u32 = 64;
 /// Largest `max_chars` accepted: past this a snippet is a document.
 pub const MAX_CHARS: u32 = 4096;
+
+/// A compact domain error, converted to transport status only at the edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HighlightError {
+    InvalidArgument(CompactMessage),
+    Internal(CompactMessage),
+    FailedPrecondition(CompactMessage),
+}
+
+#[derive(Debug)]
+pub struct CompactMessage(u16);
+
+#[derive(Default)]
+struct MessageRegistry {
+    next_id: u16,
+    messages: std::collections::HashMap<u16, Box<str>>,
+}
+
+impl MessageRegistry {
+    fn shared() -> &'static Mutex<Self> {
+        static REGISTRY: OnceLock<Mutex<MessageRegistry>> = OnceLock::new();
+        REGISTRY.get_or_init(|| {
+            Mutex::new(MessageRegistry {
+                next_id: 1,
+                messages: std::collections::HashMap::new(),
+            })
+        })
+    }
+}
+
+impl CompactMessage {
+    fn new(text: String) -> Self {
+        let mut registry = MessageRegistry::shared()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let id = (0..=u16::MAX)
+            .map(|offset| registry.next_id.wrapping_add(offset))
+            .find(|id| !registry.messages.contains_key(id))
+            .expect("too many live highlight errors");
+        registry.next_id = id.wrapping_add(1);
+        registry.messages.insert(id, text.into_boxed_str());
+        Self(id)
+    }
+
+    fn message(&self) -> String {
+        MessageRegistry::shared()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .messages
+            .get(&self.0)
+            .expect("highlight message is registered")
+            .to_string()
+    }
+}
+
+impl Clone for CompactMessage {
+    fn clone(&self) -> Self {
+        Self::new(self.message())
+    }
+}
+
+impl PartialEq for CompactMessage {
+    fn eq(&self, other: &Self) -> bool {
+        self.message() == other.message()
+    }
+}
+
+impl Eq for CompactMessage {}
+
+impl Drop for CompactMessage {
+    fn drop(&mut self) {
+        MessageRegistry::shared()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .messages
+            .remove(&self.0);
+    }
+}
+
+impl HighlightError {
+    pub(crate) fn invalid_argument(message: impl Into<String>) -> Self {
+        Self::InvalidArgument(CompactMessage::new(message.into()))
+    }
+
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
+        Self::Internal(CompactMessage::new(message.into()))
+    }
+
+    pub(crate) fn failed_precondition(message: impl Into<String>) -> Self {
+        Self::FailedPrecondition(CompactMessage::new(message.into()))
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            Self::InvalidArgument(message)
+            | Self::Internal(message)
+            | Self::FailedPrecondition(message) => message.message(),
+        }
+    }
+}
+
+impl std::fmt::Display for HighlightError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
+impl std::error::Error for HighlightError {}
+
+impl From<HighlightError> for tonic::Status {
+    fn from(error: HighlightError) -> Self {
+        let message = error.message();
+        match error {
+            HighlightError::InvalidArgument(_) => Self::invalid_argument(message),
+            HighlightError::Internal(_) => Self::internal(message),
+            HighlightError::FailedPrecondition(_) => Self::failed_precondition(message),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -72,14 +193,14 @@ pub struct Plan {
 
 impl Plan {
     /// Validate a wire spec. `fields` empty means the body.
-    pub fn from_spec(spec: &crate::pb::HighlightSpec) -> Result<Plan, Status> {
+    pub fn from_spec(spec: &crate::pb::HighlightSpec) -> Result<Plan, HighlightError> {
         let mode = match crate::pb::HighlightMode::try_from(spec.mode) {
             Ok(crate::pb::HighlightMode::Unspecified) | Ok(crate::pb::HighlightMode::Sentence) => {
                 Mode::Sentence
             }
             Ok(crate::pb::HighlightMode::Window) => Mode::Window,
             Err(_) => {
-                return Err(Status::invalid_argument(format!(
+                return Err(HighlightError::invalid_argument(format!(
                     "HighlightSpec.mode {} is not a HighlightMode",
                     spec.mode
                 )))
@@ -88,7 +209,7 @@ impl Plan {
         let max_snippets = match spec.max_snippets {
             0 => DEFAULT_MAX_SNIPPETS,
             n if n > MAX_SNIPPETS => {
-                return Err(Status::invalid_argument(format!(
+                return Err(HighlightError::invalid_argument(format!(
                     "HighlightSpec.max_snippets {n} exceeds the maximum {MAX_SNIPPETS}"
                 )))
             }
@@ -97,12 +218,12 @@ impl Plan {
         let max_chars = match spec.max_chars {
             0 => DEFAULT_MAX_CHARS,
             n if n < MIN_MAX_CHARS => {
-                return Err(Status::invalid_argument(format!(
+                return Err(HighlightError::invalid_argument(format!(
                     "HighlightSpec.max_chars {n} is below the minimum {MIN_MAX_CHARS}"
                 )))
             }
             n if n > MAX_CHARS => {
-                return Err(Status::invalid_argument(format!(
+                return Err(HighlightError::invalid_argument(format!(
                     "HighlightSpec.max_chars {n} exceeds the maximum {MAX_CHARS}"
                 )))
             }
@@ -115,12 +236,12 @@ impl Plan {
         };
         for (i, field) in fields.iter().enumerate() {
             if field.is_empty() {
-                return Err(Status::invalid_argument(
+                return Err(HighlightError::invalid_argument(
                     "HighlightSpec.fields: a field name is empty",
                 ));
             }
             if fields[..i].contains(field) {
-                return Err(Status::invalid_argument(format!(
+                return Err(HighlightError::invalid_argument(format!(
                     "HighlightSpec.fields: {field:?} repeats"
                 )));
             }
