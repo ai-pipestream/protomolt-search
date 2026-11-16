@@ -123,7 +123,39 @@ pub(crate) fn recover_interrupted(index_path: &Path) {
     if !path.exists() {
         return;
     }
-    let bytes = std::fs::read(&path)
+    let marker = read_marker(&path);
+    if marker.layout == "segments" {
+        roll_back_segments(index_path, &path, &marker);
+    } else {
+        roll_back_generation(index_path, &marker);
+    }
+    if !marker.walless {
+        let new_gen = wal::gen_dir(&wal::wal_dir(index_path), marker.new_wal_generation);
+        if new_gen.exists() {
+            must(
+                "remove the rewritten WAL generation",
+                std::fs::remove_dir_all(&new_gen),
+            );
+        }
+    }
+    must("remove the marker", std::fs::remove_file(&path));
+    must("fsync", crate::postings::fsync_parent(&path));
+    eprintln!(
+        "compaction: rolled back; the work directory {} was left for inspection and a retry \
+         refuses it until it is removed",
+        marker.work_dir.display()
+    );
+}
+
+fn must(what: &str, result: std::io::Result<()>) {
+    if let Err(error) = result {
+        panic!("compaction rollback: {what}: {error}");
+    }
+}
+
+/// Read and announce the marker; one that cannot be read is a hard stop.
+fn read_marker(path: &Path) -> CommitMarker {
+    let bytes = std::fs::read(path)
         .unwrap_or_else(|error| panic!("read compaction marker {}: {error}", path.display()));
     let marker: CommitMarker = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
         panic!(
@@ -154,75 +186,58 @@ pub(crate) fn recover_interrupted(index_path: &Path) {
             marker.old_wal_generation
         );
     }
-    let must = |what: &str, result: std::io::Result<()>| {
-        if let Err(error) = result {
-            panic!("compaction rollback: {what}: {error}");
+    marker
+}
+
+fn roll_back_segments(index_path: &Path, path: &Path, marker: &CommitMarker) {
+    let root = crate::node::segments_root(index_path);
+    let backup = manifest_backup_path(&root);
+    if backup.exists() {
+        must(
+            "restore the segment set manifest",
+            std::fs::rename(&backup, SegmentCatalog::manifest_path(&root)),
+        );
+    } else if !marker.staged_segments.is_empty() {
+        // The backup is written before the marker and removed only
+        // by the commit, which removes the marker first: a marker
+        // without a backup is a state the protocol cannot produce.
+        panic!(
+            "compaction rollback: {} exists but {} does not; the on-disk state is not one \
+             the cutover protocol produces — resolve by hand",
+            path.display(),
+            backup.display()
+        );
+    }
+    for id in &marker.staged_segments {
+        let dir = SegmentCatalog::segment_dir(&root, id);
+        if dir.exists() {
+            must("remove a staged segment", std::fs::remove_dir_all(&dir));
         }
-    };
-    if marker.layout == "segments" {
-        let root = crate::node::segments_root(index_path);
-        let backup = manifest_backup_path(&root);
-        if backup.exists() {
-            must(
-                "restore the segment set manifest",
-                std::fs::rename(&backup, SegmentCatalog::manifest_path(&root)),
-            );
-        } else if !marker.staged_segments.is_empty() {
-            // The backup is written before the marker and removed only
-            // by the commit, which removes the marker first: a marker
-            // without a backup is a state the protocol cannot produce.
-            panic!(
-                "compaction rollback: {} exists but {} does not; the on-disk state is not one \
-                 the cutover protocol produces — resolve by hand",
-                path.display(),
-                backup.display()
-            );
-        }
-        for id in &marker.staged_segments {
-            let dir = SegmentCatalog::segment_dir(&root, id);
-            if dir.exists() {
-                must("remove a staged segment", std::fs::remove_dir_all(&dir));
-            }
-        }
-    } else {
-        let snap = crate::node::generation_dir(index_path);
-        let old = crate::node::generation_old_dir(index_path);
-        if old.exists() {
-            // The swap began: the old generation is aside. Whether the
-            // new one got renamed in or not, put the old one back.
-            if snap.exists() {
-                must(
-                    "remove the compacted generation",
-                    std::fs::remove_dir_all(&snap),
-                );
-            }
-            must(
-                "restore the previous generation",
-                std::fs::rename(&old, &snap),
-            );
-        } else if !marker.previous_snapshot && snap.exists() {
-            // Legacy layout: nothing was moved aside, so a generation
-            // directory can only be the compacted one.
+    }
+}
+
+fn roll_back_generation(index_path: &Path, marker: &CommitMarker) {
+    let snap = crate::node::generation_dir(index_path);
+    let old = crate::node::generation_old_dir(index_path);
+    if old.exists() {
+        // The swap began: the old generation is aside. Whether the
+        // new one got renamed in or not, put the old one back.
+        if snap.exists() {
             must(
                 "remove the compacted generation",
                 std::fs::remove_dir_all(&snap),
             );
         }
+        must(
+            "restore the previous generation",
+            std::fs::rename(&old, &snap),
+        );
+    } else if !marker.previous_snapshot && snap.exists() {
+        // Legacy layout: nothing was moved aside, so a generation
+        // directory can only be the compacted one.
+        must(
+            "remove the compacted generation",
+            std::fs::remove_dir_all(&snap),
+        );
     }
-    if !marker.walless {
-        let new_gen = wal::gen_dir(&wal::wal_dir(index_path), marker.new_wal_generation);
-        if new_gen.exists() {
-            must(
-                "remove the rewritten WAL generation",
-                std::fs::remove_dir_all(&new_gen),
-            );
-        }
-    }
-    must("remove the marker", std::fs::remove_file(&path));
-    must("fsync", crate::postings::fsync_parent(&path));
-    eprintln!(
-        "compaction: rolled back; the work directory {} was left for inspection and a retry \
-         refuses it until it is removed",
-        marker.work_dir.display()
-    );
 }

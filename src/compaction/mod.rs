@@ -225,21 +225,7 @@ impl NodeServiceImpl {
         } else {
             request.tail_bound
         } as usize;
-        if self
-            .compacting
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::Acquire,
-                std::sync::atomic::Ordering::Relaxed,
-            )
-            .is_err()
-        {
-            return Err(Status::failed_precondition(
-                "a compaction is already running on this shard",
-            ));
-        }
-        let _gate = CompactingGuard(std::sync::Arc::clone(&self.compacting));
+        let _gate = self.claim_compaction()?;
         let preflight = self.preflight_at_row_boundary(request)?;
         let preflight = match preflight {
             PreflightKind::Wal(preflight) => preflight,
@@ -298,6 +284,25 @@ impl NodeServiceImpl {
             }
             Err(status) => Err(status),
         }
+    }
+
+    /// Claim the per-shard compaction gate, refusing a second concurrent run.
+    fn claim_compaction(&self) -> Result<CompactingGuard, Status> {
+        if self
+            .compacting
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::Acquire,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return Err(Status::failed_precondition(
+                "a compaction is already running on this shard",
+            ));
+        }
+        Ok(CompactingGuard(std::sync::Arc::clone(&self.compacting)))
     }
 }
 
