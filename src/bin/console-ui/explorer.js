@@ -2,7 +2,7 @@
 // response shapes from /api/describe, a JSON editor that a click on a
 // field fills in, and the call itself through /api/rpc or /api/stream.
 import {
-  api, el, clear, fmtMs, loadConfig, grpcurlFor, mountHeader, copyText, errorText,
+  api, el, clear, fmtMs, loadRawConfig, grpcurlFor, mountHeader, copyText, errorText,
 } from './common.js';
 import { defaultValue, insertAt } from './query-state.js';
 
@@ -25,7 +25,7 @@ init();
 
 async function init() {
   try {
-    state.config = await loadConfig();
+    state.config = await loadRawConfig();
   } catch (e) {
     showError(e);
     state.config = { methods: [], nodes: [] };

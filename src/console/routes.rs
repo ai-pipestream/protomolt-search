@@ -1,5 +1,6 @@
-//! The UI's convenience routes: health, stored documents by slot range,
-//! and the analysis endpoint's embedding.
+//! The explorer's convenience routes, and the reads the BFF shares with
+//! them: health, stored documents by slot range, and the analysis
+//! endpoint's embedding.
 
 use super::*;
 
@@ -127,49 +128,54 @@ fn route_doc_ids(ranges: &[ShardRange], ids: Vec<u64>) -> (ShardIds, Vec<u64>) {
     (by_shard, unrouted)
 }
 
-/// One shard's stored documents as the UI's JSON rows.
+/// One shard's stored documents.
 async fn shard_documents(
     ctx: &Ctx,
     shard: u32,
     addr: &str,
     doc_ids: Vec<u64>,
-) -> Result<Vec<Value>, Reply> {
-    let mut client = ctx
-        .node_client(addr)
-        .map_err(|e| Reply::error(502, "UNAVAILABLE", e))?;
-    let found = match client.get_documents(GetDocumentsRequest { doc_ids }).await {
-        Ok(r) => r.into_inner(),
-        Err(status) => {
-            return Err(Reply::error(
-                http_status(status.code()),
-                code_name(status.code()),
-                format!("get_documents on shard {shard}: {}", status.message()),
-            ))
-        }
-    };
-    Ok(found
-        .documents
-        .into_iter()
-        .map(|doc| {
-            json!({
-                "doc_id": doc.doc_id.to_string(),
-                "shard": shard,
-                "text": doc.text,
-                "lineage": doc.lineage.map(|l| json!({
-                    "parent_id": l.parent_id.to_string(),
-                    "group_id": l.group_id.to_string(),
-                    "span_start": l.span_start,
-                    "span_end": l.span_end,
-                })),
-            })
-        })
-        .collect())
+) -> Result<Vec<StoredDocument>, Status> {
+    let mut client = ctx.node_client(addr).map_err(Status::unavailable)?;
+    match client.get_documents(GetDocumentsRequest { doc_ids }).await {
+        Ok(r) => Ok(r.into_inner().documents),
+        Err(status) => Err(Status::new(
+            status.code(),
+            format!("get_documents on shard {shard}: {}", status.message()),
+        )),
+    }
 }
 
-/// Stored text for global document ids, from the owning nodes: an id
-/// belongs to the shard whose slot range holds it. The shards are read
-/// concurrently and their rows returned in shard order; the first shard
-/// to fail answers for the call and the other reads are cancelled.
+/// Stored documents per shard, in shard order, and the ids no shard holds.
+pub(super) type ShardDocuments = (Vec<(u32, Vec<StoredDocument>)>, Vec<u64>);
+
+/// Stored documents for global ids, from the owning nodes: an id belongs
+/// to the shard whose slot range holds it. The shards are read
+/// concurrently; the first shard to fail answers for the call and the
+/// other reads are cancelled.
+pub(super) async fn read_documents(
+    ctx: &Arc<Ctx>,
+    ids: Vec<u64>,
+) -> Result<ShardDocuments, Status> {
+    let ranges = shard_ranges(ctx).await.map_err(Status::unavailable)?;
+    let (by_shard, unrouted) = route_doc_ids(&ranges, ids);
+    let mut reads = tokio::task::JoinSet::new();
+    for (shard, (addr, doc_ids)) in by_shard {
+        let ctx = Arc::clone(ctx);
+        reads.spawn(async move {
+            let docs = shard_documents(&ctx, shard, &addr, doc_ids).await;
+            docs.map(|docs| (shard, docs))
+        });
+    }
+    let mut per_shard = Vec::new();
+    while let Some(joined) = reads.join_next().await {
+        per_shard.push(joined.map_err(|e| Status::internal(format!("shard read: {e}")))??);
+    }
+    per_shard.sort_by_key(|(shard, _)| *shard);
+    Ok((per_shard, unrouted))
+}
+
+/// `POST /api/documents`: stored text for global document ids as the
+/// explorer's JSON rows.
 pub(super) async fn documents(ctx: &Arc<Ctx>, body: &[u8]) -> Reply {
     let parsed: DocumentsBody = match serde_json::from_slice(body) {
         Ok(b) => b,
@@ -179,29 +185,14 @@ pub(super) async fn documents(ctx: &Arc<Ctx>, body: &[u8]) -> Reply {
         Ok(ids) => ids,
         Err(reply) => return reply,
     };
-    let ranges = match shard_ranges(ctx).await {
-        Ok(r) => r,
-        Err(e) => return Reply::error(502, "UNAVAILABLE", e),
+    let (per_shard, unrouted) = match read_documents(ctx, ids).await {
+        Ok(read) => read,
+        Err(status) => return status_reply(&status),
     };
-    let (by_shard, unrouted) = route_doc_ids(&ranges, ids);
-    let mut reads = tokio::task::JoinSet::new();
-    for (shard, (addr, doc_ids)) in by_shard {
-        let ctx = Arc::clone(ctx);
-        reads.spawn(async move {
-            let rows = shard_documents(&ctx, shard, &addr, doc_ids).await;
-            rows.map(|rows| (shard, rows))
-        });
-    }
-    let mut per_shard = Vec::new();
-    while let Some(joined) = reads.join_next().await {
-        match joined {
-            Ok(Ok(rows)) => per_shard.push(rows),
-            Ok(Err(reply)) => return reply,
-            Err(e) => return Reply::error(500, "INTERNAL", format!("shard read: {e}")),
-        }
-    }
-    per_shard.sort_by_key(|(shard, _)| *shard);
-    let documents: Vec<Value> = per_shard.into_iter().flat_map(|(_, rows)| rows).collect();
+    let documents: Vec<Value> = per_shard
+        .into_iter()
+        .flat_map(|(shard, docs)| docs.into_iter().map(move |doc| document_row(shard, doc)))
+        .collect();
     Reply::json(
         200,
         json!({
@@ -211,22 +202,39 @@ pub(super) async fn documents(ctx: &Arc<Ctx>, body: &[u8]) -> Reply {
     )
 }
 
+fn document_row(shard: u32, doc: StoredDocument) -> Value {
+    json!({
+        "doc_id": doc.doc_id.to_string(),
+        "shard": shard,
+        "text": doc.text,
+        "lineage": doc.lineage.map(|l| json!({
+            "parent_id": l.parent_id.to_string(),
+            "group_id": l.group_id.to_string(),
+            "span_start": l.span_start,
+            "span_end": l.span_end,
+        })),
+    })
+}
+
 #[derive(serde::Deserialize)]
 pub(super) struct EmbedBody {
     #[serde(default)]
     pub(super) text: String,
 }
 
-/// One query text embedded by the `--analysis` endpoint, dialed with the
+/// One text embedded by the `--analysis` endpoint, dialed with the
 /// console's client TLS material and bearer token (see `embed_options`).
-pub(super) async fn embed(ctx: &Ctx, body: &[u8]) -> Reply {
+pub(super) async fn embed_vector(ctx: &Ctx, text: &str) -> Result<Vec<f32>, Status> {
     let Some(addr) = ctx.analysis.as_deref() else {
-        return Reply::error(
-            501,
-            "UNIMPLEMENTED",
-            "no --analysis sidecar configured; dense queries need a pasted vector",
-        );
+        return Err(Status::unimplemented(
+            "no --analysis endpoint is configured; dense queries need a pasted vector",
+        ));
     };
+    crate::analyzer::embed_text_with_options(addr, text, &ctx.embed).await
+}
+
+/// `POST /api/embed`: one query text's embedding.
+pub(super) async fn embed(ctx: &Ctx, body: &[u8]) -> Reply {
     let parsed: EmbedBody = match serde_json::from_slice(body) {
         Ok(b) => b,
         Err(e) => return Reply::error(400, "INVALID_ARGUMENT", format!("bad request: {e}")),
@@ -235,7 +243,7 @@ pub(super) async fn embed(ctx: &Ctx, body: &[u8]) -> Reply {
         return Reply::error(400, "INVALID_ARGUMENT", "text is required");
     }
     let started = Instant::now();
-    match crate::analyzer::embed_text_with_options(addr, &parsed.text, &ctx.embed).await {
+    match embed_vector(ctx, &parsed.text).await {
         Ok(vector) => Reply::json(
             200,
             json!({

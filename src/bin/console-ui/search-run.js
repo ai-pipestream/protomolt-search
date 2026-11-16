@@ -1,6 +1,7 @@
 // Running a query: paging, timed runs, errors, the filter chips and
 // drill-down, and the top-level render of a response.
-import { api, clear, el, errorText, fmtMs } from './common.js';
+import { bff } from './bff.js';
+import { clear, el, errorText, fmtMs } from './common.js';
 import {
   celString, compareRuns, distribution, encodeState, splitConjuncts, toggleConjunct,
 } from './query-state.js';
@@ -39,7 +40,7 @@ export async function run({ paging = false, push = true } = {}) {
   $('run').disabled = true;
   const started = performance.now();
   try {
-    const response = await api.rpc('SearchService', 'Query', request);
+    const response = await bff.call('Query', request);
     response._wall_ms = performance.now() - started;
     state.response = response;
     await render(response);
@@ -81,7 +82,7 @@ export async function timeQuery() {
     for (let i = 0; i < TIMED_RUNS; i++) {
       button.textContent = `${i + 1}/${TIMED_RUNS}`;
       const started = performance.now();
-      const r = await api.rpc('SearchService', 'Query', request);
+      const r = await bff.call('Query', request);
       timing.wall.push(performance.now() - started);
       timing.server.push(Number(r.profile?.totalMs ?? 0));
       const hits = r.groups?.length ? r.groups.flatMap((g) => g.hits || []) : r.hits || [];

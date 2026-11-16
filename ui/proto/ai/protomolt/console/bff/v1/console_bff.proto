@@ -1,0 +1,126 @@
+// The console's browser-facing surface. The console serves this service
+// as the Connect protocol under /bff/v1 and is its only implementation;
+// every method is read-only and routed to the coordinator by the console,
+// never to an address or node the browser names. The search methods take
+// and return the coordinator's own messages unchanged.
+syntax = "proto3";
+
+package ai.protomolt.console.bff.v1;
+
+import "ai/protomolt/search/v1/search.proto";
+
+service ConsoleBffService {
+  // One query through the coordinator's Query.
+  rpc Query(ai.protomolt.search.v1.QueryRequest) returns (ai.protomolt.search.v1.QueryResponse);
+  // Progressive results through the coordinator's QueryStream.
+  rpc QueryStream(ai.protomolt.search.v1.QueryStreamRequest) returns (stream ai.protomolt.search.v1.QueryStreamResponse);
+  // Side-by-side variants through the coordinator's VariantSearch.
+  rpc VariantSearch(ai.protomolt.search.v1.VariantSearchRequest) returns (ai.protomolt.search.v1.VariantSearchResponse);
+  // Prefix completion over one field's dictionary.
+  rpc Suggest(ai.protomolt.search.v1.SuggestRequest) returns (ai.protomolt.search.v1.SuggestResponse);
+  // Did-you-mean corrections over one field's dictionary.
+  rpc TermSuggest(ai.protomolt.search.v1.TermSuggestRequest) returns (ai.protomolt.search.v1.TermSuggestResponse);
+  // The collections the coordinator serves, with their document counts.
+  rpc ListCollections(ListCollectionsRequest) returns (ListCollectionsResponse);
+  // The request and response shapes of one method of this service.
+  rpc DescribeMethod(DescribeMethodRequest) returns (DescribeMethodResponse);
+  // What the page needs to build requests.
+  rpc GetConsoleConfig(GetConsoleConfigRequest) returns (GetConsoleConfigResponse);
+  // Shard and document counts, without addresses or error text.
+  rpc HealthSummary(HealthSummaryRequest) returns (HealthSummaryResponse);
+  // Bounded stored-text snippets for result rows.
+  rpc PreviewDocuments(PreviewDocumentsRequest) returns (PreviewDocumentsResponse);
+  // The analysis endpoint's embedding of one short query text.
+  rpc PreviewEmbedding(PreviewEmbeddingRequest) returns (PreviewEmbeddingResponse);
+}
+
+message GetConsoleConfigRequest {}
+
+message GetConsoleConfigResponse {
+  // The analysis spec the coordinator's body field is indexed under.
+  ai.protomolt.search.v1.AnalysisSpec body_spec = 1;
+  // Whether PreviewEmbedding has an analysis endpoint to call.
+  bool embedding_available = 2;
+  // Whether the operator pages (/explorer, /dashboard) are enabled.
+  bool raw_explorer = 3;
+}
+
+message HealthSummaryRequest {
+  // Empty reports the coordinator's default collection.
+  string collection = 1;
+}
+
+message ShardSummary {
+  uint32 shard = 1;
+  bool replica = 2;
+  bool reachable = 3;
+  uint64 live_docs = 4;
+  uint64 deleted_docs = 5;
+  bool ingest_active = 6;
+}
+
+message HealthSummaryResponse {
+  repeated ShardSummary shards = 1;
+  uint64 topology_generation = 2;
+  // True when the reachable shards do not score in one space.
+  bool provider_mismatch = 3;
+  repeated string collections = 4;
+}
+
+message ListCollectionsRequest {}
+
+message CollectionSummary {
+  // Empty for the coordinator's unnamed collection.
+  string name = 1;
+  uint32 shards = 2;
+  uint64 live_docs = 3;
+}
+
+message ListCollectionsResponse {
+  repeated CollectionSummary collections = 1;
+}
+
+message DescribeMethodRequest {
+  // A method name of ConsoleBffService, e.g. "Query".
+  string method = 1;
+}
+
+message DescribeMethodResponse {
+  // The method's request and response messages and every message and
+  // enum they reach, with their .proto comments, as JSON.
+  string schema_json = 1;
+}
+
+message PreviewDocumentsRequest {
+  // At most 100 global document ids.
+  repeated uint64 doc_ids = 1;
+  // Snippet length in characters: 0 selects 600, at most 4000.
+  uint32 max_chars = 2;
+}
+
+message DocumentPreview {
+  uint64 doc_id = 1;
+  uint32 shard = 2;
+  string snippet = 3;
+  // Whether the stored text was longer than the snippet.
+  bool truncated = 4;
+  // The parent document, for a chunk.
+  uint64 parent_id = 5;
+}
+
+message PreviewDocumentsResponse {
+  repeated DocumentPreview documents = 1;
+  // Requested ids no shard's slot range holds.
+  repeated uint64 unrouted = 2;
+}
+
+message PreviewEmbeddingRequest {
+  // Non-empty, at most 8192 bytes.
+  string text = 1;
+}
+
+message PreviewEmbeddingResponse {
+  uint32 dim = 1;
+  repeated float vector = 2;
+  float ms = 3;
+}

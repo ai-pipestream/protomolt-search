@@ -1,5 +1,8 @@
-// Shared plumbing for the console pages: the facade's API, DOM helpers,
-// and the grpcurl rendering. Plain ES module, no dependencies.
+// Shared plumbing for the console pages: the BFF client, the operator
+// explorer's raw API, DOM helpers, and the grpcurl rendering. `bff.js` is
+// the Connect client `ui/` builds; `api` is the raw explorer's, served only
+// with --enable-raw-explorer.
+import { bff } from './bff.js';
 
 export const api = {
   async get(path) {
@@ -169,18 +172,42 @@ export function debounce(fn, ms) {
   };
 }
 
+// The page config from the BFF, in the shape the search page reads.
 let configCache;
 export async function loadConfig() {
-  if (!configCache) configCache = await api.get('/api/config');
+  if (!configCache) {
+    const c = await bff.call('GetConsoleConfig', {});
+    configCache = { body_spec: c.bodySpec, analysis: c.embeddingAvailable, raw_explorer: c.rawExplorer };
+  }
   return configCache;
+}
+
+// The raw explorer's config: addresses, nodes, and the exposed methods.
+export function loadRawConfig() {
+  return api.get('/api/config');
+}
+
+// Cluster health summary from the BFF, in the explorer's target shape.
+export async function healthSummary() {
+  const h = await bff.call('HealthSummary', {});
+  return {
+    targets: (h.shards || []).map((s) => ({
+      shard: s.shard, is_replica: s.replica, reachable: s.reachable, live_docs: s.liveDocs, deleted_docs: s.deletedDocs,
+    })),
+    topology_generation: Number(h.topologyGeneration || 0),
+    collections: h.collections || [],
+  };
 }
 
 // A working grpcurl line for the same call. The token itself never
 // reaches the browser, so it is spelled as a shell variable.
+// Without the raw explorer the page knows neither the coordinator nor its
+// transport, so both are shell variables.
 export function grpcurlFor(config, service, method, body) {
-  const target = (config.coordinator || '').replace(/^https?:\/\//, '');
+  const target = (config.coordinator || '$COORDINATOR').replace(/^https?:\/\//, '');
   const parts = ['grpcurl'];
-  if (config.tls) parts.push('-cacert ca.pem -cert client.pem -key client.key');
+  if (config.tls === undefined && !config.coordinator) parts.push('$GRPCURL_FLAGS');
+  else if (config.tls) parts.push('-cacert ca.pem -cert client.pem -key client.key');
   else parts.push('-plaintext');
   if (config.bearer) parts.push(`-H "authorization: Bearer $BEARER_TOKEN"`);
   const json = JSON.stringify(body).replace(/'/g, `'\\''`);
@@ -196,13 +223,17 @@ export function mountHeader(current) {
     el('h1', { text: 'Pipestream Search console' }),
     el('nav', {}, [
       el('a', { href: '/', class: current === 'search' ? 'current' : '', text: 'Search' }),
-      el('a', { href: '/dashboard', class: current === 'dashboard' ? 'current' : '', text: 'Dashboard' }),
-      el('a', { href: '/explorer', class: current === 'api' ? 'current' : '', text: 'API' }),
+      el('a', { href: '/dashboard', class: `raw hidden${current === 'dashboard' ? ' current' : ''}`, text: 'Dashboard' }),
+      el('a', { href: '/explorer', class: `raw hidden${current === 'api' ? ' current' : ''}`, text: 'API' }),
     ]),
     el('span', { class: 'status', id: 'cluster-status', text: 'connecting' }),
     themeButton(),
   );
   refreshStatus();
+  // The operator pages are linked only where the console serves them.
+  loadConfig().then((c) => {
+    if (c.raw_explorer) header.querySelectorAll('nav .raw').forEach((a) => a.classList.remove('hidden'));
+  }, () => {});
 }
 
 // The colour scheme: the system's unless the viewer chose one, which is
@@ -243,7 +274,7 @@ export async function refreshStatus() {
   const node = document.getElementById('cluster-status');
   if (!node) return;
   try {
-    const health = await api.get('/api/health');
+    const health = await healthSummary();
     const targets = health.targets || [];
     const up = targets.filter((t) => t.reachable).length;
     const docs = targets.reduce((a, t) => a + Number(t.live_docs ?? t.bm25_docs ?? 0), 0);
