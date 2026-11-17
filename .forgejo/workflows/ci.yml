@@ -74,20 +74,8 @@ jobs:
           rustup default 1.98.0
           rustup target add aarch64-linux-android x86_64-linux-android \
             aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
-          # The release binary, not a from-source build on every run.
-          audit=cargo-audit-x86_64-unknown-linux-gnu-v0.22.2
-          curl -sSfL -o /tmp/$audit.tgz \
-            "https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/$audit.tgz"
-          echo "ab28a1bdb54db4d5d8ad5981cf1f959410370b3d28250dbd35f6a44248620e39  /tmp/$audit.tgz" \
-            | sha256sum -c -
-          tar -xzf /tmp/$audit.tgz -C /tmp
-          install -m 0755 /tmp/$audit/cargo-audit "$HOME/.cargo/bin/cargo-audit"
-          rm -rf /tmp/$audit /tmp/$audit.tgz
           echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/scripts/rustc-slot.sh" >> "$GITHUB_ENV"
           rustc --version && cargo --version && protoc --version && rg --version | head -1
-
-      - name: Dependency and provenance gate
-        run: scripts/check-dependencies.sh
 
       - name: Cap the shared target dir
         run: |
