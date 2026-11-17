@@ -9,8 +9,9 @@
 #
 # Cargo calls it as `rustc-slot.sh <rustc> <args...>`. The slot lock is an
 # flock on an inherited descriptor, so it is released when rustc and every
-# linker it spawned have exited, including on a crash or kill.
-set -euo pipefail
+# linker it spawned have exited, including on a crash or kill. The cap is
+# best effort: if a slot cannot be opened, rustc runs uncapped rather than
+# failing the build.
 
 for arg in "$@"; do
   # Version and target probes are instant and must never queue.
@@ -21,23 +22,32 @@ done
 
 slots=${PIPESTREAM_RUSTC_SLOTS:-12}
 dir=${PIPESTREAM_RUSTC_SLOT_DIR:-/tmp/rustc-slots}
-mkdir -p "$dir"
-chmod 1777 "$dir" 2>/dev/null || true
+mkdir -p "$dir" 2>/dev/null && chmod 1777 "$dir" 2>/dev/null
 
+# Slot files are shared between users (CI containers run as root, host
+# builds do not) in a sticky world-writable directory, where the kernel's
+# protected_regular refuses an O_CREAT open of another user's file. So a
+# missing slot is created once, and every slot is then opened read-only,
+# which flock accepts and protected_regular does not apply to.
 open_slot() {
   local path="$dir/slot-$1"
-  exec {slot_fd}>>"$path"
-  chmod 666 "$path" 2>/dev/null || true
-}
+  if [[ ! -e $path ]]; then
+    (umask 000 && : >>"$path") 2>/dev/null
+  fi
+  exec {slot_fd}<"$path"
+} 2>/dev/null
 
+opened=0
 # Take the first free slot; when every slot is busy, poll until one frees.
 while :; do
   for ((i = 1; i <= slots; i++)); do
-    open_slot "$i"
+    open_slot "$i" || continue
+    opened=1
     if flock -n "$slot_fd"; then
       exec "$@"
     fi
-    exec {slot_fd}>&-
+    exec {slot_fd}<&-
   done
+  ((opened)) || exec "$@"
   sleep 0.$((RANDOM % 5 + 2))
 done
