@@ -106,9 +106,10 @@ fn sealed_rows(guard: &ShardState) -> u64 {
 /// the WAL) until their rows seal.
 fn persist_live_docs(guard: &mut ShardState, live_docs_path: &Path) -> Result<(), Status> {
     let sealed = sealed_rows(guard);
-    guard
+    // `write` masks and bounds the bitmap to `sealed` words itself
+    // without mutating the in-memory overlay, so no sliced copy.
+    let _ = guard
         .live_docs
-        .slice(0, sealed as usize)
         .write(live_docs_path, sealed)
         .map_err(|e| Status::internal(format!("write {}: {e}", live_docs_path.display())))?;
     Ok(())

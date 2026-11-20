@@ -198,18 +198,22 @@ impl NodeServiceImpl {
         }
         self.flush_index()?;
         let started = std::time::Instant::now();
-        let mut attempts = 0u32;
-        let (manifest, bytes) = loop {
-            attempts += 1;
-            if let Some(copy) = self.export_if_flushed(&index_path, directory)? {
-                break copy;
+        // Attempt 1 is lock-free. A seal writes with the shard lock free,
+        // so steady ingest can dirty a fresh tail during every seal and
+        // starve a flush-then-check loop forever; when that happens, one
+        // retry holds the mutation gate across its seal and copy, so
+        // appends pause for a single small seal instead.
+        let (manifest, bytes) = match self.export_if_flushed(&index_path, directory)? {
+            Some(copy) => copy,
+            None => {
+                let _mutation = self.mutation_gate.blocking_write();
+                self.flush_index()?;
+                self.export_if_flushed(&index_path, directory)?.ok_or_else(|| {
+                    Status::aborted(
+                        "shard stayed dirty under an ingest drain; a snapshot copies a                          flushed generation, retry when ingest pauses",
+                    )
+                })?
             }
-            if attempts >= 8 {
-                return Err(Status::aborted(format!(
-                    "shard kept writing through {attempts} flushes; a snapshot copies a flushed generation, retry when ingest pauses"
-                )));
-            }
-            self.flush_index()?;
         };
         let copy_millis = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         let (manifest_path, manifest_sha256) = repo::write_manifest(directory, &manifest)
