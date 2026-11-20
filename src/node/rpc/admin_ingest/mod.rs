@@ -25,7 +25,7 @@ fn replication_stable_key<T>(request: &Request<T>) -> Result<Option<Vec<u8>>, St
         .transpose()?;
     if key.as_deref().is_some_and(<[u8]>::is_empty) {
         return Err(Status::invalid_argument(
-            "replication stable-key metadata is present but empty; an empty key routes              nothing and proves no colocation",
+            "replication stable-key metadata is present but empty; an empty key routes nothing and proves no colocation",
         ));
     }
     Ok(key)

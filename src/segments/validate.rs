@@ -44,14 +44,34 @@ pub(super) fn validate_manifest(manifest: &SegmentSetManifest) -> Result<(), Str
 /// version number, before any per-segment file is parsed: a format-5
 /// segment record has no colocation proof to default.
 fn validate_format(manifest: &SegmentSetManifest) -> Result<(), String> {
-    if manifest.format != SET_FORMAT {
+    validate_format_number(manifest.format)
+}
+
+/// The format refusal itself, shared by the manifest probe below.
+pub(super) fn validate_format_number(format: u32) -> Result<(), String> {
+    if format != SET_FORMAT {
         return Err(format!(
-            "segment set format {} is unsupported; this build reads only format \
-             {SET_FORMAT}, so rebuild the catalog through the reshard tool",
-            manifest.format
+            "segment set format {format} is unsupported; this build reads only format \
+             {SET_FORMAT}, so rebuild the catalog through the reshard tool"
         ));
     }
     Ok(())
+}
+
+/// The one field of a set manifest read before the manifest itself:
+/// deserializing a pre-6 manifest whole would fail on segment fields
+/// it predates, masking the version refusal with a serde error.
+#[derive(Deserialize)]
+struct SetFormatProbe {
+    format: u32,
+}
+
+/// Refuse `bytes` by format number before a caller deserializes the
+/// manifest they carry.
+pub(super) fn probe_set_format(bytes: &[u8]) -> Result<(), String> {
+    let probe: SetFormatProbe = serde_json::from_slice(bytes)
+        .map_err(|error| format!("parse segment set format: {error}"))?;
+    validate_format_number(probe.format)
 }
 
 /// A documents-only segment records no vector and no exact rows (both

@@ -28,9 +28,7 @@ use crate::fixture::{self, Fixture};
 use crate::util::{
     arg, dot, harness, host, host_threads, list_usize, par_map, write_json, Error, TopK,
 };
-
 static NEXT_DIR: AtomicU32 = AtomicU32::new(0);
-
 fn scratch_dir(tag: &str) -> Result<PathBuf, Error> {
     let dir = std::env::temp_dir().join(format!(
         "ann-tail-{tag}-{}-{}",

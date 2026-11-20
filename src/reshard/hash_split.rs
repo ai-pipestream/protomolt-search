@@ -206,10 +206,10 @@ fn split_rehashed(
     }
     replay.compact();
     let routes = parent_routes(&replay);
-    let keys = replay.stable_keys.clone();
+    let lineage = super::parent_routing::lineage_keys(&replay);
     let divergent = std::cell::RefCell::new(vec![false; n]);
     let partitions = distribute(replay, n, |id, key| {
-        let (child, keyed) = parent_child(&routes, &keys, id, key, n);
+        let (child, keyed) = parent_child(&routes, &lineage, id, key, n);
         if super::parent_routing::route_of(&routes, id).is_lineage() && !keyed {
             divergent.borrow_mut()[child] = true;
         }

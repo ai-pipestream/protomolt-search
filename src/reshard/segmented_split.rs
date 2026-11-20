@@ -6,8 +6,8 @@ use super::child_build::{finish_child, ChildSlot};
 #[cfg(doc)]
 use super::hash_split::split_logs_with;
 use super::hash_split::SplitRequest;
-use super::parent_routing::{parent_child, parent_routes};
-use super::replay::{replay_buckets, Replay};
+use super::parent_routing::{extend_lineage_keys, parent_child, parent_routes, LineageKeys};
+use super::replay::{replay_buckets, replay_buckets_documents, Replay};
 use super::split_inputs::{create_out_dir, distribute, hash_range, SplitInputs};
 use super::{Analyzer, SegmentedChildImage, SegmentedReshardOutput};
 
@@ -31,7 +31,26 @@ pub fn split_logs_segmented_with(
     }
     let inputs = SplitInputs::check(request.gens, "segmented split", true)?;
     create_out_dir(request.out_dir)?;
+    // Chunks of one parent can sit in several WAL buckets, so the
+    // shared-key verdict needs every bucket before any segment seals.
+    // The pre-scan reads documents only, never the FP32 rows.
+    let mut lineage = LineageKeys::new();
+    if !request.vectors_only {
+        let (count, dim) = (
+            inputs.manifest.bucket_count as usize,
+            inputs.manifest.dim as usize,
+        );
+        for bucket in 0..inputs.manifest.bucket_count {
+            let mut scan = Replay::default();
+            for gen in request.gens {
+                replay_buckets_documents(gen, bucket..bucket + 1, count, dim, &mut scan)?;
+            }
+            scan.compact();
+            extend_lineage_keys(&mut lineage, &scan);
+        }
+    }
     let mut sealer = SegmentSealer::new(request, &inputs)?;
+    sealer.lineage = lineage;
     for bucket in 0..inputs.manifest.bucket_count {
         let mut replay = Replay::default();
         for gen in request.gens {
@@ -69,6 +88,7 @@ struct SegmentSealer<'a> {
     segment_counts: Vec<usize>,
     segments: Vec<SegmentedChildImage>,
     peak_replay_rows: u64,
+    lineage: LineageKeys,
 }
 
 impl<'a> SegmentSealer<'a> {
@@ -90,6 +110,7 @@ impl<'a> SegmentSealer<'a> {
             segment_counts: vec![0; request.n],
             segments: Vec::new(),
             peak_replay_rows: 0,
+            lineage: LineageKeys::new(),
         })
     }
 
@@ -108,10 +129,9 @@ impl<'a> SegmentSealer<'a> {
         }
         let n = self.request.n;
         let routes = parent_routes(&replay);
-        let keys = replay.stable_keys.clone();
         let divergent = std::cell::RefCell::new(vec![false; n]);
         let partitions = distribute(replay, n, |id, key| {
-            let (child, keyed) = parent_child(&routes, &keys, id, key, n);
+            let (child, keyed) = parent_child(&routes, &self.lineage, id, key, n);
             if super::parent_routing::route_of(&routes, id).is_lineage() && !keyed {
                 divergent.borrow_mut()[child] = true;
             }

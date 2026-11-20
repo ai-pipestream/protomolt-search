@@ -57,7 +57,7 @@ pub use row_update::SegmentRowRetirement;
 use stage::{cleanup_staged, stage_segment, verify_retry_source};
 pub use stage::{remove_segment_dirs, stage_segments, write_manifest_file};
 pub(crate) use summary::summarize_columns;
-use validate::{validate_manifest, validate_relative_file, validate_segment_id};
+use validate::{probe_set_format, validate_manifest, validate_relative_file, validate_segment_id};
 
 /// The one segment-set format this build writes or reads. Format 6 is
 /// the first whose segment records carry the colocation proof; there is

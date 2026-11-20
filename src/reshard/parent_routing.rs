@@ -24,14 +24,6 @@ pub(super) enum ParentKey {
 }
 
 impl ParentKey {
-    /// The global id whose stable key and hash route this group: the
-    /// parent row itself, which is the row the source key was minted for.
-    pub(super) fn global(self) -> u64 {
-        match self {
-            ParentKey::SelfRow(id) | ParentKey::Lineage(id) => id,
-        }
-    }
-
     pub(super) fn is_lineage(self) -> bool {
         matches!(self, ParentKey::Lineage(_))
     }
@@ -59,17 +51,58 @@ pub(super) fn route_of(routes: &BTreeMap<u64, ParentKey>, id: u64) -> ParentKey 
     routes.get(&id).copied().unwrap_or(ParentKey::SelfRow(id))
 }
 
+/// The stable key a lineage parent's chunks agree on, per parent id:
+/// `Some(key)` only when every live chunk of the parent carries that
+/// identical non-empty key. Any unkeyed chunk, or two disagreeing keys,
+/// records `None`: the parent then routes outside the online hash
+/// space. Built from chunk keys alone; a parent id is a source id, so
+/// it must never index the positional stable-key map, where the same
+/// number names an unrelated row.
+pub(super) type LineageKeys = BTreeMap<u64, Option<Vec<u8>>>;
+
+/// Fold one replay's chunks into a lineage key table.
+pub(super) fn extend_lineage_keys(table: &mut LineageKeys, replay: &Replay) {
+    for (id, doc) in &replay.documents {
+        let Some(lineage) = doc.lineage.as_ref() else {
+            continue;
+        };
+        let chunk = replay
+            .stable_keys
+            .get(id)
+            .filter(|key| !key.is_empty())
+            .cloned();
+        table
+            .entry(lineage.parent_id)
+            .and_modify(|held| {
+                if *held != chunk {
+                    *held = None;
+                }
+            })
+            .or_insert(chunk);
+    }
+}
+
+/// The lineage key table of one whole replay.
+pub(super) fn lineage_keys(replay: &Replay) -> LineageKeys {
+    let mut table = LineageKeys::new();
+    extend_lineage_keys(&mut table, replay);
+    table
+}
+
+fn key_child(key: &[u8], n: usize) -> usize {
+    (crate::coordinator::stable_routing_hash(key) >> (64 - n.trailing_zeros())) as usize
+}
+
 /// The child one row routes to, and whether that route is in the online
-/// hash space. A parent group with a stable key routes by
-/// `stable_routing_hash` of the parent row's key (falling back to the
-/// row's own key, which keyed ingest mints as the same source key): the
-/// exact hash online routed ingest uses, so post-reshard keyed appends
-/// for the parent land on the same child. Unkeyed groups fall back to
-/// `bucket_of` the parent global id; nothing online routes by that hash,
-/// so the caller must not let such a child claim colocation proof.
+/// hash space. A lineage group whose chunks agree on one stable key
+/// routes by that key's `stable_routing_hash`: the exact hash online
+/// routed ingest uses, so post-reshard keyed appends for the parent
+/// land on the same child. Everyone else falls back to `bucket_of` the
+/// parent (or self) id; nothing online routes by that hash, so the
+/// caller must not let such a child claim colocation proof.
 pub(super) fn parent_child(
     routes: &BTreeMap<u64, ParentKey>,
-    keys: &BTreeMap<u64, Vec<u8>>,
+    lineage: &LineageKeys,
     id: u64,
     own_key: Option<&Vec<u8>>,
     n: usize,
@@ -77,20 +110,15 @@ pub(super) fn parent_child(
     if n <= 1 {
         return (0, true);
     }
-    let global = route_of(routes, id).global();
-    let key = keys
-        .get(&global)
-        .filter(|key| !key.is_empty())
-        .or_else(|| own_key.filter(|key| !key.is_empty()));
-    match key {
-        Some(key) => {
-            let shift = 64 - n.trailing_zeros();
-            (
-                (crate::coordinator::stable_routing_hash(key) >> shift) as usize,
-                true,
-            )
-        }
-        None => (bucket_of(global, n), false),
+    match route_of(routes, id) {
+        ParentKey::Lineage(parent) => match lineage.get(&parent).and_then(Option::as_ref) {
+            Some(key) => (key_child(key, n), true),
+            None => (bucket_of(parent, n), false),
+        },
+        ParentKey::SelfRow(row) => match own_key.filter(|key| !key.is_empty()) {
+            Some(key) => (key_child(key, n), true),
+            None => (bucket_of(row, n), false),
+        },
     }
 }
 
@@ -189,14 +217,61 @@ mod tests {
     #[test]
     fn keyed_parents_route_in_the_online_hash_space() {
         let routes = parent_routes(&replay(&[(1, Some(9)), (9, None)]));
-        let keys = BTreeMap::from([(9, b"source-doc".to_vec())]);
-        let (child, keyed) = parent_child(&routes, &keys, 1, None, 4);
+        let lineage = LineageKeys::from([(9, Some(b"source-doc".to_vec()))]);
+        let (child, keyed) = parent_child(&routes, &lineage, 1, None, 4);
         assert!(keyed);
         let expect = (crate::coordinator::stable_routing_hash(b"source-doc") >> 62) as usize;
         assert_eq!(child, expect);
-        let (child, keyed) = parent_child(&routes, &BTreeMap::new(), 1, None, 4);
+        let (child, keyed) = parent_child(&routes, &LineageKeys::new(), 1, None, 4);
         assert!(!keyed);
         assert_eq!(child, bucket_of(9, 4));
+    }
+
+    #[test]
+    fn lineage_keys_never_borrow_a_positional_namesakes_key() {
+        // Positional ids 0..8 are unrelated lone rows, each keyed its
+        // own key; source parents 0..8 collide with those ids. A chunk
+        // of parent 5 must route by its chunks' shared opinion key,
+        // never by positional row 5's key.
+        let mut full = replay(&[]);
+        for id in 0..8u64 {
+            full.documents.insert(id, AddDocumentsRequest::default());
+            full.stable_keys
+                .insert(id, format!("lone-{id}").into_bytes());
+        }
+        for (id, parent, key) in [(8, 5, "opinion-5"), (9, 5, "opinion-5"), (10, 6, "x")] {
+            full.documents.insert(
+                id,
+                AddDocumentsRequest {
+                    lineage: Some(DocLineage {
+                        parent_id: parent,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            );
+            full.stable_keys.insert(id, key.as_bytes().to_vec());
+        }
+        // A second chunk of parent 6 under a different key disagrees.
+        full.documents.insert(
+            11,
+            AddDocumentsRequest {
+                lineage: Some(DocLineage {
+                    parent_id: 6,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        full.stable_keys.insert(11, b"other".to_vec());
+        let table = lineage_keys(&full);
+        assert_eq!(table[&5].as_deref(), Some(b"opinion-5".as_slice()));
+        assert_eq!(table[&6], None, "disagreeing chunks prove no shared key");
+        let routes = parent_routes(&full);
+        let (child, keyed) = parent_child(&routes, &table, 8, full.stable_keys.get(&8), 4);
+        assert!(keyed);
+        let opinion = (crate::coordinator::stable_routing_hash(b"opinion-5") >> 62) as usize;
+        assert_eq!(child, opinion);
     }
 
     #[test]
