@@ -91,7 +91,7 @@ impl NodeServiceImpl {
             })?;
             let key = keys.next();
             let (doc, analyzed_doc) =
-                self.materialize_document(doc, analyzed_doc, key.as_deref())?;
+                self.materialize_document(doc, analyzed_doc, key.as_deref(), true)?;
             let mut added = 0u64;
             let mut first = 0u64;
             self.apply_document_locked(

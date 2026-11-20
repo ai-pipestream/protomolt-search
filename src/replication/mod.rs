@@ -8,9 +8,8 @@
 //! have idempotent node contracts.
 //!
 //! Consecutive append records share one stream (`batch`); a record is
-//! admitted against the tips, and checked against the receiver's
-//! advertised contract, before it is held, so nothing a record refuses was
-//! sent for it. Keyed rows travel several to a stream under the per-row key
+//! admitted against the tips and checked for one stable key per row before
+//! it is held. Keyed rows travel several to a stream under the per-row key
 //! value `replication_wire` defines, and document streams are marked as WAL
 //! replay so logged derived values are verified rather than derived
 //! again. The live reshard tail routes each keyed row to its child alone.
@@ -33,8 +32,7 @@ pub use self::live::{catch_up_children_once, initialize_live_reshard};
 pub use self::sync::sync_once;
 pub use crate::replication_wire::{
     decode_replay_first_id, decode_stable_keys, encode_replay_first_id, encode_stable_keys,
-    plan_keyed_streams, MAX_STREAM_KEY_BYTES, RECEIVER_VERSION, STABLE_KEYS_METADATA,
-    STABLE_KEY_METADATA, WAL_REPLAY_METADATA,
+    plan_keyed_streams, MAX_STREAM_KEY_BYTES, STABLE_KEYS_METADATA, WAL_REPLAY_METADATA,
 };
 
 /// One child of a live reshard: where it serves, the hash range and
@@ -179,13 +177,14 @@ fn client(addr: &str) -> Result<NodeServiceClient<Channel>, String> {
 fn keyed_request<T>(
     row: T,
     key: &[u8],
-) -> tonic::Request<tokio_stream::Iter<std::array::IntoIter<T, 1>>> {
+) -> Result<tonic::Request<tokio_stream::Iter<std::array::IntoIter<T, 1>>>, String> {
     let mut request = tonic::Request::new(tokio_stream::iter([row]));
+    let encoded = encode_stable_keys(std::slice::from_ref(&key.to_vec()))?;
     request.metadata_mut().insert_bin(
-        STABLE_KEY_METADATA,
-        tonic::metadata::MetadataValue::from_bytes(key),
+        STABLE_KEYS_METADATA,
+        tonic::metadata::MetadataValue::from_bytes(&encoded),
     );
-    request
+    Ok(request)
 }
 
 /// The live reshard tail sends each row to a child as fresh ingest, so a

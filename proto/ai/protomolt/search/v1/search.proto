@@ -1351,12 +1351,6 @@ message HealthResponse {
   uint32 document_contract_version = 22;
   // Version 1 retains materialized vector tiers through ingestion and storage.
   uint32 multi_res_vector_version = 23;
-  // Version 1 accepts WAL catch-up append streams of several keyed rows
-  // under x-protomolt-stable-keys-bin, one key per row in row order, and
-  // document streams marked x-protomolt-wal-replay-bin whose logged derived
-  // values are verified against the declaration instead of refused as
-  // forged. Relays that do not accept document writes report zero.
-  uint32 replication_version = 24;
 }
 
 message ClusterHealthRequest {

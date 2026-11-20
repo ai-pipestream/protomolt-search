@@ -141,6 +141,10 @@ pub(super) async fn serve_shard(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = startup.cfg;
     let node = open_shard_node(startup, shard)?;
+    let node = match &cfg.principals {
+        Some(principals) => node.with_principals(principals.clone()),
+        None => node,
+    };
     let listener = TcpListener::bind(shard.listen).await?;
     let addr: SocketAddr = listener.local_addr()?;
     // The UDP stream-signal lane shares the gRPC listener's host:port.

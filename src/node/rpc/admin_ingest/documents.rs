@@ -3,6 +3,32 @@
 use crate::node::*;
 
 impl NodeServiceImpl {
+    /// Bearer-authenticated WAL replay requires ADMIN. Requests on the
+    /// cluster-member channel carry no public bearer credential.
+    fn authorize_wal_replay(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+        replay: bool,
+    ) -> Result<Option<crate::authorization::AccessPermit>, Status> {
+        if !replay {
+            return Ok(None);
+        }
+        let Some(principals) = &self.principals else {
+            return Ok(None);
+        };
+        if !metadata.contains_key("authorization") {
+            return Ok(None);
+        }
+        let principal = principals.authenticate(metadata)?;
+        principals
+            .authorize(
+                &principal,
+                &self.config.collection,
+                crate::pb::AccessAction::Admin,
+            )
+            .map(Some)
+    }
+
     /// Refuse a WAL replay stream that does not start at this shard's
     /// document tip. The caller holds the single-writer ingest slot, so the
     /// tip cannot move before the stream's first row applies.
@@ -75,12 +101,13 @@ impl NodeServiceImpl {
         request: Request<Streaming<AddDocumentsRequest>>,
     ) -> Result<Response<AddDocumentsResponse>, Status> {
         crate::metrics::timed(Route::AddDocuments, request, |request| async move {
+            let replay = replay_first_id(request.metadata())?;
+            let _replay_permit = self.authorize_wal_replay(request.metadata(), replay.is_some())?;
             let _ingest = self.claim_ingest()?;
             let addr = self.config.analysis_addr.clone().ok_or_else(|| {
                 Status::unavailable("no analysis backend configured for this shard (analysis_addr)")
             })?;
             let keys = StreamKeys::from_metadata(request.metadata())?;
-            let replay = replay_first_id(request.metadata())?;
             if let Some(claimed) = replay {
                 self.require_document_tip(claimed)?;
             }

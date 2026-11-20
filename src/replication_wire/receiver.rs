@@ -1,19 +1,5 @@
-//! What a replica advertises to a catch-up sender, and the metadata of the
-//! catch-up streams that depend on it.
-//!
-//! A receiver reporting [`RECEIVER_VERSION`] in `HealthResponse.replication_version`
-//! takes append streams of several keyed rows under
-//! [`STABLE_KEYS_METADATA`](crate::replication_wire::STABLE_KEYS_METADATA) and document streams
-//! marked [`WAL_REPLAY_METADATA`]. A receiver that predates either would
-//! read such a stream as fresh, unkeyed ingest, so the sender refuses to
-//! send one to it instead of guessing.
-
-/// The replication contract this build's receiver accepts.
-pub const RECEIVER_VERSION: u32 = 1;
-
-/// Binary metadata entry naming the stable routing key of a stream that
-/// carries exactly one row.
-pub const STABLE_KEY_METADATA: &str = "x-protomolt-stable-key-bin";
+//! Metadata of replication append streams: per-row stable keys and the
+//! WAL replay mark.
 
 /// Binary metadata entry marking a document stream as WAL replay. The
 /// value is the little-endian `u64` global id of the stream's first row,
@@ -22,9 +8,8 @@ pub const STABLE_KEY_METADATA: &str = "x-protomolt-stable-key-bin";
 /// A replayed document keeps the derived values and fingerprint its
 /// primary logged: the receiver verifies the fingerprint against its own
 /// declaration and stores the logged values without deriving them again.
-/// The entry is honored only on the cluster-internal node surface, whose
-/// callers authenticate as members; the coordinator builds node requests
-/// itself and never forwards a client's metadata.
+/// Cluster members use the trusted node channel; a bearer-authenticated
+/// caller needs an ADMIN grant on the receiver's collection.
 pub const WAL_REPLAY_METADATA: &str = "x-protomolt-wal-replay-bin";
 
 /// The [`WAL_REPLAY_METADATA`] value for a stream starting at `first_id`.
@@ -43,17 +28,6 @@ pub fn decode_replay_first_id(value: &[u8]) -> Result<u64, String> {
     Ok(u64::from_le_bytes(bytes))
 }
 
-/// Refuse a stream that needs `what` of a receiver advertising `advertised`.
-#[cfg(feature = "net")]
-pub(crate) fn require_receiver(advertised: u32, what: &str) -> Result<(), String> {
-    if advertised < RECEIVER_VERSION {
-        return Err(format!(
-            "receiver replication version {advertised} cannot accept {what}; upgrade the receiver"
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,16 +41,5 @@ mod tests {
             let error = decode_replay_first_id(&vec![0; width]).unwrap_err();
             assert!(error.contains(&format!("holds {width} bytes")), "{error}");
         }
-    }
-
-    #[cfg(feature = "net")]
-    #[test]
-    fn an_older_receiver_is_refused_by_name() {
-        let error = require_receiver(0, "keyed rows").unwrap_err();
-        assert_eq!(
-            error,
-            "receiver replication version 0 cannot accept keyed rows; upgrade the receiver"
-        );
-        assert!(require_receiver(RECEIVER_VERSION, "keyed rows").is_ok());
     }
 }

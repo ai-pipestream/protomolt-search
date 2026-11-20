@@ -81,7 +81,6 @@ impl NodeServiceImpl {
             });
         Ok(Response::new(HealthResponse {
             multi_res_vector_version: 1,
-            replication_version: crate::replication_wire::RECEIVER_VERSION,
             document_contract_version: crate::document_contract::VERSION,
             collection: self.config.collection.clone(),
             num_vectors,

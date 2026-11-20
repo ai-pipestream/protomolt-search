@@ -269,6 +269,7 @@ impl NodeServiceImpl {
         doc: AddDocumentsRequest,
         analyzed: crate::postings::AnalyzedDoc,
         stable_key: Option<&[u8]>,
+        logged: bool,
     ) -> Result<(AddDocumentsRequest, crate::postings::AnalyzedDoc), Status> {
         if let Some(hs) = self.turbo_handshake.as_deref() {
             let cfg = crate::analyzer::turbo_field_config(doc.analysis.as_ref())?;
@@ -307,7 +308,7 @@ impl NodeServiceImpl {
             analyzed.nlp.as_deref(),
             self.nlp_columns.as_deref(),
         )?;
-        let doc = self.materialize_columns(doc, stable_key)?;
+        let doc = self.materialize_columns(doc, stable_key, logged)?;
         let doc = self.place_document(doc)?;
         Ok((doc, analyzed))
     }

@@ -273,7 +273,7 @@ impl LiveTail {
             if child.skip_vectors > 0 {
                 child.skip_vectors -= 1;
             } else {
-                let request = keyed_request(vector_row(&batch, offset, vector), key);
+                let request = keyed_request(vector_row(&batch, offset, vector), key)?;
                 child
                     .client
                     .add_vectors(request)
@@ -300,7 +300,7 @@ impl LiveTail {
             } else {
                 let response = child
                     .client
-                    .add_documents(keyed_request(document, key))
+                    .add_documents(keyed_request(document, key)?)
                     .await
                     .map_err(|error| format!("append child document: {error}"))?
                     .into_inner();

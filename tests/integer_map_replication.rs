@@ -43,29 +43,23 @@ where
     fn call(&mut self, request: tonic::codegen::http::Request<B>) -> Self::Future {
         let node = self.node.clone();
         let mode = self.mode.load(Ordering::SeqCst);
-        if request.uri().path().ends_with("/Health") && (mode == 0 || mode == 3) {
+        if request.uri().path().ends_with("/Health") && mode == 0 {
             return Box::pin(async move {
-                /// Mode 0 hides the document contract, mode 3 the
-                /// replication contract.
-                struct Health(NodeServiceImpl, u8);
+                struct Health(NodeServiceImpl);
                 impl tonic::server::UnaryService<pb::HealthRequest> for Health {
                     type Response = pb::HealthResponse;
                     type Future = Reply<Self::Response>;
                     fn call(&mut self, request: tonic::Request<pb::HealthRequest>) -> Self::Future {
-                        let (node, mode) = (self.0.clone(), self.1);
+                        let node = self.0.clone();
                         Box::pin(async move {
                             let mut response = node.health(request).await?;
-                            if mode == 0 {
-                                response.get_mut().document_contract_version = 0;
-                            } else {
-                                response.get_mut().replication_version = 0;
-                            }
+                            response.get_mut().document_contract_version = 0;
                             Ok(response)
                         })
                     }
                 }
                 Ok(tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
-                    .unary(Health(node, mode), request)
+                    .unary(Health(node), request)
                     .await)
             });
         }
@@ -216,7 +210,7 @@ async fn replication_requires_advertisement_and_acknowledgement_before_advancing
 }
 
 #[tokio::test]
-async fn derived_wal_replication_needs_the_replay_contract_before_transmitting_or_advancing() {
+async fn derived_wal_replication_replays_and_retries_without_resending() {
     let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("derived-map-replication-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
@@ -258,7 +252,7 @@ async fn derived_wal_replication_needs_the_replay_contract_before_transmitting_o
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let replica = format!("http://{}", listener.local_addr().unwrap());
     let ingests = Arc::new(AtomicUsize::new(0));
-    let mode = Arc::new(AtomicU8::new(3));
+    let mode = Arc::new(AtomicU8::new(2));
     let receiver = VersionedReceiver {
         node: NodeServiceImpl::new(None, config("receiver")),
         mode: mode.clone(),
@@ -274,14 +268,6 @@ async fn derived_wal_replication_needs_the_replay_contract_before_transmitting_o
         replica,
         ..Default::default()
     };
-    let error = sync_once(&cursor).await.unwrap_err();
-    assert!(
-        error.contains("replication version 0 cannot accept logged derived columns"),
-        "{error}"
-    );
-    assert_eq!(ingests.load(Ordering::SeqCst), 0);
-    assert_eq!(cursor.clock, 0);
-    mode.store(2, Ordering::SeqCst);
     let advanced = sync_once(&cursor).await.unwrap();
     assert!(advanced.clock > 0);
     assert_eq!(ingests.load(Ordering::SeqCst), 1);
