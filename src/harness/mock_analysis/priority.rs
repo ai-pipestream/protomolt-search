@@ -1,14 +1,11 @@
-//! A one-slot accelerator shared by two admission lanes, the scheduling a
-//! priority-enforcing analysis server applies: every unit of work holds
-//! the slot for a fixed time, and a freed slot goes to the oldest
-//! interactive waiter before any bulk one. A bulk unit already running
-//! is never preempted, so an interactive call waits at most one unit.
+//! A one-slot accelerator shared by two admission lanes, with deterministic
+//! queue-depth and displacement evidence for priority tests.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Notify};
 
 /// The admission lane a call names in `x-turbo-priority`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,14 +27,17 @@ impl Lane {
     }
 }
 
-/// What the lanes admitted: units per lane, and the longest any unit of
-/// each lane waited for the slot.
+/// What the lanes admitted, including displacement at interactive grants.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LaneStats {
     pub interactive_units: u64,
     pub bulk_units: u64,
     pub max_interactive_wait: Duration,
     pub max_bulk_wait: Duration,
+    /// Most bulk units admitted between an interactive arrival and its grant.
+    pub max_units_before_interactive: u64,
+    /// Bulk waiters at interactive arrivals that those grants passed.
+    pub overtaken_bulk_waiters: u64,
 }
 
 #[derive(Default)]
@@ -48,10 +48,13 @@ struct Slot {
     stats: LaneStats,
 }
 
-/// The slot and its two queues.
+/// The slot, its queues, and queue-depth notifications.
 pub struct PriorityLanes {
     unit: Duration,
     slot: Mutex<Slot>,
+    changed: Notify,
+    #[cfg(test)]
+    gate: Option<(Arc<tokio::sync::Barrier>, std::sync::atomic::AtomicBool)>,
 }
 
 /// Hands the slot on when a running unit ends, or is dropped mid-unit.
@@ -63,12 +66,13 @@ impl Drop for Held<'_> {
     }
 }
 
-/// A queued unit's claim on the slot. Dropped after the slot was handed
-/// to it but before it ran, it hands the slot on.
+/// A queued unit's claim on the slot and its arrival measurements.
 struct Ticket<'a> {
     lanes: &'a PriorityLanes,
     granted: oneshot::Receiver<()>,
     ran: bool,
+    bulk_at_arrival: u64,
+    bulk_waiters: usize,
 }
 
 impl Drop for Ticket<'_> {
@@ -85,7 +89,22 @@ impl PriorityLanes {
         Arc::new(Self {
             unit,
             slot: Mutex::new(Slot::default()),
+            changed: Notify::new(),
+            #[cfg(test)]
+            gate: None,
         })
+    }
+
+    #[cfg(test)]
+    fn with_gate() -> (Arc<Self>, Arc<tokio::sync::Barrier>) {
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        let lanes = Arc::new(Self {
+            unit: Duration::ZERO,
+            slot: Mutex::new(Slot::default()),
+            changed: Notify::new(),
+            gate: Some((release.clone(), std::sync::atomic::AtomicBool::new(false))),
+        });
+        (lanes, release)
     }
 
     /// Run one unit of `lane`'s work: wait for the slot, hold it for one
@@ -96,14 +115,21 @@ impl PriorityLanes {
             let mut slot = self.slot.lock().unwrap();
             if slot.busy {
                 let (tx, rx) = oneshot::channel();
+                let (bulk_at_arrival, bulk_waiters) = match lane {
+                    Lane::Interactive => (slot.stats.bulk_units, slot.bulk.len()),
+                    Lane::Bulk => (0, 0),
+                };
                 match lane {
                     Lane::Interactive => slot.interactive.push_back(tx),
                     Lane::Bulk => slot.bulk.push_back(tx),
                 }
+                self.changed.notify_waiters();
                 Some(Ticket {
                     lanes: self,
                     granted: rx,
                     ran: false,
+                    bulk_at_arrival,
+                    bulk_waiters,
                 })
             } else {
                 slot.busy = true;
@@ -111,29 +137,68 @@ impl PriorityLanes {
             }
         };
         if let Some(mut ticket) = ticket {
-            // A live waiter is only ever sent the slot, never dropped unsent.
             let _ = (&mut ticket.granted).await;
             ticket.ran = true;
+            self.record(lane, queued.elapsed(), Some(&ticket));
+        } else {
+            self.record(lane, queued.elapsed(), None);
         }
         let held = Held(self);
-        self.record(lane, queued.elapsed());
+        #[cfg(test)]
+        if let Some((gate, entered)) = &self.gate {
+            if !entered.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                gate.wait().await;
+            }
+        }
         tokio::time::sleep(self.unit).await;
         drop(held);
     }
 
-    fn record(&self, lane: Lane, waited: Duration) {
+    /// Wait until at least `bulk` and `interactive` waiters are queued.
+    pub async fn wait_for_waiters(&self, bulk: usize, interactive: usize) {
+        loop {
+            let changed = self.changed.notified();
+            let slot = self.slot.lock().unwrap();
+            if slot.bulk.len() >= bulk && slot.interactive.len() >= interactive {
+                return;
+            }
+            drop(slot);
+            changed.await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn wait_for_bulk_units(&self, units: u64) {
+        loop {
+            let changed = self.changed.notified();
+            if self.slot.lock().unwrap().stats.bulk_units >= units {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    fn record(&self, lane: Lane, waited: Duration, ticket: Option<&Ticket<'_>>) {
         let mut slot = self.slot.lock().unwrap();
         let stats = &mut slot.stats;
         match lane {
             Lane::Interactive => {
                 stats.interactive_units += 1;
                 stats.max_interactive_wait = stats.max_interactive_wait.max(waited);
+                if let Some(ticket) = ticket {
+                    let units = stats.bulk_units.saturating_sub(ticket.bulk_at_arrival);
+                    stats.max_units_before_interactive =
+                        stats.max_units_before_interactive.max(units);
+                    stats.overtaken_bulk_waiters +=
+                        ticket.bulk_waiters.saturating_sub(units as usize) as u64;
+                }
             }
             Lane::Bulk => {
                 stats.bulk_units += 1;
                 stats.max_bulk_wait = stats.max_bulk_wait.max(waited);
             }
         }
+        self.changed.notify_waiters();
     }
 
     /// Hand the slot to the oldest live interactive waiter, else the
@@ -147,9 +212,11 @@ impl PriorityLanes {
             };
             let Some(waiter) = next else {
                 slot.busy = false;
+                self.changed.notify_waiters();
                 return;
             };
             if waiter.send(()).is_ok() {
+                self.changed.notify_waiters();
                 return;
             }
         }
@@ -166,23 +233,23 @@ mod tests {
 
     #[tokio::test]
     async fn a_freed_slot_goes_to_interactive_before_queued_bulk() {
-        let lanes = PriorityLanes::new(Duration::from_millis(20));
+        let (lanes, release) = PriorityLanes::with_gate();
         let order = Arc::new(Mutex::new(Vec::new()));
-        let run = |lane, tag: &'static str, after: u64| {
+        let run = |lane, tag: &'static str| {
             let (lanes, order) = (Arc::clone(&lanes), Arc::clone(&order));
             tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(after)).await;
                 lanes.run(lane).await;
                 order.lock().unwrap().push(tag);
             })
         };
-        let tasks = [
-            run(Lane::Bulk, "bulk-running", 0),
-            run(Lane::Bulk, "bulk-queued", 2),
-            run(Lane::Bulk, "bulk-queued-later", 4),
-            run(Lane::Interactive, "interactive", 6),
-        ];
-        for task in tasks {
+        let running = run(Lane::Bulk, "bulk-running");
+        lanes.wait_for_bulk_units(1).await;
+        let queued = run(Lane::Bulk, "bulk-queued");
+        let later = run(Lane::Bulk, "bulk-queued-later");
+        let interactive = run(Lane::Interactive, "interactive");
+        lanes.wait_for_waiters(2, 1).await;
+        release.wait().await;
+        for task in [running, queued, later, interactive] {
             task.await.unwrap();
         }
         assert_eq!(
@@ -196,7 +263,8 @@ mod tests {
         );
         let stats = lanes.stats();
         assert_eq!((stats.interactive_units, stats.bulk_units), (1, 3));
-        assert!(stats.max_interactive_wait < stats.max_bulk_wait);
+        assert_eq!(stats.max_units_before_interactive, 0);
+        assert_eq!(stats.overtaken_bulk_waiters, 2);
     }
 
     #[test]

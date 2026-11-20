@@ -3,7 +3,8 @@ mod priority;
 mod rerank;
 mod service;
 
-pub use priority::{Lane, LaneStats, PriorityLanes};
+pub(crate) use priority::Lane;
+pub use priority::{LaneStats, PriorityLanes};
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;

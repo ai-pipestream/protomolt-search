@@ -11,9 +11,10 @@ use super::*;
 use pipestream_search::harness::mock_analysis::start_mock_analysis_prioritized;
 
 const SERVING: usize = 2;
-const BULK_NODES: usize = 4;
+const BULK_NODES: usize = 12;
 const BULK_DOCS: usize = 150;
 const QUERIES: usize = 8;
+const QUEUED_BULK: usize = 8;
 const UNIT: Duration = Duration::from_millis(3);
 
 /// A node holding two searchable documents and their vectors, analysed by
@@ -95,7 +96,7 @@ fn bulk_ingest(node: Arc<NodeServiceImpl>, shard: usize) -> tokio::task::JoinHan
 /// A reranking coordinator over `nodes`, scoring on the interactive lane.
 fn reranking(nodes: Vec<Arc<NodeServiceImpl>>, addr: &str) -> CoordinatorServiceImpl {
     let client = RemoteClient::new(
-        RemoteEndpointConfig::new(addr.to_string()).with_priority(RemotePriority::Interactive),
+        RemoteEndpointConfig::new(addr.to_string()).with_priority(RemotePriority::Bulk),
     );
     let mut spec = RerankSpec::new(RerankBackend::Remote {
         client: Box::new(client),
@@ -159,13 +160,10 @@ async fn interactive_rerank_stays_bounded_under_concurrent_bulk_ingest() {
     let bulk: Vec<_> = (0..BULK_NODES)
         .map(|shard| bulk_ingest(bulk_node(shard, &addr), shard))
         .collect();
-    while lanes.stats().bulk_units < preloaded + 20 {
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
+    lanes.wait_for_waiters(QUEUED_BULK, 0).await;
 
-    let mut slowest = Duration::ZERO;
     for _ in 0..QUERIES {
-        slowest = slowest.max(reranked_query(&coordinator, &vectors[..DIM]).await);
+        reranked_query(&coordinator, &vectors[..DIM]).await;
     }
     let during = lanes.stats();
     let bulk_total = preloaded + (BULK_NODES * BULK_DOCS) as u64;
@@ -183,17 +181,10 @@ async fn interactive_rerank_stays_bounded_under_concurrent_bulk_ingest() {
     }
     let after = lanes.stats();
     assert_eq!(after.bulk_units, bulk_total);
-    // An interactive unit waits behind at most the bulk unit already
-    // running; a queued bulk unit waits behind every interactive one.
+    assert!(during.max_units_before_interactive <= 1, "{during:?}");
     assert!(
-        after.max_interactive_wait < after.max_bulk_wait,
-        "{after:?}"
-    );
-    let bound = Duration::from_millis(250);
-    assert!(after.max_interactive_wait < bound, "{after:?}");
-    assert!(
-        slowest < Duration::from_secs(2),
-        "slowest query {slowest:?}"
+        during.overtaken_bulk_waiters >= (QUERIES * QUEUED_BULK) as u64,
+        "{during:?}"
     );
     server.abort();
 }
