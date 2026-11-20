@@ -1,6 +1,10 @@
 mod analyze;
+mod priority;
 mod rerank;
 mod service;
+
+pub(crate) use priority::Lane;
+pub use priority::{LaneStats, PriorityLanes};
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -105,6 +109,9 @@ pub struct MockAnalysis {
     unary_delay: Option<(Duration, AnalysisDelayProbe)>,
     /// Optional semaphore holding `AnalyzeStream` open after its last result.
     pub stream_end_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// Optional accelerator slot every streamed document and every rerank
+    /// call takes one unit of, in the lane its `x-turbo-priority` names.
+    pub lanes: Option<Arc<PriorityLanes>>,
 }
 
 impl Default for MockAnalysis {
@@ -119,6 +126,7 @@ impl Default for MockAnalysis {
             stream_opens: Arc::new(AtomicUsize::new(0)),
             unary_delay: None,
             stream_end_gate: None,
+            lanes: None,
         }
     }
 }
@@ -200,6 +208,25 @@ pub async fn start_mock_analysis_without_ner() -> (String, JoinHandle<Result<(),
         ..Default::default()
     })
     .await
+}
+
+/// A mock whose analysis and reranking share one accelerator slot: every
+/// streamed document and every rerank call holds it for `unit`, and a
+/// freed slot goes to interactive calls before bulk ones.
+pub async fn start_mock_analysis_prioritized(
+    unit: Duration,
+) -> (
+    String,
+    JoinHandle<Result<(), TransportError>>,
+    Arc<PriorityLanes>,
+) {
+    let lanes = PriorityLanes::new(unit);
+    let (address, handle) = start_mock(MockAnalysis {
+        lanes: Some(Arc::clone(&lanes)),
+        ..Default::default()
+    })
+    .await;
+    (address, handle, lanes)
 }
 
 /// A normal mock plus its call meter: every analysis it serves,
