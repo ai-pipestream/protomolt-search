@@ -85,7 +85,7 @@ impl NodeServiceImpl {
             store::apply_bm25_row(shard, doc_id, &req.doc, req.analyzed, &columns)?;
             let keyed = req.stable_routing_key.is_some();
             if let Bm25Shard::Segmented(shard) = shard {
-                if !crate::colocation::row_proves_parent_colocated(&req.doc, global_id, keyed) {
+                if !crate::colocation::row_proves_parent_colocated(&req.doc, keyed) {
                     shard.note_scattered_parent();
                 }
             }
