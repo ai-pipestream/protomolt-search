@@ -1,0 +1,521 @@
+{
+  "engines": [
+    {
+      "builds": [
+        {
+          "build_s": 8.50152205,
+          "cells": [
+            {
+              "filter": "uncorrelated-50",
+              "k": 10,
+              "points": [
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 16,
+                  "exact_scores_mean": 977.736,
+                  "hops_mean": 42.894,
+                  "k": 10,
+                  "p50_ms": 0.039063999999999995,
+                  "p99_ms": 0.054763,
+                  "predicate_ms_mean": 0.01965338961451427,
+                  "qps_all_cores": 25499.596349219362,
+                  "qps_one_core": 25188.494995863828,
+                  "recall_mean": 0.8455999999999992,
+                  "recall_worst": 0.0,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 500
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 64,
+                  "exact_scores_mean": 2546.94,
+                  "hops_mean": 138.436,
+                  "k": 10,
+                  "p50_ms": 0.086304,
+                  "p99_ms": 0.106341,
+                  "predicate_ms_mean": 0.0198154601692697,
+                  "qps_all_cores": 11426.900812130178,
+                  "qps_one_core": 11459.893616030733,
+                  "recall_mean": 0.9893999999999998,
+                  "recall_worst": 0.0,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 500
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 128,
+                  "exact_scores_mean": 3752.88,
+                  "hops_mean": 267.592,
+                  "k": 10,
+                  "p50_ms": 0.13544699999999998,
+                  "p99_ms": 0.20566900000000002,
+                  "predicate_ms_mean": 0.020053721809680968,
+                  "qps_all_cores": 7286.869485920476,
+                  "qps_one_core": 7271.934058101961,
+                  "recall_mean": 1.0,
+                  "recall_worst": 1.0,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 500
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 256,
+                  "exact_scores_mean": 4968.272,
+                  "hops_mean": 522.692,
+                  "k": 10,
+                  "p50_ms": 0.203034,
+                  "p99_ms": 0.288466,
+                  "predicate_ms_mean": 0.020013783628136567,
+                  "qps_all_cores": 4884.283627004711,
+                  "qps_one_core": 4861.894584401621,
+                  "recall_mean": 1.0,
+                  "recall_worst": 1.0,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 500
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 1000,
+                  "exact_scores_mean": 6307.152,
+                  "hops_mean": 2001.416,
+                  "k": 10,
+                  "p50_ms": 0.44324,
+                  "p99_ms": 0.5574560000000001,
+                  "predicate_ms_mean": 0.020059261510952168,
+                  "qps_all_cores": 2247.1869767405633,
+                  "qps_one_core": 2236.3026716283275,
+                  "recall_mean": 1.0,
+                  "recall_worst": 1.0,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 500
+                  },
+                  "threads": 1
+                }
+              ]
+            },
+            {
+              "filter": "uncorrelated-50",
+              "k": 100,
+              "points": [
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 128,
+                  "exact_scores_mean": 3752.88,
+                  "hops_mean": 267.592,
+                  "k": 100,
+                  "p50_ms": 0.13487500000000002,
+                  "p99_ms": 0.210889,
+                  "predicate_ms_mean": 0.020148640446342472,
+                  "qps_all_cores": 7536.684004532602,
+                  "qps_one_core": 7258.377064305209,
+                  "recall_mean": 0.9987000000000007,
+                  "recall_worst": 0.98,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 500
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 256,
+                  "exact_scores_mean": 4968.272,
+                  "hops_mean": 522.692,
+                  "k": 100,
+                  "p50_ms": 0.201712,
+                  "p99_ms": 0.289418,
+                  "predicate_ms_mean": 0.020077418888662733,
+                  "qps_all_cores": 4935.815736126939,
+                  "qps_one_core": 4912.596941071373,
+                  "recall_mean": 0.9999600000000001,
+                  "recall_worst": 0.99,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 500
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 1000,
+                  "exact_scores_mean": 6307.152,
+                  "hops_mean": 2001.416,
+                  "k": 100,
+                  "p50_ms": 0.431317,
+                  "p99_ms": 0.5475770000000001,
+                  "predicate_ms_mean": 0.02013455531453362,
+                  "qps_all_cores": 2304.5976817734977,
+                  "qps_one_core": 2304.1041712105457,
+                  "recall_mean": 0.99998,
+                  "recall_worst": 0.99,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 500
+                  },
+                  "threads": 1
+                }
+              ]
+            },
+            {
+              "filter": "uncorrelated-10",
+              "k": 10,
+              "points": [
+                {
+                  "bridges_mean": 350.638,
+                  "budget_handoffs": 0,
+                  "ef": 16,
+                  "exact_scores_mean": 551.64,
+                  "hops_mean": 26.258,
+                  "k": 10,
+                  "p50_ms": 0.045255,
+                  "p99_ms": 0.053201,
+                  "predicate_ms_mean": 0.00405700516925892,
+                  "qps_all_cores": 22260.397985938147,
+                  "qps_one_core": 21859.196018770428,
+                  "recall_mean": 0.9797999999999994,
+                  "recall_worst": 0.0,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 500,
+                    "plain": 0
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 1380.358,
+                  "budget_handoffs": 3,
+                  "ef": 64,
+                  "exact_scores_mean": 768.422,
+                  "hops_mean": 74.266,
+                  "k": 10,
+                  "p50_ms": 0.135196,
+                  "p99_ms": 0.16153599999999999,
+                  "predicate_ms_mean": 0.004148786183310533,
+                  "qps_all_cores": 7142.196831397522,
+                  "qps_one_core": 7309.065002477688,
+                  "recall_mean": 0.992,
+                  "recall_worst": 0.0,
+                  "regimes": {
+                    "enumerate": 3,
+                    "filter_aware": 497,
+                    "plain": 0
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 128,
+                  "exact_scores_mean": 10171.796,
+                  "hops_mean": 9.186,
+                  "k": 10,
+                  "p50_ms": 0.086354,
+                  "p99_ms": 0.091032,
+                  "predicate_ms_mean": 0.004267895371012483,
+                  "qps_all_cores": 11572.58699751523,
+                  "qps_one_core": 11535.389650998175,
+                  "recall_mean": 1.0,
+                  "recall_worst": 1.0,
+                  "regimes": {
+                    "enumerate": 500,
+                    "filter_aware": 0,
+                    "plain": 0
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 256,
+                  "exact_scores_mean": 10171.796,
+                  "hops_mean": 9.186,
+                  "k": 10,
+                  "p50_ms": 0.086414,
+                  "p99_ms": 0.091684,
+                  "predicate_ms_mean": 0.004313733772995488,
+                  "qps_all_cores": 11576.298754126668,
+                  "qps_one_core": 11523.082520646623,
+                  "recall_mean": 1.0,
+                  "recall_worst": 1.0,
+                  "regimes": {
+                    "enumerate": 500,
+                    "filter_aware": 0,
+                    "plain": 0
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 1000,
+                  "exact_scores_mean": 10083.0,
+                  "hops_mean": 0.0,
+                  "k": 10,
+                  "p50_ms": 0.08417999999999999,
+                  "p99_ms": 0.08988,
+                  "predicate_ms_mean": 0.004252529531223557,
+                  "qps_all_cores": 11917.57873742679,
+                  "qps_one_core": 11817.86702536023,
+                  "recall_mean": 1.0,
+                  "recall_worst": 1.0,
+                  "regimes": {
+                    "enumerate": 500,
+                    "filter_aware": 0,
+                    "plain": 0
+                  },
+                  "threads": 1
+                }
+              ]
+            },
+            {
+              "filter": "uncorrelated-10",
+              "k": 100,
+              "points": [
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 128,
+                  "exact_scores_mean": 10171.796,
+                  "hops_mean": 9.186,
+                  "k": 100,
+                  "p50_ms": 0.106642,
+                  "p99_ms": 0.111952,
+                  "predicate_ms_mean": 0.004259821432394818,
+                  "qps_all_cores": 9368.36830029388,
+                  "qps_one_core": 9340.50494389747,
+                  "recall_mean": 0.99998,
+                  "recall_worst": 0.99,
+                  "regimes": {
+                    "enumerate": 500,
+                    "filter_aware": 0,
+                    "plain": 0
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 256,
+                  "exact_scores_mean": 10171.796,
+                  "hops_mean": 9.186,
+                  "k": 100,
+                  "p50_ms": 0.10658200000000001,
+                  "p99_ms": 0.111821,
+                  "predicate_ms_mean": 0.004250728712023963,
+                  "qps_all_cores": 9361.020565779223,
+                  "qps_one_core": 9347.550738016429,
+                  "recall_mean": 0.99998,
+                  "recall_worst": 0.99,
+                  "regimes": {
+                    "enumerate": 500,
+                    "filter_aware": 0,
+                    "plain": 0
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 1000,
+                  "exact_scores_mean": 10083.0,
+                  "hops_mean": 0.0,
+                  "k": 100,
+                  "p50_ms": 0.104729,
+                  "p99_ms": 0.11091,
+                  "predicate_ms_mean": 0.004275825386801389,
+                  "qps_all_cores": 9556.52020534657,
+                  "qps_one_core": 9500.917085496594,
+                  "recall_mean": 0.99998,
+                  "recall_worst": 0.99,
+                  "regimes": {
+                    "enumerate": 500,
+                    "filter_aware": 0,
+                    "plain": 0
+                  },
+                  "threads": 1
+                }
+              ]
+            }
+          ],
+          "disk_bytes": 40181024,
+          "disk_bytes_per_row": 401.81024,
+          "params": {
+            "bits": 0,
+            "ef_construction": 200,
+            "m": 16
+          },
+          "retained_bytes_per_row": 272.1792,
+          "retained_rss_bytes": 27217920
+        }
+      ],
+      "engine": "hnsw",
+      "filter": "allow bitmap (VectorSearchOptions::with_bits); enumerate, filter-aware walk",
+      "library": "ours: src/hnsw/ (HNSW over FP32 rows, parallel build)",
+      "license": "ours",
+      "version": "0.1.0"
+    }
+  ],
+  "fixture": {
+    "base_sha256": "ffe7206193b1ff53e8487329bb5be648bc632f3b6975f3724605618e273d38c6",
+    "dim": 64,
+    "dir": "<scratch>/fixture",
+    "filters": [
+      {
+        "actual_mean_percent": 50.05099999999969,
+        "column": "bucket",
+        "name": "uncorrelated-50",
+        "set": "uncorrelated",
+        "target_percent": 50
+      },
+      {
+        "actual_mean_percent": 10.083000000000027,
+        "column": "bucket",
+        "name": "uncorrelated-10",
+        "set": "uncorrelated",
+        "target_percent": 10
+      },
+      {
+        "actual_mean_percent": 1.0510000000000017,
+        "column": "bucket",
+        "name": "uncorrelated-1",
+        "set": "uncorrelated",
+        "target_percent": 1
+      },
+      {
+        "actual_mean_percent": 50.27864800000004,
+        "column": "cell",
+        "name": "near-50",
+        "set": "near",
+        "target_percent": 50
+      },
+      {
+        "actual_mean_percent": 10.251697999999989,
+        "column": "cell",
+        "name": "near-10",
+        "set": "near",
+        "target_percent": 10
+      },
+      {
+        "actual_mean_percent": 1.273284000000001,
+        "column": "cell",
+        "name": "near-1",
+        "set": "near",
+        "target_percent": 1
+      },
+      {
+        "actual_mean_percent": 50.26764799999999,
+        "column": "cell",
+        "name": "far-50",
+        "set": "far",
+        "target_percent": 50
+      },
+      {
+        "actual_mean_percent": 10.27731200000002,
+        "column": "cell",
+        "name": "far-10",
+        "set": "far",
+        "target_percent": 10
+      },
+      {
+        "actual_mean_percent": 1.3080160000000003,
+        "column": "cell",
+        "name": "far-1",
+        "set": "far",
+        "target_percent": 1
+      }
+    ],
+    "name": "challenge-100000x64",
+    "queries": 500,
+    "rows": 100000
+  },
+  "format": "protomolt-ann-bench-results-v1",
+  "harness": {
+    "commit": "",
+    "runner": "ann_bench",
+    "started_at": 1795189558,
+    "version": "0.1.0"
+  },
+  "host": {
+    "arch": "x86_64",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "cpu_features": [
+      "sse4.2",
+      "avx2",
+      "fma",
+      "avx512f"
+    ],
+    "kernel": "7.3.0-10-generic",
+    "name": "krick-1",
+    "threads": 1
+  },
+  "segments": [
+    [
+      0,
+      100000
+    ]
+  ],
+  "settings": {
+    "ef": [
+      16,
+      64,
+      128,
+      256,
+      1000
+    ],
+    "ef_construction": [
+      200
+    ],
+    "k": [
+      10,
+      100
+    ],
+    "m": [
+      16
+    ],
+    "min_qps": 0.0,
+    "min_time_ms": 1000,
+    "recall_stop": 2.0,
+    "rerank": [
+      10,
+      20,
+      50,
+      100,
+      200,
+      500,
+      1000,
+      2000,
+      5000
+    ],
+    "threads": 1
+  },
+  "shape": "single"
+}

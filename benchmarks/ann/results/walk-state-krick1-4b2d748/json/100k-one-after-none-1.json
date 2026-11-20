@@ -1,0 +1,369 @@
+{
+  "engines": [
+    {
+      "builds": [
+        {
+          "build_s": 7.397694682,
+          "cells": [
+            {
+              "filter": "none",
+              "k": 10,
+              "points": [
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 16,
+                  "exact_scores_mean": 625.072,
+                  "hops_mean": 28.082,
+                  "k": 10,
+                  "p50_ms": 0.007534,
+                  "p99_ms": 0.010489,
+                  "predicate_ms_mean": 0.000019356637030104508,
+                  "qps_all_cores": 128891.76338543717,
+                  "qps_one_core": 128219.99346078033,
+                  "recall_mean": 0.7177999999999998,
+                  "recall_worst": 0.0,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 0
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 64,
+                  "exact_scores_mean": 1601.006,
+                  "hops_mean": 73.924,
+                  "k": 10,
+                  "p50_ms": 0.026039,
+                  "p99_ms": 0.029777,
+                  "predicate_ms_mean": 0.000019691142894633248,
+                  "qps_all_cores": 37888.84113172116,
+                  "qps_one_core": 38104.031814655624,
+                  "recall_mean": 0.9663999999999985,
+                  "recall_worst": 0.0,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 0
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 128,
+                  "exact_scores_mean": 2545.41,
+                  "hops_mean": 137.89,
+                  "k": 10,
+                  "p50_ms": 0.050836,
+                  "p99_ms": 0.05834,
+                  "predicate_ms_mean": 0.000019234264298182565,
+                  "qps_all_cores": 19573.106722555396,
+                  "qps_one_core": 19477.889326632845,
+                  "recall_mean": 0.9904000000000001,
+                  "recall_worst": 0.0,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 0
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 256,
+                  "exact_scores_mean": 3752.558,
+                  "hops_mean": 266.996,
+                  "k": 10,
+                  "p50_ms": 0.093096,
+                  "p99_ms": 0.151888,
+                  "predicate_ms_mean": 0.000019160924964605945,
+                  "qps_all_cores": 10644.0232618494,
+                  "qps_one_core": 10594.829730491403,
+                  "recall_mean": 1.0,
+                  "recall_worst": 1.0,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 0
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 1000,
+                  "exact_scores_mean": 5877.116,
+                  "hops_mean": 1010.938,
+                  "k": 10,
+                  "p50_ms": 0.250134,
+                  "p99_ms": 0.34822,
+                  "predicate_ms_mean": 0.000019168018246325393,
+                  "qps_all_cores": 4013.2350693693083,
+                  "qps_one_core": 3945.7823664277976,
+                  "recall_mean": 1.0,
+                  "recall_worst": 1.0,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 0
+                  },
+                  "threads": 1
+                }
+              ]
+            },
+            {
+              "filter": "none",
+              "k": 100,
+              "points": [
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 128,
+                  "exact_scores_mean": 2545.41,
+                  "hops_mean": 137.89,
+                  "k": 100,
+                  "p50_ms": 0.050646000000000004,
+                  "p99_ms": 0.057368999999999996,
+                  "predicate_ms_mean": 0.00001923455400981997,
+                  "qps_all_cores": 19663.853184418433,
+                  "qps_one_core": 19551.754918752093,
+                  "recall_mean": 0.9786800000000034,
+                  "recall_worst": 0.0,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 0
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 256,
+                  "exact_scores_mean": 3752.558,
+                  "hops_mean": 266.996,
+                  "k": 100,
+                  "p50_ms": 0.093046,
+                  "p99_ms": 0.149032,
+                  "predicate_ms_mean": 0.00001920433962264151,
+                  "qps_all_cores": 10659.970417417204,
+                  "qps_one_core": 10599.548978591412,
+                  "recall_mean": 0.9996000000000002,
+                  "recall_worst": 0.99,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 0
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 1000,
+                  "exact_scores_mean": 5877.116,
+                  "hops_mean": 1010.938,
+                  "k": 100,
+                  "p50_ms": 0.248801,
+                  "p99_ms": 0.344503,
+                  "predicate_ms_mean": 0.0000191553764794762,
+                  "qps_all_cores": 3986.6392011790153,
+                  "qps_one_core": 3970.3243540233784,
+                  "recall_mean": 0.99994,
+                  "recall_worst": 0.99,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 0
+                  },
+                  "threads": 1
+                }
+              ]
+            },
+            {
+              "filter": "none",
+              "k": 1000,
+              "points": [
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 1000,
+                  "exact_scores_mean": 5877.116,
+                  "hops_mean": 1010.938,
+                  "k": 1000,
+                  "p50_ms": 0.24851099999999998,
+                  "p99_ms": 0.34459300000000004,
+                  "predicate_ms_mean": 0.000019161314601103864,
+                  "qps_all_cores": 3998.228317945267,
+                  "qps_one_core": 3985.513480398421,
+                  "recall_mean": 0.9999480000000005,
+                  "recall_worst": 0.998,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 0
+                  },
+                  "threads": 1
+                }
+              ]
+            }
+          ],
+          "disk_bytes": 40181024,
+          "disk_bytes_per_row": 401.81024,
+          "params": {
+            "bits": 0,
+            "ef_construction": 200,
+            "m": 16
+          },
+          "retained_bytes_per_row": 271.19616,
+          "retained_rss_bytes": 27119616
+        }
+      ],
+      "engine": "hnsw",
+      "filter": "allow bitmap (VectorSearchOptions::with_bits); enumerate, filter-aware walk",
+      "library": "ours: src/hnsw/ (HNSW over FP32 rows, parallel build)",
+      "license": "ours",
+      "version": "0.1.0"
+    }
+  ],
+  "fixture": {
+    "base_sha256": "ffe7206193b1ff53e8487329bb5be648bc632f3b6975f3724605618e273d38c6",
+    "dim": 64,
+    "dir": "<scratch>/fixture",
+    "filters": [
+      {
+        "actual_mean_percent": 50.05099999999969,
+        "column": "bucket",
+        "name": "uncorrelated-50",
+        "set": "uncorrelated",
+        "target_percent": 50
+      },
+      {
+        "actual_mean_percent": 10.083000000000027,
+        "column": "bucket",
+        "name": "uncorrelated-10",
+        "set": "uncorrelated",
+        "target_percent": 10
+      },
+      {
+        "actual_mean_percent": 1.0510000000000017,
+        "column": "bucket",
+        "name": "uncorrelated-1",
+        "set": "uncorrelated",
+        "target_percent": 1
+      },
+      {
+        "actual_mean_percent": 50.27864800000004,
+        "column": "cell",
+        "name": "near-50",
+        "set": "near",
+        "target_percent": 50
+      },
+      {
+        "actual_mean_percent": 10.251697999999989,
+        "column": "cell",
+        "name": "near-10",
+        "set": "near",
+        "target_percent": 10
+      },
+      {
+        "actual_mean_percent": 1.273284000000001,
+        "column": "cell",
+        "name": "near-1",
+        "set": "near",
+        "target_percent": 1
+      },
+      {
+        "actual_mean_percent": 50.26764799999999,
+        "column": "cell",
+        "name": "far-50",
+        "set": "far",
+        "target_percent": 50
+      },
+      {
+        "actual_mean_percent": 10.27731200000002,
+        "column": "cell",
+        "name": "far-10",
+        "set": "far",
+        "target_percent": 10
+      },
+      {
+        "actual_mean_percent": 1.3080160000000003,
+        "column": "cell",
+        "name": "far-1",
+        "set": "far",
+        "target_percent": 1
+      }
+    ],
+    "name": "challenge-100000x64",
+    "queries": 500,
+    "rows": 100000
+  },
+  "format": "protomolt-ann-bench-results-v1",
+  "harness": {
+    "commit": "",
+    "runner": "ann_bench",
+    "started_at": 1795189600,
+    "version": "0.1.0"
+  },
+  "host": {
+    "arch": "x86_64",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "cpu_features": [
+      "sse4.2",
+      "avx2",
+      "fma",
+      "avx512f"
+    ],
+    "kernel": "7.3.0-10-generic",
+    "name": "krick-1",
+    "threads": 1
+  },
+  "segments": [
+    [
+      0,
+      100000
+    ]
+  ],
+  "settings": {
+    "ef": [
+      16,
+      64,
+      128,
+      256,
+      1000
+    ],
+    "ef_construction": [
+      200
+    ],
+    "k": [
+      10,
+      100,
+      1000
+    ],
+    "m": [
+      16
+    ],
+    "min_qps": 0.0,
+    "min_time_ms": 1000,
+    "recall_stop": 2.0,
+    "rerank": [
+      10,
+      20,
+      50,
+      100,
+      200,
+      500,
+      1000,
+      2000,
+      5000
+    ],
+    "threads": 1
+  },
+  "shape": "single"
+}
