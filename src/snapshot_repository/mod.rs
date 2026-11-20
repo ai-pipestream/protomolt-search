@@ -135,7 +135,7 @@ impl RepositoryManifest {
 
     /// The hex SHA-256 of the manifest's canonical bytes.
     pub fn sha256(&self) -> String {
-        crate::sha256::hex_digest(&self.encode())
+        turbo_sha256::sha256(&self.encode()).to_hex()
     }
 
     pub fn to_pb(&self) -> SnapshotRepositoryManifest {

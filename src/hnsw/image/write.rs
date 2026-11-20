@@ -18,7 +18,7 @@ use crate::vector::VectorError;
 /// needs the whole image in memory.
 struct Hashing<W: Write> {
     inner: W,
-    sha: crate::sha256::Sha256,
+    sha: turbo_sha256::Sha256,
     written: u64,
 }
 
@@ -156,7 +156,7 @@ pub fn write_with_links(
     let file = File::create(path).map_err(&io)?;
     let mut out = Hashing {
         inner: BufWriter::with_capacity(1 << 20, file),
-        sha: crate::sha256::Sha256::new(),
+        sha: turbo_sha256::Sha256::new(),
         written: 0,
     };
     out.write_all(&header.encode()).map_err(&io)?;
@@ -171,7 +171,7 @@ pub fn write_with_links(
         write_node_map_sections(&mut out, map, &layout, path)?;
     }
     pad_to(&mut out, layout.total_len - TRAILER_LEN as u64, path)?;
-    let digest = out.sha.clone().finalize();
+    let digest = out.sha.clone().finish().0;
     out.inner.write_all(&digest).map_err(&io)?;
     out.inner.flush().map_err(&io)?;
     out.inner.get_ref().sync_all().map_err(&io)?;

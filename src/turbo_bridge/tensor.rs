@@ -159,6 +159,33 @@ impl<T: Copy> OwnedMatrix<T> {
         &self.empty_rows
     }
 
+    /// Record `rows` as rows with no usable direction. The indices must be
+    /// strictly ascending and inside the matrix, and each row must already
+    /// be all zero.
+    pub fn with_empty_rows(mut self, rows: Vec<u32>) -> Result<Self, TensorError>
+    where
+        T: Default + PartialEq,
+    {
+        let count = self.rows();
+        let mut previous = None;
+        for &row in &rows {
+            let index = row as usize;
+            if index >= count || previous.is_some_and(|p| p >= row) {
+                return Err(TensorError::EmptyRow { row, rows: count });
+            }
+            let start = index * self.dim;
+            if self.data[start..start + self.dim]
+                .iter()
+                .any(|v| *v != T::default())
+            {
+                return Err(TensorError::EmptyRow { row, rows: count });
+            }
+            previous = Some(row);
+        }
+        self.empty_rows = rows;
+        Ok(self)
+    }
+
     pub fn view(&self) -> MatrixView<'_, T> {
         MatrixView::packed(&self.data, self.dim).expect("an owned matrix is always packed")
     }
@@ -167,17 +194,16 @@ impl<T: Copy> OwnedMatrix<T> {
 impl OwnedMatrix<f32> {
     /// Normalize each non-zero row in place, retaining and recording zero rows.
     pub fn l2_normalize_rows(&mut self) {
+        self.empty_rows.clear();
         for (index, row) in self.data.chunks_exact_mut(self.dim).enumerate() {
             let norm = row
                 .iter()
                 .map(|value| f64::from(*value) * f64::from(*value))
                 .sum::<f64>()
                 .sqrt();
-            if norm == 0.0 {
-                let index = index as u32;
-                if !self.empty_rows.contains(&index) {
-                    self.empty_rows.push(index);
-                }
+            if norm == 0.0 || !norm.is_finite() {
+                row.fill(0.0);
+                self.empty_rows.push(index as u32);
             } else {
                 for value in row {
                     *value = (*value as f64 / norm) as f32;
@@ -193,6 +219,7 @@ pub enum TensorError {
     ZeroDim,
     RaggedFlat { len: usize, dim: usize },
     StrideTooSmall { dim: usize, stride: usize },
+    EmptyRow { row: u32, rows: usize },
 }
 
 impl fmt::Display for TensorError {
@@ -208,6 +235,10 @@ impl fmt::Display for TensorError {
             Self::StrideTooSmall { dim, stride } => {
                 write!(f, "tensor stride {stride} is smaller than dimension {dim}")
             }
+            Self::EmptyRow { row, rows } => write!(
+                f,
+                "empty row {row} is out of order, outside {rows} rows, or not zero"
+            ),
         }
     }
 }

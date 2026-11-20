@@ -354,7 +354,7 @@ mod imp {
             let calibration = first.calibration.as_ref().ok_or_else(|| {
                 Status::failed_precondition("clustered TurboVec first shard has no calibration")
             })?;
-            let mut digest = crate::sha256::Sha256::new();
+            let mut digest = turbo_sha256::Sha256::new();
             digest.update(b"turbovec-grpc-score-v1\0");
             digest.update(&(u64::from(info.dim)).to_le_bytes());
             digest.update(&info.bit_width.to_le_bytes());
@@ -371,7 +371,7 @@ mod imp {
                 rows: health.rows,
                 topology_generation: health.topology_generation,
                 dimensions: info.dim,
-                scoring_fingerprint: crate::sha256::to_hex(&digest.finalize()),
+                scoring_fingerprint: digest.finish().to_hex(),
             })
         }
 

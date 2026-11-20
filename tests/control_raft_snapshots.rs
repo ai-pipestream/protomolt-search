@@ -1270,7 +1270,7 @@ async fn r5_oversize_and_truncated_images_refuse_before_replacement() {
         "{}-{}-{}",
         index,
         image.len() + 100,
-        pipestream_search::sha256::to_hex(&pipestream_search::sha256::digest(&image))
+        turbo_sha256::to_hex(turbo_sha256::sha256(&image).0)
     );
     let error = match cluster.push(&announced, &image).await {
         Ok(()) => panic!("an oversize announcement must refuse, installed instead"),
@@ -1522,7 +1522,7 @@ async fn snapshot_admission_refuses_invalid_transfers_without_stopping_the_core(
         "{}-{}-{}",
         index,
         (4u64 << 30) + 1,
-        pipestream_search::sha256::to_hex(&pipestream_search::sha256::digest(&image))
+        turbo_sha256::to_hex(turbo_sha256::sha256(&image).0)
     );
     let error = peer
         .install_snapshot(chunk(&huge, 0, &image[..1024], false))

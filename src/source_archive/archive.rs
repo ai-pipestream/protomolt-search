@@ -97,14 +97,14 @@ impl SourceArchive {
                 "source requires descriptor bytes and a message type",
             ));
         }
-        let descriptor_sha = sha256::digest(&source.descriptor_set);
+        let descriptor_sha = turbo_sha256::sha256(&source.descriptor_set).0;
         let record = SourceRecord {
             descriptor_sha256: descriptor_sha.to_vec(),
             message_type: source.message_type.clone(),
             payload: source.payload.clone(),
         }
         .encode_to_vec();
-        let source_sha = sha256::digest(&record);
+        let source_sha = turbo_sha256::sha256(&record).0;
         if expected_source.is_some_and(|id| self.sources[id as usize - 1].0 != source_sha) {
             return Err(invalid(
                 "logical source version has different original bytes",
@@ -317,7 +317,7 @@ impl SourceArchive {
         let index = self.index(row_count)?.encode_to_vec();
         writer.write_all(MAGIC)?;
         writer.write_all(&(index.len() as u64).to_le_bytes())?;
-        writer.write_all(&sha256::digest(&index))?;
+        writer.write_all(&turbo_sha256::sha256(&index).0)?;
         writer.write_all(&index)?;
         for bytes in self
             .descriptors

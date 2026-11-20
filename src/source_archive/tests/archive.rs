@@ -176,7 +176,7 @@ fn conflicting_source_version_and_chunk_metadata_are_refused_before_row_attachme
     let mut index = (*reader.index).clone();
     index.format_version = 1;
     let encoded = index.encode_to_vec();
-    bytes[16..48].copy_from_slice(&sha256::digest(&encoded));
+    bytes[16..48].copy_from_slice(&turbo_sha256::sha256(&encoded).0);
     bytes[48..48 + encoded.len()].copy_from_slice(&encoded);
     assert!(SourceArchiveReader::open(&bytes, 1).is_err());
 }

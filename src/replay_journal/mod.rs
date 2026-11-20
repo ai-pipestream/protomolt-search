@@ -41,10 +41,10 @@ fn decode<T: Message + Default>(bytes: &[u8]) -> Result<T, Status> {
     Ok(value)
 }
 fn hash(domain: &[u8], bytes: &[u8]) -> Vec<u8> {
-    let mut hash = crate::sha256::Sha256::new();
+    let mut hash = turbo_sha256::Sha256::new();
     hash.update(domain);
     hash.update(bytes);
-    hash.finalize().to_vec()
+    hash.finish().0.to_vec()
 }
 
 /// Validate the immutable assignment shape. An external authority must also

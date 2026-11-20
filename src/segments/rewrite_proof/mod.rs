@@ -2,8 +2,8 @@
 use super::*;
 use crate::pb::storage::SourceRewriteCertificate;
 use crate::reshard::{reconstruct_document, segment_tables, SourceTables};
-use crate::sha256::Sha256;
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
+use turbo_sha256::Sha256;
 
 mod rows;
 mod schema;
@@ -134,7 +134,7 @@ fn compare_rows(database: &Database) -> Result<Vec<u8>, String> {
         part(&mut hash, lk.value());
         part(&mut hash, lv.value());
     }
-    Ok(hash.finalize().to_vec())
+    Ok(hash.finish().0.to_vec())
 }
 
 /// The digest of the schema and vector backend state both views share.
@@ -151,7 +151,7 @@ fn schema_digest(
         part(&mut digest, config.config_format.as_bytes());
         part(&mut digest, &config.payload);
     }
-    digest.finalize().to_vec()
+    digest.finish().0.to_vec()
 }
 
 impl OpenedSegmentSet {

@@ -5,7 +5,7 @@ use super::*;
 pub(super) fn digest_file(path: &Path) -> Result<(u64, String), String> {
     let mut file = std::fs::File::open(path)
         .map_err(|error| format!("open artifact {}: {error}", path.display()))?;
-    let mut hash = crate::sha256::Sha256::new();
+    let mut hash = turbo_sha256::Sha256::new();
     let mut bytes = 0u64;
     let mut buffer = vec![0u8; 1024 * 1024];
     loop {
@@ -20,7 +20,7 @@ pub(super) fn digest_file(path: &Path) -> Result<(u64, String), String> {
             .ok_or("artifact byte count overflow")?;
         hash.update(&buffer[..read]);
     }
-    Ok((bytes, crate::sha256::to_hex(&hash.finalize())))
+    Ok((bytes, hash.finish().to_hex()))
 }
 
 pub(super) fn copy_artifact(

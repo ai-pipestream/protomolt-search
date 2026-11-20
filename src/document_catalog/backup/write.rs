@@ -17,7 +17,7 @@ fn copy_pinned(files: &mut [PinnedFile], destination: &Path) -> Result<BTreeSet<
             ancestor = ancestor.parent().expect("generated bundle path");
         }
         let mut file = new_file(&output)?;
-        let mut hash = sha256::Sha256::new();
+        let mut hash = turbo_sha256::Sha256::new();
         let mut count = 0u64;
         let mut copy = |input: &mut dyn Read| -> Result<(), Status> {
             loop {
@@ -41,9 +41,7 @@ fn copy_pinned(files: &mut [PinnedFile], destination: &Path) -> Result<BTreeSet<
                 copy(input)?;
             }
         }
-        if count != pinned.metadata.bytes
-            || sha256::to_hex(&hash.finalize()) != pinned.metadata.sha256
-        {
+        if count != pinned.metadata.bytes || hash.finish().to_hex() != pinned.metadata.sha256 {
             return Err(Status::data_loss(
                 "backup artifact changed or failed its checksum",
             ));
@@ -98,7 +96,7 @@ impl CapturedBackup<'_> {
         let mut total = self.bytes;
         charge(&mut total, source.bytes, self.limits.max_bytes)?;
         let mut manifest = self.manifest(source);
-        manifest.manifest_sha256 = sha256::digest(&manifest.encode_to_vec()).to_vec();
+        manifest.manifest_sha256 = turbo_sha256::sha256(&manifest.encode_to_vec()).0.to_vec();
         let completed = manifest.encode_to_vec();
         charge(&mut total, completed.len() as u64, self.limits.max_bytes)?;
         drop(self.source);

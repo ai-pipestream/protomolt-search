@@ -91,7 +91,7 @@ All confirmed against commit `43596c9`:
   receipts, `ControlInstallState`, `ControlConfiguration`, ...);
   `pipestream_search::pb::{AccessAction, AccessPolicy, CollectionGrant,
   CollectionResource}`.
-- `pipestream_search::sha256::digest(&[u8]) -> [u8; 32]`, `to_hex`.
+- `turbo_sha256::sha256(bytes)` returns a digest. Use `.0` for its 32 bytes or `.to_hex()` for hexadecimal.
 - Capacity adapter and transitions (added for slice 3b, confirmed against
   `331c18f` + `b1bbe51`): `SourceAuthorityStore::configure_capacity(principal,
   &CapacityConfigureCommand) -> CapacityConfigureDecision` (a retained

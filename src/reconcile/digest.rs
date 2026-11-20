@@ -6,7 +6,7 @@ use crate::pb::AddDocumentsRequest;
 use super::{CheckTally, ColumnCheck};
 
 /// A SHA-256 over tagged, length-prefixed fields.
-struct Digest(crate::sha256::Sha256);
+struct Digest(turbo_sha256::Sha256);
 
 impl Digest {
     fn bytes(&mut self, tag: u8, data: &[u8]) {
@@ -26,7 +26,7 @@ impl Digest {
 /// The digest of a document's content: every value list sorted, so the
 /// order a store lists columns in does not matter, plus the vector.
 pub(super) fn digest(doc: &AddDocumentsRequest, vector: Option<&[f32]>) -> [u8; 32] {
-    let mut h = Digest(crate::sha256::Sha256::new());
+    let mut h = Digest(turbo_sha256::Sha256::new());
     digest_provenance(&mut h, doc);
     digest_scalars(&mut h, doc);
     digest_maps(&mut h, doc);
@@ -39,7 +39,7 @@ pub(super) fn digest(doc: &AddDocumentsRequest, vector: Option<&[f32]>) -> [u8; 
         v
     });
     h.optional(50, 51, vector.as_deref());
-    h.0.finalize()
+    h.0.finish().0
 }
 
 /// The text, lineage, identity, original source, and chunk ordinal.

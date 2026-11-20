@@ -9,11 +9,11 @@ use crate::pb::{ReplayJournalFrame, ReplayStreamBinding};
 fn frame_digest(binding: &[u8], frame: &ReplayJournalFrame) -> Vec<u8> {
     let mut unsigned = frame.clone();
     unsigned.sha256.clear();
-    let mut hash = crate::sha256::Sha256::new();
+    let mut hash = turbo_sha256::Sha256::new();
     hash.update(b"protomolt-search.replay-frame.v1\0");
     hash.update(binding);
     hash.update(&unsigned.encode_to_vec());
-    hash.finalize().to_vec()
+    hash.finish().0.to_vec()
 }
 pub(super) fn validate_frame(binding: &[u8], frame: &ReplayJournalFrame) -> Result<(), Status> {
     if frame.encoded_len() > MAX_FRAME_BYTES {

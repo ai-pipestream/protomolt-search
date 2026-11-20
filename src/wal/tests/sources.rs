@@ -35,10 +35,10 @@ fn explicit_analysis_bindings_need_a_valid_digest() {
         }],
     }
     .encode_to_vec();
-    let mut hasher = crate::sha256::Sha256::new();
+    let mut hasher = turbo_sha256::Sha256::new();
     hasher.update(b"protomolt.search.mapped-analysis.v1\0");
     hasher.update(&contract);
-    binding.analysis_sha = crate::sha256::to_hex(&hasher.finalize());
+    binding.analysis_sha = hasher.finish().to_hex();
     binding.analysis_contract = contract;
     writer
         .append(wal_record::Op::Bind(binding.clone()))

@@ -26,10 +26,10 @@ fn binding(explicit_analysis: bool) -> StoredBinding {
             }],
         }
         .encode_to_vec();
-        let mut hasher = pipestream_search::sha256::Sha256::new();
+        let mut hasher = turbo_sha256::Sha256::new();
         hasher.update(b"protomolt.search.mapped-analysis.v1\0");
         hasher.update(&binding.analysis_contract);
-        binding.analysis_sha = pipestream_search::sha256::to_hex(&hasher.finalize());
+        binding.analysis_sha = hasher.finish().to_hex();
     }
     binding
 }

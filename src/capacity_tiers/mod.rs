@@ -43,8 +43,6 @@ pub use self::snapshot::{
     FragmentRecord, FragmentRequest, NodeCapacity, NodeRecord, TierSnapshot, TierSnapshotInput,
 };
 
-use crate::sha256;
-
 const POLICY_DOMAIN: &[u8] = b"protomolt.capacity-tier-policy.v1\0";
 const OBSERVATIONS_DOMAIN: &[u8] = b"protomolt.capacity-observations.v1\0";
 const PLAN_DOMAIN: &[u8] = b"protomolt.capacity-plan-input.v1\0";
@@ -191,6 +189,6 @@ impl TierPolicy {
     }
 
     pub fn fingerprint(&self) -> [u8; 32] {
-        sha256::digest(&self.canonical_bytes())
+        turbo_sha256::sha256(&self.canonical_bytes()).0
     }
 }

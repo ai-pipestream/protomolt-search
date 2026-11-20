@@ -20,29 +20,9 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     std::hint::black_box(diff) == 0
 }
 
-/// HMAC-SHA256 over `crate::sha256` (RFC 2104).
+/// HMAC-SHA256 (RFC 2104).
 pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    const BLOCK: usize = 64;
-    let mut k = [0u8; BLOCK];
-    if key.len() > BLOCK {
-        k[..32].copy_from_slice(&crate::sha256::digest(key));
-    } else {
-        k[..key.len()].copy_from_slice(key);
-    }
-    let mut ipad = [0x36u8; BLOCK];
-    let mut opad = [0x5cu8; BLOCK];
-    for i in 0..BLOCK {
-        ipad[i] ^= k[i];
-        opad[i] ^= k[i];
-    }
-    let mut inner = crate::sha256::Sha256::new();
-    inner.update(&ipad);
-    inner.update(message);
-    let inner = inner.finalize();
-    let mut outer = crate::sha256::Sha256::new();
-    outer.update(&opad);
-    outer.update(&inner);
-    outer.finalize()
+    turbo_sha256::hmac_sha256(key, message).0
 }
 
 /// The shared key that authenticates UDP floor and cancel datagrams.
@@ -115,13 +95,13 @@ mod tests {
         // Test case 2 of RFC 4231.
         let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
         assert_eq!(
-            crate::sha256::to_hex(&mac),
+            turbo_sha256::to_hex(mac),
             "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
         );
         // Test case 1.
         let mac = hmac_sha256(&[0x0b; 20], b"Hi There");
         assert_eq!(
-            crate::sha256::to_hex(&mac),
+            turbo_sha256::to_hex(mac),
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
         // Test case 6: a key longer than the block.
@@ -130,7 +110,7 @@ mod tests {
             b"Test Using Larger Than Block-Size Key - Hash Key First",
         );
         assert_eq!(
-            crate::sha256::to_hex(&mac),
+            turbo_sha256::to_hex(mac),
             "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
         );
     }

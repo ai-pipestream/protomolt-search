@@ -43,7 +43,7 @@ fn open_checked(path: &Path) -> Result<(File, Header), VectorError> {
 
 fn check_trailer(bytes: &[u8], path: &Path) -> Result<(), VectorError> {
     let body = bytes.len() - TRAILER_LEN;
-    let digest = crate::sha256::digest(&bytes[..body]);
+    let digest = turbo_sha256::sha256(&bytes[..body]).0;
     if digest[..] != bytes[body..] {
         return Err(VectorError::new(format!(
             "load {}: {HNSW} image trailer does not match its contents",

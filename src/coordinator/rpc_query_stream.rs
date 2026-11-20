@@ -46,7 +46,7 @@ impl CoordinatorServiceImpl {
         let request_fingerprint = request
             .query
             .as_ref()
-            .map(|query| crate::sha256::hex_digest(&prost::Message::encode_to_vec(query)))
+            .map(|query| turbo_sha256::sha256(&prost::Message::encode_to_vec(query)).to_hex())
             .unwrap_or_default();
         if let Some(query) = request.query.as_mut() {
             self.admit_query_stream_query(query, access.as_ref())?;

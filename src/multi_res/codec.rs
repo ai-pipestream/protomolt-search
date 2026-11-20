@@ -10,8 +10,8 @@ use prost::encoding::{
 use prost::Message;
 
 use super::{invalid, Limits, RetainedVector, LIMITS};
-use crate::sha256::Sha256;
 use crate::turbo_bridge::MultiResVectorOutput;
+use turbo_sha256::Sha256;
 
 #[derive(Clone, PartialEq, Message)]
 pub(super) struct Tier {
@@ -100,7 +100,7 @@ pub(super) fn materialized(row: Embedding) -> io::Result<RetainedVector> {
     for value in &row.full {
         digest.update(&value.to_le_bytes());
     }
-    let sha256 = digest.finalize();
+    let sha256 = digest.finish().0;
     if row.sha256.as_slice() != sha256 {
         return Err(invalid("multi-resolution vector digest mismatch"));
     }
@@ -253,7 +253,7 @@ pub(super) fn validate_retained(row: &RetainedVector, limits: Limits) -> io::Res
     for value in &out.full {
         digest.update(&value.to_le_bytes());
     }
-    if digest.finalize() != out.sha256 {
+    if digest.finish().0 != out.sha256 {
         return Err(invalid("multi-resolution vector digest mismatch"));
     }
     Ok(size)

@@ -20,7 +20,7 @@ use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, FlushRequest, HealthRequest, HealthResponse,
 };
-use pipestream_search::sha256::Sha256;
+use turbo_sha256::Sha256;
 
 const LEGACY_REVISION: &str = "b20c74f1bf393b99499d8609c4828f125a4db6a6";
 const LEGACY_SHA256: &str = "50dc741d4318102dcf9ba9d2bc31148db2c9c735bd13a682a62e3addf50fb151";
@@ -68,7 +68,8 @@ fn verified_legacy_binary() -> PathBuf {
         hash.update(&buffer[..count]);
     }
     let actual = hash
-        .finalize()
+        .finish()
+        .0
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();

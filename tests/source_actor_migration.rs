@@ -5,7 +5,6 @@ use pipestream_search::{
         accept_document_request::Mutation, storage::*, AcceptDocumentRequest, AccessAction,
         AccessPolicy, CollectionGrant, CollectionResource, ProtobufSource,
     },
-    sha256,
 };
 use prost::Message;
 use redb::{ReadableDatabase, ReadableTable, TableHandle};
@@ -97,7 +96,7 @@ fn write(
 }
 
 fn request_sha256(request: &AcceptDocumentRequest) -> Vec<u8> {
-    sha256::digest(&request.encode_to_vec()).to_vec()
+    turbo_sha256::sha256(&request.encode_to_vec()).0.to_vec()
 }
 
 fn assignment(

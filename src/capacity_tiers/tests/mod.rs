@@ -7,8 +7,6 @@ mod validation;
 
 use std::collections::BTreeMap;
 
-use crate::sha256;
-
 use super::plan::{ensure_fan_in, rate_nanos};
 use super::*;
 
@@ -39,11 +37,11 @@ fn inc(byte: u8) -> [u8; 16] {
 }
 
 fn hex32(bytes: &[u8; 32]) -> String {
-    sha256::to_hex(bytes)
+    turbo_sha256::to_hex(bytes)
 }
 
 fn decl_fp() -> [u8; 32] {
-    sha256::digest(b"key_bucket = hash.fnv64(stable_key()) % 64u")
+    turbo_sha256::sha256(b"key_bucket = hash.fnv64(stable_key()) % 64u").0
 }
 
 fn tier(name: &str, min_replicas: u32, lo: u64, hi: u64, warmth: u64) -> CapacityTier {
@@ -86,25 +84,25 @@ fn req(bucket: u64, leaf: &str) -> FragmentRequest {
 }
 
 fn cov_l4() -> [u8; 32] {
-    sha256::digest(
+    turbo_sha256::sha256(
         b"example manifest: fragment (key_bucket=7, gen 9, L4), source generation 3, rows 1000000, bytes 268435456",
-    )
+    ).0
 }
 
 fn cov_l7() -> [u8; 32] {
-    sha256::digest(
+    turbo_sha256::sha256(
         b"example manifest: fragment (key_bucket=7, gen 9, L7), source generation 3, rows 500000, bytes 134217728",
-    )
+    ).0
 }
 
 fn tree_digest() -> [u8; 32] {
-    sha256::digest(
+    turbo_sha256::sha256(
         b"example placement tree: gen 9, leaf L4 = {krick-1, pi5v1, pi5v3}, leaf L7 = {krick-1, pi5v1}",
-    )
+    ).0
 }
 
 fn prov_digest() -> [u8; 32] {
-    sha256::digest(
+    turbo_sha256::sha256(
         b"example provider geometry: turbovec 64-shard mapped image; committed free bytes: krick-1=26843545600, pi5v1=16106127360, pi5v3=0",
-    )
+    ).0
 }

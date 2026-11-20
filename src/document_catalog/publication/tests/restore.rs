@@ -34,7 +34,7 @@ pub(super) fn read_manifest(bundle: &Path) -> SourceBackupManifest {
 
 pub(super) fn write_manifest(bundle: &Path, manifest: &mut SourceBackupManifest) {
     manifest.manifest_sha256.clear();
-    manifest.manifest_sha256 = sha256::digest(&manifest.encode_to_vec()).to_vec();
+    manifest.manifest_sha256 = turbo_sha256::sha256(&manifest.encode_to_vec()).0.to_vec();
     std::fs::write(bundle.join("source-backup.pb"), manifest.encode_to_vec()).unwrap();
 }
 

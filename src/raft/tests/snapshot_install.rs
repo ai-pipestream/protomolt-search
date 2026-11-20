@@ -90,7 +90,7 @@ async fn foreign_and_mismatched_images_refuse(
         meta.last_log_id.as_ref(),
         &ImageSignature {
             length: foreign_bytes.len() as u64,
-            sha256: crate::sha256::digest(&foreign_bytes),
+            sha256: turbo_sha256::sha256(&foreign_bytes).0,
         },
     );
     assert!(machine.install_snapshot(&foreign_meta, file).await.is_err());

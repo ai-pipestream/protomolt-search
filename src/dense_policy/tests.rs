@@ -56,7 +56,7 @@ fn the_document_round_trips_and_the_fingerprint_is_the_bytes() {
     assert_eq!(again.policy_id(), "court-ann-v1");
     assert_eq!(
         again.fingerprint(),
-        crate::sha256::hex_digest(text.as_bytes())
+        turbo_sha256::sha256(text.as_bytes()).to_hex()
     );
     // The saved file is the same document.
     let dir = std::env::temp_dir().join(format!("dense-policy-{}", std::process::id()));

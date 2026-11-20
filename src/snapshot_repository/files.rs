@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::{Artifact, RepositoryManifest, MANIFEST_FILE};
-use crate::sha256::Sha256;
+use turbo_sha256::Sha256;
 
 /// Copy buffer for hashing and copying: 1 MiB amortizes the syscalls
 /// without holding much heap.
@@ -25,7 +25,7 @@ pub fn hash_file(path: &Path) -> std::io::Result<(u64, String)> {
         hasher.update(&buf[..n]);
         total += n as u64;
     }
-    Ok((total, crate::sha256::to_hex(&hasher.finalize())))
+    Ok((total, hasher.finish().to_hex()))
 }
 
 /// Copy `source` to `destination` in one pass, hashing the bytes as they
@@ -53,7 +53,7 @@ pub fn copy_and_hash(source: &Path, destination: &Path, file: &str) -> std::io::
     Ok(Artifact {
         file: file.to_string(),
         bytes: total,
-        sha256: crate::sha256::to_hex(&hasher.finalize()),
+        sha256: hasher.finish().to_hex(),
     })
 }
 
@@ -129,7 +129,7 @@ pub fn write_manifest(
     let mut file = std::fs::File::create(&path)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
-    Ok((path, crate::sha256::hex_digest(&bytes)))
+    Ok((path, turbo_sha256::sha256(&bytes).to_hex()))
 }
 
 /// Read and parse the manifest of a repository directory, returning it
@@ -139,7 +139,7 @@ pub fn read_manifest(directory: &Path) -> Result<(RepositoryManifest, String), S
     let bytes =
         std::fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
     let manifest = RepositoryManifest::parse(&bytes)?;
-    Ok((manifest, crate::sha256::hex_digest(&bytes)))
+    Ok((manifest, turbo_sha256::sha256(&bytes).to_hex()))
 }
 
 /// Refuse a manifest digest other than the one the caller expects.

@@ -14,7 +14,7 @@ fn decode_index(bytes: &[u8], row_count: u32) -> io::Result<(SourceArchiveIndex,
         .filter(|end| *end <= bytes.len())
         .ok_or_else(|| invalid("source index is truncated"))?;
     let encoded_index = &bytes[HEADER_BYTES..index_end];
-    if sha256::digest(encoded_index).as_slice() != &bytes[16..48] {
+    if turbo_sha256::sha256(encoded_index).0.as_slice() != &bytes[16..48] {
         return Err(invalid("source index checksum mismatch"));
     }
     let index = SourceArchiveIndex::decode(encoded_index)
@@ -120,7 +120,7 @@ impl SourceArchiveReader {
         }
         let bytes = &archive[self.blobs_offset + blob.offset as usize
             ..self.blobs_offset + (blob.offset + blob.length) as usize];
-        if sha256::digest(bytes).as_slice() != blob.sha256 {
+        if turbo_sha256::sha256(bytes).0.as_slice() != blob.sha256 {
             return Err(invalid("source blob checksum mismatch"));
         }
         Ok(bytes)

@@ -36,7 +36,7 @@ impl RaftTransportService {
                 reasons::TRANSPORT_NO_CLIENT_CERTIFICATE,
             )
         })?;
-        let fingerprint = crate::sha256::digest(leaf.as_ref());
+        let fingerprint = turbo_sha256::sha256(leaf.as_ref()).0;
         let registered = self.directory.node_of(&fingerprint).ok_or_else(|| {
             reasons::reason(
                 Status::unauthenticated(

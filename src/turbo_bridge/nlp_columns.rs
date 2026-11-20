@@ -77,9 +77,9 @@ pub struct NlpColumnSpec {
 impl NlpColumnSpec {
     pub(super) fn materialization_id(&self) -> String {
         let bytes = serde_json::to_vec(self).expect("NLP column spec serializes");
-        let mut hash = crate::sha256::Sha256::new();
+        let mut hash = turbo_sha256::Sha256::new();
         hash.update(&bytes);
-        let digest: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        let digest: String = hash.finish().0.iter().map(|b| format!("{b:02x}")).collect();
         format!("v1:{digest}")
     }
 

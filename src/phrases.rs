@@ -8,7 +8,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use protomolt_analyzer::{phrase_posting_term, Glossary, GlossaryEntry};
+pub use crate::analyzer::native::{phrase_posting_term, GlossaryEntry};
+use crate::analyzer::native::{unicode_case_fold, Glossary};
 
 use crate::pb::{MapFacetEntry, OffsetSpan, PhrasePosting};
 
@@ -254,8 +255,8 @@ pub fn ner_entities(field: &str, entities: &[DocEntity]) -> Vec<MapFacetEntry> {
         .filter_map(|entity| {
             let identity = format!(
                 "{}\0{}",
-                protomolt_analyzer::unicode_case_fold(&entity.kind),
-                protomolt_analyzer::unicode_case_fold(&entity.text)
+                unicode_case_fold(&entity.kind),
+                unicode_case_fold(&entity.text)
             );
             let key = entity_key("ner", &identity);
             seen.insert(key.clone()).then(|| MapFacetEntry {

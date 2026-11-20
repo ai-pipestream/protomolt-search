@@ -192,7 +192,7 @@ impl DenseQualityProfile {
 
     pub fn parse(text: &str) -> Result<Self, String> {
         let file: ProfileFile = toml::from_str(text).map_err(|error| error.to_string())?;
-        Self::from_file(file, crate::sha256::hex_digest(text.as_bytes()))
+        Self::from_file(file, turbo_sha256::sha256(text.as_bytes()).to_hex())
     }
 
     /// Build a version 2 profile from a measured ladder. Every point must

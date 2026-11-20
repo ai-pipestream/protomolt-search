@@ -154,7 +154,7 @@ impl HnswIndex {
             return self.with_row_source(|rows| rows.identity());
         };
         self.with_row_source(|rows| {
-            let mut sha = crate::sha256::Sha256::new();
+            let mut sha = turbo_sha256::Sha256::new();
             let mut bytes = Vec::with_capacity(4 * self.dim.max(256));
             for &node in r2n {
                 bytes.clear();
@@ -166,7 +166,7 @@ impl HnswIndex {
             RowSourceIdentity {
                 dim: rows.dim(),
                 rows: rows.row_count(),
-                content_digest: sha.finalize(),
+                content_digest: sha.finish().0,
             }
         })
     }

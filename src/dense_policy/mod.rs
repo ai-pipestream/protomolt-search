@@ -127,7 +127,7 @@ impl DenseExecutionPolicy {
 
     pub fn parse(text: &str) -> Result<Self, String> {
         let file: PolicyFile = toml::from_str(text).map_err(|error| error.to_string())?;
-        Self::from_file(file, crate::sha256::hex_digest(text.as_bytes()))
+        Self::from_file(file, turbo_sha256::sha256(text.as_bytes()).to_hex())
     }
 
     /// Write the policy as the strict TOML document `load` reads, fsynced.

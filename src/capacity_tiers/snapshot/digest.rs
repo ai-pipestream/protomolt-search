@@ -5,7 +5,6 @@ use crate::capacity_tiers::{
     put_str, put_u32, put_u64, ENCODING_VERSION, FRAGMENTS_DOMAIN, NODES_DOMAIN, PLAN_DOMAIN,
     PLAN_ENCODING_VERSION,
 };
-use crate::sha256;
 
 use super::TierSnapshot;
 
@@ -25,7 +24,7 @@ impl TierSnapshot {
             put_u64(&mut out, record.capacity.total_bytes);
             put_u64(&mut out, record.capacity.resident_bytes);
         }
-        sha256::digest(&out)
+        turbo_sha256::sha256(&out).0
     }
 
     /// The canonical digest of the fragment records (domain
@@ -39,7 +38,7 @@ impl TierSnapshot {
         for fragment in &self.fragments {
             fragment.put_canonical(&mut out);
         }
-        sha256::digest(&out)
+        turbo_sha256::sha256(&out).0
     }
 
     /// §4, encoding version 2: `SHA-256(domain ‖ u32le(2) ‖ context fields
@@ -71,6 +70,6 @@ impl TierSnapshot {
         put_u64(&mut out, self.cohort_phase_unix_ms);
         out.extend_from_slice(&self.nodes_digest());
         out.extend_from_slice(&self.fragments_digest());
-        sha256::digest(&out)
+        turbo_sha256::sha256(&out).0
     }
 }

@@ -63,7 +63,7 @@ fn empty_catalog_binding_is_atomic_idempotent_and_validated_on_open() {
                     5 => record.protobuf.extend([10, 1, b'x']), // duplicate plan
                     _ => record.protobuf.clear(),
                 }
-                record.sha256 = pipestream_search::sha256::hex_digest(&record.protobuf);
+                record.sha256 = turbo_sha256::sha256(&record.protobuf).to_hex();
             }
         }
         pipestream_search::segments::write_manifest_file(&root.join("segments.json"), &bad)

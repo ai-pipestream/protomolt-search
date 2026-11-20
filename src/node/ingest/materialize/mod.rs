@@ -155,7 +155,7 @@ pub(crate) fn materialize_sha(spec: Option<&crate::pb::MaterializeSpec>) -> Stri
     if spec.columns.is_empty() {
         return String::new();
     }
-    let mut hasher = crate::sha256::Sha256::new();
+    let mut hasher = turbo_sha256::Sha256::new();
     // An I64 column changes the hash domain: a binding recorded without I64
     // presence semantics could discard a valid MIN result, so appends to it
     // refuse instead of mixing projection semantics. F64-only specs keep the
@@ -174,7 +174,7 @@ pub(crate) fn materialize_sha(spec: Option<&crate::pb::MaterializeSpec>) -> Stri
         }
         hasher.update(&column.kind.to_be_bytes());
     }
-    crate::sha256::to_hex(&hasher.finalize())
+    hasher.finish().to_hex()
 }
 
 /// Fold derived quality scalars into `doc.numerics` / `doc.integers` and clear

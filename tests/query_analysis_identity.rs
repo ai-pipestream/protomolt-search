@@ -7,10 +7,10 @@ use pipestream_search::{
     harness::{fit_calibration, start_empty_node, start_relay, unit_vectors},
     node::NodeConfig,
     pb::{node_service_client::NodeServiceClient, search_service_server::SearchService, *},
-    sha256::{to_hex, Sha256},
 };
 use prost::Message;
 use tonic::{Code, Request, Status};
+use turbo_sha256::Sha256;
 
 const DIM: usize = 8;
 const DOCS: u32 = 3;
@@ -76,7 +76,7 @@ impl Fixture {
                 .apply_wal_binding(ApplyWalBindingRequest {
                     plan_fingerprint: "query-analysis-fixture".into(),
                     body_path: "body".into(),
-                    analysis_sha: to_hex(&hash.finalize()),
+                    analysis_sha: hash.finish().to_hex(),
                     analysis_contract: bytes,
                     ..Default::default()
                 })
