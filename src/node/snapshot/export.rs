@@ -169,7 +169,8 @@ impl NodeServiceImpl {
 
     /// Export a consistent snapshot: flush, copy the current generation into
     /// `directory` under the seal mutex and shard read lock, and write the
-    /// snapshot manifest, retrying bounded flushes on intervening mutations.
+    /// snapshot manifest. A mutation between flush and copy is answered by
+    /// one retry under the mutation gate.
     pub fn export_snapshot_blocking(
         &self,
         directory: &Path,
@@ -202,7 +203,7 @@ impl NodeServiceImpl {
         // so steady ingest can dirty a fresh tail during every seal and
         // starve a flush-then-check loop forever; when that happens, one
         // retry holds the mutation gate across its seal and copy, so
-        // appends pause for a single small seal instead.
+        // appends pause for that one seal and copy instead.
         let (manifest, bytes) = match self.export_if_flushed(&index_path, directory)? {
             Some(copy) => copy,
             None => {
@@ -210,7 +211,8 @@ impl NodeServiceImpl {
                 self.flush_index()?;
                 self.export_if_flushed(&index_path, directory)?.ok_or_else(|| {
                     Status::aborted(
-                        "shard stayed dirty under an ingest drain; a snapshot copies a                          flushed generation, retry when ingest pauses",
+                        "shard stayed dirty under an ingest drain; a snapshot copies a \
+                         flushed generation, retry when ingest pauses",
                     )
                 })?
             }

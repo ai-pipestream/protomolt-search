@@ -9,9 +9,6 @@ struct LoadedArtifacts {
     live_docs: LiveDocs,
 }
 
-/// Recover an interrupted catalog swap and compaction cutover, then refuse
-/// a source-managed catalog opened under another collection or with a WAL.
-/// Returns whether the catalog declares its generation.
 /// Refuse a shard directory still holding retired single-image
 /// artifacts, by name. Opening past them would serve an empty catalog
 /// over data the operator can see on disk: the fix is a rebuild through
@@ -34,6 +31,10 @@ fn refuse_retired_artifacts(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuse retired artifacts, recover an interrupted catalog swap and
+/// compaction cutover, then refuse a source-managed catalog opened under
+/// another collection or with a WAL. Returns whether the catalog declares
+/// its generation.
 fn recover_open_paths(config: &NodeConfig) -> Result<bool, String> {
     let Some(path) = config.index_path.as_ref() else {
         return Ok(false);
