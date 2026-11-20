@@ -140,6 +140,7 @@ fn the_reconciler_settles_what_a_restart_left_unconfirmed() {
         &binding,
     )
     .unwrap();
+    assert!(*active.unconfirmed_updates().borrow());
     let pending = active.unconfirmed_operations(&admission, 10).unwrap();
     assert_eq!(
         pending
@@ -187,6 +188,7 @@ fn the_reconciler_settles_what_a_restart_left_unconfirmed() {
         .unconfirmed_operations(&admission, 10)
         .unwrap()
         .is_empty());
+    assert!(!*active.unconfirmed_updates().borrow());
     assert_eq!(recorded(&active, b"two"), (WriteOutcome::Accepted, 0));
 }
 

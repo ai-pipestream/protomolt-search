@@ -48,7 +48,7 @@ macro_rules! impl_document_write_service {
                 &self,
                 request: Request<GetDocumentPublicationStatusRequest>,
             ) -> Result<Response<DocumentPublicationStatus>, Status> {
-                metrics::timed(Route::GetDocumentWriteTarget, request, |request| {
+                metrics::timed(Route::GetDocumentPublicationStatus, request, |request| {
                     self.status(request)
                 })
                 .await

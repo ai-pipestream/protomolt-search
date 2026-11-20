@@ -66,12 +66,14 @@ impl ActiveManagedCatalog {
             .managed_activation
             .clone()
             .expect("recovered activation");
+        let unconfirmed = Self::unconfirmed_present(&inner)?;
         Ok(Self {
             inner: Arc::new(inner),
             binding: binding.clone(),
             activation,
             authority: authority.clone(),
             judging: std::sync::RwLock::new(()),
+            unconfirmed: UnconfirmedSignal::new(unconfirmed),
             #[cfg(any(test, feature = "fault-injection"))]
             settle_pause: std::sync::Mutex::new(None),
         })

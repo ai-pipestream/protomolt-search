@@ -10,7 +10,7 @@ use super::{
     admit_ingest, admit_publication_read, extract_network_document, publication_targets,
     WorkPermit, WriteBudget,
 };
-use crate::document_catalog::{Acceptance, ActiveManagedCatalog, Reconciled, Settlement};
+use crate::document_catalog::{Acceptance, ActiveManagedCatalog, Settlement};
 use crate::metrics::{self, Route};
 use crate::node::ManagedTarget;
 use crate::pb::document_write_service_server::{DocumentWriteService, DocumentWriteServiceServer};
@@ -25,6 +25,8 @@ use prost::Message;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
+
+mod reconcile;
 
 struct Inner {
     principals: Principals,
@@ -351,81 +353,6 @@ impl HostedDocumentWriteService {
             }
         })?;
         result.map(Response::new)
-    }
-
-    /// The pending-actor reconciler, run after a restart or a leader
-    /// failover: list up to `limit` UNCONFIRMED writes of `collection`
-    /// under `admin`'s leased Admin admission, then settle each under a
-    /// fresh lease of its own actor, the one whose Ingest right is judged.
-    /// A write no fresh lease can decide now stays unconfirmed and is
-    /// reported, for the next pass.
-    pub async fn reconcile_unconfirmed(
-        &self,
-        admin: &str,
-        collection: &str,
-        limit: usize,
-    ) -> Result<Reconciled, Status> {
-        let catalog = self
-            .inner
-            .catalogs
-            .get(collection)
-            .cloned()
-            .ok_or_else(|| {
-                Status::not_found(format!(
-                    "no managed catalog serves collection {collection:?}"
-                ))
-            })?;
-        let lease = self.inner.host.lease(admin).await?;
-        let listing = Arc::clone(&catalog);
-        let pending = tokio::task::spawn_blocking(move || {
-            let admission = lease.admission()?;
-            listing.unconfirmed_operations(&admission, limit)
-        })
-        .await
-        .map_err(|_| Status::internal("source reconciliation worker failed"))??;
-        let mut reconciled = Reconciled::default();
-        for operation in pending {
-            let settled = match self.inner.host.lease(&operation.principal).await {
-                Ok(lease) => {
-                    let catalog = Arc::clone(&catalog);
-                    let (actor, id) = (operation.principal.clone(), operation.operation_id.clone());
-                    tokio::task::spawn_blocking(move || {
-                        let admission = lease.admission()?;
-                        catalog.settle(&admission, &actor, &id)
-                    })
-                    .await
-                    .map_err(|_| Status::internal("source settlement worker failed"))?
-                }
-                Err(error) => Err(error),
-            };
-            reconciled.record(operation, settled);
-        }
-        Ok(reconciled)
-    }
-
-    /// Reconcile at startup and under the current leader until shutdown.
-    /// Every pass is bounded by the write-service admission budget.
-    pub fn spawn_reconciler(
-        self,
-        admin: String,
-        mut shutdown: tokio::sync::watch::Receiver<bool>,
-    ) -> tokio::task::JoinHandle<Result<(), tonic::transport::Error>> {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                let collections: Vec<String> = self.inner.catalogs.keys().cloned().collect();
-                for collection in collections {
-                    let limit = self.inner.budget.limits.max_in_flight as usize;
-                    let _ = self.reconcile_unconfirmed(&admin, &collection, limit).await;
-                }
-                tokio::select! {
-                    _ = shutdown.wait_for(|raised| *raised) => break,
-                    _ = interval.tick() => {}
-                }
-            }
-            Ok(())
-        })
     }
 
     /// Settle a durable write whose original lease lapsed before commit returned,

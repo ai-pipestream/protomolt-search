@@ -63,6 +63,41 @@ pub enum Settlement {
     Fenced(Status),
 }
 
+struct UnconfirmedSignal {
+    generation: std::sync::Mutex<u64>,
+    updates: tokio::sync::watch::Sender<bool>,
+}
+
+impl UnconfirmedSignal {
+    fn new(pending: bool) -> Self {
+        Self {
+            generation: std::sync::Mutex::new(0),
+            updates: tokio::sync::watch::channel(pending).0,
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        *self.generation.lock().unwrap()
+    }
+
+    fn pending(&self) -> bool {
+        *self.updates.borrow()
+    }
+
+    fn mark(&self) {
+        let mut generation = self.generation.lock().unwrap();
+        *generation = generation.wrapping_add(1);
+        self.updates.send_replace(true);
+    }
+
+    fn clear_if_current(&self, expected: u64) {
+        let generation = self.generation.lock().unwrap();
+        if *generation == expected {
+            self.updates.send_replace(false);
+        }
+    }
+}
+
 /// A managed source activated under its committed fence. Every write is
 /// admitted through a `SourceAdmission` that finds the owner ACTIVE under
 /// exactly this epoch and the actor permitted, and the admission is held
@@ -78,6 +113,7 @@ pub struct ActiveManagedCatalog {
     /// outcome, so a version read ACCEPTED can no longer become
     /// UNCONFIRMED.
     judging: std::sync::RwLock<()>,
+    unconfirmed: UnconfirmedSignal,
     #[cfg(any(test, feature = "fault-injection"))]
     settle_pause: std::sync::Mutex<Option<std::time::Duration>>,
 }
@@ -94,4 +130,20 @@ fn require_authority(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UnconfirmedSignal;
+
+    #[test]
+    fn a_stale_clear_cannot_hide_a_new_unconfirmed_write() {
+        let signal = UnconfirmedSignal::new(false);
+        let stale = signal.generation();
+        signal.mark();
+        signal.clear_if_current(stale);
+        assert!(signal.pending());
+        signal.clear_if_current(signal.generation());
+        assert!(!signal.pending());
+    }
 }

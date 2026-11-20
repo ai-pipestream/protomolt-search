@@ -169,12 +169,14 @@ impl PreparedManagedCatalog {
             Ok(activation)
         })()?;
         inner.managed_activation = Some(activation.clone());
+        let unconfirmed = ActiveManagedCatalog::unconfirmed_present(&inner)?;
         Ok(ActiveManagedCatalog {
             inner: Arc::new(inner),
             binding: self.binding,
             activation,
             authority: self.authority,
             judging: std::sync::RwLock::new(()),
+            unconfirmed: UnconfirmedSignal::new(unconfirmed),
             #[cfg(any(test, feature = "fault-injection"))]
             settle_pause: std::sync::Mutex::new(None),
         })

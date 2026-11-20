@@ -35,6 +35,24 @@ impl Reconciled {
 }
 
 impl ActiveManagedCatalog {
+    pub(super) fn unconfirmed_present(catalog: &DocumentCatalog) -> Result<bool, Status> {
+        let read = catalog.database.begin_read().map_err(storage)?;
+        let operations = read.open_table(actors::OPERATIONS).map_err(storage)?;
+        for entry in operations.iter().map_err(storage)? {
+            let (_, value) = entry.map_err(storage)?;
+            let operation: DocumentOperation = decode(value.value())?;
+            if outcome::outcome_of(operation.outcome)? == WriteOutcome::Unconfirmed {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    #[cfg(any(test, feature = "raft"))]
+    pub(crate) fn unconfirmed_updates(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.unconfirmed.updates.subscribe()
+    }
+
     /// Settle up to `limit` UNCONFIRMED writes, listed under `admin`'s
     /// Admin admission. `settle` decides each one under a fresh admission
     /// of the write's own actor, whose Ingest right is the one judged; an
@@ -128,15 +146,18 @@ impl ActiveManagedCatalog {
         limit: usize,
     ) -> Result<Vec<PendingOperation>, Status> {
         self.admit(admission, AccessAction::Admin)?;
+        let generation = self.unconfirmed.generation();
         let read = self.inner.database.begin_read().map_err(storage)?;
         let operations = read.open_table(actors::OPERATIONS).map_err(storage)?;
         let mut pending = Vec::new();
+        let mut remaining = false;
         for entry in operations.iter().map_err(storage)? {
             let (key, value) = entry.map_err(storage)?;
             let operation: DocumentOperation = decode(value.value())?;
             if outcome::outcome_of(operation.outcome)? != WriteOutcome::Unconfirmed {
                 continue;
             }
+            remaining = true;
             let key: ActorOperationKey = decode(key.value())?;
             let receipt = operation
                 .receipt
@@ -147,6 +168,13 @@ impl ActiveManagedCatalog {
                 version: receipt.version,
                 accepted_sequence: receipt.accepted_sequence,
             });
+        }
+        if remaining {
+            if !self.unconfirmed.pending() {
+                self.unconfirmed.mark();
+            }
+        } else {
+            self.unconfirmed.clear_if_current(generation);
         }
         pending.sort_by_key(|operation| operation.accepted_sequence);
         pending.truncate(limit);

@@ -62,6 +62,7 @@ impl ActiveManagedCatalog {
                 Err(_) => {
                     self.inner
                         .mark_unconfirmed(Some(&decision.principal), &request.operation_id)?;
+                    self.unconfirmed.mark();
                     Ok(Acceptance::Unconfirmed(written.receipt))
                 }
             },
