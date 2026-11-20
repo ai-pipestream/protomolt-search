@@ -178,3 +178,32 @@ fn source_owner_metadata_rejects_downgrade_corruption_and_noncanonical_protobuf(
         );
     }
 }
+
+#[test]
+fn raw_format5_manifest_refuses_by_version_not_missing_field() {
+    let root =
+        std::env::temp_dir().join(format!("protomolt-segments-format5-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    // A format-5 segments.json as the previous build wrote it: its one
+    // segment record has no "parents_colocated" key at all.
+    std::fs::write(
+        root.join(SET_FILE),
+        r#"{"format":5,"epoch":1,"segments":[{"segment_id":"s0","generation":1,"base_label":0,"rows":1,"live_rows":1}]}"#,
+    )
+    .unwrap();
+    for error in [
+        OpenedSegmentSet::open(root.clone()).unwrap_err(),
+        SegmentCatalog::read_manifest(&root).unwrap_err(),
+    ] {
+        assert!(
+            error.contains("reads only format 6"),
+            "version refusal, got: {error}"
+        );
+        assert!(
+            !error.contains("parents_colocated"),
+            "must not surface as a serde field error: {error}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -66,12 +66,20 @@ fn empty_catalog_binding_is_atomic_idempotent_and_validated_on_open() {
                 record.sha256 = turbo_sha256::sha256(&record.protobuf).to_hex();
             }
         }
-        pipestream_search::segments::write_manifest_file(&root.join("segments.json"), &bad)
-            .unwrap();
+        // Raw write: the manifest helper refuses to even read back a
+        // non-current format, which is the refusal under test here.
+        std::fs::write(
+            root.join("segments.json"),
+            serde_json::to_vec(&bad).unwrap(),
+        )
+        .unwrap();
         assert!(OpenedSegmentSet::open(&root).is_err(), "case {case}");
     }
-    pipestream_search::segments::write_manifest_file(&root.join("segments.json"), &canonical)
-        .unwrap();
+    std::fs::write(
+        root.join("segments.json"),
+        serde_json::to_vec(&canonical).unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         OpenedSegmentSet::open(&root).unwrap().binding(),
         Some(&binding)

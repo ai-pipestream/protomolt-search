@@ -100,6 +100,7 @@ impl SegmentCatalog {
         }
         let bytes = std::fs::read(&path)
             .map_err(|error| format!("read segment set {}: {error}", path.display()))?;
+        probe_set_format(&bytes)?;
         serde_json::from_slice(&bytes)
             .map(Some)
             .map_err(|error| format!("parse segment set {}: {error}", path.display()))

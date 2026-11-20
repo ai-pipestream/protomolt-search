@@ -29,6 +29,15 @@ impl StreamKeys {
                 "replication stable-keys metadata names no keys",
             ));
         }
+        if keys
+            .as_ref()
+            .is_some_and(|keys| keys.iter().any(|key| key.is_empty()))
+        {
+            return Err(Status::invalid_argument(
+                "replication stable-keys metadata carries an empty key; an empty key routes \
+                 nothing and proves no colocation",
+            ));
+        }
         Ok(Self {
             keyed: keys.is_some(),
             keys: keys.unwrap_or_default().into_iter(),
