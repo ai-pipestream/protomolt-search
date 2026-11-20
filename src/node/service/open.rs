@@ -12,10 +12,33 @@ struct LoadedArtifacts {
 /// Recover an interrupted catalog swap and compaction cutover, then refuse
 /// a source-managed catalog opened under another collection or with a WAL.
 /// Returns whether the catalog declares its generation.
+/// Refuse a shard directory still holding retired single-image
+/// artifacts, by name. Opening past them would serve an empty catalog
+/// over data the operator can see on disk: the fix is a rebuild through
+/// the reshard tool, never silent ignorance.
+fn refuse_retired_artifacts(path: &Path) -> Result<(), String> {
+    for suffix in [".bm25", ".bm25.build", ".snap", ".snap-old"] {
+        let mut candidate = path.as_os_str().to_owned();
+        candidate.push(suffix);
+        let candidate = PathBuf::from(candidate);
+        if probe_path_exists(&candidate, "retired shard artifact")? {
+            return Err(format!(
+                "{} is a retired single-image artifact; this build serves only the segment \
+                 catalog at {}, so rebuild the shard through the reshard tool and remove the \
+                 retired file",
+                candidate.display(),
+                segments_root(path).display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn recover_open_paths(config: &NodeConfig) -> Result<bool, String> {
     let Some(path) = config.index_path.as_ref() else {
         return Ok(false);
     };
+    refuse_retired_artifacts(path)?;
     recover_segments_swap(path)
         .map_err(|error| format!("recover segment catalog swap {}: {error}", path.display()))?;
     crate::compaction::recover_interrupted(path);

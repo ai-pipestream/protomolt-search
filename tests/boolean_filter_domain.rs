@@ -16,7 +16,6 @@ use std::sync::Mutex;
 use common::{fit_calibration, start_empty_node, unit_vectors};
 use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
 use pipestream_search::coordinator::CoordinatorServiceImpl;
-use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
@@ -46,8 +45,8 @@ fn tempdir(tag: &str) -> PathBuf {
     dir
 }
 
-fn config(index_path: PathBuf, slot_offset: u64) -> NodeConfig {
-    NodeConfig {
+fn config(index_path: PathBuf, slot_offset: u64) -> pipestream_search::node::NodeConfig {
+    pipestream_search::node::NodeConfig {
         index_path: Some(index_path),
         analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
         seal_tail_docs: SEAL as u32,
@@ -250,7 +249,7 @@ async fn uneven_fleet(tag: &str) -> Fleet {
         pipestream_search::harness::embedded_backend_request(DIM, BIT_WIDTH, &shift, &scale);
     let mut addrs = Vec::new();
     let mut handles = Vec::new();
-    let (addr, handle) = start_empty_node(NodeConfig {
+    let (addr, handle) = start_empty_node(pipestream_search::node::NodeConfig {
         seal_tail_docs: 0,
         ..config(dir.join("shard-0.tv"), 0)
     })
@@ -260,8 +259,6 @@ async fn uneven_fleet(tag: &str) -> Fleet {
         .configure_vector_backend(calibration.clone())
         .await
         .unwrap();
-    // The rows with vectors seal aligned; the vectorless documents after
-    // them seal as a documents-only segment.
     let with_vectors = SHARD_ROWS - VECTORLESS;
     for rows in [0..with_vectors, with_vectors..SHARD_ROWS] {
         let (tx, rx) = mpsc::channel(SHARD_ROWS);
@@ -272,13 +269,12 @@ async fn uneven_fleet(tag: &str) -> Fleet {
         client.add_documents(ReceiverStream::new(rx)).await.unwrap();
         if rows.start == 0 {
             let (tx, rx) = mpsc::channel(2);
-            tx.send(AddVectorsRequest {
+            let batch = AddVectorsRequest {
                 materialized_rows: Vec::new(),
                 vectors: vectors[..with_vectors * DIM].to_vec(),
                 dim: DIM as u32,
-            })
-            .await
-            .unwrap();
+            };
+            tx.send(batch).await.unwrap();
             drop(tx);
             client.add_vectors(ReceiverStream::new(rx)).await.unwrap();
         }

@@ -55,7 +55,7 @@ log is a **folder of hash-bucketed segment files**, not one file:
     ...
     bucket-063.wal
     markers.wal          # flush / snapshot markers
-  gen-000001/            # created by InstallSnapshot rotation
+  gen-000001/            # created by a snapshot-install rotation
     ...
 ```
 
@@ -126,13 +126,14 @@ from `TermStats` at query time as usual.
 
 ### Snapshot installation
 
-`InstallSnapshot` was designed for bulk load and is exactly phase 3 of
-the skeleton: stream an image, validate its provider and scoring fingerprint, atomically rename
-generation directories, recover interrupted swaps at startup. A node
-that installs a resharded image rotates its WAL to a fresh generation
+Bulk load goes through snapshot repositories: validate the provider and
+scoring fingerprint, swap the segment catalog atomically, and recover
+interrupted swaps at startup. The legacy raw-image `InstallSnapshot` stream
+is retired (UNIMPLEMENTED); only the segment-layout repository form installs.
+A node that installs a resharded image rotates its WAL to a fresh generation
 and logs on from there.
 
-Since 2026-09-04 a node can also fetch an image itself
+A node can fetch such a repository itself
 (`docs/snapshots.md`): `ExportSnapshot` publishes a shard's generation
 to a directory with a hashed manifest that records the WAL cutoff the
 image contains, and `InstallSnapshotFrom` pulls such a repository from a
@@ -176,7 +177,7 @@ the old generation and losing a tail.
    required for any shard that will ever be resharded, and defaults on
    for persisted shards.
 5. **Reshard requires full history.** A generation that began with
-   state its log does not contain — the image an `InstallSnapshot`
+   state its log does not contain — the image a snapshot-install
    rotation superseded it with, or the shard's contents when logging
    was enabled after data existed — records that state as
    `preexisting_vectors`/`preexisting_documents` in its manifest, and
@@ -201,7 +202,8 @@ image AND a fresh full-history log:
   disk as history.
 - **Offline, one-child reshard.** `reshard --split=1` over a generation
   applies its delete and replacement records and writes a dense
-  provider/BM25/FP32 image; install it with `InstallSnapshot`. That rotation
+  provider/BM25/FP32 image; install it as a snapshot repository with
+  `InstallSnapshotFrom`. That rotation
   records the image as `preexisting_*`, so the result is not
   log-reshardable and cannot be compacted again from its log; it is the
   bulk-load shape, not the maintenance one.
@@ -232,7 +234,8 @@ than index. The intended shape for an initial build:
    provider configuration and scoring identity. Retain the original FP32 rows
    as each child's exact-vector sidecar when FP32 candidate reranking is part
    of the serving contract.
-2. `InstallSnapshot` the images onto the nodes. The WAL rotates to a
+2. Install the image repositories onto the nodes with
+   `InstallSnapshotFrom`. The WAL rotates to a
    fresh generation whose manifest records the image as
    `preexisting_*` — cheap, honest, and the log stays near-empty.
 3. Live ingest from then on goes through the logged path; only the
@@ -339,7 +342,7 @@ Built and tested:
 
 Deliberately deferred:
 
-- **Image-aware reshard** — splitting a post-InstallSnapshot shard means
+- **Image-aware reshard** — splitting a post-snapshot-install shard means
   provider-specific partitioning or rebuilding the base vector image, splitting
   the BM25 store by document, and applying its log; today such shards are refused
   rather than mis-resharded.

@@ -17,7 +17,6 @@ use pipestream_search::analyzer::{
     analysis_fingerprint, body_spec, cased_body_spec, cased_twin_spec, NATIVE_ANALYSIS_BACKEND,
 };
 use pipestream_search::coordinator::CoordinatorServiceImpl;
-use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
@@ -44,8 +43,8 @@ fn tempdir(tag: &str) -> PathBuf {
     dir
 }
 
-fn config(analysis: &str, index_path: Option<PathBuf>) -> NodeConfig {
-    NodeConfig {
+fn config(analysis: &str, index_path: Option<PathBuf>) -> pipestream_search::node::NodeConfig {
+    pipestream_search::node::NodeConfig {
         index_path,
         analysis_addr: Some(analysis.to_string()),
         bm25_fields: vec!["body".into(), "body_cased".into()],
@@ -131,7 +130,6 @@ async fn one_analysis_yields_both_identities_and_each_field_answers_its_own() {
         "one Analyze per document: the cased field cost no second pass"
     );
 
-    // The node serves after its flush.
     let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
     assert!(
         client
@@ -232,7 +230,7 @@ async fn two_shards_equal_one_on_the_cased_leg() {
     let mut nodes = Vec::new();
     let mut addrs = Vec::new();
     for shard in 0..2usize {
-        let (addr, node) = start_empty_node(NodeConfig {
+        let (addr, node) = start_empty_node(pipestream_search::node::NodeConfig {
             slot_offset: (shard * 2) as u64,
             ..config(&analysis, None)
         })
@@ -360,7 +358,7 @@ async fn wal_replay_analyzes_each_document_once_and_keeps_the_pair() {
     let (analysis, mock, calls) = start_mock_analysis_metered().await;
     let dir = tempdir("replay");
     let index_path = dir.join("parent.tv");
-    let (addr, node) = start_empty_node(NodeConfig {
+    let (addr, node) = start_empty_node(pipestream_search::node::NodeConfig {
         wal: true,
         ..config(&analysis, Some(index_path.clone()))
     })

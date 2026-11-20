@@ -1020,7 +1020,6 @@ async fn a_catalog_without_the_section_serves_and_refuses_sentence_mode_by_name(
         doc.fields[0].sentences = None;
         store.add_document(i as u32, text.to_string(), doc);
     }
-    // Sealed as the one segment of the catalog the node opens.
     let path = dir.join("old.bm25");
     store.save(&path).unwrap();
     let reader = Bm25Reader::open(&path).unwrap();
@@ -1080,7 +1079,6 @@ async fn a_catalog_without_the_section_serves_and_refuses_sentence_mode_by_name(
     handle.abort();
     let _ = std::fs::remove_dir_all(&dir);
 }
-
 /// Synthetic corpus: `docs` documents of `lines` sentences each.
 fn synthetic(docs: u32, lines: usize) -> Vec<String> {
     (0..docs)
@@ -1092,7 +1090,6 @@ fn synthetic(docs: u32, lines: usize) -> Vec<String> {
         })
         .collect()
 }
-
 fn section(reader: &Bm25Reader, name: &str) -> u64 {
     reader
         .integrity_sections()
@@ -1106,7 +1103,6 @@ fn section(reader: &Bm25Reader, name: &str) -> u64 {
             )
         })
 }
-
 #[test]
 fn sentence_spans_are_priced_exactly_and_both_writers_agree() {
     let dir = tempdir("price");

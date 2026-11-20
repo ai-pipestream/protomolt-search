@@ -585,7 +585,6 @@ async fn shard_diagnostics_describe_the_catalog_and_a_heap_shard() {
     assert!(shard.segments.iter().all(|s| s.partition.is_none()));
     assert_eq!(shard.tail_rows, 0, "flushed");
     assert!(shard.segment_pruning && shard.floor_sharing);
-
     // The coordinator fans out to its node and stamps shard and address.
     let mut cdiag = DiagnosticsServiceClient::new(channel(&coord).await);
     let fan = cdiag
@@ -603,14 +602,13 @@ async fn shard_diagnostics_describe_the_catalog_and_a_heap_shard() {
         .unwrap()
         .into_inner();
     assert!(none.shards.is_empty());
-
     // A shard without an index path reports the memory layout and no
     // segments.
-    let (memory, _handle) = start_empty_node(NodeConfig {
+    let memory_config = NodeConfig {
         index_path: None,
         ..config(PathBuf::new())
-    })
-    .await;
+    };
+    let (memory, _handle) = start_empty_node(memory_config).await;
     ingest(&memory).await;
     let mut sdiag = DiagnosticsServiceClient::new(channel(&memory).await);
     let out = sdiag
@@ -622,7 +620,6 @@ async fn shard_diagnostics_describe_the_catalog_and_a_heap_shard() {
     assert!(out.shards[0].segments.is_empty());
     assert_eq!(out.shards[0].rows, rows().len() as u64);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_ring_holds_recent_requests_newest_first() {
     let (node, coord) = fleet("ring").await;

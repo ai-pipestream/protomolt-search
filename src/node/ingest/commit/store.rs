@@ -1,4 +1,4 @@
-//! Unified BM25 row and column insertion across `Segmented`, `Building`, and `Spilling` shards.
+//! Unified BM25 row and column insertion across `Segmented` and `Building` shards.
 
 use std::io;
 

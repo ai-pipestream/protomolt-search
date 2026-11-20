@@ -127,8 +127,6 @@ async fn ingest(addr: &str, from: usize, to: usize) {
     assert_eq!(added as usize, to - from);
 }
 
-/// Documents `from..to` with a court facet and no vectors: rows a flush
-/// running beside the stream can seal at any point between them.
 async fn ingest_documents(addr: &str, from: usize, to: usize) {
     let mut c = client(addr).await;
     let (tx, rx) = mpsc::channel(8);

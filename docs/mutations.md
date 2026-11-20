@@ -102,9 +102,11 @@ The shape is the live reshard's, in one process:
 6. **Closing flush.** The call then runs `Flush`, which writes the new
    generation's images, removes the marker, and retires the replaced segment
    directories. Any `Flush` completes a pending cutover the same way. A
-   flush that meets a tail mid-row (documents ahead of vectors) refuses to
-   seal; the closing flush returns that refusal and names the pending
-   cutover.
+   plain flush that meets a tail mid-row (documents ahead of vectors with
+   some vectors present) refuses to seal; the closing flush instead leaves
+   such a tail in place, documents ahead of their vectors included, for the
+   next flush once the vectors land, and persists only the sealed rows'
+   live overlay.
 
 The response reports rows before and after, tombstones reclaimed, tail
 records applied (and how many under the lock), the write-lock hold and the

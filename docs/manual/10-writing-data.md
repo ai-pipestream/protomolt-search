@@ -152,12 +152,12 @@ Two rules follow:
 
 ## Snapshots and bulk load
 
-`NodeService.InstallSnapshot` streams a finished shard image to a node: build
-once anywhere with the cluster's provider configuration, push it to every shard
-owner, and each node stages it in a generation directory, validates it, and
-swaps it in with one atomic rename. A crash mid-swap is recovered at startup.
-An image with a provider identity other than the shard's is rejected, so scores
-stay comparable cluster-wide.
+Bulk load is repository-shaped: build a segment-layout snapshot repository
+once anywhere with the cluster's provider configuration, then install it with
+`InstallSnapshotFrom` below. The legacy raw-image `NodeService.InstallSnapshot`
+stream is retired and refuses with UNIMPLEMENTED; there is no single-image
+install path. An image with a provider identity other than the shard's is
+rejected, so scores stay comparable cluster-wide.
 
 `NodeService.ExportSnapshot` publishes a shard's generation into an empty
 directory (a NAS path is the intended use) with a `snapshot-manifest.json`

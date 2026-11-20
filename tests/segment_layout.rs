@@ -1,9 +1,8 @@
-//! Segments as the default layout (`docs/immutable-segments.md`): a
-//! fresh persisted shard writes a catalog and seals its tail on flush;
-//! an old single-image fixture still opens and serves, and nothing
-//! converts on open; and every query over two sealed segments plus a
-//! tail equals the same query over one image of the same rows — global
-//! df, the live bitmap, facets, filters, highlights, prefixes, block-max.
+//! Segments as the only layout (`docs/immutable-segments.md`): a fresh
+//! persisted shard writes a catalog and seals its tail on flush; and
+//! every query over two sealed segments plus a tail equals the same
+//! query over one sealed segment of the same rows — global df, the live
+//! bitmap, facets, filters, highlights, prefixes, block-max.
 
 mod common;
 
@@ -27,7 +26,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 
 /// Three batches: the same corpus reaches a segmented shard as two
-/// sealed segments plus a tail, and a single-image shard as one file.
+/// sealed segments plus a tail, and a second shard as one sealed segment.
 const BATCHES: [&[(&str, &str)]; 3] = [
     &[
         (

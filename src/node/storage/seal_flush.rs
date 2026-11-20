@@ -2,6 +2,10 @@
 
 use super::*;
 
+#[cfg(test)]
+#[path = "seal_flush_tests.rs"]
+mod tests;
+
 /// Refuse an exact-vector sidecar whose shape disagrees with the rows it rescores.
 fn check_exact_sidecar_shape(guard: &ShardState) -> Result<(), Status> {
     if let Some(exact) = guard.exact_vectors.as_ref() {
@@ -75,12 +79,37 @@ fn adopt_sealed_exact_vectors(guard: &mut ShardState) -> Result<(), Status> {
     Ok(())
 }
 
-/// Write the tombstones over every physical row.
+/// The durable row prefix: rows the sealed catalog owns, never the
+/// volatile heap tail. A frozen-but-unpublished part is not durable
+/// either, so its base bounds the prefix while one exists.
+fn sealed_rows(guard: &ShardState) -> u64 {
+    match guard.bm25.as_ref() {
+        Some(Bm25Shard::Segmented(shard)) => u64::from(
+            shard
+                .frozen()
+                .map_or_else(|| shard.tail_base(), |(base, _, _)| base),
+        ),
+        _ => match guard.index.as_ref().and_then(VectorIndex::as_segmented) {
+            Some(provider) => provider
+                .frozen()
+                .map_or_else(|| provider.tail_base(), |(base, _, _)| base)
+                as u64,
+            None => physical_rows(guard),
+        },
+    }
+}
+
+/// Write the tombstones over the sealed prefix only. Sizing the file to
+/// every physical row would claim unsealed tail rows the catalog and the
+/// truncated WAL cannot recreate after a crash, and reopen would then
+/// refuse the overlay forever. Tail tombstones stay in memory (and in
+/// the WAL) until their rows seal.
 fn persist_live_docs(guard: &mut ShardState, live_docs_path: &Path) -> Result<(), Status> {
-    let physical_rows = physical_rows(guard);
-    guard.live_docs = guard
+    let sealed = sealed_rows(guard);
+    guard
         .live_docs
-        .write(live_docs_path, physical_rows)
+        .slice(0, sealed as usize)
+        .write(live_docs_path, sealed)
         .map_err(|e| Status::internal(format!("write {}: {e}", live_docs_path.display())))?;
     Ok(())
 }

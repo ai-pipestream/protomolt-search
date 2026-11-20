@@ -7,9 +7,6 @@ mod seal_flush;
 #[path = "seal_write.rs"]
 mod seal_write;
 
-/// What a seal in flight writes out (`NodeServiceImpl::seal_tail`):
-/// the frozen part's rows and shared artifacts, gathered under the
-/// write lock, written with no lock held.
 /// What a seal does with a tail whose documents and vectors disagree.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::node) enum TailSeal {
@@ -24,6 +21,9 @@ pub(in crate::node) enum TailSeal {
     Deferred,
 }
 
+/// What a seal in flight writes out (`NodeServiceImpl::seal_tail`):
+/// the frozen part's rows and shared artifacts, gathered under the
+/// write lock, written with no lock held.
 pub(in crate::node) struct SealPlan {
     pub(in crate::node) retained: crate::multi_res::MultiResVectors,
     pub(in crate::node) base: usize,
@@ -183,8 +183,9 @@ impl NodeServiceImpl {
                 if docs == 0 && vectors == 0 {
                     return Ok(None);
                 }
-                let awaits_vectors =
-                    mode == TailSeal::Aligned && provider.is_some() && vectors == 0;
+                let awaits_vectors = matches!(mode, TailSeal::Aligned | TailSeal::Deferred)
+                    && provider.is_some()
+                    && vectors == 0;
                 if docs != 0 && (vectors != 0 || awaits_vectors) && docs != vectors {
                     if mode == TailSeal::Deferred {
                         return Ok(None);

@@ -154,12 +154,7 @@ async fn ingest(
     let resp = client.add_documents(ReceiverStream::new(rx)).await.unwrap();
     assert_eq!(resp.into_inner().added as usize, docs);
 
-    // The rows with a document seal aligned first; the vector-only rows
-    // after them seal as their own segment.
-    assert!(
-        docs <= vectors,
-        "the fixtures hold vector-only rows, never document-only ones"
-    );
+    assert!(docs <= vectors, "fixtures hold vector-only rows only");
     for rows in [0..docs, docs..vectors] {
         if rows.is_empty() {
             continue;
