@@ -2776,7 +2776,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "turbo"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "libc",
  "serde",
@@ -2795,7 +2795,7 @@ dependencies = [
 [[package]]
 name = "turbo-analysis"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-sha256",
 ]
@@ -2803,7 +2803,7 @@ dependencies = [
 [[package]]
 name = "turbo-analysis-embed"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo",
  "turbo-analysis",
@@ -2820,7 +2820,7 @@ dependencies = [
 [[package]]
 name = "turbo-analysis-layers"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-calibration",
@@ -2830,7 +2830,7 @@ dependencies = [
 [[package]]
 name = "turbo-calibration"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-sha256",
@@ -2839,7 +2839,7 @@ dependencies = [
 [[package]]
 name = "turbo-chunker"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -2851,7 +2851,7 @@ dependencies = [
 [[package]]
 name = "turbo-client"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "bytes",
  "prost",
@@ -2894,7 +2894,7 @@ dependencies = [
 [[package]]
 name = "turbo-coref"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -2904,7 +2904,7 @@ dependencies = [
 [[package]]
 name = "turbo-depparse"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -2917,7 +2917,7 @@ dependencies = [
 [[package]]
 name = "turbo-doccat"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo",
  "turbo-analysis",
@@ -2938,7 +2938,7 @@ dependencies = [
 [[package]]
 name = "turbo-encoding"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-encoding-layers",
@@ -2948,7 +2948,7 @@ dependencies = [
 [[package]]
 name = "turbo-encoding-layers"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
 ]
@@ -2956,7 +2956,7 @@ dependencies = [
 [[package]]
 name = "turbo-entity-linker"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -2973,7 +2973,7 @@ dependencies = [
 [[package]]
 name = "turbo-formats"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -2988,7 +2988,7 @@ dependencies = [
 [[package]]
 name = "turbo-geo"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3003,7 +3003,7 @@ dependencies = [
 [[package]]
 name = "turbo-glossary"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3016,7 +3016,7 @@ dependencies = [
 [[package]]
 name = "turbo-glossary-layers"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3026,7 +3026,7 @@ dependencies = [
 [[package]]
 name = "turbo-grammar"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3036,7 +3036,7 @@ dependencies = [
 [[package]]
 name = "turbo-group"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3045,7 +3045,7 @@ dependencies = [
 [[package]]
 name = "turbo-hunspell"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3056,7 +3056,7 @@ dependencies = [
 [[package]]
 name = "turbo-keywords"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3066,7 +3066,7 @@ dependencies = [
 [[package]]
 name = "turbo-langdetect"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
 ]
@@ -3074,7 +3074,7 @@ dependencies = [
 [[package]]
 name = "turbo-langspan"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3087,7 +3087,7 @@ dependencies = [
 [[package]]
 name = "turbo-lemmatizer"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3099,7 +3099,7 @@ dependencies = [
 [[package]]
 name = "turbo-matcher"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3111,7 +3111,7 @@ dependencies = [
 [[package]]
 name = "turbo-maxent"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-sha256",
  "turbo-unicode",
@@ -3120,7 +3120,7 @@ dependencies = [
 [[package]]
 name = "turbo-morfologik"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3132,7 +3132,7 @@ dependencies = [
 [[package]]
 name = "turbo-namefind"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3145,7 +3145,7 @@ dependencies = [
 [[package]]
 name = "turbo-ngram"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-maxent",
  "turbo-unicode",
@@ -3154,7 +3154,7 @@ dependencies = [
 [[package]]
 name = "turbo-normalize"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3170,7 +3170,7 @@ dependencies = [
 [[package]]
 name = "turbo-normalize-layers"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3181,7 +3181,7 @@ dependencies = [
 [[package]]
 name = "turbo-numeric"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3191,7 +3191,7 @@ dependencies = [
 [[package]]
 name = "turbo-pii"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3206,7 +3206,7 @@ dependencies = [
 [[package]]
 name = "turbo-query"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3236,7 +3236,7 @@ dependencies = [
 [[package]]
 name = "turbo-relation"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "serde_json",
  "turbo",
@@ -3251,7 +3251,7 @@ dependencies = [
 [[package]]
 name = "turbo-sentdetect"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3262,7 +3262,7 @@ dependencies = [
 [[package]]
 name = "turbo-sequence"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3273,12 +3273,12 @@ dependencies = [
 [[package]]
 name = "turbo-sha256"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 
 [[package]]
 name = "turbo-stem"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3293,7 +3293,7 @@ dependencies = [
 [[package]]
 name = "turbo-stem-layers"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3302,7 +3302,7 @@ dependencies = [
 [[package]]
 name = "turbo-stopword"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3313,7 +3313,7 @@ dependencies = [
 [[package]]
 name = "turbo-stopword-layers"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3322,7 +3322,7 @@ dependencies = [
 [[package]]
 name = "turbo-suggest"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "memmap2",
  "turbo-analysis",
@@ -3336,7 +3336,7 @@ dependencies = [
 [[package]]
 name = "turbo-tokenize"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3348,7 +3348,7 @@ dependencies = [
 [[package]]
 name = "turbo-tokenize-layers"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3357,7 +3357,7 @@ dependencies = [
 [[package]]
 name = "turbo-train"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-calibration",
  "turbo-maxent",
@@ -3368,7 +3368,7 @@ dependencies = [
 [[package]]
 name = "turbo-trainer"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo",
 ]
@@ -3376,12 +3376,12 @@ dependencies = [
 [[package]]
 name = "turbo-unicode"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 
 [[package]]
 name = "turbo-us-zip"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3391,7 +3391,7 @@ dependencies = [
 [[package]]
 name = "turbo-vector-index"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3401,7 +3401,7 @@ dependencies = [
 [[package]]
 name = "turbo-wordnet"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "turbo-analysis",
  "turbo-analysis-layers",
@@ -3411,7 +3411,7 @@ dependencies = [
 [[package]]
 name = "turbo-zoo"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 dependencies = [
  "serde",
  "serde_json",
@@ -3423,7 +3423,7 @@ dependencies = [
 [[package]]
 name = "turbo-zstd"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turboembed.git?rev=31e9857d37e14c3f5985d882f1a7b0815d198527#31e9857d37e14c3f5985d882f1a7b0815d198527"
+source = "git+https://github.com/ai-pipestream/turboembed.git?rev=6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e#6702ddfb7de49c3f4c40fe2eeb95097eb3993b1e"
 
 [[package]]
 name = "turbovec"
