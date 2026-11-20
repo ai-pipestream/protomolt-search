@@ -251,6 +251,7 @@ mod neon;
 mod scalar;
 mod slack;
 
+pub(crate) use scalar::prefetch_bytes;
 use scalar::score_nodes_scalar;
 pub use scalar::{dot_batch4_scalar, dot_scalar, prefetch};
 #[cfg(any(feature = "net", test))]

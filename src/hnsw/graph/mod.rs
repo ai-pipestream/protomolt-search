@@ -71,12 +71,36 @@ const LOCK_STRIPES: usize = 1 << 14;
 pub trait LinkCells: Sync {
     fn get(&self, i: usize) -> u32;
     fn cell_count(&self) -> usize;
+    /// Hint the cache that cells `start..start + cells` are about to be read.
+    /// A hint only: the default does nothing, so implementors may skip it.
+    fn prefetch(&self, start: usize, cells: usize) {
+        let _ = (start, cells);
+    }
+}
+
+/// Prefetch the first `cells` link cells of `tail`. The span is counted
+/// from its 64-byte line, so a list that straddles one more line than its
+/// length suggests still has its last line fetched.
+#[inline]
+fn prefetch_cells<T>(tail: &[T], cells: usize) {
+    let bytes = cells.min(tail.len()) * std::mem::size_of::<T>();
+    if bytes == 0 {
+        return;
+    }
+    let start = tail.as_ptr() as *const u8;
+    let skew = start as usize % 64;
+    let span = skew + bytes;
+    super::distance::prefetch_bytes(start.wrapping_sub(skew), span, span.div_ceil(64));
 }
 
 impl LinkCells for [AtomicU32] {
     #[inline]
     fn get(&self, i: usize) -> u32 {
         self[i].load(Atomic::Relaxed)
+    }
+    #[inline]
+    fn prefetch(&self, start: usize, cells: usize) {
+        prefetch_cells(&self[start.min(self.len())..], cells);
     }
     fn cell_count(&self) -> usize {
         <[AtomicU32]>::len(self)
@@ -87,6 +111,10 @@ impl LinkCells for [u32] {
     #[inline]
     fn get(&self, i: usize) -> u32 {
         self[i]
+    }
+    #[inline]
+    fn prefetch(&self, start: usize, cells: usize) {
+        prefetch_cells(&self[start.min(self.len())..], cells);
     }
     fn cell_count(&self) -> usize {
         <[u32]>::len(self)
@@ -128,4 +156,46 @@ pub struct SearchStats {
     pub bridges: u64,
     /// Rows the far probe looked at (links and mask only, never scored).
     pub probed: u64,
+}
+
+#[cfg(test)]
+mod prefetch_tests {
+    use super::LinkCells;
+    use std::sync::atomic::AtomicU32;
+
+    #[test]
+    fn link_prefetch_clamps_out_of_range_starts_and_lengths() {
+        let plain: Vec<u32> = (0..37).collect();
+        let atomic: Vec<AtomicU32> = (0..37).map(AtomicU32::new).collect();
+        for start in [0, 1, 15, 36, 37, 1_000] {
+            for cells in [0, 1, 16, 33, 10_000] {
+                plain[..].prefetch(start, cells);
+                atomic[..].prefetch(start, cells);
+            }
+        }
+        // Every sub-slice start, so each 64-byte skew is covered.
+        for start in 0..plain.len() {
+            plain[start..].prefetch(0, 33);
+        }
+        assert_eq!(LinkCells::get(&plain[..], 36), 36);
+    }
+
+    /// An implementor that skips the optional hook still compiles and runs.
+    struct Bare(Vec<u32>);
+
+    impl LinkCells for Bare {
+        fn get(&self, i: usize) -> u32 {
+            self.0[i]
+        }
+        fn cell_count(&self) -> usize {
+            self.0.len()
+        }
+    }
+
+    #[test]
+    fn link_prefetch_defaults_to_a_no_op() {
+        let bare = Bare(vec![7; 4]);
+        bare.prefetch(0, 4);
+        assert_eq!(bare.get(3), 7);
+    }
 }

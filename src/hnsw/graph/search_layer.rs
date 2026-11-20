@@ -71,6 +71,11 @@ impl<L: LinkCells + ?Sized> View<'_, L> {
         let mut nbrs = std::mem::take(&mut scratch.nbrs);
         let mut outcome = Walk::Completed;
         while let Some(c) = scratch.cand.pop() {
+            // The next candidate's list is read on the next hop: fetch it
+            // while this one is scored.
+            if let Some(next) = scratch.cand.peek() {
+                self.prefetch_links(next.node, search.layer);
+            }
             match self.gate(&mut beam, c, scratch, hook) {
                 Gate::Expand => {}
                 Gate::Skip => continue,
@@ -127,6 +132,9 @@ impl<L: LinkCells + ?Sized> View<'_, L> {
         let base_scored = stats.scored;
         let mut outcome = Walk::Completed;
         while let Some(c) = scratch.cand.pop() {
+            if let Some(next) = scratch.cand.peek() {
+                self.prefetch_links(next.node, 0);
+            }
             match self.gate(&mut beam, c, scratch, hook) {
                 Gate::Expand => {}
                 Gate::Skip => continue,

@@ -76,6 +76,14 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
         }
     }
 
+    /// Hint the cache that `node`'s list at `layer` (count and neighbors) is
+    /// about to be read.
+    #[inline]
+    pub(in crate::hnsw) fn prefetch_links(&self, node: u32, layer: usize) {
+        self.cells(layer)
+            .prefetch(self.list_start(node, layer), self.cap(layer) + 1);
+    }
+
     /// Where `node`'s list at `layer` starts (its count cell).
     #[inline]
     pub(in crate::hnsw) fn list_start(&self, node: u32, layer: usize) -> usize {
