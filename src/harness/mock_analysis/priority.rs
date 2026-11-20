@@ -158,11 +158,13 @@ impl PriorityLanes {
     pub async fn wait_for_waiters(&self, bulk: usize, interactive: usize) {
         loop {
             let changed = self.changed.notified();
-            let slot = self.slot.lock().unwrap();
-            if slot.bulk.len() >= bulk && slot.interactive.len() >= interactive {
+            let ready = {
+                let slot = self.slot.lock().unwrap();
+                slot.bulk.len() >= bulk && slot.interactive.len() >= interactive
+            };
+            if ready {
                 return;
             }
-            drop(slot);
             changed.await;
         }
     }
