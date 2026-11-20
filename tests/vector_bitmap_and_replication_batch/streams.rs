@@ -123,3 +123,36 @@ async fn keyed_vector_rows_share_a_stream_apart_from_unkeyed_ones() {
         .collect();
     assert_eq!(keys, expected);
 }
+
+#[tokio::test]
+async fn an_empty_keyed_vector_batch_is_refused_without_consuming_the_next_key() {
+    let pair = Pair::start("empty-keyed-vectors", true).await;
+    let empty = pipestream_search::pb::AddVectorsRequest {
+        dim: crate::pair::DIM as u32,
+        ..Default::default()
+    };
+    let valid = pipestream_search::pb::AddVectorsRequest {
+        materialized_rows: Vec::new(),
+        vectors: crate::common::unit_vectors(1, crate::pair::DIM, 0xB17_0600),
+        dim: crate::pair::DIM as u32,
+    };
+    let mut request = tonic::Request::new(tokio_stream::iter([empty, valid]));
+    let keys = pipestream_search::replication::encode_stable_keys(&[key(0), key(1)]).unwrap();
+    request.metadata_mut().insert_bin(
+        pipestream_search::replication::STABLE_KEYS_METADATA,
+        tonic::metadata::MetadataValue::from_bytes(&keys),
+    );
+    let mut client = pair.source.clone();
+    let error = client.add_vectors(request).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument, "{error}");
+    assert!(error.message().contains("at least one vector"), "{error}");
+    let health = client
+        .health(pipestream_search::pb::HealthRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        health.num_vectors, 0,
+        "the later keyed row was not consumed"
+    );
+}

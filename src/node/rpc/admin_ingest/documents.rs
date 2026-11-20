@@ -3,11 +3,10 @@
 use crate::node::*;
 
 impl NodeServiceImpl {
-    /// Bearer-authenticated WAL replay requires ADMIN. Requests on the
-    /// cluster-member channel carry no public bearer credential.
+    /// WAL replay requires ADMIN, except on a verified cluster-member channel.
     fn authorize_wal_replay(
         &self,
-        metadata: &tonic::metadata::MetadataMap,
+        request: &Request<Streaming<AddDocumentsRequest>>,
         replay: bool,
     ) -> Result<Option<crate::authorization::AccessPermit>, Status> {
         if !replay {
@@ -16,7 +15,10 @@ impl NodeServiceImpl {
         let Some(principals) = &self.principals else {
             return Ok(None);
         };
-        if !metadata.contains_key("authorization") {
+        let metadata = request.metadata();
+        if !metadata.contains_key("authorization")
+            && crate::control_plane::cluster_membership(request, true)
+        {
             return Ok(None);
         }
         let principal = principals.authenticate(metadata)?;
@@ -102,7 +104,7 @@ impl NodeServiceImpl {
     ) -> Result<Response<AddDocumentsResponse>, Status> {
         crate::metrics::timed(Route::AddDocuments, request, |request| async move {
             let replay = replay_first_id(request.metadata())?;
-            let _replay_permit = self.authorize_wal_replay(request.metadata(), replay.is_some())?;
+            let replay_permit = self.authorize_wal_replay(&request, replay.is_some())?;
             let _ingest = self.claim_ingest()?;
             let addr = self.config.analysis_addr.clone().ok_or_else(|| {
                 Status::unavailable("no analysis backend configured for this shard (analysis_addr)")
@@ -116,11 +118,15 @@ impl NodeServiceImpl {
                 stream: &mut inbound,
                 keys,
                 logged: replay.is_some(),
+                replay_permit: replay_permit.clone().map(Box::new),
             };
             let (added, first_id, total, wal_generation) =
                 self.run_ingest_source(&addr, &mut source).await?;
             crate::metrics::add_ingested(added, 0);
             self.seal_if_due().await?;
+            if let Some(permit) = &replay_permit {
+                permit.check()?;
+            }
             Ok(Response::new(AddDocumentsResponse {
                 document_contract_version: crate::document_contract::VERSION,
                 added,
