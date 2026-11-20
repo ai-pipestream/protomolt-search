@@ -1,11 +1,6 @@
 //! `SPLIT_SHARD` end to end (`docs/cluster-control.md`, "Shard split"): the
 //! plane plans a split of an over-full primary; the node's worker builds
 //! two children from the source's WAL, places them, tails the source
-//! into them by stable key, fences the source, completes with the
-//! children as primaries, and retires the source; the plane publishes a
-//! topology that tiles the range with the children, and every query
-//! answers with the same scores through the coordinator. A restart of
-//! the agent keeps the source retired and re-serves the children.
 
 mod common;
 
@@ -88,6 +83,11 @@ async fn client(addr: &str) -> NodeServiceClient<tonic::transport::Channel> {
     NodeServiceClient::connect(addr.to_string()).await.unwrap()
 }
 
+fn stable_metadata(key: &[u8]) -> tonic::metadata::MetadataValue<tonic::metadata::Binary> {
+    let encoded = pipestream_search::replication::encode_stable_keys(&[key.to_vec()]).unwrap();
+    tonic::metadata::MetadataValue::from_bytes(&encoded)
+}
+
 /// One document and its vector, each as a stream carrying the row's
 /// stable routing key (the form replication and the live tail use).
 async fn ingest_keyed(addr: &str, i: usize) -> Result<(), tonic::Status> {
@@ -103,8 +103,8 @@ async fn ingest_keyed(addr: &str, i: usize) -> Result<(), tonic::Status> {
         ..Default::default()
     }]));
     request.metadata_mut().insert_bin(
-        "x-protomolt-stable-key-bin",
-        tonic::metadata::MetadataValue::from_bytes(key.as_bytes()),
+        pipestream_search::replication::STABLE_KEYS_METADATA,
+        stable_metadata(key.as_bytes()),
     );
     c.add_documents(request).await?;
     let corpus = unit_vectors(i + 1, DIM, 0x5EED_CA11);
@@ -114,8 +114,8 @@ async fn ingest_keyed(addr: &str, i: usize) -> Result<(), tonic::Status> {
         dim: DIM as u32,
     }]));
     request.metadata_mut().insert_bin(
-        "x-protomolt-stable-key-bin",
-        tonic::metadata::MetadataValue::from_bytes(key.as_bytes()),
+        pipestream_search::replication::STABLE_KEYS_METADATA,
+        stable_metadata(key.as_bytes()),
     );
     c.add_vectors(request).await?;
     Ok(())
