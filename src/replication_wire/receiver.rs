@@ -13,6 +13,7 @@
 pub const WAL_REPLAY_METADATA: &str = "x-protomolt-wal-replay-bin";
 
 /// The [`WAL_REPLAY_METADATA`] value for a stream starting at `first_id`.
+#[cfg(feature = "net")]
 pub fn encode_replay_first_id(first_id: u64) -> [u8; 8] {
     first_id.to_le_bytes()
 }
