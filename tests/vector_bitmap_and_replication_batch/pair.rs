@@ -7,7 +7,7 @@ use pipestream_search::node::{NodeConfig, NodeServiceImpl};
 use pipestream_search::pb::wal::{wal_record::Op, WalRecord};
 use pipestream_search::pb::{self, node_service_client::NodeServiceClient};
 use pipestream_search::replication::{
-    encode_stable_keys, sync_once, ReplicaCursor, STABLE_KEYS_METADATA, STABLE_KEY_METADATA,
+    encode_stable_keys, sync_once, ReplicaCursor, STABLE_KEYS_METADATA,
 };
 use prost::Message;
 use std::sync::{Arc, Mutex};
@@ -128,8 +128,10 @@ impl Pair {
         for document in documents {
             let mut request = tonic::Request::new(tokio_stream::iter([document]));
             request.metadata_mut().insert_bin(
-                STABLE_KEY_METADATA,
-                tonic::metadata::MetadataValue::from_bytes(key),
+                STABLE_KEYS_METADATA,
+                tonic::metadata::MetadataValue::from_bytes(
+                    &encode_stable_keys(std::slice::from_ref(&key.to_vec())).unwrap(),
+                ),
             );
             self.source.add_documents(request).await.unwrap();
         }
@@ -161,8 +163,10 @@ impl Pair {
         let mut request = tonic::Request::new(tokio_stream::iter([batch]));
         if let Some(key) = key {
             request.metadata_mut().insert_bin(
-                STABLE_KEY_METADATA,
-                tonic::metadata::MetadataValue::from_bytes(key),
+                STABLE_KEYS_METADATA,
+                tonic::metadata::MetadataValue::from_bytes(
+                    &encode_stable_keys(std::slice::from_ref(&key.to_vec())).unwrap(),
+                ),
             );
         }
         self.source.add_vectors(request).await.unwrap();

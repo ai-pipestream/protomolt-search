@@ -68,6 +68,7 @@ impl NodeServiceImpl {
         &self,
         doc: &AddDocumentsRequest,
         stable_key: Option<&[u8]>,
+        logged: bool,
     ) -> Result<(), Status> {
         let Some(pinned) = self.config.placement_tree.as_ref() else {
             return Ok(());
@@ -83,7 +84,9 @@ impl NodeServiceImpl {
             routed = apply_materialize(routed, &compiled)?;
         }
         if let Some(declaration) = self.config.derived.as_deref() {
-            if routed.derived_fingerprint.is_empty() {
+            if logged {
+                declaration.check_logged(&routed)?;
+            } else if routed.derived_fingerprint.is_empty() {
                 routed = declaration.apply(routed, stable_key)?;
             }
         }
@@ -145,6 +148,7 @@ impl NodeServiceImpl {
         &self,
         mut doc: AddDocumentsRequest,
         stable_key: Option<&[u8]>,
+        logged: bool,
     ) -> Result<AddDocumentsRequest, Status> {
         if let Some(spec) = doc
             .materialize
@@ -157,10 +161,10 @@ impl NodeServiceImpl {
         // Compute and stamp index-declared derived columns on fresh documents,
         // or verify the recorded fingerprint on replayed records.
         if let Some(declaration) = self.config.derived.as_deref() {
-            if doc.derived_fingerprint.is_empty() {
-                doc = declaration.apply(doc, stable_key)?;
-            } else {
+            if logged {
                 declaration.check_logged(&doc)?;
+            } else if doc.derived_fingerprint.is_empty() {
+                doc = declaration.apply(doc, stable_key)?;
             }
         } else if !doc.derived_fingerprint.is_empty() {
             return Err(Status::failed_precondition(

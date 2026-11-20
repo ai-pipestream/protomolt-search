@@ -6,8 +6,7 @@ use tonic::metadata::MetadataMap;
 use tonic::Status;
 
 use crate::replication_wire::{
-    decode_replay_first_id, decode_stable_keys, STABLE_KEYS_METADATA, STABLE_KEY_METADATA,
-    WAL_REPLAY_METADATA,
+    decode_replay_first_id, decode_stable_keys, STABLE_KEYS_METADATA, WAL_REPLAY_METADATA,
 };
 
 /// The stable routing keys of one append stream, handed out one per row
@@ -20,30 +19,16 @@ pub(in crate::node) struct StreamKeys {
 }
 
 impl StreamKeys {
-    /// The keys `metadata` names: one under the single-row entry, one per
-    /// row under the multi-row entry, none when it carries neither.
+    /// Decode the per-row stable keys named by `metadata`.
     pub(in crate::node) fn from_metadata(metadata: &MetadataMap) -> Result<Self, Status> {
-        let single = metadata_bytes(metadata, STABLE_KEY_METADATA)?;
-        let several = metadata_bytes(metadata, STABLE_KEYS_METADATA)?;
-        let keys = match (single, several) {
-            (None, None) => None,
-            (Some(key), None) => Some(vec![key]),
-            (None, Some(value)) => {
-                let keys = decode_stable_keys(&value).map_err(Status::invalid_argument)?;
-                if keys.is_empty() {
-                    return Err(Status::invalid_argument(
-                        "replication stable-keys metadata names no keys",
-                    ));
-                }
-                Some(keys)
-            }
-            (Some(_), Some(_)) => {
-                return Err(Status::invalid_argument(format!(
-                    "a replication stream carries {STABLE_KEY_METADATA} or \
-                     {STABLE_KEYS_METADATA}, not both"
-                )))
-            }
-        };
+        let keys = metadata_bytes(metadata, STABLE_KEYS_METADATA)?
+            .map(|value| decode_stable_keys(&value).map_err(Status::invalid_argument))
+            .transpose()?;
+        if keys.as_ref().is_some_and(Vec::is_empty) {
+            return Err(Status::invalid_argument(
+                "replication stable-keys metadata names no keys",
+            ));
+        }
         Ok(Self {
             keyed: keys.is_some(),
             keys: keys.unwrap_or_default().into_iter(),
@@ -129,11 +114,7 @@ mod tests {
     }
 
     #[test]
-    fn the_single_key_entry_names_one_row_and_none_names_an_unkeyed_stream() {
-        let mut one =
-            StreamKeys::from_metadata(&metadata(&[(STABLE_KEY_METADATA, b"key")])).unwrap();
-        assert_eq!(one.next_row("vector").unwrap(), Some(b"key".to_vec()));
-        assert!(one.next_row("vector").is_err());
+    fn no_keys_name_an_unkeyed_stream() {
         let mut none = StreamKeys::from_metadata(&MetadataMap::new()).unwrap();
         for _ in 0..3 {
             assert_eq!(none.next_row("vector").unwrap(), None);
@@ -142,10 +123,8 @@ mod tests {
     }
 
     #[test]
-    fn both_entries_an_empty_list_or_a_truncated_value_are_refused() {
+    fn an_empty_list_or_a_truncated_value_is_refused() {
         let value = encode_stable_keys(&[b"a".to_vec()]).unwrap();
-        let both = metadata(&[(STABLE_KEY_METADATA, b"a"), (STABLE_KEYS_METADATA, &value)]);
-        assert!(StreamKeys::from_metadata(&both).is_err());
         let empty = metadata(&[(STABLE_KEYS_METADATA, &[])]);
         let error = StreamKeys::from_metadata(&empty).err().unwrap();
         assert!(error.message().contains("names no keys"), "{error}");

@@ -170,7 +170,7 @@ impl NodeServiceImpl {
         }
         if has_stable_key && batch.vectors.len() / raw_dim != 1 {
             return Err(Status::invalid_argument(
-                "a replication stable-key metadata value may carry exactly one vector",
+                "each request in a replication stable-keys stream may carry exactly one vector",
             ));
         }
         if let Some((vi, ci, v)) = first_invalid_coordinate(&batch.vectors, raw_dim) {

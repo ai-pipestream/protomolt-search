@@ -182,9 +182,19 @@ impl NodeServiceImpl {
         if let Some(declaration) = self.config.derived.as_deref().filter(|_| !logged) {
             declaration.refuse_carried(&doc)?;
         }
-        self.check_placement(&doc, stable_routing_key.as_deref())?;
+        if logged
+            && doc
+                .materialize
+                .as_ref()
+                .is_some_and(|spec| !spec.columns.is_empty())
+        {
+            return Err(Status::failed_precondition(
+                "WAL replay rows carry materialized values, not a materialize spec",
+            ));
+        }
+        self.check_placement(&doc, stable_routing_key.as_deref(), logged)?;
         let (doc, analyzed) =
-            self.materialize_document(doc, analyzed, stable_routing_key.as_deref())?;
+            self.materialize_document(doc, analyzed, stable_routing_key.as_deref(), logged)?;
         let _mutation = self.mutation_gate.read().await;
         let mut guard = write_shard(&self.state);
         self.apply_document_locked(

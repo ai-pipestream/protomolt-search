@@ -25,6 +25,8 @@ pub struct NodeServiceImpl {
     /// fenced shards refuse ingest streams while continuing to serve queries.
     pub(in crate::node) ingest_fence: Arc<std::sync::Mutex<Option<String>>>,
     pub(crate) config: NodeConfig,
+    /// Bearer principals for public callers; cluster members use mTLS.
+    pub(in crate::node) principals: Option<Arc<crate::security::Principals>>,
     /// Runtime knobs read at request time.
     pub(in crate::node) knobs: Arc<crate::diagnostics::Knobs>,
     /// Shared scan queue for coalesced searches; the scheduler task is
@@ -139,6 +141,7 @@ impl NodeServiceImpl {
             seal_lock: Arc::new(std::sync::Mutex::new(())),
             compacting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config,
+            principals: None,
             scan_jobs: Arc::new(std::sync::OnceLock::new()),
             rerank_slots: Arc::new(tokio::sync::Semaphore::new(rerank_parallel)),
             stream_signals: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -169,6 +172,12 @@ impl NodeServiceImpl {
     /// The shard's configuration.
     pub fn config(&self) -> &NodeConfig {
         &self.config
+    }
+
+    /// Authenticate public bearer callers on this node.
+    pub fn with_principals(mut self, principals: Arc<crate::security::Principals>) -> Self {
+        self.principals = Some(principals);
+        self
     }
 
     /// Attach the process-wide phrase vocabulary. It is immutable and cheap

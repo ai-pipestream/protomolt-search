@@ -3,9 +3,8 @@
 //!
 //! A keyed record is cut by [`plan_keyed_streams`] into slices whose keys
 //! fit one stream's metadata, and each slice joins the held keyed run when
-//! it fits there. Every record is admitted, and every document checked
-//! against the receiver's replication contract, before any of it is held,
-//! so nothing a record refuses was sent for it.
+//! it fits there. Every record is admitted against the replica's tips and
+//! checked for one stable key per row before any of it is held.
 
 use crate::pb::wal::{LoggedAddDocuments, LoggedAddVectors};
 use crate::pb::{AddDocumentsRequest, AddVectorsRequest};
@@ -14,8 +13,8 @@ use super::batch::{Held, Piece, Run, MAX_STREAM_ROWS};
 use super::sync::ReplicaWriter;
 use super::vector_row;
 use crate::replication_wire::{
-    encode_replay_first_id, encode_stable_keys, plan_keyed_streams, require_receiver,
-    STABLE_KEYS_METADATA, WAL_REPLAY_METADATA,
+    encode_replay_first_id, encode_stable_keys, plan_keyed_streams, STABLE_KEYS_METADATA,
+    WAL_REPLAY_METADATA,
 };
 
 const DIFFERENT_VECTOR_IDS: &str = "replica assigned different vector ids";
@@ -78,16 +77,12 @@ impl ReplicaWriter {
         ))
     }
 
-    /// Refuse a keyed record before it is held when the replica cannot
-    /// take keyed rows several to a stream.
+    /// Check that a keyed record names exactly one stable key per row.
     fn require_keyed(&self, keys: &[Vec<u8>], rows: u64, what: &str) -> Result<(), String> {
-        if keys.is_empty() {
-            return Ok(());
-        }
-        if keys.len() as u64 != rows {
+        if !keys.is_empty() && keys.len() as u64 != rows {
             return Err(format!("WAL {what} stable-key count does not match rows"));
         }
-        require_receiver(self.target.replication_version, "keyed append streams")
+        Ok(())
     }
 
     pub(super) async fn apply_vectors(&mut self, add: LoggedAddVectors) -> Result<(), String> {
@@ -172,13 +167,6 @@ impl ReplicaWriter {
             self.target.document_contract_version,
             required,
         )?;
-        if add
-            .documents
-            .iter()
-            .any(|document| !document.derived_fingerprint.is_empty())
-        {
-            require_receiver(self.target.replication_version, "logged derived columns")?;
-        }
         let rows = add.documents.len() as u64;
         if rows == 0 {
             return Err("WAL document record is empty".to_string());
