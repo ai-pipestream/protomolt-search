@@ -14,7 +14,8 @@ use crate::stats_identity::StatsClaim;
 pub(crate) use maintenance::{AFTER_MAINTENANCE_VERIFIED, INTERRUPT_MAINTENANCE};
 #[cfg(feature = "net")]
 pub use managed::{
-    next_publication, publication_status, publish_next, ManagedTarget, NextPublication,
+    next_publication_blocking, publication_status_blocking, publish_next, ManagedTarget,
+    NextPublication,
 };
 #[cfg(test)]
 pub(crate) use rewrite::set_rewrite_test_hooks;

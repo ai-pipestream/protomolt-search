@@ -2,20 +2,6 @@ syntax = "proto3";
 package ai.protomolt.search.v1;
 import "ai/protomolt/search/v1/source.proto";
 
-// Receiving-side adapter for explicitly provisioned local source catalogs.
-// The receiver enforces current Ingest permission through its source commit.
-// This service does not activate, transfer or replicate a managed source owner.
-service DocumentWriteService {
-  // Requires Ingest. Returns only the exact local resource/history binding;
-  // it grants no ownership, source disclosure or permission to write.
-  rpc GetWriteTarget(GetDocumentWriteTargetRequest) returns (DocumentWriteTarget);
-  // One logical source transaction. Requires version-2 history-pinned input.
-  // Cancellation or a lost reply leaves the outcome unknown; retry the same
-  // operation under current permission. A committed write may outlive the RPC.
-  // Successful acceptance reports searchable=false until separate publication.
-  rpc AcceptDocument(DocumentWriteRequest) returns (DocumentWriteReceipt);
-}
-
 message GetDocumentWriteTargetRequest {
   // Exact collection; empty names the explicitly configured unnamed catalog.
   string collection = 1;

@@ -111,6 +111,11 @@ impl ActiveManagedCatalog {
         &self.key().collection
     }
 
+    /// Admission to a local, non-Raft authority for a status read.
+    pub fn local_admission(&self, principal: &str) -> Result<SourceAdmission<'_>, Status> {
+        self.authority.admission(principal)
+    }
+
     fn key(&self) -> &crate::pb::storage::LogicalSourceOwner {
         self.binding
             .preparation

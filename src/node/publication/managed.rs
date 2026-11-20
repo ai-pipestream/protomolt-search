@@ -31,7 +31,7 @@ pub struct NextPublication {
 
 /// The next version to project onto `targets`, under current Admin; `None`
 /// when every target has committed the whole accepted history.
-pub fn next_publication(
+pub fn next_publication_blocking(
     catalog: &ActiveManagedCatalog,
     admission: &SourceAdmission<'_>,
     targets: &[ManagedTarget],
@@ -77,6 +77,25 @@ pub async fn publish_next(
     status_of(&source, &version, targets)
 }
 
+/// Reconcile a target's staged intent before another publication step.
+async fn recover_staged(
+    source: &Arc<DocumentCatalog>,
+    version: &DocumentVersion,
+    target: &ManagedTarget,
+) -> Result<(), Status> {
+    let status = source.index_publication_target(&target.index_key, version.accepted_sequence)?;
+    if status.state != crate::pb::DocumentPublicationTargetState::Staged as i32 {
+        return Ok(());
+    }
+    let node = Arc::clone(&target.node);
+    let catalog = Arc::clone(source);
+    let key = target.index_key.clone();
+    tokio::task::spawn_blocking(move || node.recover_document_projection_blocking(&catalog, &key))
+        .await
+        .map_err(|_| Status::internal("managed recovery worker failed"))??;
+    Ok(())
+}
+
 /// Publish or skip `version` on one target.
 async fn project(
     source: &Arc<DocumentCatalog>,
@@ -84,6 +103,10 @@ async fn project(
     outcome: WriteOutcome,
     target: &ManagedTarget,
 ) -> Result<(), Status> {
+    recover_staged(source, version, target).await?;
+    if source.committed_index_sequence(&target.index_key)? >= version.accepted_sequence {
+        return Ok(());
+    }
     let node = Arc::clone(&target.node);
     let catalog = Arc::clone(source);
     let key = target.index_key.clone();
@@ -129,16 +152,16 @@ fn staging(
 }
 
 /// Where the version at `sequence` stands across `targets`, under current
-/// Admin; `None` past the accepted history.
-pub fn publication_status(
+/// Admin or Ingest; `None` past the accepted history.
+pub fn publication_status_blocking(
     catalog: &ActiveManagedCatalog,
     admission: &SourceAdmission<'_>,
     sequence: u64,
     targets: &[ManagedTarget],
 ) -> Result<Option<DocumentPublicationStatus>, Status> {
-    let source = catalog.publication_source(admission)?;
+    let source = catalog.publication_status_source(admission)?;
     catalog
-        .settled_version(admission, sequence)?
+        .settled_publication_status(admission, sequence)?
         .map(|version| status_of(&source, &version, targets))
         .transpose()
 }
@@ -154,10 +177,14 @@ fn status_of(
         Ok(WriteOutcome::Fenced) => DocumentPublicationState::Fenced,
         Err(_) => return Err(Status::data_loss("unknown write outcome")),
     };
+    let Some(first) = targets.first() else {
+        return Err(Status::invalid_argument(
+            "publication status requires at least one target",
+        ));
+    };
+    let history_id = source.index_owner(&first.index_key)?.history_id;
     let mut observed = Vec::with_capacity(targets.len());
-    let mut history_id = Vec::new();
     for target in targets {
-        history_id = source.index_owner(&target.index_key)?.history_id;
         observed.push(target_status(source, version, target)?);
     }
     Ok(DocumentPublicationStatus {

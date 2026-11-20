@@ -6,12 +6,17 @@
 //! until completion even if the caller drops the RPC future. Lease errors pass
 //! through unchanged without retry or leader forwarding.
 
-use super::{admit_ingest, extract_network_document, WorkPermit, WriteBudget};
+use super::{
+    admit_ingest, admit_publication_read, extract_network_document, publication_targets,
+    WorkPermit, WriteBudget,
+};
 use crate::document_catalog::{Acceptance, ActiveManagedCatalog, Reconciled, Settlement};
 use crate::metrics::{self, Route};
+use crate::node::ManagedTarget;
 use crate::pb::document_write_service_server::{DocumentWriteService, DocumentWriteServiceServer};
 use crate::pb::{
-    DocumentWriteReceipt, DocumentWriteRequest, DocumentWriteServiceLimits, DocumentWriteTarget,
+    DocumentPublicationStatus, DocumentWriteReceipt, DocumentWriteRequest,
+    DocumentWriteServiceLimits, DocumentWriteTarget, GetDocumentPublicationStatusRequest,
     GetDocumentWriteTargetRequest,
 };
 use crate::raft::RaftHost;
@@ -25,6 +30,7 @@ struct Inner {
     principals: Principals,
     host: Arc<RaftHost>,
     catalogs: BTreeMap<String, Arc<ActiveManagedCatalog>>,
+    publication: BTreeMap<String, Vec<ManagedTarget>>,
     budget: WriteBudget,
     /// One-shot pause between the lease and the worker's grant, armed by
     /// `arm_grant_delay` so a test can age a lease past its interval.
@@ -132,11 +138,41 @@ impl HostedDocumentWriteService {
                 principals,
                 host,
                 catalogs: members,
+                publication: BTreeMap::new(),
                 budget: WriteBudget::new(limits)?,
                 #[cfg(any(test, feature = "fault-injection"))]
                 grant_delay: std::sync::Mutex::new(None),
             }),
         })
+    }
+
+    /// Register the serving targets visible to publication-status reads.
+    pub fn with_publication_targets(
+        mut self,
+        collection: &str,
+        targets: Vec<ManagedTarget>,
+    ) -> Result<Self, Status> {
+        if targets.is_empty() {
+            return Err(Status::invalid_argument(
+                "publication status requires at least one target",
+            ));
+        }
+        if !self.inner.catalogs.contains_key(collection) {
+            return Err(Status::not_found("publication source is not configured"));
+        }
+        let inner = Arc::get_mut(&mut self.inner).ok_or_else(|| {
+            Status::failed_precondition("register publication before sharing the write service")
+        })?;
+        if inner
+            .publication
+            .insert(collection.to_string(), targets)
+            .is_some()
+        {
+            return Err(Status::invalid_argument(
+                "publication status repeats a collection",
+            ));
+        }
+        Ok(self)
     }
 
     /// Use this builder when registering the adapter so tonic enforces the
@@ -218,6 +254,56 @@ impl HostedDocumentWriteService {
         // gates the reply after the worker returns.
         access.check()?;
         result.map(Response::new)
+    }
+
+    async fn status(
+        &self,
+        request: Request<GetDocumentPublicationStatusRequest>,
+    ) -> Result<Response<DocumentPublicationStatus>, Status> {
+        let collection = request.get_ref().collection.clone();
+        let sequence = request.get_ref().accepted_sequence;
+        if sequence == 0 {
+            return Err(Status::invalid_argument(
+                "publication status requires a positive accepted_sequence",
+            ));
+        }
+        let admitted = admit_publication_read(
+            &self.inner.principals,
+            &self.inner.catalogs,
+            &self.inner.budget,
+            &request,
+            &collection,
+        )?;
+        let configured = self
+            .inner
+            .publication
+            .get(&collection)
+            .cloned()
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "publication targets are not configured for this collection",
+                )
+            })?;
+        let targets = publication_targets(&configured, &request.get_ref().index_keys)?;
+        let access = admitted.access.clone();
+        let lease = self.inner.host.lease(&admitted.actor).await?;
+        self.handoff().await?;
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = admitted.permit;
+            let admission = lease.admission()?;
+            crate::node::publication_status_blocking(
+                &admitted.catalog,
+                &admission,
+                sequence,
+                &targets,
+            )
+        })
+        .await
+        .map_err(|_| Status::internal("publication status worker failed"))??;
+        access.check()?;
+        result
+            .map(Response::new)
+            .ok_or_else(|| Status::not_found("accepted sequence is not in the source history"))
     }
 
     async fn accept(
@@ -315,6 +401,31 @@ impl HostedDocumentWriteService {
             reconciled.record(operation, settled);
         }
         Ok(reconciled)
+    }
+
+    /// Reconcile at startup and under the current leader until shutdown.
+    /// Every pass is bounded by the write-service admission budget.
+    pub fn spawn_reconciler(
+        self,
+        admin: String,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<Result<(), tonic::transport::Error>> {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                let collections: Vec<String> = self.inner.catalogs.keys().cloned().collect();
+                for collection in collections {
+                    let limit = self.inner.budget.limits.max_in_flight as usize;
+                    let _ = self.reconcile_unconfirmed(&admin, &collection, limit).await;
+                }
+                tokio::select! {
+                    _ = shutdown.wait_for(|raised| *raised) => break,
+                    _ = interval.tick() => {}
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Settle a durable write whose original lease lapsed before commit returned,

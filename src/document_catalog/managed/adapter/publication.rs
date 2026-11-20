@@ -62,17 +62,39 @@ impl ActiveManagedCatalog {
         Ok(Arc::clone(&self.inner))
     }
 
-    /// The accepted version at `sequence` with an outcome no write is
-    /// still judging, or `None` past the accepted history. The read waits
-    /// out every write between its commit and its judgement, so an
-    /// ACCEPTED outcome read here is final; an UNCONFIRMED one moves only
-    /// by settlement.
-    pub fn settled_version(
+    /// The source a status reader inspects under Admin or Ingest.
+    pub fn publication_status_source(
+        &self,
+        admission: &SourceAdmission<'_>,
+    ) -> Result<Arc<DocumentCatalog>, Status> {
+        self.admit_publication_read(admission)?;
+        Ok(Arc::clone(&self.inner))
+    }
+
+    /// The settled version visible to a publication-status reader.
+    pub fn settled_publication_status(
         &self,
         admission: &SourceAdmission<'_>,
         sequence: u64,
     ) -> Result<Option<DocumentVersion>, Status> {
-        self.admit(admission, AccessAction::Admin)?;
+        self.admit_publication_read(admission)?;
+        self.settled_version_at(sequence)
+    }
+
+    fn admit_publication_read(
+        &self,
+        admission: &SourceAdmission<'_>,
+    ) -> Result<crate::pb::AccessDecision, Status> {
+        match self.admit(admission, AccessAction::Admin) {
+            Ok(decision) => Ok(decision),
+            Err(error) if error.code() == tonic::Code::PermissionDenied => {
+                self.admit(admission, AccessAction::Ingest)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn settled_version_at(&self, sequence: u64) -> Result<Option<DocumentVersion>, Status> {
         let _judged = self
             .judging
             .write()
@@ -84,9 +106,22 @@ impl ActiveManagedCatalog {
         }
     }
 
-    /// Up to `limit` writes still UNCONFIRMED, in the order of their
-    /// encoded actor-scoped operation keys, for a
-    /// reconciler to settle each under a fresh lease of its own actor.
+    /// The accepted version at `sequence` with an outcome no write is
+    /// still judging, or `None` past the accepted history. The read waits
+    /// out every write between its commit and its judgement, so an
+    /// ACCEPTED outcome read here is final; an UNCONFIRMED one moves only
+    /// by settlement.
+    pub fn settled_version(
+        &self,
+        admission: &SourceAdmission<'_>,
+        sequence: u64,
+    ) -> Result<Option<DocumentVersion>, Status> {
+        self.admit(admission, AccessAction::Admin)?;
+        self.settled_version_at(sequence)
+    }
+
+    /// Up to `limit` writes still UNCONFIRMED, in accepted-sequence order,
+    /// for a reconciler to settle each under a fresh lease of its own actor.
     pub fn unconfirmed_operations(
         &self,
         admission: &SourceAdmission<'_>,
@@ -97,9 +132,6 @@ impl ActiveManagedCatalog {
         let operations = read.open_table(actors::OPERATIONS).map_err(storage)?;
         let mut pending = Vec::new();
         for entry in operations.iter().map_err(storage)? {
-            if pending.len() == limit {
-                break;
-            }
             let (key, value) = entry.map_err(storage)?;
             let operation: DocumentOperation = decode(value.value())?;
             if outcome::outcome_of(operation.outcome)? != WriteOutcome::Unconfirmed {
@@ -116,6 +148,8 @@ impl ActiveManagedCatalog {
                 accepted_sequence: receipt.accepted_sequence,
             });
         }
+        pending.sort_by_key(|operation| operation.accepted_sequence);
+        pending.truncate(limit);
         Ok(pending)
     }
 }

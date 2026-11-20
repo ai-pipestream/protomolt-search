@@ -3,6 +3,7 @@ package ai.protomolt.search.v1;
 
 import "ai/protomolt/search/v1/source.proto";
 import "ai/protomolt/search/v1/search.proto";
+import "ai/protomolt/search/v1/document_write.proto";
 
 // Trusted local preparation of one immutable accepted source version. This is
 // neither an ingest RPC nor evidence that any row is durable or searchable.
@@ -174,4 +175,29 @@ message DocumentPublicationStatus {
   DocumentPublicationState state = 5;
   uint64 fenced_at_revision = 6;
   repeated DocumentPublicationTarget targets = 7;
+}
+
+
+// Receiving-side adapter for explicitly provisioned local source catalogs.
+// This service does not activate, transfer or replicate a managed source owner.
+service DocumentWriteService {
+  // Requires Ingest. Returns only the exact local resource/history binding;
+  // it grants no ownership, source disclosure or permission to write.
+  rpc GetWriteTarget(GetDocumentWriteTargetRequest) returns (DocumentWriteTarget);
+  // One logical source transaction. Requires version-2 history-pinned input.
+  // Cancellation or a lost reply leaves the outcome unknown; retry the same
+  // operation under current permission. A committed write may outlive the RPC.
+  // Successful acceptance reports searchable=false until separate publication.
+  rpc AcceptDocument(DocumentWriteRequest) returns (DocumentWriteReceipt);
+  // Requires Admin or Ingest. Reports each named target at one accepted sequence.
+  rpc GetDocumentPublicationStatus(GetDocumentPublicationStatusRequest) returns (DocumentPublicationStatus);
+}
+
+message GetDocumentPublicationStatusRequest {
+  // Exact collection; empty names the explicitly configured unnamed catalog.
+  string collection = 1;
+  // Exact positive accepted sequence to inspect.
+  uint64 accepted_sequence = 2;
+  // Logical target indexes to report. At least one is required.
+  repeated bytes index_keys = 3;
 }

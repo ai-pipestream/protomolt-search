@@ -6,17 +6,15 @@
 //! admits nothing and leaves no row and no retry record; off-leader and
 //! isolated members refuse by name.
 //!
-//! Compiled only with `raft`, `tls` and `fault-injection` together (the
-//! `control_raft_admission` convention: the lease scenarios need the pause
-//! hook `arm_grant_delay`, and the group needs the mTLS transport). The
-//! write service itself serves plain loopback HTTP here with a bearer
-//! principal; in production it registers on the process's secured listener.
+//! Compiled with `raft`, `tls` and `fault-injection`; loopback HTTP uses a
+//! bearer principal, while production uses the secured listener.
 #![cfg(all(feature = "raft", feature = "tls", feature = "fault-injection"))]
-// Every test holds the target-wide `serial()` guard for its whole body,
-// across awaits, on purpose.
+// Every test holds the target-wide serial guard across awaits.
 #![allow(clippy::await_holding_lock)]
 
 mod control_adversarial;
+#[path = "control_raft_hosted_writes/status_and_reconcile.rs"]
+mod status_and_reconcile;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

@@ -64,11 +64,15 @@ pub(super) fn chunked(
 
 /// The segmented node serving the target index, and the target itself.
 pub(super) fn target(dir: &Directory) -> ManagedTarget {
+    target_named(dir, INDEX, "target-index")
+}
+
+pub(super) fn target_named(dir: &Directory, key: &[u8], path: &str) -> ManagedTarget {
     let plan = crate::mapping::derive_plan(DESCRIPTOR, TYPE).unwrap();
     let node = NodeServiceImpl::open(
         NodeConfig {
             collection: "books".into(),
-            index_path: Some(dir.0.join("target-index")),
+            index_path: Some(dir.0.join(path)),
             wal: false,
             analysis_addr: Some("native".into()),
             unsigned_integer_fields: plan
@@ -85,7 +89,7 @@ pub(super) fn target(dir: &Directory) -> ManagedTarget {
     .unwrap();
     ManagedTarget {
         node: Arc::new(node),
-        index_key: INDEX.to_vec(),
+        index_key: key.to_vec(),
         stage: StageDocumentProjectionRequest {
             projection: Some(PrepareDocumentProjectionRequest {
                 expected_plan_fingerprint: plan.fingerprint,
@@ -112,7 +116,8 @@ pub(super) async fn step(
 ) -> Option<DocumentPublicationStatus> {
     let next = {
         let admission = fixture.authority.admission("alice").unwrap();
-        crate::node::next_publication(active, &admission, std::slice::from_ref(target)).unwrap()
+        crate::node::next_publication_blocking(active, &admission, std::slice::from_ref(target))
+            .unwrap()
     };
     match next {
         Some(next) => Some(
@@ -168,4 +173,94 @@ pub(super) fn revoke_ingest(fixture: &Fixture, control_revision: u64) {
         fixture.authority.execute("alice", &command).unwrap().code,
         0
     );
+}
+
+fn append_candidate(
+    catalog: &crate::segments::SegmentCatalog,
+    candidate: &crate::node::StagedDocumentCandidate,
+) -> Arc<crate::segments::OpenedSegmentSet> {
+    let staged = candidate.segments().unwrap();
+    let metadata = staged.metadata(0);
+    let directory =
+        crate::segments::SegmentCatalog::segment_dir(staged.root(), &metadata.segment_id);
+    let artifact = |file: &str| directory.join(file);
+    catalog
+        .append(crate::segments::SegmentSource {
+            multi_res_path: metadata
+                .multi_res
+                .as_ref()
+                .map(|a| artifact(&a.file))
+                .as_deref(),
+            segment_id: &metadata.segment_id,
+            generation: 1,
+            base_label: 0,
+            backend_kind: &metadata.backend_kind,
+            vector_path: (!metadata.vector.file.is_empty())
+                .then(|| artifact(&metadata.vector.file))
+                .as_deref(),
+            exact_vector_path: (!metadata.exact_vectors.file.is_empty())
+                .then(|| artifact(&metadata.exact_vectors.file))
+                .as_deref(),
+            bm25_path: &artifact(&metadata.bm25.file),
+            live_docs_path: &artifact(&metadata.live_docs.file),
+            partition_column: None,
+        })
+        .unwrap()
+}
+
+/// Prepare an accepted candidate and leave its journal intent unresolved.
+pub(super) async fn stage_pending_accepted(
+    fixture: &Fixture,
+    active: &ActiveManagedCatalog,
+    target: &ManagedTarget,
+) {
+    let admission = fixture.authority.admission("alice").unwrap();
+    let source = active.publication_source(&admission).unwrap();
+    let version = active.settled_version(&admission, 1).unwrap().unwrap();
+    let mut request = target.stage.clone();
+    let projection = request.projection.get_or_insert_with(Default::default);
+    projection.history_id = source.index_owner(&target.index_key).unwrap().history_id;
+    projection.document_key = version.document_key.clone();
+    projection.version = version.version;
+    let candidate = target
+        .node
+        .stage_document_projection(source.clone(), request)
+        .await
+        .unwrap();
+    let catalog = crate::segments::SegmentCatalog::open(crate::node::segments_root(
+        &fixture.dir.0.join("target-index"),
+    ))
+    .unwrap();
+    let before = catalog.snapshot();
+    let after = append_candidate(&catalog, &candidate);
+    source
+        .prepare_index_publication(&target.index_key, &candidate, &before, &after)
+        .unwrap();
+}
+
+/// Leave a fenced version's skip intent unresolved.
+pub(super) fn stage_pending_fenced(
+    fixture: &Fixture,
+    active: &ActiveManagedCatalog,
+    target: &ManagedTarget,
+) {
+    let admission = fixture.authority.admission("alice").unwrap();
+    let source = active.publication_source(&admission).unwrap();
+    let version = active.settled_version(&admission, 2).unwrap().unwrap();
+    let catalog = crate::segments::SegmentCatalog::open(crate::node::segments_root(
+        &fixture.dir.0.join("target-index"),
+    ))
+    .unwrap();
+    let before = catalog.snapshot();
+    let mut after = before.manifest().clone();
+    after.epoch += 1;
+    std::fs::write(
+        before.root().join("segments.json"),
+        serde_json::to_vec_pretty(&after).unwrap(),
+    )
+    .unwrap();
+    let after = Arc::new(crate::segments::OpenedSegmentSet::open(before.root()).unwrap());
+    source
+        .prepare_fenced_skip(&target.index_key, &version, &before, &after)
+        .unwrap();
 }

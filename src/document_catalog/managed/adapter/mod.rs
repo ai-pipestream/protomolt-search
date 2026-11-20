@@ -66,7 +66,8 @@ pub enum Settlement {
 /// A managed source activated under its committed fence. Every write is
 /// admitted through a `SourceAdmission` that finds the owner ACTIVE under
 /// exactly this epoch and the actor permitted, and the admission is held
-/// through the source commit.
+/// through the source commit. Lock order is `SourceAdmission`, then the
+/// judgement barrier, then redb; no lock is acquired in the reverse order.
 pub struct ActiveManagedCatalog {
     pub(super) inner: Arc<DocumentCatalog>,
     binding: SourceManagedBinding,
