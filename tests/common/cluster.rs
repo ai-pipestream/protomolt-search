@@ -11,9 +11,10 @@ use tokio::task::JoinHandle;
 
 type NodeTask = JoinHandle<Result<(), tonic::transport::Error>>;
 
-/// An abort-on-drop guard over a started node or mock-sidecar serving task,
-/// ensuring panicked tests stop the server before any `TestDir` unlinks its
-/// shard directory.
+/// An abort-on-drop guard over a started node or mock-sidecar serving task.
+/// Dropping it aborts the serving task, which requests cancellation: work
+/// the server already handed to a blocking thread can still run while a
+/// `TestDir` unlinks the shard directory, and that removal ignores errors.
 pub struct ShardGuard(NodeTask);
 
 impl From<NodeTask> for ShardGuard {
