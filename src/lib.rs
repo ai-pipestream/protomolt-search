@@ -132,6 +132,7 @@ pub mod values;
 
 // Crate-private implementation details.
 mod column_stats;
+pub(crate) mod domain_error;
 pub(crate) mod facet_rows;
 mod field_permissions;
 pub(crate) mod highlight;

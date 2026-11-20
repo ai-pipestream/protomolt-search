@@ -1,8 +1,8 @@
 //! Hint resolution: what a field descriptor is, the kind inferred for it,
 //! and the merge of an explicit hint over that inference.
 
+use super::MappingError;
 use prost_types::FieldDescriptorProto;
-use tonic::Status;
 
 use super::refuse_at;
 use super::type_index::{MsgEntry, TypeIndex};
@@ -36,7 +36,7 @@ pub(super) fn shape<'a>(
     field: &FieldDescriptorProto,
     index: &'a TypeIndex<'a>,
     path: &str,
-) -> Result<Shape<'a>, Status> {
+) -> Result<Shape<'a>, MappingError> {
     use prost_types::field_descriptor_proto::Type;
     match field.r#type() {
         Type::Message | Type::Group => {
@@ -175,7 +175,7 @@ pub(super) fn resolve_hint(
     shape: &Shape<'_>,
     explicit: Option<&hints::FieldIndexHint>,
     path: &str,
-) -> Result<ResolvedHint, Status> {
+) -> Result<ResolvedHint, MappingError> {
     let Some(hint) = explicit else {
         return Ok(plain_hint(inferred_kind(field, shape)));
     };
@@ -229,7 +229,7 @@ pub(super) fn resolve_hint(
     })
 }
 
-fn convert_kind(hint: hints::IndexFieldType, path: &str) -> Result<pb::MappedKind, Status> {
+fn convert_kind(hint: hints::IndexFieldType, path: &str) -> Result<pb::MappedKind, MappingError> {
     use hints::IndexFieldType as H;
     Ok(match hint {
         H::Text => pb::MappedKind::Text,

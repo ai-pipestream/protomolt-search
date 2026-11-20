@@ -3,8 +3,9 @@
 
 use std::collections::HashMap;
 
+use super::MappingError;
+use crate::domain_error::DomainError;
 use prost_reflect::{DynamicMessage, MessageDescriptor, ReflectMessage, Value};
-use tonic::Status;
 
 use super::project::project_leaf;
 use crate::pb;
@@ -135,7 +136,7 @@ impl Extractor {
         descriptor_set: &[u8],
         message_type: &str,
         body_path: &str,
-    ) -> Result<Extractor, Status> {
+    ) -> Result<Extractor, MappingError> {
         Self::with_definition(descriptor_set, message_type, body_path, None)
     }
 
@@ -154,7 +155,7 @@ impl Extractor {
     /// zero rows). Refuses malformed bytes and absent required values
     /// — body, id, vector, declared chunk id — each naming the field,
     /// chunk refusals naming the chunk ordinal.
-    pub fn extract(&self, bytes: &[u8]) -> Result<Vec<ExtractedDoc>, Status> {
+    pub fn extract(&self, bytes: &[u8]) -> Result<Vec<ExtractedDoc>, MappingError> {
         let mut rows = Vec::new();
         self.visit_rows(bytes, usize::MAX, |_, row| {
             rows.push(row);
@@ -170,15 +171,16 @@ impl Extractor {
         &self,
         bytes: &[u8],
         max_rows: usize,
-        mut emit: impl FnMut(Option<u32>, ExtractedDoc) -> Result<(), Status>,
-    ) -> Result<(), Status> {
+        mut emit: impl FnMut(Option<u32>, ExtractedDoc) -> Result<(), MappingError>,
+    ) -> Result<(), MappingError> {
         if max_rows == 0 {
-            return Err(Status::invalid_argument(
+            return Err(MappingError::invalid_argument(
                 "projection max_rows must be positive",
             ));
         }
         let mut slots: Vec<Option<Slot>> = (0..self.leaves.len()).map(|_| None).collect();
-        let message = crate::protobuf::decode(self.descriptor.clone(), bytes)?;
+        let message = crate::protobuf::decode(self.descriptor.clone(), bytes)
+            .map_err(|err| MappingError::invalid_argument(err.message()))?;
         self.project_message(&message, &self.root, &mut slots)?;
         if self.chunked.is_none() {
             return emit(None, self.assemble(&slots, None)?);
@@ -188,14 +190,9 @@ impl Extractor {
             let row = self
                 .project_message(sub, node, &mut chunk_slots)
                 .and_then(|()| self.assemble(&slots, Some(&chunk_slots)))
-                .map_err(|status| {
-                    Status::new(
-                        status.code(),
-                        format!("chunk {ordinal}: {}", status.message()),
-                    )
-                })?;
+                .map_err(|error| error.prefixed(&format!("chunk {ordinal}: ")))?;
             let ordinal = u32::try_from(ordinal)
-                .map_err(|_| Status::resource_exhausted("chunk ordinal exceeds u32"))?;
+                .map_err(|_| MappingError::resource_exhausted("chunk ordinal exceeds u32"))?;
             emit(Some(ordinal), row)
         })
     }
@@ -205,8 +202,8 @@ impl Extractor {
         message: &DynamicMessage,
         node: &TrieNode,
         max_rows: usize,
-        emit: &mut impl FnMut(usize, &DynamicMessage, &TrieNode) -> Result<(), Status>,
-    ) -> Result<(), Status> {
+        emit: &mut impl FnMut(usize, &DynamicMessage, &TrieNode) -> Result<(), MappingError>,
+    ) -> Result<(), MappingError> {
         let descriptor = message.descriptor();
         for (number, child) in &node.children {
             if matches!(child, Child::Leaf(_)) {
@@ -225,7 +222,7 @@ impl Extractor {
                 }
                 (Child::Chunks(inner), Value::List(values)) => {
                     if values.len() > max_rows {
-                        return Err(Status::resource_exhausted(
+                        return Err(MappingError::resource_exhausted(
                             "document projection exceeds max_rows",
                         ));
                     }
@@ -247,7 +244,7 @@ impl Extractor {
         message: &DynamicMessage,
         node: &TrieNode,
         slots: &mut [Option<Slot>],
-    ) -> Result<(), Status> {
+    ) -> Result<(), MappingError> {
         let descriptor = message.descriptor();
         for (number, child) in &node.children {
             let field = descriptor

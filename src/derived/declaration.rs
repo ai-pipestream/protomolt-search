@@ -207,9 +207,9 @@ impl Declaration {
 
     /// A fresh request must not carry a derived value or a fingerprint:
     /// the node computes them. Refused by name as forged.
-    pub fn refuse_carried(&self, doc: &AddDocumentsRequest) -> Result<(), Status> {
+    pub fn refuse_carried(&self, doc: &AddDocumentsRequest) -> Result<(), DerivedError> {
         if !doc.derived_fingerprint.is_empty() {
-            return Err(Status::invalid_argument(format!(
+            return Err(DerivedError::invalid_argument(format!(
                 "the request stamps derived fingerprint {:?}; derived columns are computed \
                  by the index from its declaration, and a client supplies neither the values \
                  nor the fingerprint",
@@ -222,7 +222,7 @@ impl Declaration {
                 || doc.unsigned_integers.iter().any(|v| v.field == column.name)
                 || doc.timestamps.iter().any(|v| v.field == column.name);
             if carried {
-                return Err(Status::invalid_argument(format!(
+                return Err(DerivedError::invalid_argument(format!(
                     "the request carries a value under derived column {:?}; derived columns \
                      are computed by the index from its declaration, and a supplied value is \
                      refused as forged",
@@ -235,9 +235,9 @@ impl Declaration {
 
     /// A logged record already carries its derived values: its
     /// fingerprint must be this declaration's.
-    pub fn check_logged(&self, doc: &AddDocumentsRequest) -> Result<(), Status> {
+    pub fn check_logged(&self, doc: &AddDocumentsRequest) -> Result<(), DerivedError> {
         if doc.derived_fingerprint != self.fingerprint {
-            return Err(Status::failed_precondition(format!(
+            return Err(DerivedError::failed_precondition(format!(
                 "the record was derived under declaration {:?}, this index declares {:?}; \
                  rebuild the rows through the reshard tool (docs/derived-columns.md)",
                 doc.derived_fingerprint, self.fingerprint
@@ -254,7 +254,7 @@ impl Declaration {
         &self,
         doc: AddDocumentsRequest,
         stable_key: Option<&[u8]>,
-    ) -> Result<AddDocumentsRequest, Status> {
+    ) -> Result<AddDocumentsRequest, DerivedError> {
         self.refuse_carried(&doc)?;
         if self.reads_stable_key() && stable_key.is_none_or(<[u8]>::is_empty) {
             let column = self
@@ -262,7 +262,7 @@ impl Declaration {
                 .iter()
                 .find(|column| column.reads_stable_key)
                 .expect("reads_stable_key found one");
-            return Err(Status::invalid_argument(format!(
+            return Err(DerivedError::invalid_argument(format!(
                 "derived column {:?} reads the stable routing key and this document arrived \
                  without one; route it through the coordinator, which stamps the key",
                 column.name
@@ -286,12 +286,12 @@ impl Declaration {
         doc: AddDocumentsRequest,
         names: &[String],
         stable_key: Option<&[u8]>,
-    ) -> Result<AddDocumentsRequest, Status> {
+    ) -> Result<AddDocumentsRequest, DerivedError> {
         if doc.derived_fingerprint == self.fingerprint {
             if names.is_empty() {
                 return Ok(doc);
             }
-            return Err(Status::failed_precondition(format!(
+            return Err(DerivedError::failed_precondition(format!(
                 "the row is already derived under this declaration ({}); --derive names \
                  {names:?}, which have nothing to recompute",
                 self.fingerprint
@@ -299,7 +299,7 @@ impl Declaration {
         }
         for name in names {
             if !self.is_derived(name) {
-                return Err(Status::invalid_argument(format!(
+                return Err(DerivedError::invalid_argument(format!(
                     "{name:?} is not a column of the declaration"
                 )));
             }
@@ -312,7 +312,7 @@ impl Declaration {
                 .map(|column| column.name.as_str())
                 .collect();
             if !missing.is_empty() {
-                return Err(Status::failed_precondition(format!(
+                return Err(DerivedError::failed_precondition(format!(
                     "the row was never derived; --derive must name every declared column, and \
                      {missing:?} are not named"
                 )));
@@ -322,7 +322,7 @@ impl Declaration {
         for name in names {
             let column = self.column(name).expect("checked above");
             if column.reads_stable_key && stable_key.is_none_or(<[u8]>::is_empty) {
-                return Err(Status::failed_precondition(format!(
+                return Err(DerivedError::failed_precondition(format!(
                     "derived column {name:?} reads the stable routing key, which this row \
                      does not carry; split from the logs, which record it"
                 )));

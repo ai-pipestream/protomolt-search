@@ -1,6 +1,6 @@
 //! Ingest-time comparisons, Kleene logic, and the conditional.
 
-use tonic::Status;
+use super::ValuesError;
 
 use super::eval::{cmp_double, cmp_int, string_ordering};
 use super::ingest::eval_ingest_inner;
@@ -13,7 +13,7 @@ pub(super) fn ingest_compare(
     cmp: &pb::ValueCompare,
     env: &IngestEnv,
     strict: bool,
-) -> Result<Option<IngestVal>, Status> {
+) -> Result<Option<IngestVal>, ValuesError> {
     use pb::value_expr::Expr as V;
 
     let op = cmp_op_of(cmp.op)?;
@@ -93,7 +93,7 @@ pub(super) fn ingest_logic(
     logic: &pb::ValueLogic,
     env: &IngestEnv,
     strict: bool,
-) -> Result<Option<IngestVal>, Status> {
+) -> Result<Option<IngestVal>, ValuesError> {
     let and = match pb::ValueLogicOp::try_from(logic.op) {
         Ok(pb::ValueLogicOp::And) => true,
         Ok(pb::ValueLogicOp::Or) => false,
@@ -137,7 +137,7 @@ pub(super) fn ingest_ternary(
     t: &pb::ValueTernary,
     env: &IngestEnv,
     strict: bool,
-) -> Result<Option<IngestVal>, Status> {
+) -> Result<Option<IngestVal>, ValuesError> {
     let cond = t
         .cond
         .as_ref()

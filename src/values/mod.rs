@@ -20,6 +20,8 @@
 //! CEL yields a value, this module yields the same value (the
 //! differential oracle in `tests/cel_values.rs` holds it there).
 
+#![deny(clippy::result_large_err)]
+
 mod contract;
 mod eval;
 mod functions;
@@ -34,8 +36,6 @@ mod resolve_call;
 mod resolve_compare;
 mod types;
 
-use tonic::Status;
-
 pub use contract::{
     merge_projection_types, projected_type, validate_map_fetch_contract, validate_projection_row,
     TYPED_MAP_FETCH_VERSION,
@@ -49,7 +49,16 @@ pub use lookup::{ColumnLookup, NumericTypes};
 pub use resolve::resolve;
 pub use types::{CmpOp, Op, ResolvedValue, Val, ValueType};
 
+crate::domain_error::domain_error! {
+    /// Why a value expression or projection was refused, converted to
+    /// transport status only at the RPC edge.
+    pub enum ValuesError {
+        InvalidArgument => invalid_argument,
+        FailedPrecondition => failed_precondition,
+    }
+}
+
 /// One refusal, uniformly shaped like the compiler's.
-fn refuse(msg: impl Into<String>) -> Status {
-    Status::invalid_argument(format!("projection: {}", msg.into()))
+fn refuse(msg: impl Into<String>) -> ValuesError {
+    ValuesError::invalid_argument(format!("projection: {}", msg.into()))
 }

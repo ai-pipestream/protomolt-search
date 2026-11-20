@@ -34,6 +34,8 @@
 //!   needs no new math; what changes is only WHERE the test sits (the
 //!   heap gate), which `crate::bm25` owns.
 
+#![deny(clippy::result_large_err)]
+
 use std::cmp::Ordering;
 use std::ops::Not;
 
@@ -338,4 +340,12 @@ mod walk;
 
 pub use self::resolved::{DocFilter, MapKeyRef, PhraseGate, ResolvedFilter, ResolvedLeaf};
 pub use self::validate::validate_filter;
+
+crate::domain_error::domain_error! {
+    /// Why a wire filter tree was refused, converted to transport status
+    /// only at the RPC edge.
+    pub enum FilterError {
+        InvalidArgument => invalid_argument,
+    }
+}
 pub use self::walk::{edge_of, leaf_count, walk_leaves, LeafRef};

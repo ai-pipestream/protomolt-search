@@ -1,6 +1,6 @@
 //! Assembly of one engine row from projected slots.
 
-use tonic::Status;
+use super::MappingError;
 
 use super::extractor::{ExtractedDoc, Extractor, Land, Leaf, Slot};
 use super::refuse_at;
@@ -18,7 +18,7 @@ impl Extractor {
         &self,
         parent: &[Option<Slot>],
         chunk: Option<&Vec<Option<Slot>>>,
-    ) -> Result<ExtractedDoc, Status> {
+    ) -> Result<ExtractedDoc, MappingError> {
         let mut request = pb::AddDocumentsRequest::default();
         let mut vector = Vec::new();
         let mut reduced_id = None;
@@ -73,7 +73,7 @@ impl Extractor {
 
     /// Refuses the absence of a value every row carries: body, vector,
     /// document id, or a declared chunk id.
-    fn refuse_absent(&self, index: usize, leaf: &Leaf) -> Result<(), Status> {
+    fn refuse_absent(&self, index: usize, leaf: &Leaf) -> Result<(), MappingError> {
         if index == self.body {
             return Err(refuse_at(&leaf.path, "the document has no body text"));
         }
@@ -205,7 +205,7 @@ impl Extractor {
 /// bytes of SHA-256 over its UTF-8 bytes, big-endian. Keyed on the
 /// DESCRIPTOR type (a KEYWORD hint on an integer field renders as a
 /// facet string but still reduces as the integer it is).
-fn reduce_id(land: &Land, slot: &Slot, path: &str) -> Result<u64, Status> {
+fn reduce_id(land: &Land, slot: &Slot, path: &str) -> Result<u64, MappingError> {
     if let Land::Wrapper(inner) = land {
         return reduce_id(inner, slot, path);
     }
@@ -219,7 +219,7 @@ fn reduce_id(land: &Land, slot: &Slot, path: &str) -> Result<u64, Status> {
                 rendered.parse::<i64>().map(|value| value as u64)
             };
             parsed.map_err(|_| {
-                Status::internal(format!(
+                MappingError::internal(format!(
                     "plan: doc id {path}: non-decimal own rendering {rendered:?}"
                 ))
             })
@@ -229,7 +229,7 @@ fn reduce_id(land: &Land, slot: &Slot, path: &str) -> Result<u64, Status> {
                 .try_into()
                 .expect("32 bytes hold 8"),
         )),
-        _ => Err(Status::internal(format!(
+        _ => Err(MappingError::internal(format!(
             "plan: doc id {path} landed a non-identity slot"
         ))),
     }

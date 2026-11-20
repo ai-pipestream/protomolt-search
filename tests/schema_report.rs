@@ -1,4 +1,4 @@
-use pipestream_search::mapping::{derive_plan, describe_schema};
+use pipestream_search::mapping::{derive_plan, describe_schema, MappingError};
 use pipestream_search::pb::{
     MappedQueryRepresentation as Query, ProjectionUse as Use, SchemaField, SchemaReport,
     SourcePreservation,
@@ -179,7 +179,7 @@ fn source_description_rejects_invalid_descriptors_and_unknown_roots() {
         (&bytes[..], ".source_report.Empty"),
     ] {
         assert_eq!(
-            describe_schema(descriptor, root).unwrap_err().code(),
+            tonic::Status::from(describe_schema(descriptor, root).unwrap_err()).code(),
             tonic::Code::InvalidArgument
         );
     }
@@ -189,6 +189,7 @@ fn source_description_rejects_invalid_descriptors_and_unknown_roots() {
         .retain(|f| f.package() == "source_report");
     assert_eq!(
         describe_schema(&missing_import.encode_to_vec(), "source_report.AllShapes")
+            .map_err(tonic::Status::from)
             .unwrap_err()
             .code(),
         tonic::Code::InvalidArgument
@@ -202,7 +203,7 @@ fn source_description_rejects_invalid_descriptors_and_unknown_roots() {
             let description = describe_schema(&bytes, "source_report.AllShapes").unwrap_err();
             let planning = derive_plan(&bytes, "source_report.AllShapes").unwrap_err();
             for error in [description, planning] {
-                assert_eq!(error.code(), tonic::Code::InvalidArgument);
+                assert!(matches!(error, MappingError::InvalidArgument(_)));
                 assert!(error.message().contains("unsupported protobuf syntax"));
             }
         }

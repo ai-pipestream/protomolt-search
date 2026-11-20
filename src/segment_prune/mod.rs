@@ -22,6 +22,8 @@
 //! indices, and a segment's summary names its columns, so the caller
 //! supplies the shard's index-to-name mapping.
 
+#![deny(clippy::result_large_err)]
+
 mod leaf;
 #[cfg(test)]
 mod tests;

@@ -1,6 +1,6 @@
 //! The predicate compiler: [`Ast`] to [`pb::FilterExpr`].
 
-use tonic::Status;
+use super::CelError;
 
 use super::ast::{Ast, RelOp};
 use super::calls::{compile_call, compile_in};
@@ -34,7 +34,7 @@ fn bound(value: pb::filter_bound::Value, exclusive: bool) -> pb::FilterBound {
     }
 }
 
-pub(super) fn compile(ast: &Ast) -> Result<pb::FilterExpr, Status> {
+pub(super) fn compile(ast: &Ast) -> Result<pb::FilterExpr, CelError> {
     match ast {
         Ast::Or(children) => Ok(wrap(pb::filter_expr::Expr::Or(pb::FilterList {
             exprs: children.iter().map(compile).collect::<Result<_, _>>()?,
@@ -79,7 +79,7 @@ pub(super) fn compile(ast: &Ast) -> Result<pb::FilterExpr, Status> {
 
 /// Fold one relation side into a [`Side`], resolving `timestamp()`
 /// calls into their epoch-micros integer.
-pub(super) fn side_of(ast: &Ast) -> Result<Side, Status> {
+pub(super) fn side_of(ast: &Ast) -> Result<Side, CelError> {
     match ast {
         Ast::Ident(name) => match name.as_str() {
             "true" | "false" => Err(refuse(
@@ -120,11 +120,11 @@ pub(super) fn side_of(ast: &Ast) -> Result<Side, Status> {
     }
 }
 
-pub(super) fn int_literal(v: i128) -> Result<i64, Status> {
+pub(super) fn int_literal(v: i128) -> Result<i64, CelError> {
     i64::try_from(v).map_err(|_| refuse(format!("integer literal {v} is out of i64 range")))
 }
 
-fn compile_relation(l: &Ast, op: RelOp, r: &Ast) -> Result<pb::FilterExpr, Status> {
+fn compile_relation(l: &Ast, op: RelOp, r: &Ast) -> Result<pb::FilterExpr, CelError> {
     let (lhs, rhs) = (side_of(l)?, side_of(r)?);
     match op {
         RelOp::In => compile_in(lhs, rhs),
@@ -172,7 +172,7 @@ fn compile_relation(l: &Ast, op: RelOp, r: &Ast) -> Result<pb::FilterExpr, Statu
     }
 }
 
-fn compile_string_relation(col: &Side, op: RelOp, value: &str) -> Result<pb::FilterExpr, Status> {
+fn compile_string_relation(col: &Side, op: RelOp, value: &str) -> Result<pb::FilterExpr, CelError> {
     let eq = match col {
         Side::Column(name) => wrap(pb::filter_expr::Expr::Facet(pb::FacetPredicate {
             column: name.clone(),
@@ -233,7 +233,7 @@ pub(super) fn compile_number_relation(
     col: &Side,
     op: RelOp,
     value: pb::filter_bound::Value,
-) -> Result<pb::FilterExpr, Status> {
+) -> Result<pb::FilterExpr, CelError> {
     let (min, max) = match op {
         RelOp::Eq | RelOp::Ne => (Some(bound(value, false)), Some(bound(value, false))),
         RelOp::Gt => (Some(bound(value, true)), None),

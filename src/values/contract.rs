@@ -1,7 +1,7 @@
 //! The projection contract between shards and the coordinator: fetch
 //! versions, declared types, and row validation.
 
-use tonic::Status;
+use super::ValuesError;
 
 use super::leaves::{column_leaves, ValueLeaf};
 use crate::pb;
@@ -14,7 +14,7 @@ pub const TYPED_MAP_FETCH_VERSION: u32 = 1;
 pub fn validate_map_fetch_contract(
     projections: &[pb::CompiledProjection],
     version: u32,
-) -> Result<(), Status> {
+) -> Result<(), ValuesError> {
     let mut leaves = Vec::new();
     for projection in projections {
         if let Some(expr) = &projection.expr {
@@ -26,7 +26,7 @@ pub fn validate_map_fetch_contract(
             .iter()
             .any(|leaf| matches!(leaf, ValueLeaf::TypedMap { .. }))
     {
-        return Err(Status::failed_precondition("shard omitted the typed map fetch contract acknowledgement; update every node and relay"));
+        return Err(ValuesError::failed_precondition("shard omitted the typed map fetch contract acknowledgement; update every node and relay"));
     }
     Ok(())
 }
@@ -50,18 +50,18 @@ pub fn merge_projection_types(
     projections: &[pb::CompiledProjection],
     accumulated: &mut [pb::ScalarValueType],
     declared: &[i32],
-) -> Result<(), Status> {
+) -> Result<(), ValuesError> {
     if declared.len() != projections.len() || accumulated.len() != projections.len() {
-        return Err(Status::failed_precondition(
+        return Err(ValuesError::failed_precondition(
             "shard omitted projection type metadata; use matching server builds",
         ));
     }
     for ((projection, acc), &raw) in projections.iter().zip(accumulated).zip(declared) {
         let ty = pb::ScalarValueType::try_from(raw)
-            .map_err(|_| Status::failed_precondition("unknown projection type from shard"))?;
+            .map_err(|_| ValuesError::failed_precondition("unknown projection type from shard"))?;
         if ty != pb::ScalarValueType::Unspecified {
             if *acc != pb::ScalarValueType::Unspecified && *acc != ty {
-                return Err(Status::failed_precondition(format!(
+                return Err(ValuesError::failed_precondition(format!(
                     "projection {:?} has incompatible types across shards: {:?} and {:?}",
                     projection.name, acc, ty
                 )));
@@ -77,18 +77,18 @@ pub fn merge_projection_types(
 pub fn validate_projection_row(
     values: &[pb::ProjectedValue],
     declared: &[i32],
-) -> Result<(), Status> {
+) -> Result<(), ValuesError> {
     if values.len() != declared.len() {
-        return Err(Status::failed_precondition(
+        return Err(ValuesError::failed_precondition(
             "shard returned a projection row with the wrong width",
         ));
     }
     for (value, &raw) in values.iter().zip(declared) {
         let ty = pb::ScalarValueType::try_from(raw)
-            .map_err(|_| Status::failed_precondition("unknown projection type from shard"))?;
+            .map_err(|_| ValuesError::failed_precondition("unknown projection type from shard"))?;
         let actual = projected_type(value);
         if actual != pb::ScalarValueType::Unspecified && actual != ty {
-            return Err(Status::failed_precondition(
+            return Err(ValuesError::failed_precondition(
                 "shard projected value disagrees with its declared type",
             ));
         }

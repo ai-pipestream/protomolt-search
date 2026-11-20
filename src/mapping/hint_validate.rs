@@ -1,7 +1,7 @@
 //! Refusal of hints that cannot apply to the field they sit on.
 
+use super::MappingError;
 use prost_types::{DescriptorProto, FieldDescriptorProto};
-use tonic::Status;
 
 use super::hint_resolve::{is_repeated, wrapper_kind, ResolvedHint, Shape};
 use super::refuse_at;
@@ -15,7 +15,7 @@ pub(super) fn validate_hint(
     shape: &Shape<'_>,
     hint: &ResolvedHint,
     path: &str,
-) -> Result<(), Status> {
+) -> Result<(), MappingError> {
     use prost_types::field_descriptor_proto::Type;
     if hint.kind == pb::MappedKind::Date
         && !matches!(shape, Shape::Message { full, map: false, .. } if full == "google.protobuf.Timestamp")
@@ -72,7 +72,7 @@ fn validate_identity_role(
     shape: &Shape<'_>,
     hint: &ResolvedHint,
     path: &str,
-) -> Result<(), Status> {
+) -> Result<(), MappingError> {
     use prost_types::field_descriptor_proto::Type;
 
     let role_name = if hint.role == pb::MappedRole::DocId {
@@ -133,7 +133,7 @@ fn validate_wrapper_descriptor(
     message: &DescriptorProto,
     kind: prost_types::field_descriptor_proto::Type,
     path: &str,
-) -> Result<(), Status> {
+) -> Result<(), MappingError> {
     use prost_types::field_descriptor_proto::{Label, Type};
     let valid = message.field.iter().any(|field| {
         let default_ok = field
@@ -165,7 +165,10 @@ fn validate_wrapper_descriptor(
 /// Compatible proto2 descriptors are accepted, but their defaults must remain
 /// zero and the components must not select a oneof or repeat. Extra source
 /// fields remain preserved; only the two standard components project.
-fn validate_timestamp_descriptor(message: &DescriptorProto, path: &str) -> Result<(), Status> {
+fn validate_timestamp_descriptor(
+    message: &DescriptorProto,
+    path: &str,
+) -> Result<(), MappingError> {
     use prost_types::field_descriptor_proto::{Label, Type};
     for (name, number, kind) in [("seconds", 1, Type::Int64), ("nanos", 2, Type::Int32)] {
         let valid = message.field.iter().any(|field| {

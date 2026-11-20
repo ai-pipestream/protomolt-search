@@ -1,6 +1,6 @@
 //! Query-time evaluation of a resolved expression for one document.
 
-use tonic::Status;
+use super::ValuesError;
 
 use super::functions::eval_fn;
 use super::refuse;
@@ -9,7 +9,7 @@ use crate::pb;
 use crate::scorefn::NumericRead;
 
 /// The string-ordering refusal, shared by both evaluation paths.
-pub(super) fn string_ordering(op: CmpOp) -> Status {
+pub(super) fn string_ordering(op: CmpOp) -> ValuesError {
     refuse(format!(
         "`{}` orders strings, which is not in the vocabulary; only `==` and \
          `!=` compare strings",

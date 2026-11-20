@@ -98,7 +98,7 @@ fn error_refuses_naming_document_and_dimension() {
     let mut hits = vec![hit(0, 2.0, &[("lex", 3.0)]), hit(7, 1.0, &[])];
     let s = validate(&scorer(CompositeScoreOperation::WeightedSum, vec![d])).unwrap();
     let err = s.apply(&mut hits, &[]).unwrap_err();
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(matches!(err, super::LtrError::FailedPrecondition(_)));
     assert!(err.message().contains("document 7"));
     assert!(err.message().contains("\"l\""));
 }

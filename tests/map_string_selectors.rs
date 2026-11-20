@@ -95,9 +95,10 @@ fn older_filter_schema_cannot_reinterpret_explicit_map_context() {
         let discarded = pb::FilterExpr::decode(old.encode_to_vec().as_slice()).unwrap();
         assert!(discarded.expr.is_none());
         assert_eq!(
-            pipestream_search::filter::validate_filter(&discarded)
-                .unwrap_err()
-                .code(),
+            tonic::Status::from(
+                pipestream_search::filter::validate_filter(&discarded).unwrap_err()
+            )
+            .code(),
             tonic::Code::InvalidArgument
         );
         for expr in [

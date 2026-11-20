@@ -1,4 +1,4 @@
-use pipestream_search::mapping::{derive_plan, Extractor};
+use pipestream_search::mapping::{derive_plan, Extractor, MappingError};
 use prost::Message;
 use prost_types::field_descriptor_proto::{Label, Type};
 use prost_types::{
@@ -143,7 +143,7 @@ fn wrong_wire_required_field_does_not_satisfy_presence() {
             .extract(&wire)
             .err()
             .expect("wrong wire type cannot satisfy the required field");
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(matches!(error, MappingError::InvalidArgument(_)));
         assert!(
             error
                 .message()
@@ -186,7 +186,7 @@ fn required_fields_are_validated_even_when_not_indexed() {
             .extract(&wire)
             .err()
             .expect("missing required field");
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(matches!(error, MappingError::InvalidArgument(_)));
         assert!(error.message().contains(path), "{error}");
     }
 }
@@ -529,7 +529,7 @@ fn malformed_unindexed_values_are_still_rejected() {
     let mut wire = base_wire();
     wire.extend([58, 1, 255]);
     assert_eq!(
-        extractor.extract(&wire).err().unwrap().code(),
+        tonic::Status::from(extractor.extract(&wire).err().unwrap()).code(),
         tonic::Code::InvalidArgument
     );
 }
@@ -539,9 +539,7 @@ fn invalid_descriptor_cannot_receive_a_plan() {
     let mut schema = schema();
     schema.file[0].message_type[0].field[3].number = Some(1);
     assert_eq!(
-        derive_plan(&schema.encode_to_vec(), "audit.Doc")
-            .unwrap_err()
-            .code(),
+        tonic::Status::from(derive_plan(&schema.encode_to_vec(), "audit.Doc").unwrap_err()).code(),
         tonic::Code::InvalidArgument
     );
 }
@@ -645,7 +643,7 @@ fn inferred_vector_columns_cannot_alias_scalar_columns_after_name_flattening() {
         .field
         .push(field("metadata_embedding", 7, Type::Int64));
     let error = derive_plan(&input.encode_to_vec(), "audit.Doc").unwrap_err();
-    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(matches!(error, MappingError::InvalidArgument(_)));
     assert!(error.message().contains("both land column"));
 }
 
@@ -725,7 +723,7 @@ fn hinted_vector_names_remain_distinct_from_scalar_text_and_lineage_grants() {
         "ReservedGroup",
     ] {
         let error = derive_plan(descriptor, &format!("vector_binding.{name}")).unwrap_err();
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(matches!(error, MappingError::InvalidArgument(_)));
         assert!(
             error.message().contains("both land column") || error.message().contains("built-in"),
             "{name}: {error}"

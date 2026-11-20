@@ -71,6 +71,7 @@ impl FlatRun<'_> {
                     Status::invalid_argument("projection: empty compiled expression")
                 })?;
                 crate::values::resolve(expression, columns)
+                    .map_err(Status::from)
                     .map(|(value, ty)| (value, crate::pb::ScalarValueType::from(ty) as i32))
             })
             .collect::<Result<Vec<_>, Status>>()?

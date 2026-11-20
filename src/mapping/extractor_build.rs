@@ -2,10 +2,10 @@
 
 use std::collections::HashMap;
 
+use super::MappingError;
 use prost::Message as _;
 use prost_reflect::DescriptorPool;
 use prost_types::FileDescriptorSet;
-use tonic::Status;
 
 use super::derive::derive_plan_with_definition;
 use super::extractor::{Child, ChunkShape, Extractor, Leaf, TrieNode};
@@ -23,7 +23,7 @@ fn resolve_body_path(
     plan: &pb::MappedPlan,
     body_path: &str,
     chunk_prefix: Option<&str>,
-) -> Result<String, Status> {
+) -> Result<String, MappingError> {
     let in_scope =
         |path: &str| -> bool { chunk_prefix.is_none_or(|prefix| path.starts_with(prefix)) };
     let text_paths: Vec<&str> = plan
@@ -92,7 +92,11 @@ struct LeafCompile<'a> {
 impl LeafCompile<'_> {
     /// Compiles one landing field into a leaf and threads its path into
     /// the trie of its scope. Returns the leaf's slot.
-    fn add_leaf(&mut self, field: &pb::MappedField, is_vector: bool) -> Result<usize, Status> {
+    fn add_leaf(
+        &mut self,
+        field: &pb::MappedField,
+        is_vector: bool,
+    ) -> Result<usize, MappingError> {
         let scoped = self
             .chunk_prefix
             .and_then(|prefix| field.path.strip_prefix(prefix));
@@ -134,7 +138,11 @@ impl LeafCompile<'_> {
 
     /// Compiles every landing field of `plan` and, for a chunked plan,
     /// hangs the chunk trie under its container.
-    fn run(mut self, plan: &pb::MappedPlan, body_path: &str) -> Result<CompiledLeaves, Status> {
+    fn run(
+        mut self,
+        plan: &pb::MappedPlan,
+        body_path: &str,
+    ) -> Result<CompiledLeaves, MappingError> {
         let mut body = None;
         let mut vector = None;
         let mut doc_id = None;
@@ -205,7 +213,7 @@ impl Extractor {
         message_type: &str,
         body_path: &str,
         definition: Option<&pb::IndexDefinition>,
-    ) -> Result<Extractor, Status> {
+    ) -> Result<Extractor, MappingError> {
         let plan = derive_plan_with_definition(descriptor_set, message_type, definition)?;
         let pool = DescriptorPool::decode(descriptor_set)
             .map_err(|e| refuse(format!("invalid descriptor set: {e}")))?;
@@ -280,7 +288,7 @@ fn insert_path(
     index: &TypeIndex<'_>,
     path: &str,
     terminal: Child,
-) -> Result<(), Status> {
+) -> Result<(), MappingError> {
     let mut node = root;
     let mut current = entry.desc;
     let segments: Vec<&str> = path.split('.').collect();
@@ -307,7 +315,7 @@ fn insert_path(
         node = match &mut children[at].1 {
             Child::Descend(inner) => inner,
             Child::Leaf(_) | Child::Chunks(_) => {
-                return Err(Status::internal(format!(
+                return Err(MappingError::internal(format!(
                     "plan: path {path} descends through a field already planned as a leaf"
                 )))
             }

@@ -75,6 +75,7 @@ impl FetchScope<'_> {
                     Status::invalid_argument("projection: empty compiled expression")
                 })?;
                 crate::values::resolve(expr, &columns)
+                    .map_err(Status::from)
                     .map(|(_, ty)| crate::pb::ScalarValueType::from(ty) as i32)
             })
             .collect::<Result<_, Status>>()?;
@@ -94,7 +95,7 @@ impl FetchScope<'_> {
                 let expr = p.expr.as_ref().ok_or_else(|| {
                     Status::invalid_argument("projection: empty compiled expression")
                 })?;
-                crate::values::resolve(expr, store)
+                Ok(crate::values::resolve(expr, store)?)
             })
             .collect::<Result<_, Status>>()
     }

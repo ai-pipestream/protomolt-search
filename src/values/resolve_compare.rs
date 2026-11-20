@@ -1,7 +1,7 @@
 //! Resolution of comparisons: numbers and booleans against each other, and
 //! a facet read against a string literal.
 
-use tonic::Status;
+use super::ValuesError;
 
 use super::eval::string_ordering;
 use super::lookup::ColumnLookup;
@@ -13,7 +13,7 @@ use crate::pb;
 pub(super) fn resolve_compare(
     cmp: &pb::ValueCompare,
     cols: &dyn ColumnLookup,
-) -> Result<(ResolvedValue, ValueType), Status> {
+) -> Result<(ResolvedValue, ValueType), ValuesError> {
     use pb::value_expr::Expr as V;
 
     let op = cmp_op_of(cmp.op)?;
@@ -60,7 +60,7 @@ fn resolve_literal_compare(
     lit: String,
     read_pb: &pb::ValueExpr,
     cols: &dyn ColumnLookup,
-) -> Result<(ResolvedValue, ValueType), Status> {
+) -> Result<(ResolvedValue, ValueType), ValuesError> {
     let (rv, vt) = resolve(read_pb, cols)?;
     let lit_ord = match &rv {
         ResolvedValue::FacetCol(fi) => cols.facet_value_ord_of(*fi, &lit),
@@ -91,7 +91,7 @@ fn resolve_operand_compare(
     left: &pb::ValueExpr,
     right: &pb::ValueExpr,
     cols: &dyn ColumnLookup,
-) -> Result<(ResolvedValue, ValueType), Status> {
+) -> Result<(ResolvedValue, ValueType), ValuesError> {
     let ordering = !matches!(op, CmpOp::Eq | CmpOp::Ne);
 
     let (lrv, lt) = resolve(left, cols)?;

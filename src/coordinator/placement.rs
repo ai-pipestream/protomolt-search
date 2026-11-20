@@ -1,6 +1,7 @@
 //! Placement planning and shard assignment.
 
 use super::*;
+use crate::domain_error::DomainError;
 
 /// One routed ingest stream's placement evaluator: the bind's plan as
 /// an extractor, its materialize spec compiled, and the tree. A source
@@ -48,12 +49,10 @@ impl PlacementRouter {
         position: u64,
         stable_key: &[u8],
     ) -> Result<i64, Status> {
-        let rows = self.extractor.extract(bytes).map_err(|status| {
-            Status::new(
-                status.code(),
-                format!("document {position}: {}", status.message()),
-            )
-        })?;
+        let rows = self
+            .extractor
+            .extract(bytes)
+            .map_err(|error| Status::from(error.prefixed(&format!("document {position}: "))))?;
         if rows.is_empty() {
             let empty = crate::pb::AddDocumentsRequest::default();
             let leaf = self
@@ -72,14 +71,9 @@ impl PlacementRouter {
                     )
                 })?;
             let doc = match self.derived.as_deref() {
-                Some(declaration) => {
-                    declaration.apply(doc, Some(stable_key)).map_err(|status| {
-                        Status::new(
-                            status.code(),
-                            format!("document {position}: {}", status.message()),
-                        )
-                    })?
-                }
+                Some(declaration) => declaration.apply(doc, Some(stable_key)).map_err(|error| {
+                    Status::from(error.prefixed(&format!("document {position}: ")))
+                })?,
                 None => doc,
             };
             let leaf = self

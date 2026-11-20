@@ -29,6 +29,8 @@
 //! the epoch MICROSECONDS an i64 column stores, so `decided >= timestamp(...)` is an
 //! ordinary integer bound by the time a shard sees it.
 
+#![deny(clippy::result_large_err)]
+
 mod ast;
 mod calls;
 mod lex;
@@ -45,8 +47,6 @@ mod filter_tests;
 #[cfg(test)]
 mod value_tests;
 
-use tonic::Status;
-
 use crate::pb;
 use lex::lex;
 use parser::Parser;
@@ -58,7 +58,7 @@ use value::{compile_value_ast, VType};
 /// returned tree has already passed [`crate::filter::validate_filter`]
 /// — depth and leaf caps, bound finiteness, geo region rules — so
 /// callers hold a tree every shard will accept.
-pub fn compile_filter(text: &str) -> Result<Option<pb::FilterExpr>, Status> {
+pub fn compile_filter(text: &str) -> Result<Option<pb::FilterExpr>, CelError> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Ok(None);
@@ -76,10 +76,27 @@ pub fn compile_filter(text: &str) -> Result<Option<pb::FilterExpr>, Status> {
     Ok(Some(expr))
 }
 
+crate::domain_error::domain_error! {
+    /// Why a CEL filter or value expression was refused, converted to
+    /// transport status only at the RPC edge.
+    pub enum CelError {
+        InvalidArgument => invalid_argument,
+    }
+}
+
+impl From<crate::filter::FilterError> for CelError {
+    fn from(error: crate::filter::FilterError) -> Self {
+        use crate::filter::FilterError;
+        match error {
+            FilterError::InvalidArgument(message) => Self::InvalidArgument(message),
+        }
+    }
+}
+
 /// One refusal, uniformly shaped: every message begins `filter: ` and
 /// names the construct it refuses.
-fn refuse(msg: impl Into<String>) -> Status {
-    Status::invalid_argument(format!("filter: {}", msg.into()))
+fn refuse(msg: impl Into<String>) -> CelError {
+    CelError::invalid_argument(format!("filter: {}", msg.into()))
 }
 
 /// Compile a CEL VALUE expression (projections, materialized columns):
@@ -89,7 +106,7 @@ fn refuse(msg: impl Into<String>) -> Status {
 /// filter front-end. Typing is stock CEL's — int with int, double with
 /// double — checked here as far as literals pin it down and finished
 /// per shard where column kinds are known.
-pub fn compile_value(text: &str) -> Result<pb::ValueExpr, Status> {
+pub fn compile_value(text: &str) -> Result<pb::ValueExpr, CelError> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Err(refuse("empty value expression"));

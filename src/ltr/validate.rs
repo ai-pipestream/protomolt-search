@@ -1,6 +1,6 @@
 //! Validation of the wire scorer against the request's id namespace.
 
-use tonic::Status;
+use super::LtrError;
 
 use crate::pb::{
     score_signal, CompositeScoreOperation, CompositeScorer, MissingScorePolicy, ScoreDimension,
@@ -12,7 +12,10 @@ use super::{op_name, refuse, Dim, Scorer, SignalKind, Source};
 impl Scorer {
     /// Validate the wire scorer against the request's id namespace.
     /// `ids` holds every (search, boost, filter) id in the request.
-    pub fn validate(scorer: &CompositeScorer, ids: &[(&str, SignalKind)]) -> Result<Self, Status> {
+    pub fn validate(
+        scorer: &CompositeScorer,
+        ids: &[(&str, SignalKind)],
+    ) -> Result<Self, LtrError> {
         let operation = CompositeScoreOperation::try_from(scorer.operation).map_err(|_| {
             refuse(format!(
                 "unknown composite score operation {}",
@@ -66,7 +69,7 @@ fn validate_dim(
     operation: CompositeScoreOperation,
     ids: &[(&str, SignalKind)],
     stored: &mut Vec<crate::pb::ScoreStage>,
-) -> Result<Dim, Status> {
+) -> Result<Dim, LtrError> {
     let weight = d.weight.unwrap_or(1.0);
     if !weight.is_finite() {
         return Err(refuse(format!(
@@ -120,7 +123,7 @@ fn dim_source(
     d: &ScoreDimension,
     ids: &[(&str, SignalKind)],
     stored: &mut Vec<crate::pb::ScoreStage>,
-) -> Result<Source, Status> {
+) -> Result<Source, LtrError> {
     match d.source.as_ref().and_then(|s| s.source.as_ref()) {
         Some(score_signal::Source::Base(_)) => Ok(Source::Base),
         Some(score_signal::Source::QueryRelevanceId(id)) => {
@@ -142,7 +145,8 @@ fn dim_source(
             // The stage admission rules apply here exactly as on the
             // lexical route; a malformed stage refuses by name before
             // anything runs.
-            crate::node::parse_score_stages(std::slice::from_ref(stage))?;
+            crate::node::parse_score_stages(std::slice::from_ref(stage))
+                .map_err(|err| LtrError::invalid_argument(err.message()))?;
             stored.push(stage.clone());
             Ok(Source::Stored(stored.len() - 1))
         }
