@@ -35,7 +35,7 @@ impl StreamRun<'_> {
                 StreamLoopStep::Message(message) => message,
             };
             let result = match message {
-                Ok(Some((shard, message))) => self.message(coordinator, shard, message),
+                Ok(Some((shard, message))) => self.message(coordinator, shard, *message),
                 Ok(None) => continue,
                 Err(status) => Err(status),
             };

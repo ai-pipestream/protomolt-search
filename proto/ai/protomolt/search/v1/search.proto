@@ -1536,6 +1536,15 @@ message StartShardSearch {
   // and stored sentence spans so Stage-2 reranking and highlighting run in a
   // single retrieval pass without a follow-up GetDocuments RPC (#105).
   bool include_rerank_candidate = 17;
+  // Filter routing for providers that choose a filter regime.
+  DenseFilterStrategy filter_strategy = 18;
+  // Score every admitted row: providers that choose a filter regime pin
+  // enumeration over the whole admitted set, including an unfiltered one.
+  bool enumerate_all = 19;
+  // Score every admitted row directly from the shard-local FP32 sidecar,
+  // returning a tie-complete local top-k without streaming full-corpus
+  // candidate lists to the coordinator.
+  bool exact_fp32_scan = 21;
 }
 
 // A score floor: a lower bound on the global k-th best score. Flows both
@@ -1626,6 +1635,18 @@ message ShardScanStats {
   // (#72; docs/hnsw.md, "Shared floor pruning"). Zero when floor pruning is
   // off or on exhaustive scan providers.
   uint32 floor_pruned = 11;
+  // Per-part execution accounting across the shard's vector-bearing parts.
+  uint32 parts_total = 12;
+  uint32 parts_skipped = 13;
+  uint32 parts_walked = 14;
+  uint32 parts_enumerated = 15;
+  uint32 parts_scanned = 16;
+  uint32 parts_staged = 17;
+  // Shard-local FP32 sidecar scan metrics when `exact_fp32_scan` is set.
+  uint64 fp32_rows_scored = 18;
+  uint64 fp32_logical_bytes = 19;
+  uint64 fp32_pages_touched = 20;
+  uint32 fp32_tasks = 21;
 }
 
 // Inline candidate payload captured under the Stage-1 shard read lock so
@@ -1751,6 +1772,11 @@ message StartStreamSearch {
   // When true, `StreamIdentity` responses also carry `rerank_candidate` for
   // each selected winner (#105).
   bool include_rerank_candidate = 19;
+  // As `StartShardSearch.filter_strategy` and `enumerate_all`.
+  DenseFilterStrategy filter_strategy = 20;
+  bool enumerate_all = 21;
+  // Score every admitted row directly from the shard-local FP32 sidecar.
+  bool exact_fp32_scan = 23;
 }
 
 // Bounds for the post-scan identity exchange. All fields must be positive.
@@ -1932,6 +1958,18 @@ message StreamSearchSummary {
   // Layer-0 graph walks on this shard that pruned candidates against the
   // active score floor (#72; docs/hnsw.md, "Shared floor pruning").
   uint32 floor_pruned = 14;
+  // Per-part execution accounting across the shard's vector-bearing parts.
+  uint32 parts_total = 15;
+  uint32 parts_skipped = 16;
+  uint32 parts_walked = 17;
+  uint32 parts_enumerated = 18;
+  uint32 parts_scanned = 19;
+  uint32 parts_staged = 20;
+  // Shard-local FP32 sidecar scan metrics when `exact_fp32_scan` is set.
+  uint64 fp32_rows_scored = 21;
+  uint64 fp32_logical_bytes = 22;
+  uint64 fp32_pages_touched = 23;
+  uint32 fp32_tasks = 24;
 }
 
 // How a provider that can steer its search by the filter answered: one
@@ -2291,6 +2329,11 @@ message SearchRequest {
   // Requests inline Stage-1 `RerankCandidatePayload` on each returned `ScoredHit`
   // so coordinator Stage-2 reranking and highlighting run in a single pass (#105).
   bool include_rerank_candidate = 17;
+  // Filter routing for providers that choose a filter regime.
+  DenseFilterStrategy filter_strategy = 18;
+  // Score every admitted row: providers that choose a filter regime pin
+  // enumeration over the whole admitted set, including an unfiltered one.
+  bool enumerate_all = 19;
 }
 
 // Client-facing search response.
@@ -4689,6 +4732,15 @@ message HybridShardRequest {
   VectorReadContext read_context = 18;
   // When true, each returned `HybridLegHit` carries inline `rerank_candidate` (#105).
   bool include_rerank_candidate = 19;
+  // Dense vector-leg execution controls forwarded to the shard.
+  optional uint32 enumerate_max_rows = 20;
+  DenseFilterStrategy filter_strategy = 21;
+  bool enumerate_all = 22;
+  optional uint32 patience_saturation_ppm = 23;
+  optional uint32 patience_hops = 24;
+  optional bool floor_prune = 25;
+  optional uint32 floor_greediness_ppm = 26;
+  optional uint32 floor_clamp_min = 27;
 }
 
 // One fused hit in a shard's hybrid result, with per-leg provenance.
@@ -4725,6 +4777,8 @@ message HybridShardResponse {
   repeated bool filter_columns_known = 3;
   // Captured with the local fusion inputs under one physical read guard.
   VectorReadReceipt read_receipt = 4;
+  // Per-part execution stats reported by the vector leg when it ran.
+  ShardScanStats vector_scan = 5;
 }
 
 // A second-pass lexical boost applied AFTER fusion (the rescore-window
@@ -4822,6 +4876,10 @@ message HybridSearchRequest {
   bool include_rerank_candidate = 20;
   // Optional pre-analyzed BM25 leg terms from one-pass query planning (#104).
   repeated string pre_analyzed_terms = 21;
+  // As `SearchRequest.filter_strategy` and `enumerate_all`, for the
+  // vector leg.
+  DenseFilterStrategy filter_strategy = 22;
+  bool enumerate_all = 23;
 }
 
 // Profile of one hybrid query; populated only when the request set
@@ -4960,6 +5018,15 @@ message ShardLegsRequest {
   VectorReadContext read_context = 15;
   // When true, each returned `RawLegHit` carries inline `rerank_candidate` (#105).
   bool include_rerank_candidate = 16;
+  // Dense vector-leg execution controls forwarded to the shard.
+  optional uint32 enumerate_max_rows = 17;
+  DenseFilterStrategy filter_strategy = 18;
+  bool enumerate_all = 19;
+  optional uint32 patience_saturation_ppm = 20;
+  optional uint32 patience_hops = 21;
+  optional bool floor_prune = 22;
+  optional uint32 floor_greediness_ppm = 23;
+  optional uint32 floor_clamp_min = 24;
 }
 
 // One raw leg hit.
@@ -4989,6 +5056,8 @@ message ShardLegsResponse {
   repeated bool filter_columns_known = 4;
   // Captured under the same read guard as both raw lists, when requested.
   VectorReadReceipt read_receipt = 5;
+  // Per-part execution stats reported by the vector leg when it ran.
+  ShardScanStats vector_scan = 6;
 }
 
 message BroadcastVectorBackendRequest {
@@ -5635,56 +5704,126 @@ message LexicalQuery {
   bool synonyms_off = 7;
 }
 
-// Dense vector relevance (the Search leg).
-enum DenseScoreMode {
-  // Backward-compatible provider-native scoring.
-  DENSE_SCORE_MODE_UNSPECIFIED = 0;
-  DENSE_SCORE_MODE_NATIVE = 1;
-  // Select `selection_k` candidates with the configured provider, then
-  // replace their scores with product-owned FP32 dot products and reorder
-  // that fixed pool. Exact within the pool, not a global recall guarantee.
-  DENSE_SCORE_MODE_FP32_RERANK = 2;
+// How the dense candidate set is selected. Coverage is separate from score
+// precision: an exhaustive selection under quantized scores is not an FP32
+// ranking, and FP32 scores over a graph's candidates do not certify
+// exhaustive coverage.
+enum DenseExecutionMode {
+  // Refused: every dense request names its execution contract.
+  DENSE_EXECUTION_MODE_UNSPECIFIED = 0;
+  reserved 1, 2, 3;
+  reserved "DENSE_EXECUTION_MODE_EXACT", "DENSE_EXECUTION_MODE_ANN";
+  // Score every live, authorized, filter-admitted row at the requested
+  // precision. A provider that cannot is refused, never substituted.
+  DENSE_EXECUTION_MODE_EXHAUSTIVE = 4;
+  // The provider's balanced approximate technique under its versioned
+  // built-in preset. Where the provider has none, the same-precision
+  // exhaustive technique runs and the substitution is disclosed.
+  DENSE_EXECUTION_MODE_BALANCED = 5;
+  // A distinct speed-oriented technique (smaller beam, patience, SPEED
+  // filter routing). Refused where the provider has no such technique.
+  DENSE_EXECUTION_MODE_FAST = 6;
+  // Let the coordinator choose. Approximation requires qualifying measured
+  // evidence; without it AUTO runs the exhaustive technique at the
+  // requested precision.
+  DENSE_EXECUTION_MODE_AUTO = 7;
 }
 
-// How the dense candidate set is selected. This is independent of
-// DenseScoreMode: FP32_RERANK may replace scores inside either an exhaustive
-// or approximate candidate pool, but it does not turn an approximate pool
-// into a corpus-wide exact result.
-enum DenseExecutionMode {
-  // Backward-compatible exact traversal. Callers that want the planner must
-  // opt into AUTO explicitly so a future backend change cannot silently
-  // weaken an existing request's quality contract.
-  DENSE_EXECUTION_MODE_UNSPECIFIED = 0;
-  // Require an exhaustive provider-native traversal and completion
-  // certificate. The request is refused if the live provider cannot prove it.
-  DENSE_EXECUTION_MODE_EXACT = 1;
-  // Accept the live provider's configured approximate traversal. The response
-  // reports the provider quality contract; it never claims corpus-wide top-k.
-  DENSE_EXECUTION_MODE_ANN = 2;
-  // Let the coordinator choose. AUTO is conservative: it uses exact traversal
-  // today and will admit ANN only after a generation-bound adaptive policy is
-  // installed and qualified for the live provider.
-  DENSE_EXECUTION_MODE_AUTO = 3;
+// Requested dense score precision.
+enum DensePrecisionRequest {
+  // The provider's native score precision. Never converted because a
+  // sidecar happens to exist.
+  DENSE_PRECISION_REQUEST_AUTO = 0;
+  // Product-owned FP32 dot products over original rows. Strict.
+  DENSE_PRECISION_REQUEST_FP32 = 1;
+  // The provider's quantized scores. Strict.
+  DENSE_PRECISION_REQUEST_QUANTIZED = 2;
+}
+
+// Concrete score precision. Never UNSPECIFIED on a successful response,
+// including an empty one.
+enum DenseScorePrecision {
+  DENSE_SCORE_PRECISION_UNSPECIFIED = 0;
+  DENSE_SCORE_PRECISION_FP32 = 1;
+  DENSE_SCORE_PRECISION_QUANTIZED = 2;
+}
+
+// How a filtered dense search routes its mask on providers that choose a
+// filter regime.
+enum DenseFilterStrategy {
+  // The mode's default: ENUMERATE_SMALL for BALANCED, SPEED for FAST.
+  DENSE_FILTER_STRATEGY_DEFAULT = 0;
+  // Enumerate a mask only where that is cheaper than any walk.
+  DENSE_FILTER_STRATEGY_SPEED = 1;
+  // Enumerate every mask at most the provider's enumerate threshold.
+  DENSE_FILTER_STRATEGY_ENUMERATE_SMALL = 2;
+}
+
+// Candidate coverage assessed in the final dense score space.
+enum DenseCoverage {
+  DENSE_COVERAGE_UNSPECIFIED = 0;
+  // Every live, authorized, filter-admitted row was scored at the output
+  // precision on every required shard.
+  DENSE_COVERAGE_EXHAUSTIVE_CERTIFIED = 1;
+  // The output ranks a candidate set. Rescoring that set at FP32 never
+  // upgrades it.
+  DENSE_COVERAGE_CANDIDATE_SET = 2;
+}
+
+// Why the selection stopped, separate from what it covered.
+enum DenseTermination {
+  DENSE_TERMINATION_UNSPECIFIED = 0;
+  // Every candidate the technique enumerates was scored.
+  DENSE_TERMINATION_EXHAUSTED = 1;
+  // A graph traversal converged at its beam.
+  DENSE_TERMINATION_CONVERGED = 2;
+  // Patience, a work budget or an allowed early Finish ended a traversal.
+  DENSE_TERMINATION_BUDGET_STOPPED = 3;
+}
+
+// One physical selection technique.
+enum DenseTechnique {
+  DENSE_TECHNIQUE_UNSPECIFIED = 0;
+  // Every admitted original row scored in FP32.
+  DENSE_TECHNIQUE_FP32_SCAN = 1;
+  // Every admitted encoded row scored in the quantized space.
+  DENSE_TECHNIQUE_QUANTIZED_SCAN = 2;
+  // Staged top-k over quantized bit planes.
+  DENSE_TECHNIQUE_BITPLANE_STAGED = 3;
+  // A graph walk.
+  DENSE_TECHNIQUE_HNSW_WALK = 4;
+}
+
+// How many searched parts ran one technique. Mixed execution is listed,
+// never collapsed into one value.
+message DenseTechniqueCount {
+  DenseTechnique technique = 1;
+  uint32 parts = 2;
 }
 
 message DenseQuery {
+  reserved 2;
+  reserved "score_mode";
   // The query vector; length must equal the shard dimension.
   repeated float vector = 1;
-  DenseScoreMode score_mode = 2;
-  // Optional measured recall policy. This is served only with FP32_RERANK
-  // on a single dense selection. When present, QueryRequest.selection_k
-  // MUST be zero: the coordinator resolves the candidate depth from its
-  // generation-bound quality profile instead of accepting two competing
-  // depth authorities.
+  // Optional measured recall policy for the FP32 candidate pool of a
+  // BALANCED selection on a quantized provider. When present,
+  // QueryRequest.selection_k MUST be zero: the coordinator resolves the
+  // candidate depth from its generation-bound quality profile instead of
+  // accepting two competing depth authorities.
   DenseQualityPolicy quality = 3;
-  // Candidate traversal contract. Unspecified preserves the historical exact
-  // behavior; AUTO must be requested explicitly.
+  // Candidate selection contract. UNSPECIFIED is refused.
   DenseExecutionMode execution_mode = 4;
   // Exact indexed vector name. A named read requires a durable mapped binding
   // and compatible read receipts from every product shard. Empty selects the
   // shard's single vector index without a field restriction; it cannot
   // satisfy a field-restricted grant.
   string field = 5;
+  // Requested score precision; AUTO is the provider's native precision.
+  DensePrecisionRequest precision = 6;
+  // Filter routing for BALANCED/FAST. Must stay DEFAULT for EXHAUSTIVE and
+  // AUTO, whose routing the planner owns.
+  DenseFilterStrategy filter_strategy = 7;
 }
 
 // A request for a measured candidate depth. Recall is expressed in parts per
@@ -6024,58 +6163,69 @@ message DenseQualityOutcome {
 }
 
 message DenseExecutionOutcome {
-  // The wire value supplied by the caller. UNSPECIFIED is retained here even
-  // though it resolves to EXACT for backward compatibility.
+  reserved 6;
+  reserved "exhaustive_completion";
+  // The wire value supplied by the caller.
   DenseExecutionMode requested_mode = 1;
-  // The traversal that actually ran. Never UNSPECIFIED on success.
+  // The mode whose contract the response satisfies: the requested one, or
+  // EXHAUSTIVE when BALANCED disclosed a fallback or AUTO chose it.
   DenseExecutionMode resolved_mode = 2;
   string provider_backend = 3;
   VectorQualityContract quality_contract = 4;
   string scoring_fingerprint = 5;
-  // True only when every shard/provider advertised and completed an
-  // exhaustive traversal contract. False is not an error for explicit ANN.
-  bool exhaustive_completion = 6;
   // Stable, human-readable planner explanation for logs and experiments.
   string planner_reason = 7;
-  // AUTO provenance: the generation-bound policy that admitted the resolved
-  // traversal, and the point it matched. Empty when AUTO resolved to EXACT on
-  // an exhaustive provider, and for explicit EXACT/ANN requests.
+  // Measured-policy provenance. Empty without a qualifying measured policy;
+  // a built-in preset never appears here.
   string policy_id = 8;
   string policy_fingerprint = 9;
   DensePolicyPoint policy_point = 10;
-  // The live request key AUTO was judged on: filter selectivity in parts per
-  // million of the corpus (1,000,000 when unfiltered), set whenever a policy
-  // was consulted.
+  // The live filter selectivity in parts per million of the corpus
+  // (1,000,000 when unfiltered), set whenever a policy was consulted.
   uint32 filter_selectivity_ppm = 11;
-  // The candidate depth the providers were asked for: the beam an
-  // approximate traversal executed at. Set whenever resolved_mode is ANN
-  // (a policy point's `candidates` when AUTO qualified through one, else the
-  // request's selection_k or k); 0 for an exact traversal.
+  // The candidate depth an approximate selection executed at; 0 for an
+  // exhaustive selection.
   uint32 candidate_depth = 12;
-  // NOT_APPLICABLE without a measured AUTO policy; otherwise the scope of the
+  // NOT_APPLICABLE without a measured policy; otherwise the scope of the
   // benchmark behind policy_point. FP32 depth evidence is in dense_quality.
   DenseEvidenceScope evidence_scope = 13;
   // How the providers answered the request's filter, summed over every
-  // segment searched (docs/hnsw.md, "Filters"). Unset for an unfiltered
-  // request and for providers with one way to filter. A request reported
-  // as ANN whose every count is `enumerate` scored every allowed row.
+  // segment searched. Unset for an unfiltered request and for providers
+  // with one way to filter.
   DenseFilterRegimes filter_regimes = 14;
   // Rows scored by enumeration across unlinked HNSW parts, summed over
-  // every shard searched (docs/hnsw.md). Withheld when physical execution
-  // details are redacted.
+  // every shard searched. Withheld when physical execution details are
+  // redacted.
   uint64 tail_enumerated_rows = 15;
-  // Layer-0 graph walks that ended early via patience saturation, summed over
-  // every shard searched (#95; docs/hnsw.md, "Patience"). Withheld when
-  // physical execution details are redacted.
+  // Layer-0 graph walks that ended early via patience saturation. Withheld
+  // when physical execution details are redacted.
   uint32 patience_stopped = 16;
   // Shards whose approximate streaming walk ended early via
-  // `FinishStreamSearch` (#100; docs/hnsw.md). Withheld when physical
-  // execution details are redacted.
+  // `FinishStreamSearch`. Withheld when physical execution details are
+  // redacted.
   uint32 shards_finished_early = 17;
   // Shards whose approximate streaming walk pruned candidates against the
-  // shared score floor (#72; docs/hnsw.md). Withheld when physical execution
-  // details are redacted.
+  // shared score floor. Withheld when physical execution details are
+  // redacted.
   uint32 shards_floor_pruned = 18;
+  DensePrecisionRequest requested_precision = 19;
+  // Precision of the scores that chose the candidates.
+  DenseScorePrecision selection_precision = 20;
+  // Precision of the returned scores.
+  DenseScorePrecision output_precision = 21;
+  DenseCoverage coverage = 22;
+  DenseTermination termination = 23;
+  // Every technique that ran, with the parts it ran on.
+  repeated DenseTechniqueCount techniques = 24;
+  // The filter routing the selection actually ran under.
+  DenseFilterStrategy filter_strategy = 25;
+  // The versioned built-in preset an approximate technique ran under,
+  // e.g. "hnsw-balanced-v1"; empty for exhaustive techniques.
+  string preset = 26;
+  // True only when measured evidence qualified an approximate selection.
+  bool policy_qualified = 27;
+  // Why the resolved mode differs from the requested one; empty otherwise.
+  string fallback_reason = 28;
 }
 
 // One measured point of a dense execution policy

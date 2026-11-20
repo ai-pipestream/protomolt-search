@@ -329,17 +329,12 @@ async fn public_query_admits_every_field_before_statistics_or_selection() {
     disabled.scorer.as_mut().unwrap().dimensions[0].weight = Some(0.);
     denied.push(disabled);
     let mut boost = public_query();
-    boost.boosts.push(BoostQuery {
-        query: Some(SearchQuery {
-            id: "dense".into(),
-            query: Some(search_query::Query::Dense(DenseQuery {
-                field: "secret".into(),
-                vector: vec![0.25; 16],
-                ..Default::default()
-            })),
-        }),
-        ..Default::default()
-    });
+    boost.boosts.push(common::dense_boost(
+        "dense",
+        "secret",
+        vec![0.25; 16],
+        DenseExecutionMode::Exhaustive as i32,
+    ));
     denied.push(boost);
     for spec in denied {
         let error = SearchService::query(&reader, request(spec))

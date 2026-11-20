@@ -126,7 +126,7 @@ impl NodeServiceImpl {
             }
             let service = self.clone();
             tokio::task::spawn_blocking(move || {
-                let query = crate::node::lexical::LegQuery {
+                let mut legs = service.compute_legs(LegCompute {
                     vector: &req.vector,
                     terms: &req.terms,
                     analysis_fingerprint: req.analysis_fingerprint,
@@ -137,15 +137,24 @@ impl NodeServiceImpl {
                     k: req.k as usize,
                     expected_stats_epoch: req.expected_stats_epoch,
                     expected_stats_incarnation: &req.expected_stats_incarnation,
+                    filters: &LegFilters {
+                        geo: &req.geo_filters,
+                        regions: geo_regions,
+                        tree: req.filter.as_ref(),
+                    },
                     read_context: req.read_context.as_ref(),
                     include_rerank_candidate: req.include_rerank_candidate,
-                };
-                let filters = LegFilters {
-                    geo: &req.geo_filters,
-                    regions: geo_regions,
-                    tree: req.filter.as_ref(),
-                };
-                let mut legs = service.compute_legs(query, &filters)?;
+                    vector_controls: VectorLegControls {
+                        enumerate_max_rows: req.enumerate_max_rows,
+                        filter_strategy: req.filter_strategy,
+                        enumerate_all: req.enumerate_all,
+                        patience_saturation_ppm: req.patience_saturation_ppm,
+                        patience_hops: req.patience_hops,
+                        floor_prune: req.floor_prune,
+                        floor_greediness_ppm: req.floor_greediness_ppm,
+                        floor_clamp_min: req.floor_clamp_min,
+                    },
+                })?;
                 Ok(ShardLegsResponse {
                     vector_hits: legs
                         .vector
@@ -168,6 +177,7 @@ impl NodeServiceImpl {
                     geo_columns_known: legs.geo_columns_known,
                     filter_columns_known: legs.filter_columns_known,
                     read_receipt: legs.read_receipt,
+                    vector_scan: legs.vector_scan,
                 })
             })
             .await

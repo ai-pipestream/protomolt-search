@@ -21,8 +21,8 @@ use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     selection_query, AddDocumentsRequest, AddVectorsRequest, AggregateOp, AggregateRequest,
     AggregateResponse, Aggregation, BooleanQuery, CompositeSearchStrategy, DeleteDocumentsRequest,
-    DenseQuery, FacetValue, FilterQuery, FlushRequest, IntegerValue, LexicalQuery, NumericValue,
-    QueryRequest, QueryResponse, SearchQuery, SelectionOperator, SelectionQuery,
+    FacetValue, FilterQuery, FlushRequest, IntegerValue, LexicalQuery, NumericValue, QueryRequest,
+    QueryResponse, SearchQuery, SelectionOperator, SelectionQuery,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -332,17 +332,12 @@ fn lexical(id: &str, text: &str) -> SelectionQuery {
 }
 
 fn dense(id: &str, q: usize) -> SelectionQuery {
-    SelectionQuery {
-        node: Some(selection_query::Node::Search(SearchQuery {
-            id: id.to_string(),
-            query: Some(pipestream_search::pb::search_query::Query::Dense(
-                DenseQuery {
-                    vector: corpus()[q * DIM..(q + 1) * DIM].to_vec(),
-                    ..Default::default()
-                },
-            )),
-        })),
-    }
+    common::dense_selection(
+        id,
+        corpus()[q * DIM..(q + 1) * DIM].to_vec(),
+        pipestream_search::pb::DenseExecutionMode::Exhaustive as i32,
+        0,
+    )
 }
 
 fn cel(id: &str, cel: &str) -> SelectionQuery {

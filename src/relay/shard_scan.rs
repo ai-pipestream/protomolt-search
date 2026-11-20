@@ -40,7 +40,7 @@ pub(super) struct ShardScan {
 }
 
 /// Add one child's scan counters into the relay's, each with a check.
-fn add_scan_stats(
+pub(super) fn add_scan_stats(
     acc: &mut ShardScanStats,
     share: ShardScanStats,
     child: usize,
@@ -109,7 +109,70 @@ fn add_scan_stats(
         share.floor_pruned,
         child,
         "floor pruned count",
-    )
+    )?;
+    add_part_and_fp32_stats(acc, &share, child)
+}
+
+fn add_part_and_fp32_stats(
+    acc: &mut ShardScanStats,
+    share: &ShardScanStats,
+    child: usize,
+) -> Result<(), Status> {
+    add_count32(
+        &mut acc.parts_total,
+        share.parts_total,
+        child,
+        "parts total",
+    )?;
+    add_count32(
+        &mut acc.parts_skipped,
+        share.parts_skipped,
+        child,
+        "parts skipped",
+    )?;
+    add_count32(
+        &mut acc.parts_walked,
+        share.parts_walked,
+        child,
+        "parts walked",
+    )?;
+    add_count32(
+        &mut acc.parts_enumerated,
+        share.parts_enumerated,
+        child,
+        "parts enumerated",
+    )?;
+    add_count32(
+        &mut acc.parts_scanned,
+        share.parts_scanned,
+        child,
+        "parts scanned",
+    )?;
+    add_count32(
+        &mut acc.parts_staged,
+        share.parts_staged,
+        child,
+        "parts staged",
+    )?;
+    add_count(
+        &mut acc.fp32_rows_scored,
+        share.fp32_rows_scored,
+        child,
+        "fp32 rows scored",
+    )?;
+    add_count(
+        &mut acc.fp32_logical_bytes,
+        share.fp32_logical_bytes,
+        child,
+        "fp32 logical bytes",
+    )?;
+    add_count(
+        &mut acc.fp32_pages_touched,
+        share.fp32_pages_touched,
+        child,
+        "fp32 pages touched",
+    )?;
+    add_count32(&mut acc.fp32_tasks, share.fp32_tasks, child, "fp32 tasks")
 }
 
 impl ShardScan {

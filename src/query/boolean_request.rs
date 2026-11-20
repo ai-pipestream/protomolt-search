@@ -11,12 +11,11 @@ use super::entry::names_own_filter;
 use super::ids::check_unique;
 use super::prepare::named_scorer;
 use super::refuse;
-use super::selection::dense_score_mode;
 use crate::coordinator::{CompiledAggregate, CoordinatorServiceImpl};
 use crate::ltr::SignalKind;
 use crate::pb::{
-    search_query, selection_query, BooleanQuery, BooleanShardAggregate, BoostQuery, DenseScoreMode,
-    QueryRequest, SelectionQuery,
+    search_query, selection_query, BooleanQuery, BooleanShardAggregate, BoostQuery, QueryRequest,
+    SelectionQuery,
 };
 
 /// A validated boolean request: what runs above the shards' exact
@@ -185,12 +184,10 @@ fn parse_boolean_boosts(
                 }
             }
             search_query::Query::Dense(dense) => {
-                if dense.vector.is_empty() || dense_score_mode(dense)? == DenseScoreMode::Fp32Rerank
-                {
-                    return Err(refuse(
-                        "a boolean dense boost needs a vector and uses provider-native candidate scoring",
-                    ));
+                if dense.vector.is_empty() {
+                    return Err(refuse("a boolean dense boost needs a vector"));
                 }
+                super::boosts::native_boost_scoring(dense)?;
                 BoostKind::Dense {
                     field: &dense.field,
                     vector: &dense.vector,

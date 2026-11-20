@@ -49,6 +49,7 @@ fn dense(id: &str, vector: Vec<f32>) -> SelectionQuery {
             id: id.to_string(),
             query: Some(search_query::Query::Dense(DenseQuery {
                 vector,
+                execution_mode: pipestream_search::pb::DenseExecutionMode::Exhaustive as i32,
                 ..Default::default()
             })),
         })),

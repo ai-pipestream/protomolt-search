@@ -16,10 +16,9 @@ use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     routed_ingest_mapped_request, selection_query, AddDocumentsRequest, BooleanQuery,
-    CompositeSearchStrategy, DenseQuery, FacetValue, FilterQuery, FlushRequest, HealthRequest,
-    IntegerValue, LexicalQuery, MappedBind, QueryHit, QueryRequest, QueryResponse,
-    RoutedIngestMappedRequest, RoutedMappedBind, RoutedMappedDocument, SearchQuery,
-    SelectionOperator, SelectionQuery,
+    CompositeSearchStrategy, FacetValue, FilterQuery, FlushRequest, HealthRequest, IntegerValue,
+    LexicalQuery, MappedBind, QueryHit, QueryRequest, QueryResponse, RoutedIngestMappedRequest,
+    RoutedMappedBind, RoutedMappedDocument, SearchQuery, SelectionOperator, SelectionQuery,
 };
 use pipestream_search::placement::{Placement, PlacementNodeConfig, PlacementTreeConfig};
 use prost::Message as _;
@@ -326,17 +325,12 @@ fn lexical(id: &str, text: &str) -> SelectionQuery {
 }
 
 fn dense(id: &str) -> SelectionQuery {
-    SelectionQuery {
-        node: Some(selection_query::Node::Search(SearchQuery {
-            id: id.to_string(),
-            query: Some(pipestream_search::pb::search_query::Query::Dense(
-                DenseQuery {
-                    vector: vectors()[..DIM].to_vec(),
-                    ..Default::default()
-                },
-            )),
-        })),
-    }
+    common::dense_selection(
+        id,
+        vectors()[..DIM].to_vec(),
+        pipestream_search::pb::DenseExecutionMode::Exhaustive as i32,
+        0,
+    )
 }
 
 fn and(clauses: Vec<SelectionQuery>) -> SelectionQuery {

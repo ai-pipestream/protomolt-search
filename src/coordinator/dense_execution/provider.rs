@@ -10,11 +10,12 @@ pub(super) struct DenseProviderFacts {
     pub(super) exhaustive: bool,
     pub(super) enumerates: bool,
     pub(super) supports_patience: bool,
+    pub(super) supports_floor_pruning: bool,
     pub(super) supports_stream: bool,
-    pub(super) supports_floor_prune: bool,
     pub(super) dimensions: u32,
+    /// 32 for providers that score original FP32 rows.
+    pub(super) bits_per_dimension: u32,
     pub(super) rows: u64,
-    pub(super) generation: u64,
 }
 
 impl DenseProviderFacts {
@@ -28,11 +29,11 @@ impl DenseProviderFacts {
             exhaustive: true,
             enumerates: false,
             supports_patience: false,
-            supports_stream: false,
-            supports_floor_prune: false,
+            supports_floor_pruning: false,
+            supports_stream: true,
             dimensions: identity.dimensions,
+            bits_per_dimension: 0,
             rows: identity.rows,
-            generation: identity.topology_generation,
         }
     }
 
@@ -59,9 +60,10 @@ struct ShardFactsFold {
     exhaustive: Option<bool>,
     enumerates: bool,
     supports_patience: bool,
+    supports_floor_pruning: bool,
     supports_stream: bool,
-    supports_floor_prune: bool,
     dimensions: Option<u32>,
+    bits_per_dimension: Option<u32>,
     rows: u64,
 }
 
@@ -76,9 +78,10 @@ impl ShardFactsFold {
             exhaustive: None,
             enumerates: true,
             supports_patience: true,
+            supports_floor_pruning: true,
             supports_stream: true,
-            supports_floor_prune: true,
             dimensions: None,
+            bits_per_dimension: None,
             rows: 0,
         }
     }
@@ -93,8 +96,8 @@ impl ShardFactsFold {
             && advertises(&descriptor, "exhaustive_completion");
         self.enumerates &= advertises(&descriptor, "mask_enumeration");
         self.supports_patience &= advertises(&descriptor, "patience_early_stop");
+        self.supports_floor_pruning &= advertises(&descriptor, "floor_pruning");
         self.supports_stream &= advertises(&descriptor, "candidate_stream");
-        self.supports_floor_prune &= advertises(&descriptor, "floor_pruning");
 
         hold_uniform(
             &mut self.provider,
@@ -117,13 +120,18 @@ impl ShardFactsFold {
             "dense execution preflight found mixed completion capabilities",
         )?;
         hold_uniform(
+            &mut self.bits_per_dimension,
+            descriptor.bits_per_dimension,
+            "dense execution preflight found mixed score precisions",
+        )?;
+        hold_uniform(
             &mut self.dimensions,
             descriptor.dim,
             "dense execution preflight found mixed vector dimensions",
         )
     }
 
-    fn finish(self, generation: u64) -> DenseProviderFacts {
+    fn finish(self) -> DenseProviderFacts {
         let configured = self.provider.is_some();
         DenseProviderFacts {
             provider: self.provider.unwrap_or_default(),
@@ -134,11 +142,11 @@ impl ShardFactsFold {
             exhaustive: self.exhaustive.unwrap_or(false),
             enumerates: self.enumerates && configured,
             supports_patience: self.supports_patience && configured,
+            supports_floor_pruning: self.supports_floor_pruning && configured,
             supports_stream: self.supports_stream && configured,
-            supports_floor_prune: self.supports_floor_prune && configured,
             dimensions: self.dimensions.unwrap_or_default(),
+            bits_per_dimension: self.bits_per_dimension.unwrap_or_default(),
             rows: self.rows,
-            generation,
         }
     }
 }
@@ -237,6 +245,6 @@ impl CoordinatorServiceImpl {
             let shard_quality = shard_quality_contract(&descriptor)?;
             fold.absorb(descriptor, shard_quality)?;
         }
-        Ok(fold.finish(self.topology_generation))
+        Ok(fold.finish())
     }
 }

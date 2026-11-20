@@ -226,10 +226,10 @@ the request supplies the generic composite scorer. Filter clauses and
 negative search clauses contribute membership and provenance but no score;
 a member no positive scoring clause matches has a zero score, no signal,
 and follows the scored members in id order. Dense and lexical clauses in
-the same boolean group are the recursive hybrid form; the older
-`CompositeSearchStrategy` remains a top-level compatibility route for RRF,
-score blend, decomposed, and cascade. ANN cannot certify recursive
-membership and is refused.
+the same boolean group are the recursive hybrid form;
+`CompositeSearchStrategy` carries the top-level RRF, score blend, decomposed,
+and cascade strategies. An approximate dense selection cannot certify
+recursive membership and is refused.
 
 An optional `BooleanQuery.aggregate` folds on each shard over that shard's
 match set, in the same call, and merges at the coordinator as the
@@ -272,86 +272,93 @@ This is the honest form of the existing rescore-window behavior. A caller that
 needs more recall under a strong boost increases `selection_k`; the server does
 not silently over-fetch by an undocumented factor.
 
-## Dense execution modes
+## Dense execution contract
 
-`DenseQuery.execution_mode` separates the traversal contract from scoring:
+A dense leaf names how its candidates are selected and in which score
+precision they are ranked; the two are independent.
 
-- `UNSPECIFIED` preserves the historical exact behavior. It resolves to
-  `EXACT`, and fails if the live generation cannot prove exhaustive native
-  scoring and completion.
-- `EXACT` makes that requirement explicit.
-- `ANN` accepts a provider's configured approximate traversal. It fails on the
-  current embedded TurboVec provider because that provider exposes exhaustive
-  traversal, not a configured ANN path.
-- `AUTO` asks the coordinator to choose, and it chooses only through
-  evidence. An exhaustive provider resolves to `EXACT`, bitwise the same
-  response as `EXACT`. A configured ANN provider resolves to `ANN` only
-  through the generation-bound policy installed with
-  `--dense-execution-policy` (`docs/dense-execution-policy.md`): the policy's
-  identity (embedding model, corpus generation and row count, dimensions,
-  provider kind, scoring fingerprint) must match the live cluster, and the
-  request must match a measured point exactly on `k`, the filter's live
-  selectivity band, and the candidate depth. No policy, a mismatched
-  identity, or an unmeasured key refuses by name; nothing is interpolated
-  and no provider control is hidden behind a default.
+`DenseQuery.execution_mode` is required (`UNSPECIFIED` and the retired values
+1-3 refuse):
+
+- `EXHAUSTIVE` scores every live, authorized, filter-admitted row at the
+  requested precision, or refuses. On a quantized scan provider (embedded or
+  clustered TurboVec) it is the provider's own scan; on a graph provider
+  (`hnsw`) the shards pin enumeration of every admitted row, filtered or not,
+  and never merely walk the graph.
+- `BALANCED` runs the provider's balanced technique under a versioned
+  built-in preset (`hnsw-balanced-v1`: the request's depth as the beam,
+  `ENUMERATE_SMALL` routing). A provider without one runs its exhaustive
+  technique at the same precision and says so in `fallback_reason`.
+- `FAST` runs a distinct speed preset (`hnsw-fast-v1`: patience 0.99 over 15
+  hops, `SPEED` routing) and refuses where the provider has none. It is never
+  replaced by another mode.
+- `AUTO` lets the coordinator choose. Approximation needs qualifying measured
+  evidence, so AUTO runs the exhaustive technique at the requested precision;
+  an installed version-1 policy cannot qualify a plan and refuses by name.
+
+`DenseQuery.precision` is `AUTO` (the provider's native precision: FP32 for
+`hnsw`, quantized for TurboVec), `FP32` or `QUANTIZED`. Explicit precisions
+are strict: `QUANTIZED` on a provider that scores original FP32 rows refuses.
+`EXHAUSTIVE` FP32 on a quantized provider fetches every row from the scan
+and scores all of them from the FP32 sidecar (bounded by `--max-k`), so it
+matches a full-row FP32 oracle; `BALANCED` FP32 there rescores a quantized
+candidate pool and reports candidate-set coverage.
+
+`DenseQuery.filter_strategy` (`DEFAULT`, `SPEED`, `ENUMERATE_SMALL`) is the
+mask routing of a `BALANCED` or `FAST` walk; `EXHAUSTIVE` and `AUTO` own their
+routing and refuse a non-default value.
 
 Every successful selection containing a dense leaf returns
-`QueryResponse.dense_execution`. It records the requested and resolved modes,
-provider kind, provider quality contract, scoring fingerprint, exhaustive
-completion status, and planner reason, and — when AUTO went through a
-policy — the policy id and fingerprint, the point it matched, the live
-filter selectivity, and the candidate depth the providers were asked for.
-An `ANN` resolution stays `ANN` under `DENSE_SCORE_MODE_FP32_RERANK`: the
-rerank rescores the candidate pool, it does not widen it. Mixed provider kinds, scoring spaces,
+`QueryResponse.dense_execution` with the requested and resolved modes, the
+requested, selection and output precisions (never `UNSPECIFIED` on success),
+`coverage` (`EXHAUSTIVE_CERTIFIED` or `CANDIDATE_SET`), `termination`
+(`EXHAUSTED`, `CONVERGED`, `BUDGET_STOPPED`), every technique that ran with
+the parts it ran on, the actual filter strategy, the built-in `preset`,
+`policy_qualified` (false for a preset), `fallback_reason`, the provider kind,
+quality contract and scoring fingerprint. The coordinator validates what the
+shards report against the plan: a part that walked or stopped early under an
+exhaustive plan, or an FP32 row scan that fetched fewer rows than the fleet
+holds, is an error, never a weaker certificate. FP32 rescoring of a pool never
+certifies exhaustive coverage. Two plans never share a kernel call merely
+because their masks match. Mixed provider kinds, scoring spaces, precisions,
 dimensions, quality contracts, or completion capabilities across shards fail
-preflight. An approximate response therefore cannot be confused with a
-corpus-wide exact result.
+preflight. Redaction withholds the per-technique part counts and the
+physical counters, never the mode, precision or coverage.
 
-Execution mode and score mode are orthogonal. `execution_mode` chooses the
-candidate traversal; `score_mode = FP32_RERANK` replaces scores only inside the
-returned candidate pool. FP32 reranking never upgrades an ANN pool to a global
-exact-top-k guarantee.
+Composite fusion consumes provider-native dense scores and does not yet
+return per-part receipts, so a composite dense leaf serves a provider's own
+exhaustive scan or a `BALANCED` walk; FP32 precision on a quantized provider,
+pinned enumeration and `FAST` are served on a single dense leaf. Recursive
+boolean dense clauses take `EXHAUSTIVE` or `AUTO`, with `FP32` precision
+scoring the original rows. Dense boosts score a fixed pool with
+provider-native candidate scoring and leave mode, precision and routing unset.
 
-One rule joins them (2026-09-04): `AUTO` with `FP32_RERANK`, no
-`DenseQualityPolicy`, and `selection_k = 0` resolves the rerank depth through
-the installed quality profile's `default_target_recall_ppm`, bitwise as an
-explicit policy naming that target would, with `dense_quality` set and the
-planner reason naming the profile and default
-(`docs/dense-quality-profile.md`). Without a profile or a default it refuses:
-"AUTO with FP32 rerank needs a measured quality profile with
-default_target_recall_ppm, or an explicit DenseQualityPolicy or selection_k".
-`EXACT` and `UNSPECIFIED` with `FP32_RERANK` and `selection_k = 0` keep the
-pool at `k` — the caller chose the traversal, and `dense_quality` stays
-absent.
+## Dense FP32 candidate pools
 
-## Dense FP32 rerank
-
-A single dense leaf can set `DenseQuery.score_mode` to
-`DENSE_SCORE_MODE_FP32_RERANK`. The provider still selects exactly
-`selection_k` candidates. The coordinator then calls
+A `BALANCED` dense leaf with `FP32` precision on a quantized provider selects
+exactly `selection_k` candidates. The coordinator then calls
 `ExactVectorRescore` for those ids, replaces the dense signal with the
 ordinary FP32 dot product over the original vectors, sorts by exact score
 descending and document id ascending, and returns the best `k`.
 
-This is exact within the fixed candidate pool. It is not a global exact-top-k
-claim unless `selection_k` covers the corpus. Candidate depth is therefore the
-recall knob, not a hidden expansion factor. The 100,000-vector, k=10,000
-experiment found that the tested corpus needed 35,777 TurboQuant candidates
-for 100% recall; that is evidence for that workload, not a universal default.
+This is exact within the fixed candidate pool and reports `CANDIDATE_SET`
+coverage. Candidate depth is therefore the recall knob, not a hidden
+expansion factor. The 100,000-vector, k=10,000 experiment found that the
+tested corpus needed 35,777 TurboQuant candidates for 100% recall; that is
+evidence for that workload, not a universal default.
 
 Original FP32 rows live in the product generation, one-for-one with provider
 slots. `Flush` writes and reopens the sidecar through mmap; snapshot install
-and offline resharding carry it with the provider image. A legacy generation
-without the sidecar continues to serve native queries and fails FP32 rerank
-with `FAILED_PRECONDITION`. Clustered TurboVec uses the same terminal path:
-stable provider labels route candidates back to product shards that own the
-aligned FP32 rows, so embedded, in-process clustered, and external clustered
-transports produce the same reranked result. Composite dense leaves and dense
-boosts remain provider-native for now.
+and offline resharding carry it with the provider image. A generation without
+the sidecar serves native queries and fails FP32 precision with
+`FAILED_PRECONDITION`. Clustered TurboVec uses the same terminal path: stable
+provider labels route candidates back to product shards that own the aligned
+FP32 rows.
 
 Candidate depth can be request-explicit (`selection_k`), measured through a
-`DenseQualityPolicy`, or — under `AUTO` — measured through the profile's
-default target. A `DenseQualityPolicy` supplies `(k, target_recall_ppm)` and
+`DenseQualityPolicy`, or — with neither — measured through the installed
+profile's `default_target_recall_ppm`; without a profile or a default the
+pool stays at `k`. A `DenseQualityPolicy` supplies `(k, target_recall_ppm)` and
 the coordinator resolves that exact point from the TOML file configured by
 `--dense-quality-profile` (`docs/dense-quality-profile.md`). The profile is
 bound to embedding model, corpus generation and row count, dimensions,
@@ -508,9 +515,11 @@ message SearchQuery {
 
 message DenseQuery {
   repeated float vector = 1;
-  DenseScoreMode score_mode = 2;
   DenseQualityPolicy quality = 3;
   DenseExecutionMode execution_mode = 4;
+  string field = 5;
+  DensePrecisionRequest precision = 6;
+  DenseFilterStrategy filter_strategy = 7;
 }
 
 message FilterQuery {

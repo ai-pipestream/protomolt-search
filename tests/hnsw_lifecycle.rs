@@ -24,8 +24,8 @@ use pipestream_search::pb::{
     install_snapshot_from_request, search_query, search_shard_request, search_shard_response,
     selection_query, AddDocumentsRequest, AddVectorsRequest, CommitReplacementsRequest,
     CompactShardRequest, ConfigureVectorBackendRequest, DeleteDocumentsRequest, DenseExecutionMode,
-    DenseQuery, ExportSnapshotRequest, FlushRequest, GetDocumentsRequest, HealthRequest,
-    InstallSnapshotFromRequest, QueryRequest, Replacement, ScoredHit, SearchQuery,
+    DenseFilterStrategy, DenseQuery, ExportSnapshotRequest, FlushRequest, GetDocumentsRequest,
+    HealthRequest, InstallSnapshotFromRequest, QueryRequest, Replacement, ScoredHit, SearchQuery,
     SearchShardRequest, SelectionQuery, StartShardSearch, VectorBackendConfig,
 };
 use pipestream_search::segments::{OpenedSegmentSet, SegmentCatalog, VectorLoad};

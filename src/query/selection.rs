@@ -6,8 +6,8 @@ use super::composite_shape::composite_shape;
 use super::refuse;
 use crate::pb::{
     search_query, selection_query, BlendScore, CompositeSearchStrategy, DecomposedScore,
-    DenseExecutionMode, DenseQuery, DenseScoreMode, FilterQuery, GeoFilter, LexicalQuery, RrfScore,
-    SearchQuery, SelectionOperator, SelectionQuery,
+    DenseQuery, FilterQuery, GeoFilter, LexicalQuery, RrfScore, SearchQuery, SelectionOperator,
+    SelectionQuery,
 };
 
 /// The composite strategies increment 1 executes, each carrying its
@@ -182,18 +182,4 @@ fn leaf_shape(leaf: &SearchQuery) -> Result<Shape<'_>, Status> {
 /// dense query.
 pub(super) fn no_query(leaf: &SearchQuery) -> Status {
     refuse(format!("search query {:?} has no query", leaf.id))
-}
-
-pub(super) fn dense_score_mode(query: &DenseQuery) -> Result<DenseScoreMode, Status> {
-    DenseScoreMode::try_from(query.score_mode)
-        .map_err(|_| refuse(format!("unknown dense score_mode {}", query.score_mode)))
-}
-
-pub(super) fn dense_execution_mode(query: &DenseQuery) -> Result<DenseExecutionMode, Status> {
-    DenseExecutionMode::try_from(query.execution_mode).map_err(|_| {
-        refuse(format!(
-            "unknown dense execution_mode {}",
-            query.execution_mode
-        ))
-    })
 }

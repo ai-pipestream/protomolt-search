@@ -10,9 +10,8 @@ use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     search_query, selection_query, AddDocumentsRequest, AddVectorsRequest, Bm25SearchRequest,
     BrowseShardRequest, CommitReplacementsRequest, DeleteDocumentsRequest, DenseQuery,
-    DenseScoreMode, ExactVectorRescoreRequest, FetchValuesRequest, FlushRequest,
-    GetDocumentsRequest, HealthRequest, QueryRequest, Replacement, SearchQuery, SelectionQuery,
-    TermStatsRequest,
+    ExactVectorRescoreRequest, FetchValuesRequest, FlushRequest, GetDocumentsRequest,
+    HealthRequest, QueryRequest, Replacement, SearchQuery, SelectionQuery, TermStatsRequest,
 };
 use tonic::Request;
 
@@ -328,7 +327,8 @@ async fn delete_and_append_then_replace_are_consistent_across_read_paths() {
                     id: "dense".into(),
                     query: Some(search_query::Query::Dense(DenseQuery {
                         vector: corpus[..DIM].to_vec(),
-                        score_mode: DenseScoreMode::Fp32Rerank as i32,
+                        execution_mode: pipestream_search::pb::DenseExecutionMode::Balanced as i32,
+                        precision: pipestream_search::pb::DensePrecisionRequest::Fp32 as i32,
                         ..Default::default()
                     })),
                 })),

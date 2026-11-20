@@ -62,6 +62,8 @@ impl<'a> StreamOpen<'a> {
                 initial_floor: self.initial_floor,
                 candidate_depth: self.candidate_depth,
                 enumerate_max_rows: filters.enumerate_max_rows,
+                filter_strategy: filters.filter_strategy,
+                enumerate_all: filters.enumerate_all,
                 patience_saturation_ppm: filters.patience_saturation_ppm,
                 patience_hops: filters.patience_hops,
                 floor_token,
@@ -75,6 +77,7 @@ impl<'a> StreamOpen<'a> {
                 floor_greediness_ppm: filters.floor_greediness_ppm,
                 floor_clamp_min: filters.floor_clamp_min,
                 include_rerank_candidate: filters.include_rerank_candidate,
+                exact_fp32_scan: filters.exact_fp32_scan,
             })),
         }
     }

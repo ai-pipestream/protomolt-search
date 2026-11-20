@@ -122,15 +122,12 @@ async fn reranked_query(coordinator: &CoordinatorServiceImpl, vector: &[f32]) ->
             k: 4,
             selection_k: 4,
             highlight: Some(HighlightSpec::default()),
-            selection: Some(SelectionQuery {
-                node: Some(selection_query::Node::Search(SearchQuery {
-                    id: "vec".into(),
-                    query: Some(search_query::Query::Dense(DenseQuery {
-                        vector: vector.to_vec(),
-                        ..Default::default()
-                    })),
-                })),
-            }),
+            selection: Some(common::dense_selection(
+                "vec",
+                vector.to_vec(),
+                DenseExecutionMode::Exhaustive as i32,
+                0,
+            )),
             ..Default::default()
         }),
     )

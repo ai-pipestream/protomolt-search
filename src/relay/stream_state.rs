@@ -45,6 +45,16 @@ pub(super) struct StreamTotals {
     tail_enumerated_rows: u64,
     patience_stopped: u32,
     floor_pruned: u32,
+    parts_total: u32,
+    parts_skipped: u32,
+    parts_walked: u32,
+    parts_enumerated: u32,
+    parts_scanned: u32,
+    parts_staged: u32,
+    fp32_rows_scored: u64,
+    fp32_logical_bytes: u64,
+    fp32_pages_touched: u64,
+    fp32_tasks: u32,
     pub(super) end_reason: crate::vector::VectorStreamEndReason,
 }
 
@@ -68,6 +78,24 @@ impl StreamTotals {
             .patience_stopped
             .saturating_add(summary.patience_stopped);
         self.floor_pruned = self.floor_pruned.saturating_add(summary.floor_pruned);
+        self.parts_total = self.parts_total.saturating_add(summary.parts_total);
+        self.parts_skipped = self.parts_skipped.saturating_add(summary.parts_skipped);
+        self.parts_walked = self.parts_walked.saturating_add(summary.parts_walked);
+        self.parts_enumerated = self
+            .parts_enumerated
+            .saturating_add(summary.parts_enumerated);
+        self.parts_scanned = self.parts_scanned.saturating_add(summary.parts_scanned);
+        self.parts_staged = self.parts_staged.saturating_add(summary.parts_staged);
+        self.fp32_rows_scored = self
+            .fp32_rows_scored
+            .saturating_add(summary.fp32_rows_scored);
+        self.fp32_logical_bytes = self
+            .fp32_logical_bytes
+            .saturating_add(summary.fp32_logical_bytes);
+        self.fp32_pages_touched = self
+            .fp32_pages_touched
+            .saturating_add(summary.fp32_pages_touched);
+        self.fp32_tasks = self.fp32_tasks.saturating_add(summary.fp32_tasks);
         self.end_reason = self
             .end_reason
             .merge(crate::vector::VectorStreamEndReason::from_proto(
@@ -143,6 +171,16 @@ impl ForwardState {
             patience_stopped: t.patience_stopped,
             end_reason,
             floor_pruned: t.floor_pruned,
+            parts_total: t.parts_total,
+            parts_skipped: t.parts_skipped,
+            parts_walked: t.parts_walked,
+            parts_enumerated: t.parts_enumerated,
+            parts_scanned: t.parts_scanned,
+            parts_staged: t.parts_staged,
+            fp32_rows_scored: t.fp32_rows_scored,
+            fp32_logical_bytes: t.fp32_logical_bytes,
+            fp32_pages_touched: t.fp32_pages_touched,
+            fp32_tasks: t.fp32_tasks,
         }
     }
 

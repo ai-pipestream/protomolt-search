@@ -1,5 +1,11 @@
 # Dense execution policy
 
+> Under the dense execution contract ([Query API](query-api.md#dense-execution-contract))
+> AUTO runs the exhaustive technique at the requested precision, and a
+> coordinator holding a policy in the version-1 schema below refuses AUTO by
+> name rather than ignoring it. The version-2 policy that qualifies AUTO
+> approximation replaces this schema.
+
 Implemented on branch 2026-09-02. `DENSE_EXECUTION_MODE_AUTO` chooses a
 dense traversal only through evidence: an exhaustive provider resolves to
 `EXACT`, and a provider with a configured approximate traversal resolves to

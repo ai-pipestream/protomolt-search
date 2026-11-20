@@ -2,6 +2,28 @@
 
 use super::FilterRegime;
 
+/// Per-part execution counts across vector-bearing parts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PartCounts {
+    pub total: u32,
+    pub skipped: u32,
+    pub walked: u32,
+    pub enumerated: u32,
+    pub scanned: u32,
+    pub staged: u32,
+}
+
+impl PartCounts {
+    pub fn add(&mut self, other: Self) {
+        self.total = self.total.saturating_add(other.total);
+        self.skipped = self.skipped.saturating_add(other.skipped);
+        self.walked = self.walked.saturating_add(other.walked);
+        self.enumerated = self.enumerated.saturating_add(other.enumerated);
+        self.scanned = self.scanned.saturating_add(other.scanned);
+        self.staged = self.staged.saturating_add(other.staged);
+    }
+}
+
 /// Row-major native search results. Negative slots and negative-infinity
 /// scores are padding when a supplied floor admits fewer than `k` rows.
 #[derive(Debug, Clone, PartialEq)]
@@ -10,6 +32,8 @@ pub struct VectorSearchResults {
     pub slots: Vec<i64>,
     pub query_count: usize,
     pub result_count: usize,
+    /// Per-part execution breakdown across searched parts.
+    pub parts: PartCounts,
     /// How the filtered queries were answered; all zero for a provider
     /// with one way to filter.
     pub regimes: FilterRegimeCounts,
@@ -149,6 +173,8 @@ pub struct VectorStreamSummary {
     pub units_scanned: usize,
     pub completed: bool,
     pub end_reason: VectorStreamEndReason,
+    /// Per-part execution breakdown across searched parts.
+    pub parts: PartCounts,
     /// How the filtered queries of this stream were answered; all zero for
     /// a provider with one way to filter.
     pub regimes: FilterRegimeCounts,

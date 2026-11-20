@@ -643,13 +643,13 @@ async fn ingest_opensearch() -> Result<(), Error> {
 }
 
 fn filter_leaf(year: i64) -> SelectionQuery {
+    let pred = pipestream_search::pb::filter_query::Predicate::Cel(format!("year >= {year}"));
+    let f = FilterQuery {
+        id: "year-filter".into(),
+        predicate: Some(pred),
+    };
     SelectionQuery {
-        node: Some(selection_query::Node::Filter(FilterQuery {
-            id: "year-filter".into(),
-            predicate: Some(pipestream_search::pb::filter_query::Predicate::Cel(
-                format!("year >= {year}"),
-            )),
-        })),
+        node: Some(selection_query::Node::Filter(f)),
     }
 }
 
@@ -657,6 +657,7 @@ fn search_leaf(workload: &Workload, dense: bool) -> SelectionQuery {
     let query = if dense {
         search_query::Query::Dense(DenseQuery {
             vector: workload.vector.clone(),
+            execution_mode: pipestream_search::pb::DenseExecutionMode::Exhaustive as i32,
             ..Default::default()
         })
     } else {
@@ -665,11 +666,12 @@ fn search_leaf(workload: &Workload, dense: bool) -> SelectionQuery {
             ..Default::default()
         })
     };
+    let s = SearchQuery {
+        id: if dense { "dense" } else { "lexical" }.into(),
+        query: Some(query),
+    };
     SelectionQuery {
-        node: Some(selection_query::Node::Search(SearchQuery {
-            id: if dense { "dense" } else { "lexical" }.into(),
-            query: Some(query),
-        })),
+        node: Some(selection_query::Node::Search(s)),
     }
 }
 
@@ -695,25 +697,23 @@ fn protomolt_query(workload: &Workload, request_id: String) -> QueryRequest {
     let fusion_depth = workload.k.max(100);
     let base = match workload.kind {
         WorkloadKind::Lexical | WorkloadKind::FilteredLexical => search_leaf(workload, false),
-        WorkloadKind::Vector | WorkloadKind::FilteredVector => search_leaf(workload, true),
+        WorkloadKind::Vector | WorkloadKind::FilteredVector | WorkloadKind::CollapseVector => {
+            search_leaf(workload, true)
+        }
         WorkloadKind::Hybrid => composite(
             SelectionOperator::Or,
             vec![search_leaf(workload, true), search_leaf(workload, false)],
             Some(selection_score_strategy::Strategy::Rrf(RrfScore::default())),
         ),
-        WorkloadKind::CollapseVector => search_leaf(workload, true),
     };
     let selection = workload.min_year.map_or(base.clone(), |year| {
         composite(SelectionOperator::And, vec![base, filter_leaf(year)], None)
     });
+    let selection_k = u32::from(matches!(workload.kind, WorkloadKind::Hybrid)) * fusion_depth;
     QueryRequest {
         request_id,
         k: workload.k,
-        selection_k: if matches!(workload.kind, WorkloadKind::Hybrid) {
-            fusion_depth
-        } else {
-            0
-        },
+        selection_k,
         selection: Some(selection),
         ..Default::default()
     }

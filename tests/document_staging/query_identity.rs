@@ -75,14 +75,23 @@ fn lexical() -> SelectionQuery {
         })),
     }
 }
-fn dense(mode: DenseScoreMode) -> SelectionQuery {
+fn dense(fp32: bool) -> SelectionQuery {
     SelectionQuery {
         node: Some(selection_query::Node::Search(SearchQuery {
             id: "vec".into(),
             query: Some(search_query::Query::Dense(DenseQuery {
                 field: "embedding".into(),
                 vector: vec![0.25; 8],
-                score_mode: mode as i32,
+                execution_mode: if fp32 {
+                    pipestream_search::pb::DenseExecutionMode::Balanced as i32
+                } else {
+                    pipestream_search::pb::DenseExecutionMode::Exhaustive as i32
+                },
+                precision: if fp32 {
+                    pipestream_search::pb::DensePrecisionRequest::Fp32 as i32
+                } else {
+                    pipestream_search::pb::DensePrecisionRequest::Auto as i32
+                },
                 ..Default::default()
             })),
         })),
@@ -98,7 +107,7 @@ fn requests() -> Vec<QueryRequest> {
         },
         false,
     )];
-    for leaf in [lexical(), dense(DenseScoreMode::Unspecified)] {
+    for leaf in [lexical(), dense(false)] {
         selections.push((
             SelectionQuery {
                 node: Some(selection_query::Node::Boolean(BooleanQuery {
@@ -109,11 +118,7 @@ fn requests() -> Vec<QueryRequest> {
             false,
         ));
     }
-    selections.extend([
-        (lexical(), true),
-        (dense(DenseScoreMode::Unspecified), true),
-        (dense(DenseScoreMode::Fp32Rerank), true),
-    ]);
+    selections.extend([(lexical(), true), (dense(false), true), (dense(true), true)]);
     for strategy in [
         selection_score_strategy::Strategy::Rrf(RrfScore::default()),
         selection_score_strategy::Strategy::ScoreBlend(BlendScore::default()),
@@ -131,7 +136,7 @@ fn requests() -> Vec<QueryRequest> {
                     } else {
                         SelectionOperator::Or
                     } as i32,
-                    clauses: vec![dense(DenseScoreMode::Unspecified), lexical()],
+                    clauses: vec![dense(false), lexical()],
                     scoring: Some(SelectionScoreStrategy {
                         strategy: Some(strategy),
                     }),

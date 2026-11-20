@@ -159,9 +159,11 @@ impl VectorProvider for HnswIndex {
         let mut tail_enumerated_rows = 0u64;
         let mut patience_stopped = 0u32;
         let mut floor_pruned = 0u32;
+        let mut enumerated_part = false;
         with_scratch(|scratch| {
             for query in queries.chunks_exact(self.dim) {
                 let (hits, answer) = self.answer(query, k, ef, floor, &plan, scratch);
+                enumerated_part |= answer.enumerated_part;
                 tail_enumerated_rows =
                     tail_enumerated_rows.saturating_add(answer.tail_enumerated_rows);
                 if answer.patience_stopped {
@@ -185,11 +187,13 @@ impl VectorProvider for HnswIndex {
                 }
             }
         });
+        let parts = self.part_summary(query_count, true, &plan, enumerated_part);
         Ok(VectorSearchResults {
             scores,
             slots,
             query_count,
             result_count: k,
+            parts,
             regimes,
             tail_enumerated_rows,
             patience_stopped,

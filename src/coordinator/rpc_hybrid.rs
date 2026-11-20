@@ -8,64 +8,59 @@ impl CoordinatorServiceImpl {
         request: Request<HybridSearchRequest>,
     ) -> Result<Response<HybridSearchResponse>, Status> {
         crate::metrics::timed(Route::HybridSearch, request, |request| async move {
-            self.admit(&request.get_ref().collection)?;
-            if let Some(snapshot) = self.request_snapshot() {
-                return Box::pin(SearchService::hybrid_search(
-                    &snapshot,
-                    crate::metrics::nested(request),
-                ))
-                .await;
-            }
-            self.execute_hybrid_rpc(request.into_inner())
+            self.execute_hybrid_with_evidence(request.into_inner())
                 .await
-                .map(Response::new)
+                .map(|(resp, _)| Response::new(resp))
         })
         .await
     }
 
-    async fn execute_hybrid_rpc(
+    pub(crate) async fn execute_hybrid_with_evidence(
         &self,
         req: HybridSearchRequest,
-    ) -> Result<HybridSearchResponse, Status> {
+    ) -> Result<(HybridSearchResponse, DenseScanExecution), Status> {
+        self.admit(&req.collection)?;
+        if let Some(snapshot) = self.request_snapshot() {
+            return Box::pin(snapshot.execute_hybrid_with_evidence(req)).await;
+        }
         let k = self.resolve_k(req.k)?;
         validate_hybrid_rpc_query(&req)?;
-        let request_id = if req.request_id.is_empty() {
-            format!(
-                "req-{}-{}",
-                std::process::id(),
-                REQUEST_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
-            )
-        } else {
-            req.request_id.clone()
-        };
+        let request_id = Self::next_hybrid_request_id(&req.request_id);
         let filters = self.hybrid_rpc_filters(&req, k)?;
         let legs = hybrid_rpc_legs(&req, k)?;
-        let (mut hits, mut cascade_hits, mut debug) = match legs.fusion_mode {
+        let runs_vector = matches!(
+            legs.fusion_mode,
+            FusionMode::Cascade | FusionMode::Unspecified
+        ) || legs.vector_weight != 0.0;
+        let rows = self.check_hybrid_raw_controls(&req, runs_vector).await?;
+        let (mut hits, mut cascade_hits, mut debug, mut exec) = match legs.fusion_mode {
             FusionMode::Cascade | FusionMode::Unspecified => {
-                let (cascade_hits, debug) = self
-                    .fanout_cascade_with_terms(CascadeQuery::from_request(
-                        &request_id,
-                        &req,
-                        k,
-                        legs.min_vector_score,
-                        &filters,
-                    )?)
-                    .await?;
-                (Vec::new(), cascade_hits, debug)
+                let query = CascadeQuery::from_request(
+                    &request_id,
+                    &req,
+                    k,
+                    legs.min_vector_score,
+                    &filters,
+                )?;
+                let (cascade_hits, debug, exec) = self.fanout_cascade_with_terms(query).await?;
+                (Vec::new(), cascade_hits, debug, exec)
             }
             _ => {
-                let (hits, debug) = self
-                    .fanout_hybrid_with_terms(HybridQuery::from_request(
-                        &request_id,
-                        &req,
-                        k,
-                        legs,
-                        &filters,
-                    )?)
-                    .await?;
-                (hits, Vec::new(), debug)
+                let query = HybridQuery::from_request(&request_id, &req, k, legs, &filters)?;
+                let (hits, debug, exec) = self.fanout_hybrid_with_terms(query).await?;
+                (hits, Vec::new(), debug, exec)
             }
         };
+        if exec.evidence.rows == 0 {
+            exec.evidence.rows = rows;
+        }
+        if runs_vector && req.enumerate_all {
+            crate::dense_execution::verify_exhaustive_scan(
+                crate::dense_execution::Route::EnumerateAll,
+                &exec.evidence,
+            )
+            .map_err(dense_status)?;
+        }
         if let Some(boost) = &req.boost {
             self.apply_boost(
                 boost,
@@ -76,12 +71,41 @@ impl CoordinatorServiceImpl {
             )
             .await?;
         }
-        Ok(HybridSearchResponse {
-            request_id,
-            hits,
-            cascade_hits,
-            debug,
-        })
+        Ok((
+            HybridSearchResponse {
+                request_id,
+                hits,
+                cascade_hits,
+                debug,
+            },
+            exec,
+        ))
+    }
+
+    async fn check_hybrid_raw_controls(
+        &self,
+        req: &HybridSearchRequest,
+        runs_vector: bool,
+    ) -> Result<u64, Status> {
+        let raw = raw_hybrid_controls(req);
+        if runs_vector {
+            self.validate_raw_dense_controls(&raw).await
+        } else {
+            crate::dense_execution::validate_raw_controls(&raw, None).map_err(dense_status)?;
+            Ok(0)
+        }
+    }
+
+    fn next_hybrid_request_id(request_id: &str) -> String {
+        if request_id.is_empty() {
+            format!(
+                "req-{}-{}",
+                std::process::id(),
+                REQUEST_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
+            )
+        } else {
+            request_id.to_string()
+        }
     }
 
     fn hybrid_rpc_filters(
@@ -92,6 +116,8 @@ impl CoordinatorServiceImpl {
         // Compile one filter tree for both retrieval legs.
         let mut filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
         filters.enumerate_max_rows = req.enumerate_max_rows;
+        filters.filter_strategy = req.filter_strategy;
+        filters.enumerate_all = req.enumerate_all;
         filters.patience_saturation_ppm = req.patience_saturation_ppm;
         filters.patience_hops = req.patience_hops;
         filters.finish_settle_us = req.finish_settle_us;
@@ -103,6 +129,21 @@ impl CoordinatorServiceImpl {
         filters.include_rerank_candidate = req.include_rerank_candidate;
         let _ = self.resolve_finish_windows(&filters)?;
         Ok(filters)
+    }
+}
+
+fn raw_hybrid_controls(req: &HybridSearchRequest) -> crate::dense_execution::RawDenseControls {
+    crate::dense_execution::RawDenseControls {
+        filter_strategy: req.filter_strategy,
+        enumerate_all: req.enumerate_all,
+        enumerate_max_rows: req.enumerate_max_rows,
+        patience_saturation_ppm: req.patience_saturation_ppm,
+        patience_hops: req.patience_hops,
+        finish_settle_us: req.finish_settle_us,
+        finish_deadline_us: req.finish_deadline_us,
+        floor_prune: req.floor_prune,
+        floor_greediness_ppm: req.floor_greediness_ppm,
+        floor_clamp_min: req.floor_clamp_min,
     }
 }
 

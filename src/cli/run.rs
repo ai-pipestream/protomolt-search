@@ -127,6 +127,8 @@ async fn demo_query(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
             floor_greediness_ppm: None,
             floor_clamp_min: None,
             include_rerank_candidate: false,
+            filter_strategy: 0,
+            enumerate_all: false,
         })
         .await?
         .into_inner();

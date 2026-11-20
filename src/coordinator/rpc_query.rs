@@ -48,46 +48,48 @@ impl CoordinatorServiceImpl {
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         crate::metrics::timed(Route::Search, request, |request| async move {
-            self.admit(&request.get_ref().collection)?;
-            if let Some(snapshot) = self.request_snapshot() {
-                return Box::pin(SearchService::search(
-                    &snapshot,
-                    crate::metrics::nested(request),
-                ))
-                .await;
-            }
-            let mut req = request.into_inner();
-            if !req.field.is_empty() {
-                let scoped = self.for_vector_field(&req.field)?;
-                req.field.clear();
-                return Box::pin(SearchService::search(
-                    &scoped,
-                    crate::metrics::nested(Request::new(req)),
-                ))
-                .await;
-            }
-            if self.scoped_vector_scan() && self.query_read_versions.is_none() {
-                let mut filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
-                filters.floor_prune = req.floor_prune;
-                filters.floor_greediness_ppm = req.floor_greediness_ppm;
-                filters.floor_clamp_min = req.floor_clamp_min;
-                self.check_vector_scan(&filters, req.collapse_parents)?;
-                let (pinned, reads) = self.pin_read_versions().await?;
-                let result = Box::pin(SearchService::search(
-                    &pinned,
-                    crate::metrics::nested(Request::new(req)),
-                ))
-                .await;
-                pinned.validate_read_versions(&reads).await?;
-                return result;
-            }
-            self.search_vectors(req).await
+            self.search_with_evidence(request.into_inner(), false)
+                .await
+                .map(|(resp, _)| Response::new(resp))
         })
         .await
     }
 
+    pub(crate) async fn search_with_evidence(
+        &self,
+        mut req: SearchRequest,
+        exact_fp32_scan: bool,
+    ) -> Result<(SearchResponse, DenseScanExecution), Status> {
+        self.admit(&req.collection)?;
+        if let Some(snapshot) = self.request_snapshot() {
+            return Box::pin(snapshot.search_with_evidence(req, exact_fp32_scan)).await;
+        }
+        if !req.field.is_empty() {
+            let scoped = self.for_vector_field(&req.field)?;
+            req.field.clear();
+            return Box::pin(scoped.search_with_evidence(req, exact_fp32_scan)).await;
+        }
+        if self.scoped_vector_scan() && self.query_read_versions.is_none() {
+            let mut filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
+            filters.floor_prune = req.floor_prune;
+            filters.floor_greediness_ppm = req.floor_greediness_ppm;
+            filters.floor_clamp_min = req.floor_clamp_min;
+            filters.exact_fp32_scan = exact_fp32_scan;
+            self.check_vector_scan(&filters, req.collapse_parents)?;
+            let (pinned, reads) = self.pin_read_versions().await?;
+            let result = Box::pin(pinned.search_with_evidence(req, exact_fp32_scan)).await;
+            pinned.validate_read_versions(&reads).await?;
+            return result;
+        }
+        self.search_vectors(req, exact_fp32_scan).await
+    }
+
     /// The validated vector search past admission, scoping, and read pinning.
-    async fn search_vectors(&self, req: SearchRequest) -> Result<Response<SearchResponse>, Status> {
+    async fn search_vectors(
+        &self,
+        req: SearchRequest,
+        exact_fp32_scan: bool,
+    ) -> Result<(SearchResponse, DenseScanExecution), Status> {
         let k = self.resolve_k(req.k)?;
         if req.vector.is_empty() {
             return Err(Status::invalid_argument("empty query vector"));
@@ -97,6 +99,8 @@ impl CoordinatorServiceImpl {
                 "query vector has non-finite coordinates",
             ));
         }
+        let raw = raw_search_controls(&req);
+        self.validate_raw_dense_controls(&raw).await?;
         let request_id = if req.request_id.is_empty() {
             format!(
                 "req-{}-{}",
@@ -106,19 +110,41 @@ impl CoordinatorServiceImpl {
         } else {
             req.request_id.clone()
         };
-        let filters = search_filters(&req, k)?;
+        let mut filters = search_filters(&req, k)?;
+        filters.exact_fp32_scan = exact_fp32_scan;
         let _ = self.resolve_finish_windows(&filters)?;
         self.check_vector_scan(&filters, req.collapse_parents)?;
-        // Refuse mixed provider kinds or scoring fingerprints before fan-out.
-        if !self.has_clustered_vectors() {
-            self.fleet_vector_identity(true).await?;
-        }
+        let rows = if !self.has_clustered_vectors() {
+            self.fleet_vector_identity(true).await?.rows
+        } else if exact_fp32_scan {
+            self.ensure_shard_vector_rows().await;
+            self.clustered_quality_identity()
+                .await?
+                .map_or(0, |id| id.rows)
+        } else {
+            0
+        };
 
         #[cfg(feature = "net")]
-        if self.clustered_vectors.is_some() {
-            return self.search_clustered(request_id, &req, k, &filters).await;
+        let (response, exec) = if self.clustered_vectors.is_some() && !exact_fp32_scan {
+            self.search_clustered(request_id, &req, k, &filters).await?
+        } else {
+            self.search_shards(request_id, &req, k, &filters, rows)
+                .await?
+        };
+        #[cfg(not(feature = "net"))]
+        let (response, exec) = self
+            .search_shards(request_id, &req, k, &filters, rows)
+            .await?;
+
+        if req.enumerate_all {
+            crate::dense_execution::verify_exhaustive_scan(
+                crate::dense_execution::Route::EnumerateAll,
+                &exec.evidence,
+            )
+            .map_err(dense_status)?;
         }
-        self.search_shards(request_id, &req, k, &filters).await
+        Ok((response, exec))
     }
 
     #[cfg(feature = "net")]
@@ -128,12 +154,35 @@ impl CoordinatorServiceImpl {
         req: &SearchRequest,
         k: u32,
         filters: &RequestFilters,
-    ) -> Result<Response<SearchResponse>, Status> {
-        if req.collapse_parents {
+    ) -> Result<(SearchResponse, DenseScanExecution), Status> {
+        let (hits, groups, chunk_floor) = if req.collapse_parents {
             let collapsed = self
                 .clustered_parent_collapse(&request_id, &req.vector, k, filters)
                 .await?;
-            return Ok(Response::new(SearchResponse {
+            (collapsed.hits, collapsed.groups, collapsed.chunk_floor)
+        } else {
+            let result = self
+                .clustered_vector_candidates(&request_id, &req.vector, k, None, false, filters)
+                .await?;
+            let hits = result
+                .hits
+                .into_iter()
+                .map(|(vector_id, score)| ScoredHit {
+                    identity: None,
+                    vector_id,
+                    score,
+                    parent_id: 0,
+                    rerank_candidate: None,
+                })
+                .collect();
+            (hits, Vec::new(), 0.0)
+        };
+        let rows = self
+            .clustered_quality_identity()
+            .await?
+            .map_or(0, |id| id.rows);
+        Ok((
+            SearchResponse {
                 filter_regimes: None,
                 tail_enumerated_rows: 0,
                 patience_stopped: 0,
@@ -142,38 +191,12 @@ impl CoordinatorServiceImpl {
                 segments_total: 0,
                 segments_skipped: 0,
                 request_id,
-                hits: collapsed.hits,
-                groups: collapsed.groups,
-                chunk_floor: collapsed.chunk_floor,
-            }));
-        }
-        let result = self
-            .clustered_vector_candidates(&request_id, &req.vector, k, None, false, filters)
-            .await?;
-        let hits = result
-            .hits
-            .into_iter()
-            .map(|(vector_id, score)| ScoredHit {
-                identity: None,
-                vector_id,
-                score,
-                parent_id: 0,
-                rerank_candidate: None,
-            })
-            .collect();
-        Ok(Response::new(SearchResponse {
-            filter_regimes: None,
-            tail_enumerated_rows: 0,
-            patience_stopped: 0,
-            shards_finished_early: 0,
-            shards_floor_pruned: 0,
-            segments_total: 0,
-            segments_skipped: 0,
-            request_id,
-            hits,
-            groups: Vec::new(),
-            chunk_floor: 0.0,
-        }))
+                hits,
+                groups,
+                chunk_floor,
+            },
+            clustered_scan_execution(rows),
+        ))
     }
 
     async fn search_shards(
@@ -182,58 +205,134 @@ impl CoordinatorServiceImpl {
         req: &SearchRequest,
         k: u32,
         filters: &RequestFilters,
-    ) -> Result<Response<SearchResponse>, Status> {
+        rows: u64,
+    ) -> Result<(SearchResponse, DenseScanExecution), Status> {
         let use_streaming = self.stream_search
             || filters.finish_settle_us.is_some()
             || filters.finish_deadline_us.is_some();
+        if use_streaming {
+            return self
+                .search_shards_streaming(request_id, req, k, filters, rows)
+                .await;
+        }
         let result = if req.collapse_parents {
-            // Document mode on a streaming coordinator: parents
-            // aggregate here from tagged chunk emissions, and the
-            // response carries the per-parent chunk groups. The bidi
-            // path collapses shard-side and returns representatives
-            // only.
-            if use_streaming {
-                let doc = self
-                    .fanout_stream_search_collapse(&request_id, &req.vector, k, filters)
-                    .await?;
-                return Ok(Response::new(SearchResponse {
-                    filter_regimes: summed_filter_regimes(&doc.summaries),
-                    tail_enumerated_rows: summed_tail_enumerated_rows(&doc.summaries),
-                    patience_stopped: summed_patience_stopped(&doc.summaries),
-                    shards_finished_early: doc.shards_finished_early,
-                    shards_floor_pruned: doc.shards_floor_pruned,
-                    segments_total: 0,
-                    segments_skipped: 0,
-                    request_id,
-                    hits: doc.hits,
-                    groups: doc.groups,
-                    chunk_floor: doc.chunk_floor,
-                }));
-            }
             self.fanout_search_collapse(&request_id, &req.vector, k, filters)
                 .await?
-        } else if use_streaming {
-            let streamed = self
-                .fanout_stream_search(&request_id, &req.vector, k, None, filters)
-                .await?;
-            return Ok(Response::new(SearchResponse {
-                filter_regimes: summed_filter_regimes(&streamed.summaries),
-                tail_enumerated_rows: summed_tail_enumerated_rows(&streamed.summaries),
-                patience_stopped: summed_patience_stopped(&streamed.summaries),
-                shards_finished_early: streamed.shards_finished_early,
-                shards_floor_pruned: streamed.shards_floor_pruned,
-                segments_total: 0,
-                segments_skipped: 0,
-                request_id,
-                hits: streamed.hits,
-                groups: Vec::new(),
-                chunk_floor: 0.0,
-            }));
         } else {
-            self.fanout_search(&request_id, &req.vector, k, false, filters)
-                .await?
+            self.fanout_search(
+                &request_id,
+                &req.vector,
+                k,
+                filters.exact_fp32_scan,
+                filters,
+            )
+            .await?
         };
-        Ok(Response::new(unary_search_response(request_id, result)))
+        let refs: Vec<(usize, Option<&ShardScanStats>)> = result
+            .shard_hits
+            .iter()
+            .zip(&result.shard_stats)
+            .map(|((shard, _), stats)| (*shard as usize, stats.as_ref()))
+            .collect();
+        let exec = self.evidence_from_shard_stats(&refs, rows);
+        Ok((unary_search_response(request_id, result), exec))
+    }
+
+    async fn search_shards_streaming(
+        &self,
+        request_id: String,
+        req: &SearchRequest,
+        k: u32,
+        filters: &RequestFilters,
+        rows: u64,
+    ) -> Result<(SearchResponse, DenseScanExecution), Status> {
+        let mask = self.vector_scan_mask(filters.tree.as_ref());
+        let skipped = mask.as_ref().map(|m| m.skipped.as_slice());
+        if req.collapse_parents {
+            let doc = self
+                .fanout_stream_search_collapse(&request_id, &req.vector, k, filters)
+                .await?;
+            let exec = self.evidence_from_summaries(
+                &doc.summaries,
+                skipped,
+                rows,
+                doc.shards_finished_early,
+                doc.shards_floor_pruned,
+            );
+            return Ok((
+                stream_search_response(
+                    request_id,
+                    &doc.summaries,
+                    doc.hits,
+                    doc.groups,
+                    doc.chunk_floor,
+                    doc.shards_finished_early,
+                    doc.shards_floor_pruned,
+                ),
+                exec,
+            ));
+        }
+        let streamed = self
+            .fanout_stream_search(&request_id, &req.vector, k, None, filters)
+            .await?;
+        let exec = self.evidence_from_summaries(
+            &streamed.summaries,
+            skipped,
+            rows,
+            streamed.shards_finished_early,
+            streamed.shards_floor_pruned,
+        );
+        Ok((
+            stream_search_response(
+                request_id,
+                &streamed.summaries,
+                streamed.hits,
+                Vec::new(),
+                0.0,
+                streamed.shards_finished_early,
+                streamed.shards_floor_pruned,
+            ),
+            exec,
+        ))
+    }
+}
+
+fn stream_search_response(
+    request_id: String,
+    summaries: &[StreamSearchSummary],
+    hits: Vec<ScoredHit>,
+    groups: Vec<crate::pb::ParentGroup>,
+    chunk_floor: f32,
+    shards_finished_early: u32,
+    shards_floor_pruned: u32,
+) -> SearchResponse {
+    SearchResponse {
+        filter_regimes: summed_filter_regimes(summaries),
+        tail_enumerated_rows: summed_tail_enumerated_rows(summaries),
+        patience_stopped: summed_patience_stopped(summaries),
+        shards_finished_early,
+        shards_floor_pruned,
+        segments_total: 0,
+        segments_skipped: 0,
+        request_id,
+        hits,
+        groups,
+        chunk_floor,
+    }
+}
+
+fn raw_search_controls(req: &SearchRequest) -> crate::dense_execution::RawDenseControls {
+    crate::dense_execution::RawDenseControls {
+        filter_strategy: req.filter_strategy,
+        enumerate_all: req.enumerate_all,
+        enumerate_max_rows: req.enumerate_max_rows,
+        patience_saturation_ppm: req.patience_saturation_ppm,
+        patience_hops: req.patience_hops,
+        finish_settle_us: req.finish_settle_us,
+        finish_deadline_us: req.finish_deadline_us,
+        floor_prune: req.floor_prune,
+        floor_greediness_ppm: req.floor_greediness_ppm,
+        floor_clamp_min: req.floor_clamp_min,
     }
 }
 
@@ -242,6 +341,8 @@ impl CoordinatorServiceImpl {
 fn search_filters(req: &SearchRequest, k: u32) -> Result<RequestFilters, Status> {
     let mut filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
     filters.enumerate_max_rows = req.enumerate_max_rows;
+    filters.filter_strategy = req.filter_strategy;
+    filters.enumerate_all = req.enumerate_all;
     filters.patience_saturation_ppm = req.patience_saturation_ppm;
     filters.patience_hops = req.patience_hops;
     filters.finish_settle_us = req.finish_settle_us;

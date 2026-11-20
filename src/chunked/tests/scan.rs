@@ -51,6 +51,7 @@ fn a_shared_pass_counts_once() {
             keep_ties: false,
             allow: None,
             enumerate_max_rows: None,
+            controls: Default::default(),
             patience: None,
             floor_prune: None,
         })

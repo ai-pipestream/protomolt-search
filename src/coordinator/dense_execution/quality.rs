@@ -77,38 +77,29 @@ impl ShardQualityFold {
 }
 
 impl CoordinatorServiceImpl {
-    /// Resolve `DENSE_EXECUTION_MODE_AUTO` with FP32 rerank and no explicit
-    /// policy or `selection_k` through the installed profile's default recall
-    /// target, refusing when no profile or default target is configured.
+    /// Size a BALANCED FP32 pool that names neither a policy nor
+    /// `selection_k` through the installed profile's default recall target.
+    /// `None` without a profile or a default target: the pool stays at k.
     pub(crate) async fn resolve_dense_quality_default(
         &self,
         k: u32,
         query_dim: usize,
-    ) -> Result<crate::quality::DenseQualityResolution, Status> {
-        const NEEDS: &str = "AUTO with FP32 rerank needs a measured quality profile with \
-                             default_target_recall_ppm, or an explicit DenseQualityPolicy or \
-                             selection_k";
-        let profile = self.dense_quality_profile.as_ref().ok_or_else(|| {
-            Status::failed_precondition(format!(
-                "{NEEDS}; this coordinator has no --dense-quality-profile"
-            ))
-        })?;
-        let target = profile.default_target_recall_ppm().ok_or_else(|| {
-            Status::failed_precondition(format!(
-                "{NEEDS}; profile {:?} carries no default_target_recall_ppm",
-                profile.profile_id()
-            ))
-        })?;
-        self.resolve_dense_quality(
-            k,
-            query_dim,
-            &crate::pb::DenseQualityPolicy {
-                target_recall_ppm: target,
-                max_candidates: 0,
-                required_profile_fingerprint: String::new(),
-            },
-        )
-        .await
+    ) -> Result<Option<crate::quality::DenseQualityResolution>, Status> {
+        let Some(target) = self
+            .dense_quality_profile
+            .as_ref()
+            .and_then(|profile| profile.default_target_recall_ppm())
+        else {
+            return Ok(None);
+        };
+        let policy = crate::pb::DenseQualityPolicy {
+            target_recall_ppm: target,
+            max_candidates: 0,
+            required_profile_fingerprint: String::new(),
+        };
+        self.resolve_dense_quality(k, query_dim, &policy)
+            .await
+            .map(Some)
     }
 
     /// Resolve and prove one measured dense quality request against the live

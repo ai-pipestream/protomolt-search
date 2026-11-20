@@ -14,7 +14,6 @@ async fn finish_stream_search_flushes_straggler_resolves_identities_and_protects
     use std::time::Duration;
 
     const PER_SHARD: usize = 1200;
-    const K: u32 = 10;
     let query_vector = unit_vectors(1, DIM, 0x4A5E_0100);
     let mut corpus = unit_vectors(PER_SHARD * 2, DIM, 0x4A5E_0101);
     // Plant the unique global rank-1 hit (exact match = score 1.0) at row 0 of
@@ -136,41 +135,6 @@ async fn finish_stream_search_flushes_straggler_resolves_identities_and_protects
         Some(&planted_identity),
         "IdentityReady + ResolveStreamIdentities must resolve straggler's flushed #1 hit"
     );
-
-    // 2. Policy-driven `finish_settle_us` through `Query` under `AUTO`.
-    let fingerprint = graph_index().descriptor().scoring_fingerprint;
-    let policy = load_policy(
-        "finish-settle-auto",
-        &format!(
-            "format_version = 1\npolicy_id = \"hnsw-finish\"\n\
-             embedding_model = \"test-embed\"\ncorpus_generation = {GENERATION}\n\
-             corpus_rows = {}\ndimensions = {DIM}\nprovider_backend = \"{HNSW}\"\n\
-             scoring_fingerprint = \"{fingerprint}\"\nmeasured_queries = 16\n\n\
-             [[points]]\nk = {K}\nfilter_selectivity_ppm_min = 1000000\n\
-             filter_selectivity_ppm_max = 1000000\ncandidates = 200\n\
-             measured_recall_ppm = 990000\nfinish_settle_us = 45000\n",
-            PER_SHARD * 2
-        ),
-    );
-    let auto_coord = CoordinatorServiceImpl::new(addrs.clone())
-        .with_bm25(
-            Some(NATIVE_ANALYSIS_BACKEND.to_string()),
-            Default::default(),
-        )
-        .with_topology_generation(GENERATION)
-        .with_dense_execution_policy(policy);
-    let qresp = query(
-        &auto_coord,
-        dense_request(&query_vector, K, DenseExecutionMode::Auto),
-    )
-    .await
-    .unwrap();
-    assert_eq!(qresp.hits[0].doc_id, planted_id);
-    assert_eq!(qresp.hits[0].identity.as_ref(), Some(&planted_identity));
-    let outcome = qresp.dense_execution.unwrap();
-    assert_eq!(outcome.shards_finished_early, 1);
-    assert_eq!(outcome.policy_point.unwrap().finish_settle_us, Some(45_000));
-    assert!(outcome.planner_reason.contains("finish settle 45000 us"));
 
     // 3. Coordinator deadline finish (`finish_deadline_us = 35_000`) sets
     //    `StreamEndReason::Deadline`.

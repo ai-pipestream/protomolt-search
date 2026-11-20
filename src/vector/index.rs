@@ -194,6 +194,22 @@ impl VectorIndex {
         }
     }
 
+    /// `(parts_total, parts_skipped)` across non-empty vector-bearing parts.
+    pub fn part_counts(&self, allow: Option<Mask<'_>>) -> (u32, u32) {
+        let mut total = 0u32;
+        let mut skipped = 0u32;
+        for (base, rows) in self.vector_rows() {
+            if rows == 0 {
+                continue;
+            }
+            total = total.saturating_add(1);
+            if allow.is_some_and(|m| !m.any_in(base, base + rows)) {
+                skipped = skipped.saturating_add(1);
+            }
+        }
+        (total, skipped)
+    }
+
     pub fn dimension(&self) -> Option<usize> {
         self.engine.dimension()
     }

@@ -105,9 +105,9 @@ async fn relay_over(children: &[&str]) -> String {
 }
 
 use pipestream_search::pb::{
-    filter_query, search_query, selection_query, BooleanQuery, CompositeSearchStrategy, DenseQuery,
-    FilterQuery, LexicalQuery, QueryHit, QueryRequest, SearchQuery, SelectionOperator,
-    SelectionQuery,
+    filter_query, search_query, selection_query, BooleanQuery, CompositeSearchStrategy,
+    DenseExecutionMode, FilterQuery, LexicalQuery, QueryHit, QueryRequest, SearchQuery,
+    SelectionOperator, SelectionQuery,
 };
 
 #[path = "relay/fixtures.rs"]

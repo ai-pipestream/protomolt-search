@@ -71,6 +71,13 @@ pub fn chunked_topk_collapsed(
     if n == 0 || k == 0 {
         return (Vec::new(), scan.stats);
     }
+    let (total, skipped) = index.part_counts(allow);
+    scan.stats.parts = crate::vector::PartCounts {
+        total,
+        skipped,
+        scanned: total.saturating_sub(skipped),
+        ..Default::default()
+    };
     let chunk_size = chunk_blocks.max(1) * BLOCK_VECTORS;
     let mut start = 0;
     while start < n {

@@ -74,25 +74,27 @@ async fn single_leaves_execute_their_ordinary_routes() {
         .expect("every dense result reports its execution contract");
     assert_eq!(
         DenseExecutionMode::try_from(execution.requested_mode).unwrap(),
-        DenseExecutionMode::Unspecified
+        DenseExecutionMode::Exhaustive
     );
     assert_eq!(
         DenseExecutionMode::try_from(execution.resolved_mode).unwrap(),
-        DenseExecutionMode::Exact
+        DenseExecutionMode::Exhaustive
     );
     assert_eq!(execution.provider_backend, "embedded-turbovec");
     assert_eq!(
         VectorQualityContract::try_from(execution.quality_contract).unwrap(),
         VectorQualityContract::ExhaustiveNativeScore
     );
-    assert!(execution.exhaustive_completion);
+    assert_eq!(
+        execution.coverage,
+        DenseCoverage::ExhaustiveCertified as i32
+    );
     assert!(!execution.scoring_fingerprint.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dense_execution_modes_are_explicit_and_fail_closed() {
     let (coordinator, qvec, _handles) = start_fleet().await;
-
     let run = |mode: DenseExecutionMode| QueryRequest {
         k: 5,
         selection: Some(SelectionQuery {
@@ -108,42 +110,37 @@ async fn dense_execution_modes_are_explicit_and_fail_closed() {
         ..Default::default()
     };
 
-    let exact = query(&coordinator, run(DenseExecutionMode::Exact))
+    let exact = query(&coordinator, run(DenseExecutionMode::Exhaustive))
         .await
         .unwrap();
     let auto = query(&coordinator, run(DenseExecutionMode::Auto))
         .await
         .unwrap();
-    assert_eq!(
-        exact
-            .hits
+    let bits = |r: &QueryResponse| {
+        r.hits
             .iter()
-            .map(|hit| (hit.doc_id, hit.score.to_bits()))
-            .collect::<Vec<_>>(),
-        auto.hits
-            .iter()
-            .map(|hit| (hit.doc_id, hit.score.to_bits()))
+            .map(|h| (h.doc_id, h.score.to_bits()))
             .collect::<Vec<_>>()
-    );
+    };
+    assert_eq!(bits(&exact), bits(&auto));
     for (response, requested) in [
-        (exact, DenseExecutionMode::Exact),
+        (exact, DenseExecutionMode::Exhaustive),
         (auto, DenseExecutionMode::Auto),
     ] {
         let outcome = response.dense_execution.unwrap();
         assert_eq!(outcome.requested_mode, requested as i32);
-        assert_eq!(outcome.resolved_mode, DenseExecutionMode::Exact as i32);
-        assert!(outcome.exhaustive_completion);
+        assert_eq!(outcome.resolved_mode, DenseExecutionMode::Exhaustive as i32);
+        assert_eq!(outcome.coverage, DenseCoverage::ExhaustiveCertified as i32);
         assert!(!outcome.planner_reason.is_empty());
     }
 
-    let ann = query(&coordinator, run(DenseExecutionMode::Ann))
+    let fast = query(&coordinator, run(DenseExecutionMode::Fast))
         .await
         .unwrap_err();
-    assert_eq!(ann.code(), tonic::Code::FailedPrecondition);
-    assert!(ann.message().contains("ANN"), "{}", ann.message());
-    assert!(ann.message().contains("exhaustive"), "{}", ann.message());
+    assert_eq!(fast.code(), tonic::Code::FailedPrecondition);
+    assert!(fast.message().contains("FAST") && fast.message().contains("never substituted"));
 
-    let mut unknown = run(DenseExecutionMode::Exact);
+    let mut unknown = run(DenseExecutionMode::Exhaustive);
     let Some(selection_query::Node::Search(leaf)) =
         unknown.selection.as_mut().unwrap().node.as_mut()
     else {
@@ -231,7 +228,7 @@ candidates = {ROWS}
         ..Default::default()
     };
     let response = query(&coordinator, request.clone()).await.unwrap();
-    assert_eq!(response.executed, "search:fp32_rerank");
+    assert_eq!(response.executed, "search:fp32_pool");
     let physical = response.profile.as_ref().unwrap();
     assert!(physical.rerank_ms >= 0.0);
     assert_eq!(physical.rerank_rows, ROWS as u64);
@@ -273,12 +270,13 @@ candidates = {ROWS}
                 id: "vec".into(),
                 query: Some(search_query::Query::Dense(DenseQuery {
                     vector: query_vector.clone(),
-                    score_mode: DenseScoreMode::Fp32Rerank as i32,
                     quality: Some(DenseQualityPolicy {
                         target_recall_ppm: 1_000_000,
                         max_candidates: ROWS as u32,
                         required_profile_fingerprint: String::new(),
                     }),
+                    execution_mode: pipestream_search::pb::DenseExecutionMode::Balanced as i32,
+                    precision: pipestream_search::pb::DensePrecisionRequest::Fp32 as i32,
                     ..Default::default()
                 })),
             })),

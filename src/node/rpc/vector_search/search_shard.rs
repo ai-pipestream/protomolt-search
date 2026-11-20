@@ -2,20 +2,21 @@
 
 use crate::node::*;
 
+use super::exact_scan::run_exact_fp32_shard_scan;
 use super::{
     build_search_shard_done, collect_rerank_candidates, validate_scan_filters, DonePayload,
 };
 
-struct SearchShardExec {
-    state: Arc<RwLock<ShardState>>,
-    start: StartShardSearch,
-    geo_regions: Vec<crate::geo::GeoRegion>,
-    ready_tx: mpsc::Sender<Result<SearchShardResponse, Status>>,
-    external: Box<dyn FnMut() -> Option<f32> + Send>,
-    publish: Box<dyn FnMut(f32) -> bool + Send>,
-    chunk_blocks: usize,
-    slot_offset: u64,
-    segment_pruning: bool,
+pub(super) struct SearchShardExec {
+    pub(super) state: Arc<RwLock<ShardState>>,
+    pub(super) start: StartShardSearch,
+    pub(super) geo_regions: Vec<crate::geo::GeoRegion>,
+    pub(super) ready_tx: mpsc::Sender<Result<SearchShardResponse, Status>>,
+    pub(super) external: Box<dyn FnMut() -> Option<f32> + Send>,
+    pub(super) publish: Box<dyn FnMut(f32) -> bool + Send>,
+    pub(super) chunk_blocks: usize,
+    pub(super) slot_offset: u64,
+    pub(super) segment_pruning: bool,
 }
 
 fn spawn_floor_pump(mut inbound: Streaming<SearchShardRequest>) -> watch::Receiver<f32> {
@@ -97,14 +98,14 @@ fn make_floor_callbacks(
     (external, publish)
 }
 
-struct PreparedExecFilters {
-    allow: Option<crate::boolean_bits::Bits>,
-    prune: crate::segment_prune::PruneStats,
-    geo_columns_known: Vec<bool>,
-    filter_columns_known: Vec<bool>,
+pub(super) struct PreparedExecFilters {
+    pub(super) allow: Option<crate::boolean_bits::Bits>,
+    pub(super) prune: crate::segment_prune::PruneStats,
+    pub(super) geo_columns_known: Vec<bool>,
+    pub(super) filter_columns_known: Vec<bool>,
 }
 
-fn prepare_exec_filters(
+pub(super) fn prepare_exec_filters(
     guard: &ShardState,
     rows: usize,
     exec: &SearchShardExec,
@@ -225,6 +226,7 @@ fn run_solo_blocking(mut exec: SearchShardExec) -> Result<ScanOutcome, Status> {
         keep_ties: exec.start.tie_complete,
         allow: filters.allow.as_ref().map(crate::vector::Mask::Bits),
         enumerate_max_rows: exec.start.enumerate_max_rows.map(|r| r as usize),
+        controls: selection_controls(index, exec.start.filter_strategy, exec.start.enumerate_all)?,
         patience,
         floor_prune,
     }];
@@ -285,6 +287,8 @@ async fn enqueue_coalesced_scan(
         geo_regions: exec.geo_regions,
         filter: exec.start.filter,
         enumerate_max_rows: exec.start.enumerate_max_rows,
+        filter_strategy: exec.start.filter_strategy,
+        enumerate_all: exec.start.enumerate_all,
         patience_saturation_ppm: exec.start.patience_saturation_ppm,
         patience_hops: exec.start.patience_hops,
         floor_prune: exec.start.floor_prune,
@@ -324,26 +328,53 @@ async fn send_done_or_err(
     }
 }
 
-async fn drive_search_shard(
-    mut inbound: Streaming<SearchShardRequest>,
-    tx: mpsc::Sender<Result<SearchShardResponse, Status>>,
+struct ShardDriver {
     state: Arc<RwLock<ShardState>>,
     config: NodeConfig,
     knobs: Arc<crate::diagnostics::Knobs>,
     scan_queue: Option<mpsc::Sender<ScanJob>>,
-) {
-    let start = match inbound.message().await {
-        Ok(Some(SearchShardRequest {
+    rerank_slots: Arc<tokio::sync::Semaphore>,
+}
+
+async fn run_exact_fp32_driver(
+    drv: &ShardDriver,
+    exec: SearchShardExec,
+) -> Result<DonePayload, Status> {
+    let parallel = resolved_rerank_parallel(drv.config.rerank_parallel);
+    let permits = drv
+        .rerank_slots
+        .clone()
+        .acquire_many_owned(parallel as u32)
+        .await
+        .map_err(|_| Status::unavailable("exact rerank worker budget closed"))?;
+    tokio::task::spawn_blocking(move || {
+        let _permits = permits;
+        run_exact_fp32_shard_scan(exec, parallel)
+    })
+    .await
+    .map_err(|e| Status::internal(format!("exact FP32 scan task failed: {e}")))?
+}
+
+async fn recv_start_shard_search(
+    inbound: &mut Streaming<SearchShardRequest>,
+) -> Result<StartShardSearch, Status> {
+    match inbound.message().await? {
+        Some(SearchShardRequest {
             payload: Some(search_shard_request::Payload::Start(start)),
-        })) => start,
-        Ok(_) => {
-            let _ = tx
-                .send(Err(Status::invalid_argument(
-                    "first SearchShardRequest must be StartShardSearch",
-                )))
-                .await;
-            return;
-        }
+        }) => Ok(start),
+        _ => Err(Status::invalid_argument(
+            "first SearchShardRequest must be StartShardSearch",
+        )),
+    }
+}
+
+async fn drive_search_shard(
+    mut inbound: Streaming<SearchShardRequest>,
+    tx: mpsc::Sender<Result<SearchShardResponse, Status>>,
+    drv: ShardDriver,
+) {
+    let start = match recv_start_shard_search(&mut inbound).await {
+        Ok(start) => start,
         Err(e) => {
             let _ = tx.send(Err(e)).await;
             return;
@@ -357,10 +388,9 @@ async fn drive_search_shard(
         }
     };
     let floor_rx = spawn_floor_pump(inbound);
-    let (external, publish) = make_floor_callbacks(&knobs, floor_rx, tx.clone());
-    let slot_offset = config.slot_offset;
-    let collapse_parents = start.collapse_parents;
-    if collapse_parents && start.tie_complete {
+    let (external, publish) = make_floor_callbacks(&drv.knobs, floor_rx, tx.clone());
+    let slot_offset = drv.config.slot_offset;
+    if start.collapse_parents && (start.tie_complete || start.exact_fp32_scan) {
         let _ = tx
             .send(Err(Status::invalid_argument(
                 "collapse_parents and tie_complete are mutually exclusive",
@@ -368,17 +398,24 @@ async fn drive_search_shard(
             .await;
         return;
     }
+    let collapse_parents = start.collapse_parents;
+    let exact_fp32 = start.exact_fp32_scan;
     let exec = SearchShardExec {
-        state,
+        state: Arc::clone(&drv.state),
         start,
         geo_regions,
         ready_tx: tx.clone(),
         external,
         publish,
-        chunk_blocks: config.chunk_blocks,
+        chunk_blocks: drv.config.chunk_blocks,
         slot_offset,
-        segment_pruning: knobs.segment_pruning(),
+        segment_pruning: drv.knobs.segment_pruning(),
     };
+    if exact_fp32 {
+        let outcome = run_exact_fp32_driver(&drv, exec).await;
+        send_done_or_err(&tx, slot_offset, outcome).await;
+        return;
+    }
     if collapse_parents {
         let outcome = tokio::task::spawn_blocking(move || run_collapsed_blocking(exec))
             .await
@@ -387,7 +424,7 @@ async fn drive_search_shard(
         send_done_or_err(&tx, slot_offset, outcome).await;
         return;
     }
-    let outcome = match scan_queue {
+    let outcome = match drv.scan_queue {
         Some(jobs) => enqueue_coalesced_scan(jobs, exec).await,
         None => tokio::task::spawn_blocking(move || run_solo_blocking(exec))
             .await
@@ -413,13 +450,14 @@ impl NodeServiceImpl {
         crate::metrics::timed_stream(Route::SearchShard, request, |request| async move {
             let inbound = request.into_inner();
             let (tx, rx) = mpsc::channel::<Result<SearchShardResponse, Status>>(64);
-            let state = self.state.clone();
-            let config = self.config.clone();
-            let knobs = Arc::clone(&self.knobs);
-            let scan_queue = config.coalesce.then(|| self.scan_queue());
-            tokio::spawn(drive_search_shard(
-                inbound, tx, state, config, knobs, scan_queue,
-            ));
+            let drv = ShardDriver {
+                state: self.state.clone(),
+                config: self.config.clone(),
+                knobs: Arc::clone(&self.knobs),
+                scan_queue: self.config.coalesce.then(|| self.scan_queue()),
+                rerank_slots: Arc::clone(&self.rerank_slots),
+            };
+            tokio::spawn(drive_search_shard(inbound, tx, drv));
             Ok(Response::new(ReceiverStream::new(rx)))
         })
         .await

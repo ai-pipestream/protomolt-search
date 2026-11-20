@@ -230,7 +230,7 @@ production.
 
 ## Dense quality profile
 
-`DENSE_SCORE_MODE_FP32_RERANK` selects `selection_k` candidates with the
+A `BALANCED` dense leaf with `FP32` precision selects `selection_k` candidates with the
 provider, then replaces their scores with product-owned FP32 dot products over
 the original vectors and reorders that fixed pool. It is exact within the pool.
 It is not a corpus-wide exact claim unless the pool covers the corpus, so

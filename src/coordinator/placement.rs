@@ -125,19 +125,8 @@ impl PlanCounter<'_> {
             })?;
         }
         let filters = RequestFilters {
-            geo: Vec::new(),
             tree,
-            enumerate_max_rows: None,
-            patience_saturation_ppm: None,
-            patience_hops: None,
-            finish_settle_us: None,
-            finish_deadline_us: None,
-            floor_prune: None,
-            floor_k: None,
-            parent_floor_share_ppm: None,
-            floor_greediness_ppm: None,
-            floor_clamp_min: None,
-            include_rerank_candidate: false,
+            ..Default::default()
         };
         let count = crate::pb::CompiledAggregation {
             expr: Some(crate::cel::compile_value("1")?),

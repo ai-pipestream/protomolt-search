@@ -12,17 +12,10 @@ async fn shard_health(addr: &str) -> pipestream_search::pb::HealthResponse {
 }
 
 fn dense_cursor_query(probe: Vec<f32>, cursor: String) -> QueryRequest {
-    let dense = search_query::Query::Dense(DenseQuery {
-        vector: probe,
-        ..Default::default()
-    });
-    let node = selection_query::Node::Search(SearchQuery {
-        id: "dense".into(),
-        query: Some(dense),
-    });
+    let mode = pipestream_search::pb::DenseExecutionMode::Exhaustive as i32;
     QueryRequest {
         k: 1,
-        selection: Some(SelectionQuery { node: Some(node) }),
+        selection: Some(common::dense_selection("dense", probe, mode, 0)),
         cursor,
         ..Default::default()
     }

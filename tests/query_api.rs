@@ -13,7 +13,7 @@ use pipestream_search::pb::{
     selection_score_strategy, AddDocumentsRequest, AddVectorsRequest, AggregateOp,
     AggregateRequest, Aggregation, Bm25SearchRequest, BooleanQuery, BoostQuery, BoostRescore,
     CascadeScore, CollapseSpec, CompositeScorer, CompositeSearchStrategy, DecomposedScore,
-    DeleteDocumentsRequest, DenseExecutionMode, DenseQualityPolicy, DenseQuery, DenseScoreMode,
+    DeleteDocumentsRequest, DenseCoverage, DenseExecutionMode, DenseQualityPolicy, DenseQuery,
     DocLineage, FacetValue, FilterQuery, FlushRequest, FusionMode, HealthRequest, HybridLegOptions,
     HybridSearchRequest, IntegerValue, LexicalQuery, QueryRequest, QueryResponse, QuerySort,
     QueryStreamCompletion, QueryStreamPhase, QueryStreamRequest, QueryStreamResponse,

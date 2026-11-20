@@ -3,6 +3,7 @@
 use crate::node::*;
 use crate::pb::{StartStreamSearch, StreamIdentityLimits};
 
+use super::exact_scan::run_exact_fp32_stream_scan;
 use super::stream_scan::{run_stream_scan_blocking, StreamScanCtx, StreamScanResult};
 use super::validate_scan_filters;
 
@@ -150,6 +151,8 @@ struct StreamDriver {
     share_floors: bool,
     stream_poll_delay: Option<std::time::Duration>,
     stream_signals: Arc<std::sync::Mutex<HashMap<u64, Arc<StreamSignals>>>>,
+    rerank_parallel: usize,
+    rerank_slots: Arc<tokio::sync::Semaphore>,
 }
 
 async fn drive_stream_search(
@@ -196,7 +199,24 @@ async fn drive_stream_search(
         stream_poll_delay: drv.stream_poll_delay,
         identity_enabled,
     };
-    let outcome = tokio::task::spawn_blocking(move || run_stream_scan_blocking(scan_ctx)).await;
+    let exact_fp32 = scan_ctx.start.exact_fp32_scan;
+    let outcome = if exact_fp32 {
+        let parallel = drv.rerank_parallel;
+        match drv.rerank_slots.acquire_many_owned(parallel as u32).await {
+            Ok(permits) => {
+                tokio::task::spawn_blocking(move || {
+                    let _permits = permits;
+                    run_exact_fp32_stream_scan(scan_ctx, parallel)
+                })
+                .await
+            }
+            Err(_) => Ok(Err(Status::unavailable(
+                "exact rerank worker budget closed",
+            ))),
+        }
+    } else {
+        tokio::task::spawn_blocking(move || run_stream_scan_blocking(scan_ctx)).await
+    };
     if let Some(token) = udp_token {
         drv.stream_signals
             .lock()
@@ -278,6 +298,8 @@ impl NodeServiceImpl {
                 share_floors: self.knobs.share_floors(),
                 stream_poll_delay: self.stream_poll_delay,
                 stream_signals: Arc::clone(&self.stream_signals),
+                rerank_parallel: resolved_rerank_parallel(self.config.rerank_parallel),
+                rerank_slots: Arc::clone(&self.rerank_slots),
             };
             tokio::spawn(drive_stream_search(inbound, tx, drv));
             Ok(Response::new(ReceiverStream::new(rx)))

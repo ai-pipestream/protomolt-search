@@ -1,7 +1,7 @@
 # Dense quality profile
 
 Landed 2026-09-04. A dense quality profile is the measured answer to one
-question: how many quantized candidates must `DENSE_SCORE_MODE_FP32_RERANK`
+question: how many quantized candidates must a `BALANCED` `FP32` dense leaf
 select so that the exact top-`k` it returns reaches a recall target against
 the exhaustive FP32 order. The file binds `(k, target) -> candidates` points
 to the provider score space and corpus generation they were measured on,
@@ -154,9 +154,9 @@ handler itself in the tests. Both are the public route.
   must equal the live corpus exactly. Every smaller `k` is a prefix, because
   the rerank order is total (score descending, id ascending).
 - **The ladder.** For each `k` and each depth at or above it, every query
-  runs `Query { k, selection_k: depth, FP32_RERANK, EXACT, profile: true }`.
-  A response short of `k`, one whose `dense_execution` did not resolve
-  `EXACT`, or one without a `QueryProfile` refuses the run. Per query the
+  runs `Query { k, selection_k: depth, BALANCED, FP32, profile: true }`.
+  A response short of `k`, one whose candidates were not selected by an
+  exhaustive quantized scan, or one without a `QueryProfile` refuses the run. Per query the
   recall is `|top-k ∩ truth| / k` in integer ppm; the rung records the mean,
   the minimum, and the p50 of `total_ms`, `selection_ms`, `rerank_ms`, plus
   the client wall p50 on the table. A rung at `depth = rows` must recover
@@ -185,46 +185,32 @@ candidates. Debug-build loopback timings, not a latency claim.
 ## How the coordinator serves it
 
 An explicit `DenseQualityPolicy { target_recall_ppm }` on a single dense
-leaf with `FP32_RERANK` and `selection_k = 0` resolves as before: the
+`BALANCED` leaf with `FP32` precision and `selection_k = 0` resolves: the
 profile point for `(k, target)`, checked against the live provider kind,
 scoring fingerprint, dimensions, rows, generation, exact-row alignment, and
 tombstones (`resolve_dense_quality`, `docs/query-api.md`).
 
-**AUTO.** `DENSE_EXECUTION_MODE_AUTO` with `FP32_RERANK`, no
-`DenseQualityPolicy`, and `selection_k = 0` used to run at `selection_k = k`
-— the raw quantized top-`k`, the 0.544 number, under a mode whose contract
-is "choose through evidence". It now resolves the depth through the
-installed profile's `default_target_recall_ppm`, exactly as an explicit
+**Default target.** A `BALANCED` leaf with `FP32` precision, no
+`DenseQualityPolicy`, and `selection_k = 0` resolves its pool depth through
+the installed profile's `default_target_recall_ppm`, exactly as an explicit
 policy naming that target would: the same `resolve_dense_quality` call, the
 same hits bitwise, `dense_quality` set with the same fields, and
 `dense_execution.planner_reason` extended with
-`FP32 rerank depth selection_k=<n> resolved through quality profile "<id>"
-default_target_recall_ppm=<t>`. The rule applies only when AUTO resolved to
-`EXACT` on an exhaustive provider; AUTO through a dense execution policy on
-an ANN provider already fixed its depth (`docs/dense-execution-policy.md`)
-and is untouched.
-
-Without a profile, or with a profile carrying no default, AUTO with FP32
-refuses (`FAILED_PRECONDITION`): "AUTO with FP32 rerank needs a measured
-quality profile with default_target_recall_ppm, or an explicit
-DenseQualityPolicy or selection_k", followed by which of the two is missing.
-
-`EXACT` and `UNSPECIFIED` with `FP32_RERANK` and `selection_k = 0` keep
-today's behavior: the pool is `k`, `dense_quality` is absent, and the
-rerank reorders exactly those `k` candidates. That is the caller's explicit
-choice of traversal, not a planner's, and the response says so
-(`rerank_rows = k`). AUTO with an explicit `selection_k` likewise runs at
-the caller's depth with no `dense_quality`.
+`FP32 pool depth selection_k=<n> resolved through quality profile "<id>"
+default_target_recall_ppm=<t>`. Without a profile, or with a profile
+carrying no default, the pool stays at `k` and `dense_quality` is absent
+(`rerank_rows = k`). An explicit `selection_k` runs at the caller's depth
+with no `dense_quality`. `EXHAUSTIVE` or `AUTO` with `FP32` precision never
+consults the profile: they score every row from the FP32 sidecar.
 
 | Request | Depth | `dense_quality` |
 |---|---|---|
-| any mode, `quality` set, `selection_k = 0` | profile point | set |
-| any mode, `quality` set, `selection_k != 0` | refused: competing depth authorities | — |
-| AUTO, FP32, no `quality`, `selection_k = 0`, profile with default | profile point at the default target | set, planner reason names the default |
-| AUTO, FP32, no `quality`, `selection_k = 0`, no profile / no default | refused by name | — |
-| AUTO, FP32, `selection_k = n` | `n` | absent |
-| EXACT / UNSPECIFIED, FP32, `selection_k = 0` | `k` | absent |
-| AUTO through an ANN execution policy | the policy point's depth | absent |
+| BALANCED, FP32, `quality` set, `selection_k = 0` | profile point | set |
+| BALANCED, FP32, `quality` set, `selection_k != 0` | refused: competing depth authorities | — |
+| BALANCED, FP32, no `quality`, `selection_k = 0`, profile with default | profile point at the default target | set, planner reason names the default |
+| BALANCED, FP32, no `quality`, `selection_k = 0`, no profile / no default | `k` | absent |
+| BALANCED, FP32, `selection_k = n` | `n` | absent |
+| EXHAUSTIVE / AUTO, FP32 | every row (FP32 sidecar scan) | absent |
 
 ## What is not guaranteed
 
@@ -234,8 +220,8 @@ the caller's depth with no `dense_quality`.
   say how many were run.
 - A tombstone invalidates the profile: the sidecar rows and the quantized
   order no longer describe the same live set. The coordinator's existing
-  `deleted_docs != 0` refusal ("compact and remeasure") applies to the AUTO
-  default exactly as to an explicit policy, and the tool refuses to measure
+  `deleted_docs != 0` refusal ("compact and remeasure") applies to the
+  default target exactly as to an explicit policy, and the tool refuses to measure
   a generation with tombstones.
 - A `(k, target)` the profile did not measure is refused, not
   interpolated; a request that needs `k = 100` against a profile measured

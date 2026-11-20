@@ -24,8 +24,7 @@ use pipestream_search::harness::{fit_calibration, nodelay_incoming, seeded_index
 use pipestream_search::node::{NodeConfig, NodeServiceImpl};
 use pipestream_search::pb::search_service_client::SearchServiceClient;
 use pipestream_search::pb::{
-    search_query, selection_query, DenseQuery, DenseScoreMode, QueryRequest, SearchQuery,
-    SelectionQuery,
+    search_query, selection_query, DenseQuery, QueryRequest, SearchQuery, SelectionQuery,
 };
 use pipestream_search::vector::{VectorIndex, VectorSearchOptions, VectorStreamControl};
 use pipestream_search::{H2_CONN_WINDOW, H2_STREAM_WINDOW, MAX_MESSAGE_BYTES};
@@ -723,7 +722,8 @@ fn fp32_request(query: &[f32], k: usize, depth: usize, sequence: usize) -> Query
                 id: "dense".to_string(),
                 query: Some(search_query::Query::Dense(DenseQuery {
                     vector: query.to_vec(),
-                    score_mode: DenseScoreMode::Fp32Rerank as i32,
+                    execution_mode: pipestream_search::pb::DenseExecutionMode::Balanced as i32,
+                    precision: pipestream_search::pb::DensePrecisionRequest::Fp32 as i32,
                     ..Default::default()
                 })),
             })),

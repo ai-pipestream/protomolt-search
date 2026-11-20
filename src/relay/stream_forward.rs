@@ -16,7 +16,7 @@ use super::stream_search::{await_vector_rows, sync_map_changes};
 use super::stream_state::{send_summary, ForwardState, StreamArgs};
 
 enum StreamEvent {
-    Message(Option<(usize, StreamSearchResponse)>),
+    Message(Option<(usize, Box<StreamSearchResponse>)>),
     Failed(Status),
     Floor(f32),
     Finish(bool),
@@ -185,7 +185,7 @@ async fn next_event(
                 }
             },
             message = fanout.next_message(terminal) => match message {
-                Ok(pair) => StreamEvent::Message(pair),
+                Ok(pair) => StreamEvent::Message(pair.map(|(s, r)| (s, Box::new(r)))),
                 Err(status) => StreamEvent::Failed(status),
             },
         };
@@ -244,7 +244,7 @@ async fn on_event(
         StreamEvent::Failed(status) => fanout.cancel_with(status).await,
         StreamEvent::Message(None) => Ok(Step::Continue),
         StreamEvent::Message(Some((shard, message))) => {
-            match on_child_message(args, state, fanout, shard, message).await {
+            match on_child_message(args, state, fanout, shard, *message).await {
                 Ok(step) => Ok(step),
                 Err(status) => fanout.cancel_with(status).await,
             }

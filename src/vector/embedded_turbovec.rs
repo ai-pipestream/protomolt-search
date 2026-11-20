@@ -318,16 +318,33 @@ impl VectorProvider for EmbeddedTurboVec {
         k: usize,
         options: VectorSearchOptions<'_>,
     ) -> Result<VectorSearchResults, VectorError> {
-        let allow = options.allow.map(|mask| mask.bools());
+        let allow_mask = options.allow;
+        let allow = allow_mask.map(|mask| mask.bools());
         let result = self
             .index
             .try_search_with_options(queries, k, Self::options(options, allow.as_deref()))
             .map_err(|e| VectorError::new(e.to_string()))?;
+        let parts = if self.index.is_empty() || result.nq == 0 {
+            PartCounts::default()
+        } else if allow_mask.is_some_and(|m| !m.any_in(0, self.index.len())) {
+            PartCounts {
+                total: 1,
+                skipped: 1,
+                ..Default::default()
+            }
+        } else {
+            PartCounts {
+                total: 1,
+                scanned: 1,
+                ..Default::default()
+            }
+        };
         Ok(VectorSearchResults {
             scores: result.scores,
             slots: result.indices,
             query_count: result.nq,
             result_count: result.k,
+            parts,
             regimes: FilterRegimeCounts::default(),
             tail_enumerated_rows: 0,
             patience_stopped: 0,
@@ -342,7 +359,8 @@ impl VectorProvider for EmbeddedTurboVec {
         sink: &mut dyn FnMut(&VectorStreamBatch<'_>) -> VectorStreamControl,
         control: &mut dyn FnMut() -> VectorStreamControl,
     ) -> Result<VectorStreamSummary, VectorError> {
-        let allow = options.allow.map(|mask| mask.bools());
+        let allow_mask = options.allow;
+        let allow = allow_mask.map(|mask| mask.bools());
         let summary = self
             .index
             .try_search_streaming_controlled(
@@ -359,6 +377,21 @@ impl VectorProvider for EmbeddedTurboVec {
                 || Self::map_control(control()),
             )
             .map_err(|e| VectorError::new(e.to_string()))?;
+        let parts = if self.index.is_empty() || summary.nq == 0 {
+            PartCounts::default()
+        } else if allow_mask.is_some_and(|m| !m.any_in(0, self.index.len())) {
+            PartCounts {
+                total: 1,
+                skipped: 1,
+                ..Default::default()
+            }
+        } else {
+            PartCounts {
+                total: 1,
+                scanned: u32::from(summary.completed),
+                ..Default::default()
+            }
+        };
         Ok(VectorStreamSummary {
             query_count: summary.nq,
             emitted: summary.emitted,
@@ -369,6 +402,7 @@ impl VectorProvider for EmbeddedTurboVec {
             } else {
                 VectorStreamEndReason::Abandoned
             },
+            parts,
             regimes: FilterRegimeCounts::default(),
             tail_enumerated_rows: 0,
             patience_stopped: 0,

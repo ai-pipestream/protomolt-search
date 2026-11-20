@@ -16,7 +16,7 @@ mod lexical;
 #[cfg(test)]
 mod tests;
 
-use crate::pb::{DenseScoreMode, Explanation, QueryHit};
+use crate::pb::{Explanation, QueryHit};
 
 pub use composite::{cascade, composite, Fusion, LegacyBoost};
 pub use finish::{finish, WindowBoost};
@@ -37,10 +37,10 @@ pub fn leaf(value: f64, description: impl Into<String>) -> Explanation {
 }
 
 /// The dense leaf's tree. `estimate` is the candidate score the
-/// provider produced before an exact FP32 rerank replaced it.
-pub fn dense(id: &str, score: f32, mode: DenseScoreMode, estimate: Option<f32>) -> Explanation {
-    match (mode, estimate) {
-        (DenseScoreMode::Fp32Rerank, Some(estimate)) => node(
+/// provider produced before an FP32 score from the original row replaced it.
+pub fn dense(id: &str, score: f32, estimate: Option<f32>) -> Explanation {
+    match estimate {
+        Some(estimate) => node(
             f64::from(score),
             format!(
                 "dense leaf {id:?}: exact FP32 dot product of the query with the stored \
@@ -48,11 +48,11 @@ pub fn dense(id: &str, score: f32, mode: DenseScoreMode, estimate: Option<f32>) 
             ),
             vec![leaf(
                 f64::from(estimate),
-                "the provider's candidate score that selected this document for the rerank \
-                 (not part of the served score)",
+                "the provider's quantized score that selected this document for FP32 \
+                 scoring (not part of the served score)",
             )],
         ),
-        _ => leaf(
+        None => leaf(
             f64::from(score),
             format!(
                 "dense leaf {id:?}: the provider's native similarity score for the stored \

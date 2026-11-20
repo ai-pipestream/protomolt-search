@@ -81,6 +81,7 @@ fn dense_query(vector: Vec<f32>) -> QueryRequest {
         4,
         search_query::Query::Dense(DenseQuery {
             vector,
+            execution_mode: pipestream_search::pb::DenseExecutionMode::Exhaustive as i32,
             ..Default::default()
         }),
     )

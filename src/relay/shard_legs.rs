@@ -8,6 +8,7 @@ use crate::stats_identity::StatsClaim;
 
 use super::fanout::{fan_out, shares_only, Opened};
 use super::merge_util::merge_known;
+use super::shard_scan::add_scan_stats;
 use super::{grpc_timeout, RelayService};
 
 type Binding = Option<Option<crate::pb::MappedVectorBinding>>;
@@ -152,6 +153,13 @@ fn merge_leg_shares(
             &mut filter_known,
             &share.filter_columns_known,
         )?;
+        if let Some(scan) = share.vector_scan {
+            add_scan_stats(
+                merged.vector_scan.get_or_insert_with(Default::default),
+                scan,
+                shard,
+            )?;
+        }
         merged.vector_hits.extend(share.vector_hits);
         merged.bm25_hits.extend(share.bm25_hits);
     }

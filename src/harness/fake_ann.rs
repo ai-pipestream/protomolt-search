@@ -82,7 +82,12 @@ impl VectorProvider for FakeAnn {
         k: usize,
         options: VectorSearchOptions<'_>,
     ) -> Result<VectorSearchResults, VectorError> {
-        self.inner.try_search(queries, k, options)
+        let mut results = self.inner.try_search(queries, k, options)?;
+        results.parts.walked = results
+            .parts
+            .walked
+            .saturating_add(std::mem::take(&mut results.parts.scanned));
+        Ok(results)
     }
 
     fn search_streaming_controlled(
@@ -92,7 +97,13 @@ impl VectorProvider for FakeAnn {
         sink: &mut dyn FnMut(&VectorStreamBatch<'_>) -> VectorStreamControl,
         control: &mut dyn FnMut() -> VectorStreamControl,
     ) -> Result<VectorStreamSummary, VectorError> {
-        self.inner
-            .try_search_streaming_controlled(queries, options, sink, control)
+        let mut summary = self
+            .inner
+            .try_search_streaming_controlled(queries, options, sink, control)?;
+        summary.parts.walked = summary
+            .parts
+            .walked
+            .saturating_add(std::mem::take(&mut summary.parts.scanned));
+        Ok(summary)
     }
 }

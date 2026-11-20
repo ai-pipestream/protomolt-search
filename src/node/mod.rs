@@ -83,6 +83,7 @@ pub(in crate::node) use self::boolean::EvaluatedLeaf;
 pub(in crate::node) use self::boolean::LeafSlot;
 pub(in crate::node) use self::boolean::{
     check_enumerate_threshold, check_floor_prune_options, check_patience_options,
+    selection_controls,
 };
 pub(in crate::node) use self::config::{
     check_placement_columns, declare_derived_columns, declare_placement_column, node_knobs,
@@ -93,7 +94,8 @@ pub(in crate::node) use self::ingest::{
     IngestSource, MappedSource, StreamKeys,
 };
 pub(in crate::node) use self::lexical::{
-    bm25_scoring_fingerprint, cut_snippets, explain_terms, highlight_plan, params_from, LegFilters,
+    bm25_scoring_fingerprint, cut_snippets, explain_terms, highlight_plan, params_from, LegCompute,
+    LegFilters, VectorLegControls,
 };
 #[cfg(all(test, feature = "net"))]
 pub(in crate::node) use self::scan::apply_stream_datagram;
@@ -101,7 +103,9 @@ pub(in crate::node) use self::scan::apply_stream_datagram;
 pub(in crate::node) use self::scan::run_scan_batch;
 #[cfg(doc)]
 pub(in crate::node) use self::scan::MAX_COALESCE;
-pub(in crate::node) use self::scan::{raise_floor_cell, ScanJob, ScanOutcome, StreamSignals};
+pub(in crate::node) use self::scan::{
+    proto_scan_stats, raise_floor_cell, ScanJob, ScanOutcome, StreamSignals,
+};
 pub(in crate::node) use self::shard::{
     active_artifact_rows, filter_known_flags, int_min_max_as_f64, live_document_count,
     live_field_stats, projected_value, prune_segments, resolve_shard_filters,
@@ -125,8 +129,10 @@ pub(in crate::node) use tokio_stream::wrappers::ReceiverStream;
 pub(in crate::node) use tonic::{Request, Response, Status, Streaming};
 
 pub(in crate::node) use crate::bm25::{self, Bm25Params};
+#[cfg(doc)]
+pub(in crate::node) use crate::chunked::chunked_topk;
 pub(in crate::node) use crate::chunked::{
-    chunked_topk, chunked_topk_collapsed, BatchQuery, ChunkHit, ScanStats, DEFAULT_CHUNK_BLOCKS,
+    chunked_topk_collapsed, BatchQuery, ChunkHit, ScanStats, DEFAULT_CHUNK_BLOCKS,
 };
 pub(in crate::node) use crate::exact_vectors::ExactVectorStore;
 pub(in crate::node) use crate::fusion::{self, Leg};

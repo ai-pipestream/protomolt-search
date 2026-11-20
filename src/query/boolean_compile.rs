@@ -6,12 +6,11 @@ use std::pin::Pin;
 use tonic::Status;
 
 use super::refuse;
-use super::selection::{dense_execution_mode, dense_score_mode, filter_predicate, Predicate};
+use super::selection::{filter_predicate, Predicate};
 use crate::coordinator::{CoordinatorServiceImpl, RequestFilters};
 use crate::pb::{
     search_query, selection_query, BooleanPlanGroup, BooleanPlanLeaf, BooleanPlanNode,
-    BooleanQuery, DenseExecutionMode, DenseQuery, DenseScoreMode, FilterQuery, LexicalQuery,
-    SearchQuery, SelectionQuery,
+    BooleanQuery, DenseQuery, FilterQuery, LexicalQuery, SearchQuery, SelectionQuery,
 };
 
 /// One leaf of a compiled `BooleanQuery` as the coordinator names it:
@@ -197,10 +196,15 @@ fn dense_leaf(id: &str, query: &DenseQuery) -> Result<crate::pb::boolean_plan_le
             "DenseQualityPolicy is not used by exact bitmap Boolean planning",
         ));
     }
-    let execution = dense_execution_mode(query)?;
-    if execution == DenseExecutionMode::Ann {
+    let request =
+        crate::dense_execution::parse_request(query).map_err(crate::coordinator::dense_status)?;
+    if !matches!(
+        request.mode,
+        crate::pb::DenseExecutionMode::Exhaustive | crate::pb::DenseExecutionMode::Auto
+    ) {
         return Err(refuse(
-            "ANN cannot establish recursive boolean membership exactly; use EXACT/AUTO or a top-level ANN selection",
+            "an approximate selection cannot establish recursive boolean membership; use \
+             EXHAUSTIVE/AUTO or a top-level BALANCED/FAST selection",
         ));
     }
     if query.vector.is_empty() {
@@ -210,7 +214,7 @@ fn dense_leaf(id: &str, query: &DenseQuery) -> Result<crate::pb::boolean_plan_le
         crate::pb::BooleanPlanDense {
             field: query.field.clone(),
             vector: query.vector.clone(),
-            exact_fp32: dense_score_mode(query)? == DenseScoreMode::Fp32Rerank,
+            exact_fp32: request.precision == crate::pb::DensePrecisionRequest::Fp32,
         },
     ))
 }

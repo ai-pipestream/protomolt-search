@@ -1,13 +1,10 @@
-//! `DENSE_EXECUTION_MODE_AUTO` through the generation-bound policy
-//! (`docs/dense-execution-policy.md`), against a provider that advertises
-//! a configured ANN contract over an exhaustive image
-//! (`harness::fake_ann`): AUTO on an exhaustive provider equals EXACT
-//! bitwise and consults no policy; AUTO on the fake provider refuses
-//! without one; a policy bound to another generation or corpus refuses
-//! naming the field; a qualified point runs ANN with its provenance, the
-//! same over two shards as over one; a filter keys the point on its live
-//! selectivity; a named candidate depth must be a measured one; explicit
-//! ANN is approximate and FP32 rerank does not upgrade it.
+//! The dense execution contract end to end: EXHAUSTIVE and AUTO run the
+//! same certified scan on an exhaustive quantized provider; missing and
+//! retired modes refuse; BALANCED discloses its same-precision fallback
+//! where the provider has no balanced technique; FAST never substitutes;
+//! a configured ANN provider walks under a built-in preset that claims no
+//! measured recall, and FP32 pool rescoring never certifies coverage; a
+//! version-1 policy cannot qualify AUTO.
 
 mod common;
 
@@ -23,9 +20,10 @@ use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     search_query, selection_query, AddDocumentsRequest, AddVectorsRequest, CompositeSearchStrategy,
-    DenseExecutionMode, DenseExecutionOutcome, DensePolicyPoint, DenseQuery, DenseScoreMode,
-    FacetValue, FilterQuery, QueryRequest, QueryResponse, SearchQuery, SelectionOperator,
-    SelectionQuery, VectorQualityContract,
+    DenseCoverage, DenseExecutionMode as Mode, DenseExecutionOutcome, DenseFilterStrategy,
+    DensePrecisionRequest as Precision, DenseQuery, DenseScorePrecision, DenseTechnique,
+    DenseTermination, FacetValue, FilterQuery, QueryRequest, QueryResponse, SearchQuery,
+    SelectionOperator, SelectionQuery,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -133,57 +131,26 @@ async fn start_fixture(shards: usize, fake: bool) -> Fixture {
     }
 }
 
-const POINTS: &str = r#"
-[[points]]
-k = 3
-filter_selectivity_ppm_min = 1000000
-filter_selectivity_ppm_max = 1000000
-candidates = 5
-measured_recall_ppm = 990000
-
-[[points]]
-k = 2
-filter_selectivity_ppm_min = 400000
-filter_selectivity_ppm_max = 600000
-candidates = 4
-measured_recall_ppm = 980000
-"#;
-
-fn policy_text(fingerprint: &str, generation: u64, rows: usize) -> String {
-    format!(
-        "format_version = 1\npolicy_id = \"court-ann-v1\"\nembedding_model = \"test-embed\"\n\
-         corpus_generation = {generation}\ncorpus_rows = {rows}\ndimensions = {DIM}\n\
-         provider_backend = \"{}\"\nscoring_fingerprint = \"{fingerprint}\"\n\
-         measured_queries = 16\n{POINTS}",
-        fake_ann::BACKEND_KIND
-    )
-}
-
-/// Persist the policy the way an operator would and load it back: the
-/// coordinator sees the file, not the text.
-fn load_policy(tag: &str, text: &str) -> DenseExecutionPolicy {
+/// Write a policy document the way an operator installs one and load it back.
+fn load_policy(tag: &str, bytes: &[u8]) -> Result<DenseExecutionPolicy, String> {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("dense_policy_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("policy.toml");
-    std::fs::write(&path, text).unwrap();
-    let policy = DenseExecutionPolicy::load(&path).unwrap();
+    std::fs::write(&path, bytes).unwrap();
+    let policy = DenseExecutionPolicy::load(&path);
     let _ = std::fs::remove_dir_all(&dir);
     policy
 }
 
-fn dense_leaf(
-    vector: &[f32],
-    mode: DenseExecutionMode,
-    score_mode: DenseScoreMode,
-) -> SelectionQuery {
+fn dense_leaf(vector: &[f32], mode: Mode, precision: Precision) -> SelectionQuery {
     SelectionQuery {
         node: Some(selection_query::Node::Search(SearchQuery {
             id: "vec".into(),
             query: Some(search_query::Query::Dense(DenseQuery {
                 vector: vector.to_vec(),
                 execution_mode: mode as i32,
-                score_mode: score_mode as i32,
+                precision: precision as i32,
                 ..Default::default()
             })),
         })),
@@ -238,466 +205,176 @@ fn hit_bits(response: &QueryResponse) -> Vec<(u64, u32)> {
         .collect()
 }
 
-fn qualified_point() -> DensePolicyPoint {
-    DensePolicyPoint {
-        k: 3,
-        filter_selectivity_ppm_min: 1_000_000,
-        filter_selectivity_ppm_max: 1_000_000,
-        candidates: 5,
-        measured_recall_ppm: 990_000,
-        enumerate_max_rows: None,
-        patience_saturation_ppm: None,
-        patience_hops: None,
-        finish_settle_us: None,
-        floor_greediness_ppm: None,
-        floor_clamp_min: None,
-    }
-}
-
-fn assert_ann_through_policy(outcome: &DenseExecutionOutcome, policy: &DenseExecutionPolicy) {
-    assert_eq!(
-        outcome.evidence_scope,
-        pipestream_search::pb::DenseEvidenceScope::SelectivityBandBenchmark as i32
-    );
-    assert_eq!(outcome.requested_mode, DenseExecutionMode::Auto as i32);
-    assert_eq!(outcome.resolved_mode, DenseExecutionMode::Ann as i32);
-    assert!(
-        !outcome.exhaustive_completion,
-        "ANN never claims completion"
-    );
-    assert_eq!(
-        outcome.quality_contract,
-        VectorQualityContract::ConfiguredAnn as i32
-    );
-    assert_eq!(outcome.provider_backend, fake_ann::BACKEND_KIND);
-    assert_eq!(outcome.policy_id, "court-ann-v1");
-    assert_eq!(outcome.policy_fingerprint, policy.fingerprint());
-    assert!(
-        outcome.planner_reason.contains("policy \"court-ann-v1\"")
-            && outcome.planner_reason.contains("measured recall"),
-        "{}",
-        outcome.planner_reason
-    );
+fn techniques(outcome: &DenseExecutionOutcome) -> Vec<i32> {
+    outcome.techniques.iter().map(|t| t.technique).collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn auto_on_an_exhaustive_provider_is_exact_bitwise_and_consults_no_policy() {
+async fn exhaustive_and_auto_run_one_certified_quantized_scan() {
     let fixture = start_fixture(2, false).await;
-    let policy = load_policy(
-        "exhaustive",
-        &policy_text(&fixture.fingerprint, GENERATION, N_DOCS),
-    );
-    let coordinator = fixture
-        .coordinator
-        .clone()
-        .with_dense_execution_policy(policy);
-    let leaf = |mode| dense_leaf(&fixture.query_vector, mode, DenseScoreMode::Unspecified);
-    let exact = query(&coordinator, request(3, 0, leaf(DenseExecutionMode::Exact)))
+    let leaf = |mode| dense_leaf(&fixture.query_vector, mode, Precision::Auto);
+    let exhaustive = query(&fixture.coordinator, request(3, 0, leaf(Mode::Exhaustive)))
         .await
         .unwrap();
-    let auto = query(&coordinator, request(3, 0, leaf(DenseExecutionMode::Auto)))
+    let auto = query(&fixture.coordinator, request(3, 0, leaf(Mode::Auto)))
         .await
         .unwrap();
-    assert_eq!(hit_bits(&exact), hit_bits(&auto));
-    assert_eq!(exact.hits.len(), 3);
-    let outcome = auto.dense_execution.unwrap();
-    assert_eq!(outcome.requested_mode, DenseExecutionMode::Auto as i32);
-    assert_eq!(outcome.resolved_mode, DenseExecutionMode::Exact as i32);
-    assert!(outcome.exhaustive_completion);
-    assert!(outcome.policy_id.is_empty() && outcome.policy_point.is_none());
-    assert_eq!(outcome.candidate_depth, 0);
-    assert_eq!(outcome.filter_selectivity_ppm, 0);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn auto_on_a_configured_ann_provider_refuses_without_a_policy() {
-    let fixture = start_fixture(2, true).await;
-    let leaf = dense_leaf(
-        &fixture.query_vector,
-        DenseExecutionMode::Auto,
-        DenseScoreMode::Unspecified,
-    );
-    let error = query(&fixture.coordinator, request(3, 0, leaf))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert!(
-        error.message().contains("fake-ann")
-            && error.message().contains("--dense-execution-policy"),
-        "{}",
-        error.message()
-    );
-    // EXACT on that provider is refused too: it cannot prove completion.
-    let leaf = dense_leaf(
-        &fixture.query_vector,
-        DenseExecutionMode::Exact,
-        DenseScoreMode::Unspecified,
-    );
-    let error = query(&fixture.coordinator, request(3, 0, leaf))
-        .await
-        .unwrap_err();
-    assert!(error.message().contains("EXACT"), "{}", error.message());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn auto_refuses_a_policy_bound_to_another_generation_or_corpus() {
-    let fixture = start_fixture(2, true).await;
-    let leaf = || {
-        dense_leaf(
-            &fixture.query_vector,
-            DenseExecutionMode::Auto,
-            DenseScoreMode::Unspecified,
-        )
-    };
-    // The policy measured generation 8; the coordinator serves 7.
-    let stale = load_policy(
-        "generation",
-        &policy_text(&fixture.fingerprint, GENERATION + 1, N_DOCS),
-    );
-    let coordinator = fixture
-        .coordinator
-        .clone()
-        .with_dense_execution_policy(stale);
-    let error = query(&coordinator, request(3, 0, leaf()))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert!(
-        error
-            .message()
-            .contains("corpus_generation 8 does not match live 7"),
-        "{}",
-        error.message()
-    );
-    // The policy measured one row more than the shards hold.
-    let grown = load_policy(
-        "rows",
-        &policy_text(&fixture.fingerprint, GENERATION, N_DOCS + 1),
-    );
-    let coordinator = fixture
-        .coordinator
-        .clone()
-        .with_dense_execution_policy(grown);
-    let error = query(&coordinator, request(3, 0, leaf()))
-        .await
-        .unwrap_err();
-    assert!(
-        error
-            .message()
-            .contains("corpus_rows 9 does not match live 8"),
-        "{}",
-        error.message()
-    );
-    // Another provider's scoring fingerprint.
-    let foreign = load_policy(
-        "fingerprint",
-        &policy_text("fake-ann:elsewhere", GENERATION, N_DOCS),
-    );
-    let coordinator = fixture
-        .coordinator
-        .clone()
-        .with_dense_execution_policy(foreign);
-    let error = query(&coordinator, request(3, 0, leaf()))
-        .await
-        .unwrap_err();
-    assert!(
-        error.message().contains("scoring_fingerprint"),
-        "{}",
-        error.message()
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn auto_through_a_qualified_point_runs_ann_and_reports_it() {
-    let distributed = start_fixture(2, true).await;
-    let monolithic = start_fixture(1, true).await;
-    assert_eq!(distributed.fingerprint, monolithic.fingerprint);
-    let text = policy_text(&distributed.fingerprint, GENERATION, N_DOCS);
-    let policy = load_policy("qualified", &text);
-    let mut responses = Vec::new();
-    for fixture in [&distributed, &monolithic] {
-        let coordinator = fixture
-            .coordinator
-            .clone()
-            .with_dense_execution_policy(policy.clone());
-        let leaf = dense_leaf(
-            &fixture.query_vector,
-            DenseExecutionMode::Auto,
-            DenseScoreMode::Unspecified,
-        );
-        let response = query(&coordinator, request(3, 0, leaf)).await.unwrap();
+    assert_eq!(hit_bits(&auto), hit_bits(&exhaustive));
+    assert_eq!(auto.hits.len(), 3);
+    for (response, requested) in [(&exhaustive, Mode::Exhaustive), (&auto, Mode::Auto)] {
+        let outcome = response.dense_execution.as_ref().unwrap();
+        assert_eq!(outcome.requested_mode, requested as i32);
+        assert_eq!(outcome.resolved_mode, Mode::Exhaustive as i32);
+        assert_eq!(outcome.coverage, DenseCoverage::ExhaustiveCertified as i32);
+        assert_eq!(outcome.termination, DenseTermination::Exhausted as i32);
         assert_eq!(
-            response.hits.len(),
-            3,
-            "trimmed to k from the point's depth"
+            outcome.output_precision,
+            DenseScorePrecision::Quantized as i32
         );
-        let outcome = response.dense_execution.clone().unwrap();
-        assert_ann_through_policy(&outcome, &policy);
-        assert_eq!(outcome.policy_point, Some(qualified_point()));
-        assert_eq!(outcome.filter_selectivity_ppm, 1_000_000);
-        assert_eq!(outcome.candidate_depth, 5);
-        // An unmeasured k refuses by name; k = 0 is not defaulted.
-        let leaf = dense_leaf(
-            &fixture.query_vector,
-            DenseExecutionMode::Auto,
-            DenseScoreMode::Unspecified,
+        assert_eq!(
+            techniques(outcome),
+            vec![DenseTechnique::QuantizedScan as i32]
         );
-        let error = query(&coordinator, request(4, 0, leaf)).await.unwrap_err();
-        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-        assert!(
-            error.message().contains("no point for k=4") && error.message().contains("[2, 3]"),
-            "{}",
-            error.message()
-        );
-        let leaf = dense_leaf(
-            &fixture.query_vector,
-            DenseExecutionMode::Auto,
-            DenseScoreMode::Unspecified,
-        );
-        let error = query(&coordinator, request(0, 0, leaf)).await.unwrap_err();
-        assert!(
-            error.message().contains("explicit k"),
-            "{}",
-            error.message()
-        );
-        responses.push(response);
+        assert!(outcome.preset.is_empty() && !outcome.policy_qualified);
+        assert!(outcome.fallback_reason.is_empty());
     }
-    // Distributed = monolithic: the hits and the provenance.
-    assert_eq!(hit_bits(&responses[0]), hit_bits(&responses[1]));
-    assert_eq!(responses[0].dense_execution, responses[1].dense_execution);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_filter_keys_the_point_on_its_live_selectivity() {
-    let fixture = start_fixture(2, true).await;
-    let policy = load_policy(
-        "filtered",
-        &policy_text(&fixture.fingerprint, GENERATION, N_DOCS),
+async fn missing_retired_and_contradictory_contracts_refuse() {
+    let fixture = start_fixture(1, false).await;
+    for retired in [0, 1, 2, 3, 99] {
+        let mut req = request(
+            3,
+            0,
+            dense_leaf(&fixture.query_vector, Mode::Auto, Precision::Auto),
+        );
+        let Some(selection_query::Node::Search(search)) =
+            req.selection.as_mut().and_then(|s| s.node.as_mut())
+        else {
+            unreachable!()
+        };
+        let Some(search_query::Query::Dense(dense)) = search.query.as_mut() else {
+            unreachable!()
+        };
+        dense.execution_mode = retired;
+        let err = query(&fixture.coordinator, req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "mode {retired}");
+    }
+    let mut leaf = dense_leaf(&fixture.query_vector, Mode::Exhaustive, Precision::Auto);
+    if let Some(selection_query::Node::Search(search)) = leaf.node.as_mut() {
+        if let Some(search_query::Query::Dense(dense)) = search.query.as_mut() {
+            dense.filter_strategy = DenseFilterStrategy::Speed as i32;
+        }
+    }
+    let err = query(&fixture.coordinator, request(3, 0, leaf))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("owns its routing"),
+        "{}",
+        err.message()
     );
-    let coordinator = fixture
-        .coordinator
-        .clone()
-        .with_dense_execution_policy(policy.clone());
-    let leaf = || {
-        dense_leaf(
-            &fixture.query_vector,
-            DenseExecutionMode::Auto,
-            DenseScoreMode::Unspecified,
-        )
-    };
-    // ca9 admits four of eight rows: 500,000 ppm, inside the measured band.
-    let response = query(
-        &coordinator,
-        request(2, 0, filtered("court == \"ca9\"", leaf())),
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn balanced_discloses_its_fallback_and_fast_never_substitutes() {
+    let fixture = start_fixture(2, false).await;
+    let leaf = |mode| dense_leaf(&fixture.query_vector, mode, Precision::Auto);
+    let exhaustive = query(&fixture.coordinator, request(3, 0, leaf(Mode::Exhaustive)))
+        .await
+        .unwrap();
+    let balanced = query(&fixture.coordinator, request(3, 0, leaf(Mode::Balanced)))
+        .await
+        .unwrap();
+    assert_eq!(hit_bits(&balanced), hit_bits(&exhaustive));
+    let outcome = balanced.dense_execution.unwrap();
+    assert_eq!(outcome.requested_mode, Mode::Balanced as i32);
+    assert_eq!(outcome.resolved_mode, Mode::Exhaustive as i32);
+    assert_eq!(outcome.coverage, DenseCoverage::ExhaustiveCertified as i32);
+    assert!(
+        outcome.fallback_reason.contains("same precision"),
+        "{}",
+        outcome.fallback_reason
+    );
+    let err = query(&fixture.coordinator, request(3, 0, leaf(Mode::Fast)))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message().contains("never substituted"),
+        "{}",
+        err.message()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_configured_ann_provider_walks_under_a_preset_and_never_certifies() {
+    let fixture = start_fixture(2, true).await;
+    let leaf = |mode, precision| dense_leaf(&fixture.query_vector, mode, precision);
+    let err = query(
+        &fixture.coordinator,
+        request(3, 0, leaf(Mode::Exhaustive, Precision::Auto)),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    let walked = query(
+        &fixture.coordinator,
+        request(3, 0, leaf(Mode::Balanced, Precision::Auto)),
     )
     .await
     .unwrap();
-    assert_eq!(response.hits.len(), 2);
-    assert!(
-        response.hits.iter().all(|h| h.doc_id < 4),
-        "{:?}",
-        response.hits
-    );
-    let outcome = response.dense_execution.unwrap();
-    assert_ann_through_policy(&outcome, &policy);
-    assert_eq!(outcome.filter_selectivity_ppm, 500_000);
-    assert_eq!(outcome.candidate_depth, 4);
+    let outcome = walked.dense_execution.unwrap();
+    assert_eq!(outcome.resolved_mode, Mode::Balanced as i32);
+    assert_eq!(outcome.coverage, DenseCoverage::CandidateSet as i32);
+    assert_eq!(outcome.termination, DenseTermination::Converged as i32);
+    assert_eq!(outcome.preset, "hnsw-balanced-v1");
+    assert!(!outcome.policy_qualified && outcome.policy_id.is_empty());
+    assert_eq!(outcome.candidate_depth, 3);
+    assert_eq!(techniques(&outcome), vec![DenseTechnique::HnswWalk as i32]);
+    let pooled = query(
+        &fixture.coordinator,
+        request(3, 6, leaf(Mode::Balanced, Precision::Fp32)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(pooled.executed, "search:fp32_pool");
+    let outcome = pooled.dense_execution.unwrap();
+    assert_eq!(outcome.coverage, DenseCoverage::CandidateSet as i32);
     assert_eq!(
-        outcome.policy_point.map(|p| (p.k, p.candidates)),
-        Some((2, 4))
+        outcome.selection_precision,
+        DenseScorePrecision::Quantized as i32
     );
-    // scotus admits two of eight: 250,000 ppm, outside every band for k = 2.
-    let error = query(
-        &coordinator,
-        request(2, 0, filtered("court == \"scotus\"", leaf())),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert!(
-        error.message().contains("250000 ppm") && error.message().contains("400000..=600000"),
-        "{}",
-        error.message()
-    );
-    // Unfiltered k = 2 was not measured either: the band is not stretched.
-    let error = query(&coordinator, request(2, 0, leaf()))
-        .await
-        .unwrap_err();
-    assert!(
-        error.message().contains("1000000 ppm"),
-        "{}",
-        error.message()
-    );
-    // A point that names an enumerate threshold was measured on a provider
-    // with filter regimes; this one has none, and the point is refused
-    // rather than served under a rule the provider does not run.
-    let text = policy_text(&fixture.fingerprint, GENERATION, N_DOCS);
-    // Appended to the last point: k = 2 on the filtered band.
-    let with_threshold = format!("{text}enumerate_max_rows = 2\n");
-    let coordinator = fixture
-        .coordinator
-        .clone()
-        .with_dense_execution_policy(load_policy("threshold", &with_threshold));
-    let error = query(
-        &coordinator,
-        request(2, 0, filtered("court == \"ca9\"", leaf())),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert!(
-        error.message().contains("enumerate_max_rows 2")
-            && error.message().contains("mask_enumeration"),
-        "{}",
-        error.message()
-    );
-    // And a point naming patience parameters is refused on a provider that
-    // does not advertise `patience_early_stop`.
-    let with_patience = format!("{text}patience_saturation_ppm = 990000\npatience_hops = 15\n");
-    let coordinator = fixture
-        .coordinator
-        .clone()
-        .with_dense_execution_policy(load_policy("patience", &with_patience));
-    let error = query(
-        &coordinator,
-        request(2, 0, filtered("court == \"ca9\"", leaf())),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert!(
-        error.message().contains("patience") && error.message().contains("patience_early_stop"),
-        "{}",
-        error.message()
-    );
-    // And a point naming `finish_settle_us` is refused on a provider that does
-    // not advertise `candidate_stream`.
-    let with_finish = format!("{text}finish_settle_us = 250\n");
-    let coordinator = fixture
-        .coordinator
-        .clone()
-        .with_dense_execution_policy(load_policy("finish", &with_finish));
-    let error = query(
-        &coordinator,
-        request(2, 0, filtered("court == \"ca9\"", leaf())),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert!(
-        error.message().contains("finish_settle_us 250")
-            && error.message().contains("candidate_stream"),
-        "{}",
-        error.message()
-    );
-    // And a point naming `floor_greediness_ppm` / `floor_clamp_min` is refused
-    // on a provider that does not advertise `floor_pruning`.
-    let with_floor_prune = format!("{text}floor_greediness_ppm = 500000\nfloor_clamp_min = 8\n");
-    let coordinator = fixture
-        .coordinator
-        .clone()
-        .with_dense_execution_policy(load_policy("floor-prune", &with_floor_prune));
-    let error = query(
-        &coordinator,
-        request(2, 0, filtered("court == \"ca9\"", leaf())),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert!(
-        error
-            .message()
-            .contains("floor pruning (greediness 500000 ppm, clamp_min 8)")
-            && error.message().contains("floor_pruning"),
-        "{}",
-        error.message()
-    );
+    assert_eq!(outcome.output_precision, DenseScorePrecision::Fp32 as i32);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_named_candidate_depth_must_be_a_measured_one() {
-    let fixture = start_fixture(2, true).await;
-    let policy = load_policy(
-        "depth",
-        &policy_text(&fixture.fingerprint, GENERATION, N_DOCS),
+async fn version_one_policy_refuses_at_load_and_filters_keep_the_contract() {
+    let fixture = start_fixture(2, false).await;
+    let v1 = format!(
+        "format_version = 1\npolicy_id = \"court-ann-v1\"\nembedding_model = \"e\"\n\
+         corpus_generation = {GENERATION}\ncorpus_rows = {N_DOCS}\ndimensions = {DIM}\n\
+         provider_backend = \"{}\"\nscoring_fingerprint = \"{}\"\n\
+         measured_queries = 16\n[[points]]\nk = 3\nfilter_selectivity_ppm_min = 1000000\n\
+         filter_selectivity_ppm_max = 1000000\ncandidates = 5\nmeasured_recall_ppm = 990000\n",
+        fake_ann::BACKEND_KIND,
+        fixture.fingerprint
     );
-    let coordinator = fixture
-        .coordinator
-        .clone()
-        .with_dense_execution_policy(policy);
-    let leaf = || {
-        dense_leaf(
-            &fixture.query_vector,
-            DenseExecutionMode::Auto,
-            DenseScoreMode::Unspecified,
-        )
-    };
-    let error = query(&coordinator, request(3, 6, leaf()))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    let refused = load_policy("v1", v1.as_bytes()).unwrap_err();
     assert!(
-        error.message().contains("not at the requested 6"),
-        "{}",
-        error.message()
+        refused.contains("version-1 TOML schema is not read"),
+        "{refused}"
     );
-    let response = query(&coordinator, request(3, 5, leaf())).await.unwrap();
-    let outcome = response.dense_execution.unwrap();
-    assert_eq!(outcome.resolved_mode, DenseExecutionMode::Ann as i32);
-    assert_eq!(outcome.candidate_depth, 5);
-    assert_eq!(response.hits.len(), 3);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn explicit_ann_is_approximate_and_fp32_rerank_does_not_upgrade_it() {
-    let fixture = start_fixture(2, true).await;
-    // Explicit ANN needs no policy: the caller accepted the contract.
-    let leaf = dense_leaf(
-        &fixture.query_vector,
-        DenseExecutionMode::Ann,
-        DenseScoreMode::Fp32Rerank,
-    );
-    let response = query(&fixture.coordinator, request(3, 5, leaf))
-        .await
-        .unwrap();
-    assert_eq!(response.hits.len(), 3);
-    let outcome = response.dense_execution.unwrap();
-    assert_eq!(outcome.requested_mode, DenseExecutionMode::Ann as i32);
-    assert_eq!(outcome.resolved_mode, DenseExecutionMode::Ann as i32);
-    assert!(!outcome.exhaustive_completion);
-    assert_eq!(
-        outcome.quality_contract,
-        VectorQualityContract::ConfiguredAnn as i32
-    );
-    assert!(
-        outcome.planner_reason.contains("approximate")
-            && outcome.planner_reason.contains("FP32 rerank"),
-        "{}",
-        outcome.planner_reason
-    );
-    assert!(outcome.policy_id.is_empty(), "no policy was consulted");
-    // AUTO through the policy with FP32 rerank on top: still ANN.
-    let policy = load_policy(
-        "rerank",
-        &policy_text(&fixture.fingerprint, GENERATION, N_DOCS),
-    );
-    let coordinator = fixture
-        .coordinator
-        .clone()
-        .with_dense_execution_policy(policy.clone());
-    let leaf = dense_leaf(
-        &fixture.query_vector,
-        DenseExecutionMode::Auto,
-        DenseScoreMode::Fp32Rerank,
-    );
-    let response = query(&coordinator, request(3, 0, leaf)).await.unwrap();
-    let outcome = response.dense_execution.unwrap();
-    assert_ann_through_policy(&outcome, &policy);
-    assert!(
-        outcome.planner_reason.contains("FP32 rerank"),
-        "{}",
-        outcome.planner_reason
-    );
-    assert_eq!(outcome.candidate_depth, 5);
-    assert_eq!(response.hits.len(), 3);
+    let leaf = |mode| dense_leaf(&fixture.query_vector, mode, Precision::Auto);
+    let filtered_auto = query(
+        &fixture.coordinator,
+        request(2, 0, filtered("court == 'ca9'", leaf(Mode::Auto))),
+    )
+    .await
+    .unwrap();
+    let outcome = filtered_auto.dense_execution.unwrap();
+    assert_eq!(outcome.coverage, DenseCoverage::ExhaustiveCertified as i32);
+    assert!(filtered_auto.hits.len() <= 2);
 }

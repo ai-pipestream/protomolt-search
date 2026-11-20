@@ -216,29 +216,17 @@ async fn cascade_and_decomposed_fusion_through_relays_equal_the_flat_fanout() {
 }
 
 fn dense_clause(id: &str, vector: &[f32]) -> SelectionQuery {
-    SelectionQuery {
-        node: Some(selection_query::Node::Search(SearchQuery {
-            id: id.to_string(),
-            query: Some(search_query::Query::Dense(DenseQuery {
-                vector: vector.to_vec(),
-                ..Default::default()
-            })),
-        })),
-    }
+    common::dense_selection(
+        id,
+        vector.to_vec(),
+        DenseExecutionMode::Exhaustive as i32,
+        0,
+    )
 }
 
-/// A dense clause reranked on the original vectors (`ExactVectorRescore`).
-fn fp32_clause(id: &str, vector: &[f32]) -> SelectionQuery {
-    SelectionQuery {
-        node: Some(selection_query::Node::Search(SearchQuery {
-            id: id.to_string(),
-            query: Some(search_query::Query::Dense(DenseQuery {
-                vector: vector.to_vec(),
-                score_mode: pipestream_search::pb::DenseScoreMode::Fp32Rerank as i32,
-                ..Default::default()
-            })),
-        })),
-    }
+fn fp32_clause(id: &str, vector: &[f32], mode: DenseExecutionMode) -> SelectionQuery {
+    let fp32 = pipestream_search::pb::DensePrecisionRequest::Fp32 as i32;
+    common::dense_selection(id, vector.to_vec(), mode as i32, fp32)
 }
 
 fn and_filtered(filter: SelectionQuery, leaf: SelectionQuery) -> SelectionQuery {
@@ -311,12 +299,15 @@ async fn filtered_and_boolean_queries_through_relays_equal_the_flat_fanout() {
                 Vec::new(),
             ),
         ),
-        ("fp32 rerank", fp32_clause("vec", &vector)),
+        (
+            "fp32 rerank",
+            fp32_clause("vec", &vector, DenseExecutionMode::Balanced),
+        ),
         (
             "boolean fp32 must filter",
             boolean(
                 vec![
-                    fp32_clause("vec", &vector),
+                    fp32_clause("vec", &vector, DenseExecutionMode::Exhaustive),
                     cel_clause("f", r#"court == "scotus""#),
                 ],
                 Vec::new(),

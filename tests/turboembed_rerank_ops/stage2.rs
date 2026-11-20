@@ -96,15 +96,12 @@ async fn stage2_rerank_and_highlight_reorders_dense_and_composite_and_composes_l
         &base_coord,
         Request::new(QueryRequest {
             k: 4,
-            selection: Some(SelectionQuery {
-                node: Some(selection_query::Node::Search(SearchQuery {
-                    id: "vec".into(),
-                    query: Some(search_query::Query::Dense(DenseQuery {
-                        vector: q_vec.clone(),
-                        ..Default::default()
-                    })),
-                })),
-            }),
+            selection: Some(common::dense_selection(
+                "vec",
+                q_vec.clone(),
+                DenseExecutionMode::Exhaustive as i32,
+                0,
+            )),
             ..Default::default()
         }),
     )
@@ -159,15 +156,12 @@ async fn stage2_rerank_and_highlight_reorders_dense_and_composite_and_composes_l
                 k: 4,
                 selection_k: 4,
                 highlight: Some(HighlightSpec::default()),
-                selection: Some(SelectionQuery {
-                    node: Some(selection_query::Node::Search(SearchQuery {
-                        id: "vec".into(),
-                        query: Some(search_query::Query::Dense(DenseQuery {
-                            vector: q_vec.clone(),
-                            ..Default::default()
-                        })),
-                    })),
-                }),
+                selection: Some(common::dense_selection(
+                    "vec",
+                    q_vec.clone(),
+                    DenseExecutionMode::Exhaustive as i32,
+                    0,
+                )),
                 ..Default::default()
             }),
         )
@@ -221,15 +215,12 @@ async fn stage2_rerank_and_highlight_reorders_dense_and_composite_and_composes_l
                     node: Some(selection_query::Node::Composite(CompositeSearchStrategy {
                         operator: SelectionOperator::Or as i32,
                         clauses: vec![
-                            SelectionQuery {
-                                node: Some(selection_query::Node::Search(SearchQuery {
-                                    id: "vec".into(),
-                                    query: Some(search_query::Query::Dense(DenseQuery {
-                                        vector: q_vec.clone(),
-                                        ..Default::default()
-                                    })),
-                                })),
-                            },
+                            common::dense_selection(
+                                "vec",
+                                q_vec.clone(),
+                                DenseExecutionMode::Exhaustive as i32,
+                                0,
+                            ),
                             SelectionQuery {
                                 node: Some(selection_query::Node::Search(SearchQuery {
                                     id: "lex".into(),
