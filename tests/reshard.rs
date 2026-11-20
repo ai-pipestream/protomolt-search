@@ -968,7 +968,7 @@ async fn split_logs_redistributes_two_shards_into_four() {
 /// ranking bit for bit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn split_preserves_multi_field_postings_and_fused_ranking() {
-    use protomolt_analyzer::GlossaryEntry;
+    use pipestream_search::phrases::GlossaryEntry;
 
     let dir = tempdir("multifield");
     let n = 600usize;
@@ -1100,7 +1100,7 @@ fn verify_multifield_children<'a>(
     raw_children: &'a [reshard::ChildImage],
     phrase_fp: u64,
 ) -> Vec<(&'a reshard::ChildImage, Bm25Reader)> {
-    let phrase_term = protomolt_analyzer::phrase_posting_term("alpha-gamma");
+    let phrase_term = pipestream_search::phrases::phrase_posting_term("alpha-gamma");
     let parent_phrase_df = parent.field(2).df(&phrase_term);
     assert!(parent_phrase_df > 0);
     let children: Vec<(&reshard::ChildImage, Bm25Reader)> = raw_children

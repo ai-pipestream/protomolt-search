@@ -222,8 +222,8 @@ pub(super) struct EmbedBody {
     pub(super) text: String,
 }
 
-/// One text embedded by the `--analysis` endpoint, dialed with the
-/// console's client TLS material and bearer token (see `embed_options`).
+/// Embed with the configured provider. Remote calls carry the console TLS and bearer
+/// options. With `local-core`, `--analysis turbo` uses the bundle at `TURBO_EMBED_BUNDLE`.
 pub(super) async fn embed_vector(ctx: &Ctx, text: &str) -> Result<Vec<f32>, Status> {
     let Some(addr) = ctx.analysis.as_deref() else {
         return Err(Status::unimplemented(

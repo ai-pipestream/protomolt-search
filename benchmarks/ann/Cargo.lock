@@ -1410,6 +1410,7 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "turbo-client",
+ "turbo-sha256",
  "turbovec",
 ]
 
@@ -1565,6 +1566,7 @@ dependencies = [
  "rand_pcg",
  "serde_json",
  "space",
+ "turbo-sha256",
  "usearch",
 ]
 

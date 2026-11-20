@@ -8,7 +8,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use crate::analyzer::native::{phrase_posting_term, unicode_case_fold, Glossary, GlossaryEntry};
+pub use crate::analyzer::native::{phrase_posting_term, GlossaryEntry};
+use crate::analyzer::native::{unicode_case_fold, Glossary};
 
 use crate::pb::{MapFacetEntry, OffsetSpan, PhrasePosting};
 

@@ -164,6 +164,16 @@ fn vector_digest_matches_canonical_bytes_including_signed_zero() {
     }
 }
 
+#[test]
+fn sha256_matches_the_fips_abc_vector_in_one_or_multiple_updates() {
+    let expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    let mut hash = turbo_sha256::Sha256::new();
+    hash.update(b"a");
+    hash.update(b"bc");
+    assert_eq!(hash.finish().to_hex(), expected);
+    assert_eq!(turbo_sha256::sha256(b"abc").to_hex(), expected);
+}
+
 #[cfg(feature = "net")]
 mod remote {
     use pipestream_search::analyzer::{
@@ -190,6 +200,7 @@ mod remote {
         revision: AtomicUsize,
         fail_infer: AtomicBool,
         stall_metadata: AtomicBool,
+        wider_metadata: AtomicBool,
         saw_timeout: AtomicBool,
     }
 
@@ -242,7 +253,15 @@ mod remote {
                 ),
                 ("model_info.manifest_sha256", "a".repeat(64)),
                 ("model_info.task", "embed".into()),
-                ("model_info.dim", "2".into()),
+                (
+                    "model_info.dim",
+                    if self.0.wider_metadata.load(Ordering::SeqCst) {
+                        "3"
+                    } else {
+                        "2"
+                    }
+                    .into(),
+                ),
                 ("model_info.pooling", "mean".into()),
                 ("model_info.normalize", "l2".into()),
             ]
@@ -424,6 +443,27 @@ mod remote {
             .unwrap();
         assert_eq!(mock.metadata.load(Ordering::SeqCst), 2);
         assert_eq!(mock.inference.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn inferred_width_must_match_fresh_cached_and_explicit_metadata() {
+        let _guard = RPC_TEST.lock().await;
+        let mock = Arc::new(Mock::default());
+        mock.wider_metadata.store(true, Ordering::SeqCst);
+        let (addr, task) = server(Arc::clone(&mock)).await;
+        let explicit = format!("{addr}&sha256={}&dim=3&revision=0", "a".repeat(64));
+        for endpoint in [&addr, &addr, &explicit] {
+            let error = embed_text_with_options(endpoint, "query", &RemoteCallOptions::default())
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert!(error
+                .message()
+                .contains("dimension 2 differs from model metadata 3"));
+        }
+        assert_eq!(mock.metadata.load(Ordering::SeqCst), 2);
+        assert_eq!(mock.inference.load(Ordering::SeqCst), 3);
         task.abort();
     }
 

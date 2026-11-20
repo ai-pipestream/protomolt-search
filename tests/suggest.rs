@@ -31,10 +31,10 @@ use pipestream_search::pb::{
     AddDocumentsRequest, AnalysisSpec, DeleteDocumentsRequest, FlushRequest, SuggestRequest,
     SuggestResponse, SuggestTermsRequest, Suggestion,
 };
+use pipestream_search::phrases::GlossaryEntry;
 use pipestream_search::phrases::PhraseIndex;
 use pipestream_search::postings::{AnalyzedDoc, Bm25Index, Bm25Reader, Bm25Store};
 use pipestream_search::security::{PrincipalConfig, Principals};
-use protomolt_analyzer::GlossaryEntry;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request};

@@ -2,13 +2,15 @@
 
 use tonic::Status;
 
+pub use protomolt_analyzer::{phrase_posting_term, GlossaryEntry};
+
 /// Every `protomolt-analyzer` item the crate uses. Other modules reach the
 /// native stack only through these names, so retiring it in favor of
 /// `turbo-client` replaces this list and nothing else outside this module.
 pub(crate) use protomolt_analyzer::{
-    analyze, analyze_dual, normalize_term, phrase_posting_term, unicode_case_fold,
-    AnalysisSpec as NativeSpec, AnalyzedDocument, Glossary, GlossaryEntry, NormalizerStep, Stemmer,
-    TermVectorMode, TermVectorSource, Tokenizer,
+    analyze, analyze_dual, normalize_term, unicode_case_fold, AnalysisSpec as NativeSpec,
+    AnalyzedDocument, Glossary, NormalizerStep, Stemmer, TermVectorMode, TermVectorSource,
+    Tokenizer,
 };
 
 use super::spec::validate_dual_cased_spec;

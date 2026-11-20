@@ -194,17 +194,16 @@ impl<T: Copy> OwnedMatrix<T> {
 impl OwnedMatrix<f32> {
     /// Normalize each non-zero row in place, retaining and recording zero rows.
     pub fn l2_normalize_rows(&mut self) {
+        self.empty_rows.clear();
         for (index, row) in self.data.chunks_exact_mut(self.dim).enumerate() {
             let norm = row
                 .iter()
                 .map(|value| f64::from(*value) * f64::from(*value))
                 .sum::<f64>()
                 .sqrt();
-            if norm == 0.0 {
-                let index = index as u32;
-                if !self.empty_rows.contains(&index) {
-                    self.empty_rows.push(index);
-                }
+            if norm == 0.0 || !norm.is_finite() {
+                row.fill(0.0);
+                self.empty_rows.push(index as u32);
             } else {
                 for value in row {
                     *value = (*value as f64 / norm) as f32;

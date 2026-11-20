@@ -180,7 +180,7 @@ fn manifest_produced_by() -> serde_json::Value {
     })
 }
 
-fn write_bundle_manifest(bundle_dir: &Path, files: &[(&str, &[u8])]) {
+fn write_bundle_manifest(bundle_dir: &Path, normalize: &str, files: &[(&str, &[u8])]) {
     let file_entries: Vec<serde_json::Value> = files
         .iter()
         .map(|(rel, bytes)| {
@@ -207,7 +207,7 @@ fn write_bundle_manifest(bundle_dir: &Path, files: &[(&str, &[u8])]) {
         "embed": {
             "dim": DIM,
             "pooling": "POOLING_MEAN",
-            "normalize": "NORMALIZE_L2",
+            "normalize": normalize,
             "max_seq": MAX_SEQ,
             "max_batch": 16
         },
@@ -247,7 +247,7 @@ fn write_bundle_manifest(bundle_dir: &Path, files: &[(&str, &[u8])]) {
     .unwrap();
 }
 
-fn create_static_fixture(tag: &str) -> TempFixtureDir {
+fn create_static_fixture(tag: &str, normalize: &str) -> TempFixtureDir {
     let fx = TempFixtureDir::new(tag);
     let tokenizer = synthetic_tokenizer_bytes();
     let weights = synthetic_embeddings_bytes();
@@ -261,6 +261,7 @@ fn create_static_fixture(tag: &str) -> TempFixtureDir {
     .unwrap();
     write_bundle_manifest(
         &fx.bundle_dir,
+        normalize,
         &[
             ("reference/reference.safetensors", &reference),
             ("tokenizer.json", &tokenizer),
@@ -282,7 +283,7 @@ fn vector_digest(vector: &[f32]) -> String {
 
 #[test]
 fn static_pooling_pins_f64_native_and_f32_turbo_outputs() {
-    let fx = create_static_fixture("pooling");
+    let fx = create_static_fixture("pooling", "NORMALIZE_L2");
     let native = StaticEmbedder::load(&fx.native_dir).unwrap();
     let turbo = LocalEmbedEngine::open(&fx.bundle_dir, &LocalEncoderOptions::default(), None, None)
         .unwrap();
@@ -310,7 +311,7 @@ fn static_pooling_pins_f64_native_and_f32_turbo_outputs() {
 
 #[test]
 fn static_empty_pooling_is_none_natively_and_zero_rows_in_turbo() {
-    let fx = create_static_fixture("empty");
+    let fx = create_static_fixture("empty", "NORMALIZE_L2");
     let native = StaticEmbedder::load(&fx.native_dir).unwrap();
     let turbo = LocalEmbedEngine::open(&fx.bundle_dir, &LocalEncoderOptions::default(), None, None)
         .unwrap();
@@ -338,7 +339,7 @@ async fn static_bundles_run_through_the_shared_batch_embedder() {
     use pipestream_search::turbo_bridge::{
         BatchEmbedder, EmbedOptions, EmbedRole, LocalBatchEmbedder,
     };
-    let fx = create_static_fixture("batch");
+    let fx = create_static_fixture("batch", "NORMALIZE_NONE");
     let engine =
         LocalEmbedEngine::open(&fx.bundle_dir, &LocalEncoderOptions::default(), None, None)
             .unwrap();
@@ -356,9 +357,34 @@ async fn static_bundles_run_through_the_shared_batch_embedder() {
         let single = engine
             .embed_texts_multires(&[text], EmbedPromptRole::None, &MultiResOptions::default())
             .unwrap();
+        let norm = single
+            .full
+            .data
+            .iter()
+            .map(|&v| f64::from(v).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        if index == 0 {
+            assert!(
+                (norm - 1.0).abs() > 0.01,
+                "fixture must yield a non-unit row"
+            );
+        }
+        let expected: Vec<_> = single
+            .full
+            .data
+            .iter()
+            .map(|&v| {
+                if norm > 0.0 {
+                    (f64::from(v) / norm) as f32
+                } else {
+                    0.0
+                }
+            })
+            .collect();
         assert_eq!(
             vector_digest(batch.view().row(index).unwrap()),
-            vector_digest(&single.full.data),
+            vector_digest(&expected),
             "{text}"
         );
     }
@@ -367,4 +393,42 @@ async fn static_bundles_run_through_the_shared_batch_embedder() {
     let empty = embedder.embed_blocking(&[], EmbedRole::None).unwrap_err();
     assert_eq!(empty.code(), tonic::Code::InvalidArgument);
     assert_eq!(empty.message(), "embed batch is empty");
+}
+
+#[test]
+fn configured_local_provider_serves_the_public_embedding_route() {
+    use pipestream_search::analyzer::{embed_text, embed_texts_with_options};
+    if std::env::var_os("PSEARCH_LOCAL_EMBED_FIXTURE_CHILD").is_some() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let single = embed_text("turbo", "fox").await.unwrap();
+            let matrix = embed_texts_with_options("turbo", &["fox", "zero"], &Default::default())
+                .await
+                .unwrap();
+            assert_eq!(matrix.view().row(0).unwrap(), single);
+            assert_eq!(matrix.empty_rows(), &[1]);
+            assert_eq!(matrix.dim(), DIM);
+        });
+        return;
+    }
+    let fixture = create_static_fixture("production", "NORMALIZE_L2");
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            std::thread::current().name().unwrap(),
+            "--test-threads=2",
+        ])
+        .env("PSEARCH_LOCAL_EMBED_FIXTURE_CHILD", "1")
+        .env("TURBO_EMBED_BUNDLE", fixture.bundle_dir.as_os_str())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        result.status.success() && stdout.contains("1 passed"),
+        "{stdout} {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
 }

@@ -49,12 +49,12 @@ impl EmbedRole {
     }
 }
 
-/// Per-batch embedding options. `call` reaches only remote endpoints.
+/// Per-batch embedding options for the selected provider.
 #[derive(Debug, Clone, Default)]
 pub struct EmbedOptions {
     /// Prompt role for every text in the batch.
     pub role: EmbedRole,
-    /// Scheduling, auth, TLS, deadline, and handshake for a remote call.
+    /// Admission timeout and model pin, plus scheduling and credentials for remote calls.
     pub call: RemoteCallOptions,
 }
 
@@ -72,22 +72,12 @@ pub trait BatchEmbedder: Send + Sync {
 /// [`crate::analyzer::embed_text_with_options`] addresses it.
 #[derive(Debug, Clone)]
 pub struct RemoteBatchEmbedder {
-    addr: String,
+    pub(crate) addr: String,
 }
 
 impl RemoteBatchEmbedder {
     pub fn new(addr: impl Into<String>) -> Self {
         Self { addr: addr.into() }
-    }
-}
-
-impl BatchEmbedder for RemoteBatchEmbedder {
-    fn embed_batch<'a>(
-        &'a self,
-        texts: &'a [&'a str],
-        options: &'a EmbedOptions,
-    ) -> impl Future<Output = Result<OwnedMatrix, Status>> + Send + 'a {
-        crate::analyzer::embed_texts_with_options(&self.addr, texts, options)
     }
 }
 
@@ -106,17 +96,6 @@ pub(crate) fn unit_rows(flat: Vec<f32>, rows: usize, dim: usize) -> Result<Owned
             "turbo-kserve returned {} values for {rows} rows of dimension {dim}",
             flat.len()
         )));
-    }
-    let mut flat = flat;
-    for row in flat.chunks_exact_mut(dim) {
-        let norm = row
-            .iter()
-            .map(|&v| f64::from(v) * f64::from(v))
-            .sum::<f64>()
-            .sqrt();
-        if !norm.is_finite() {
-            row.fill(0.0);
-        }
     }
     let mut matrix = OwnedMatrix::from_flat(flat, dim)?;
     matrix.l2_normalize_rows();
@@ -177,36 +156,52 @@ impl LocalBatchEmbedder {
                 texts.len()
             )));
         }
-        let matrix = OwnedMatrix::from_flat(tier.data, tier.dim as usize)?;
-        let empty = matrix
-            .view()
-            .iter_rows()
-            .enumerate()
-            .filter(|(_, row)| row.iter().all(|v| *v == 0.0))
-            .map(|(index, _)| index as u32)
-            .collect();
-        Ok(matrix.with_empty_rows(empty)?)
+        let mut matrix = OwnedMatrix::from_flat(tier.data, tier.dim as usize)?;
+        matrix.l2_normalize_rows();
+        Ok(matrix)
     }
 }
 
 #[cfg(feature = "local-core")]
+pub(crate) async fn local_permit(
+    timeout: Option<std::time::Duration>,
+) -> Result<tokio::sync::SemaphorePermit<'static>, Status> {
+    static LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+    let acquire = LIMIT.acquire();
+    match timeout {
+        Some(limit) => tokio::time::timeout(limit, acquire)
+            .await
+            .map_err(|_| Status::deadline_exceeded("local embedding capacity wait timed out"))?,
+        None => acquire.await,
+    }
+    .map_err(|_| Status::unavailable("local embedding executor closed"))
+}
+
+#[cfg(feature = "local-core")]
 impl BatchEmbedder for LocalBatchEmbedder {
-    fn embed_batch<'a>(
+    async fn embed_batch<'a>(
         &'a self,
         texts: &'a [&'a str],
         options: &'a EmbedOptions,
-    ) -> impl Future<Output = Result<OwnedMatrix, Status>> + Send + 'a {
-        let owned: Vec<String> = texts.iter().map(|&t| t.to_owned()).collect();
+    ) -> Result<OwnedMatrix, Status> {
+        if texts.is_empty() {
+            return Err(Status::invalid_argument("embed batch is empty"));
+        }
+        if let Some(pin) = &options.call.expected_handshake {
+            pin.verify_bundle(&self.engine.scoring_spec().fingerprint())
+                .map_err(|e| Status::failed_precondition(format!("embedding bundle: {e}")))?;
+        }
+        let permit = local_permit(options.call.timeout).await?;
+        let owned: Vec<String> = texts.iter().map(|&text| text.to_owned()).collect();
         let role = options.role;
         let this = self.clone();
-        async move {
-            tokio::task::spawn_blocking(move || {
-                let texts: Vec<&str> = owned.iter().map(String::as_str).collect();
-                this.embed_blocking(&texts, role)
-            })
-            .await
-            .map_err(|e| Status::internal(format!("local embedding join error: {e}")))?
-        }
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let texts: Vec<&str> = owned.iter().map(String::as_str).collect();
+            this.embed_blocking(&texts, role)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("local embedding join error: {e}")))?
     }
 }
 

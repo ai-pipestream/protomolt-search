@@ -137,3 +137,17 @@ fn empty_rows_must_be_ascending_in_range_and_zero() {
         "empty row 1 is out of order, outside 3 rows, or not zero"
     );
 }
+
+#[test]
+fn repeated_normalization_rebuilds_empty_rows_in_order() {
+    let mut matrix =
+        OwnedMatrix::from_flat(vec![f32::NEG_INFINITY, 1., 3., 4., 0., 0., 1., f32::NAN], 2)
+            .unwrap()
+            .with_empty_rows(vec![2])
+            .unwrap();
+    for _ in 0..2 {
+        matrix.l2_normalize_rows();
+        assert_eq!(matrix.empty_rows(), &[0, 2, 3]);
+        assert_eq!(matrix.data(), &[0., 0., 0.6, 0.8, 0., 0., 0., 0.]);
+    }
+}
