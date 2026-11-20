@@ -72,7 +72,7 @@ impl<L: LinkCells + ?Sized> View<'_, L> {
         let mut outcome = Walk::Completed;
         while let Some(c) = scratch.cand.pop() {
             // The next candidate's list is read on the next hop: fetch it
-            // while this one is scored (#201).
+            // while this one is scored.
             if let Some(next) = scratch.cand.peek() {
                 self.prefetch_links(next.node, search.layer);
             }

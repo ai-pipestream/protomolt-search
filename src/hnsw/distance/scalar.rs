@@ -146,7 +146,7 @@ pub fn prefetch(row: &[f32], lines: usize) {
 /// Hint the cache that the first `lines` cache lines of the `available`
 /// bytes at `bytes` are about to be read.
 #[inline]
-pub fn prefetch_bytes(bytes: *const u8, available: usize, lines: usize) {
+pub(crate) fn prefetch_bytes(bytes: *const u8, available: usize, lines: usize) {
     #[cfg(target_arch = "x86_64")]
     {
         use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
@@ -157,9 +157,9 @@ pub fn prefetch_bytes(bytes: *const u8, available: usize, lines: usize) {
                 break;
             }
             // SAFETY: prefetch is a hint and has no effect on memory
-            // safety, whatever the address; the pointer stays within the
-            // `available` bytes here anyway.
-            unsafe { _mm_prefetch::<_MM_HINT_T0>(bytes.add(at)) };
+            // safety; `wrapping_add` forms the address without the in-bounds
+            // requirement of `add`, so no caller contract is needed.
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(bytes.wrapping_add(at)) };
             at += 64;
         }
     }
@@ -172,9 +172,9 @@ pub fn prefetch_bytes(bytes: *const u8, available: usize, lines: usize) {
             }
             // SAFETY: `prfm pldl2keep` is a read-only architectural cache
             // hint into per-core L2 that never faults and has no effect on
-            // memory safety; `p` stays within the `available` bytes as well.
+            // memory safety; `wrapping_add` needs no in-bounds contract.
             unsafe {
-                let p = bytes.add(at);
+                let p = bytes.wrapping_add(at);
                 core::arch::asm!(
                     "prfm pldl2keep, [{p}]",
                     p = in(reg) p,
