@@ -261,8 +261,7 @@ impl<'a> LinkBuilder<'a> {
             view.search_layer(&search, &[ep], scratch, &mut NoHook, &mut stats);
             let mut pool = std::mem::take(&mut scratch.pool);
             pool.clear();
-            pool.extend(scratch.res.drain().map(|r| r.0));
-            pool.sort_unstable_by(|a, b| b.cmp(a));
+            scratch.res.drain_into(&mut pool);
             if let Some(best) = pool.first() {
                 ep = *best;
             }
