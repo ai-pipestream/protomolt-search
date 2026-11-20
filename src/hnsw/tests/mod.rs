@@ -13,9 +13,11 @@ mod patience;
 mod provider;
 mod regimes;
 mod repair;
+mod search_identity;
 mod streaming;
 mod unlinked;
 mod visit_budget;
+mod walk_identity;
 
 use std::path::PathBuf;
 

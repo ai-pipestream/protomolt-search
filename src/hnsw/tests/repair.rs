@@ -39,7 +39,7 @@ fn two_clusters(dim: usize, half: usize) -> (Vec<f32>, Vec<f32>) {
 }
 
 /// Drop every edge between `0..half` and `half..`, at layer 0 and above.
-fn sever_cross_cluster_links(links: &GraphLinks, half: usize, m: usize) {
+pub(super) fn sever_cross_cluster_links(links: &GraphLinks, half: usize, m: usize) {
     let total = links.level.len();
     let stride0 = 2 * m + 1;
     let stride_up = m + 1;
