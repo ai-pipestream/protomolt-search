@@ -2,10 +2,10 @@
 
 `DENSE_EXECUTION_MODE_AUTO` selects an approximate technique only through
 measured evidence: a version-2 policy, bound to one provider, score space,
-corpus generation and execution shape, that names the request keys at which
-an approximate technique met the policy's recall target against the
-exhaustive selection. Without a qualifying point `AUTO` runs the exhaustive
-technique at the requested precision and reports why in
+corpus generation, hardware profile and execution shape, that names the request
+keys at which an approximate technique met the policy's recall target and
+measured faster than the exhaustive selection. Without a qualifying point `AUTO`
+runs the exhaustive technique at the requested precision and reports why in
 `dense_execution.fallback_reason`. Explicit `BALANCED` and `FAST` never
 consult a policy: they run versioned built-in presets and report
 `policy_qualified = false` with no measured-recall claim
@@ -23,8 +23,10 @@ fails startup by name:
 
 - `format_version` must be `2`; the version-1 TOML schema is refused at load.
 - `policy_id`, `embedding_model`, `provider_backend`,
-  `scoring_fingerprint` and `corpus_fingerprint` are non-empty (after
-  trimming); `corpus_rows`, `dimensions` and `measured_queries` are positive;
+  `scoring_fingerprint`, `corpus_fingerprint` and `hardware_fingerprint`
+  are non-empty (after trimming); `corpus_rows`, `dimensions`,
+  `measured_queries` and `node_count` are positive; `hosts` lists `node_count`
+  profiled `DenseHostProfile` entries matching `hardware_fingerprint`;
   `deleted_docs <= corpus_rows`; `target_recall_ppm` is in `1..=1000000`.
 - Every point names `mode` (`BALANCED` or `FAST`), `technique`
   (`HNSW_WALK` or `BITPLANE_STAGED`), `selection_precision` and
@@ -32,7 +34,9 @@ fails startup by name:
   `ENUMERATE_SMALL` on `HNSW_WALK`; `DEFAULT` on `BITPLANE_STAGED`), and
   `shape` (`UNARY` or `STREAMING`, with `BITPLANE_STAGED` restricted to
   `UNARY`), plus `1 <= k <= candidates <= corpus_rows`, a selectivity band
-  inside `1..=1000000` ppm, and `measured_recall_ppm` in `1..=1000000`.
+  inside `1..=1000000` ppm, `measured_recall_ppm` in `1..=1000000`, and both
+  techniques' measured latency (`approximate_p50_us`/`p99_us`,
+  `exhaustive_p50_us`/`p99_us`) and positive finite QPS.
 - Filtered `HNSW_WALK` points under `ENUMERATE_SMALL` pin
   `enumerate_max_rows <= corpus_rows`; unfiltered points leave
   `enumerate_max_rows` unset, `UNARY` points forbid `finish_settle_us`, and
@@ -45,17 +49,19 @@ fails startup by name:
 
 ## How AUTO resolves
 
-1. **Live identity & restart drift.** The policy's identity (`provider_backend`,
-   `scoring_fingerprint`, `corpus_generation`, `corpus_rows`, `deleted_docs`,
-   `corpus_fingerprint`, and `dimensions`) is checked against the live fleet.
-   `corpus_fingerprint` hashes each shard's `num_vectors`, `deleted_docs`,
-   `wal_generation`, `wal_high_watermark`, `stats_epoch`, and non-empty
-   per-process `stats_incarnation` (peers reporting an empty
-   `stats_incarnation` fail preflight). Because `stats_incarnation` is
-   generated per process start, any node or relay restart—like an append,
-   tombstone, replacement, or same-row-count snapshot swap—invalidates
-   installed policies and fails `AUTO` closed to `EXHAUSTIVE`, disclosing the
-   drifted field in `dense_execution.fallback_reason`, incrementing
+1. **Live identity, hardware & restart drift.** The policy's corpus and
+   hardware identity (`provider_backend`, `scoring_fingerprint`,
+   `corpus_generation`, `corpus_rows`, `deleted_docs`, `corpus_fingerprint`,
+   `dimensions`, and `hardware_fingerprint` over the per-shard CPU/SIMD/core
+   profile) is checked against the live fleet. `corpus_fingerprint` hashes each
+   shard's `num_vectors`, `deleted_docs`, `wal_generation`,
+   `wal_high_watermark`, `stats_epoch`, and non-empty per-process
+   `stats_incarnation` (peers reporting an empty `stats_incarnation` fail
+   preflight). Because `stats_incarnation` is generated per process start, any
+   node or relay restart—like an append, tombstone, replacement, snapshot swap,
+   or hardware mismatch—invalidates installed policies and fails `AUTO` closed
+   to `EXHAUSTIVE`, disclosing the drifted field in
+   `dense_execution.fallback_reason`, incrementing
    `turbovec_dense_policy_drift_total`, and writing a warning to stderr via
    `eprintln!` until a fresh policy is generated (refusing only when the
    provider has no exhaustive technique).
@@ -69,10 +75,12 @@ fails startup by name:
    `--stream-search`/finish-window scans and `DECOMPOSED` composite scans;
    `UNARY` on single-leaf unary scans and `RRF`/`SCORE_BLEND`/`CASCADE`
    composite leg rounds) match the request, any explicit `selection_k` equals
-   `candidates`, and `measured_recall_ppm >= target_recall_ppm`. Among
-   qualifying points the fewest `candidates` wins, then `FAST` before
-   `BALANCED`. Nothing is interpolated across keys, precisions, routings, or
-   shapes.
+   `candidates`, `measured_recall_ppm >= target_recall_ppm`, **and** its
+   approximate technique measured faster than the exhaustive one
+   (`approximate_p50_us < exhaustive_p50_us`). Among qualifying points the
+   fastest p50 wins, then fewest `candidates`, then `FAST` before `BALANCED`.
+   Nothing is interpolated across keys, precisions, routings, shapes, or
+   hardware.
 4. **Live capability drift.** The live fleet must advertise every capability
    the qualifying point requires (`walks`, `staged_top_k`, `mask_enumeration`,
    `patience_early_stop`, `candidate_stream`, `floor_pruning`, matching native
@@ -113,3 +121,28 @@ holds at least `32,768` eligible rows; after sealing a segment, staging stays
 off until the tail regrows past `32,768` rows. Staged selection is `UNARY`
 only: streaming coordinators do not advertise it, and nodes refuse it on the
 streaming route.
+
+## optimize()
+
+`SearchService.OptimizeDensePolicy` (Admin; `examples/dense_optimize.rs` is
+the CLI) measures a homogeneous shard fleet under a single-flight guard and
+produces the policy:
+
+- **Sample.** Supply representative held-out sample query vectors at the
+  fleet's dimension (at least 64 queries is recommended, as each cell
+  qualifies on worst-query recall).
+- **Sweep.** For each deduplicated `k` band (default 10, 100, 1,000 and
+  10,000 within `max_k.min(corpus_rows)`), the coordinator executes its own
+  `Query` route (`ExhaustiveCertified` verified on truth baselines) and
+  measures each approximate technique at depths `k`, `2k`, `4k` and `8k`.
+  On quantized providers with exact-vector sidecars, both `QUANTIZED` and
+  reranked `FP32` output points are measured and emitted.
+- **Bound & Recheck.** `max_runtime_ms` bounds fleet discovery, every
+  in-flight `Query` RPC, cell scoring, and post-sweep verification; incomplete
+  cells are discarded and `truncated = true` is reported. Before installing or
+  returning, `LiveIdentity` and normalized shard `DenseHostProfile`s are
+  re-verified and abort if concurrent mutations or hardware changes occurred
+  mid-sweep.
+- **Install.** With `install`, the coordinator persists the policy in a
+  blocking worker and swaps the serving `Arc` atomically under its
+  `--dense-execution-policy` slot.

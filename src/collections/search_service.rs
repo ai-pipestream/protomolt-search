@@ -170,4 +170,5 @@ search_service_over_collections! {
     suggest [Search]: SuggestRequest => SuggestResponse,
     plan_placement [Admin]: PlanPlacementRequest => PlanPlacementResponse,
     term_suggest [Search]: TermSuggestRequest => TermSuggestResponse,
+    optimize_dense_policy [Admin]: OptimizeDensePolicyRequest => OptimizeDensePolicyResponse,
 }

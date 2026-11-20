@@ -160,6 +160,11 @@ fn fake_policy(fingerprint: &str, corpus_fp: &str, generation: u64) -> Vec<u8> {
         dimensions: DIM as u32,
         measured_queries: 16,
         target_recall_ppm: 950_000,
+        hardware_fingerprint: pipestream_search::dense_policy::fleet_fingerprint(&[
+            pipestream_search::dense_policy::local_host_profile(),
+        ]),
+        node_count: 2,
+        hosts: Vec::new(),
         points: vec![DensePolicyPoint {
             k: 3,
             filter_selectivity_ppm_min: 1_000_000,
@@ -172,6 +177,12 @@ fn fake_policy(fingerprint: &str, corpus_fp: &str, generation: u64) -> Vec<u8> {
             output_precision: DenseScorePrecision::Quantized as i32,
             filter_strategy: DenseFilterStrategy::Speed as i32,
             shape: DenseExecutionShape::Unary as i32,
+            approximate_p50_us: 10,
+            approximate_p99_us: 20,
+            exhaustive_p50_us: 100,
+            exhaustive_p99_us: 200,
+            approximate_qps: 1000.0,
+            exhaustive_qps: 100.0,
             ..Default::default()
         }],
     }
@@ -297,8 +308,10 @@ async fn balanced_discloses_its_fallback_and_fast_never_substitutes() {
         .unwrap();
     assert_eq!(hit_bits(&balanced), hit_bits(&exhaustive));
     let outcome = balanced.dense_execution.unwrap();
-    assert_eq!(outcome.requested_mode, Mode::Balanced as i32);
-    assert_eq!(outcome.resolved_mode, Mode::Exhaustive as i32);
+    assert_eq!(
+        (outcome.requested_mode, outcome.resolved_mode),
+        (Mode::Balanced as i32, Mode::Exhaustive as i32)
+    );
     assert_eq!(outcome.coverage, DenseCoverage::ExhaustiveCertified as i32);
     assert!(
         outcome.fallback_reason.contains("same precision"),

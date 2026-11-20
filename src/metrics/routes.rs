@@ -55,6 +55,7 @@ pub enum Route {
     ClusterHealth,
     BroadcastVectorBackend,
     VariantSearch,
+    OptimizeDensePolicy,
     // Cluster control routes.
     RegisterNode,
     RenewNodeLease,
@@ -150,6 +151,7 @@ pub(super) const REQUEST_ROUTES: [(Route, &str, bool); 74] = [
         false,
     ),
     (Route::VariantSearch, "variant_search", false),
+    (Route::OptimizeDensePolicy, "optimize_dense_policy", false),
     (Route::RegisterNode, "register_node", false),
     (Route::RenewNodeLease, "renew_node_lease", false),
     (Route::DrainNode, "drain_node", false),

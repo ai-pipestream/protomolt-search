@@ -13,12 +13,9 @@ mod raw;
 mod receipt;
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-use plan::{HNSW_BALANCED, HNSW_FAST};
-
 pub(crate) use plan::{
-    output_precision, parse_request, resolve, DenseExecutionError, DenseRequest, ProviderCaps,
-    ResolvedDensePlan, Route,
+    output_precision, parse_request, resolve, DenseExecutionError, DenseRequest, Preset,
+    ProviderCaps, ResolvedDensePlan, Route, HNSW_BALANCED, HNSW_FAST,
 };
 pub(crate) use qualified::qualified;
 pub(crate) use raw::{validate_raw_controls, RawDenseControls};

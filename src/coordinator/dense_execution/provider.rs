@@ -23,6 +23,8 @@ pub(super) struct DenseProviderFacts {
     pub(super) deleted_docs: u64,
     pub(super) generation: u64,
     pub(super) corpus_fingerprint: String,
+    /// Each shard's host, in node order (empty for an unprofiled shard).
+    pub(super) hosts: Vec<crate::pb::DenseHostProfile>,
 }
 
 impl DenseProviderFacts {
@@ -58,12 +60,18 @@ impl DenseProviderFacts {
             deleted_docs: 0,
             generation: identity.topology_generation,
             corpus_fingerprint: corpus_hash.finish().to_hex(),
+            hosts: Vec::new(),
         }
     }
 
     /// Whether the provider proves exhaustive native scoring and completion.
     pub(super) fn exact_available(&self) -> bool {
         self.quality == crate::pb::VectorQualityContract::ExhaustiveNativeScore && self.exhaustive
+    }
+
+    /// The fleet's hardware fingerprint (`dense_policy::fleet_fingerprint`).
+    pub(super) fn hardware_fingerprint(&self) -> String {
+        crate::dense_policy::fleet_fingerprint(&self.hosts)
     }
 
     /// Whether the provider exposes a configured approximate traversal.
@@ -92,6 +100,7 @@ struct ShardFactsFold {
     rows: u64,
     deleted_docs: u64,
     corpus_hash: turbo_sha256::Sha256,
+    hosts: Vec<crate::pb::DenseHostProfile>,
 }
 
 impl ShardFactsFold {
@@ -115,6 +124,7 @@ impl ShardFactsFold {
             rows: 0,
             deleted_docs: 0,
             corpus_hash,
+            hosts: Vec::new(),
         }
     }
 
@@ -215,6 +225,7 @@ impl ShardFactsFold {
             deleted_docs: self.deleted_docs,
             generation,
             corpus_fingerprint: self.corpus_hash.finish().to_hex(),
+            hosts: self.hosts,
         }
     }
 }
@@ -297,6 +308,7 @@ impl CoordinatorServiceImpl {
             let (addr, backend) = task.await.map_err(|error| {
                 Status::internal(format!("dense execution preflight failed: {error}"))
             })??;
+            fold.hosts.push(backend.host.clone().unwrap_or_default());
             fold.rows = fold
                 .rows
                 .checked_add(backend.num_vectors)

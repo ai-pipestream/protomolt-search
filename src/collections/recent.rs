@@ -155,6 +155,7 @@ impl RecentFields for BroadcastVectorBackendResponse {}
 impl RecentFields for FreezeTopologyWritesResponse {}
 impl RecentFields for PublishTopologyResponse {}
 impl RecentFields for AbortTopologyCutoverResponse {}
+impl RecentFields for OptimizeDensePolicyResponse {}
 
 impl RequestK for PhraseSearchRequest {}
 impl RequestK for AggregateRequest {}
@@ -165,6 +166,7 @@ impl RequestK for BroadcastVectorBackendRequest {}
 impl RequestK for FreezeTopologyWritesRequest {}
 impl RequestK for PublishTopologyRequest {}
 impl RequestK for AbortTopologyCutoverRequest {}
+impl RequestK for OptimizeDensePolicyRequest {}
 impl RequestK for ClusterHealthRequest {}
 // `limit` is not a `k`: it is capped absolutely at MAX_SUGGEST_LIMIT,
 // so only the concurrency quota applies.

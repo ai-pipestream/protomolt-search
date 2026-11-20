@@ -45,13 +45,13 @@ use crate::pb::{
     CollectionHealth, CompletePlacementActionRequest, DescribeSchemaRequest,
     DescribeSchemaResponse, DrainNodeRequest, FreezeTopologyWritesRequest,
     FreezeTopologyWritesResponse, GetClusterPlanRequest, HybridSearchRequest, HybridSearchResponse,
-    NodeLease, PhraseSearchRequest, PlanBalanceRequest, PlanBalanceResponse, PlanIndexRequest,
-    PlanIndexResponse, PlanPlacementRequest, PlanPlacementResponse, PublishTopologyRequest,
-    PublishTopologyResponse, QueryRequest, QueryResponse, QueryStreamRequest,
-    ReconcileClusterRequest, RegisterNodeRequest, RenewNodeLeaseRequest, ReportShardRequest,
-    RollbackClusterRequest, RoutedIngestMappedRequest, RoutedIngestMappedResponse, SearchRequest,
-    SearchResponse, SuggestRequest, SuggestResponse, TermSuggestRequest, TermSuggestResponse,
-    VariantSearchRequest, VariantSearchResponse,
+    NodeLease, OptimizeDensePolicyRequest, OptimizeDensePolicyResponse, PhraseSearchRequest,
+    PlanBalanceRequest, PlanBalanceResponse, PlanIndexRequest, PlanIndexResponse,
+    PlanPlacementRequest, PlanPlacementResponse, PublishTopologyRequest, PublishTopologyResponse,
+    QueryRequest, QueryResponse, QueryStreamRequest, ReconcileClusterRequest, RegisterNodeRequest,
+    RenewNodeLeaseRequest, ReportShardRequest, RollbackClusterRequest, RoutedIngestMappedRequest,
+    RoutedIngestMappedResponse, SearchRequest, SearchResponse, SuggestRequest, SuggestResponse,
+    TermSuggestRequest, TermSuggestResponse, VariantSearchRequest, VariantSearchResponse,
 };
 use crate::security::{Guarded, MeteredIngest, Permit, Principal, Principals};
 

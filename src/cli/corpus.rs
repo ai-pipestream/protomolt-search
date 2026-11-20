@@ -200,15 +200,25 @@ fn with_tuning(
         coordinator = coordinator.with_synonyms(table);
     }
     if let Some(path) = dataset.dense_execution_policy {
-        let policy = pipestream_search::dense_policy::DenseExecutionPolicy::load(path)?;
-        eprintln!(
-            "dense execution policy: {} ({}, {} measured queries, {} points)",
-            path.display(),
-            policy.policy_id(),
-            policy.measured_queries(),
-            policy.points().len()
-        );
-        coordinator = coordinator.with_dense_execution_policy(policy);
+        // A path without a file yet is where OptimizeDensePolicy installs one.
+        let policy = if path.exists() {
+            let policy = pipestream_search::dense_policy::DenseExecutionPolicy::load(path)?;
+            eprintln!(
+                "dense execution policy: {} ({}, {} measured queries, {} points)",
+                path.display(),
+                policy.policy_id(),
+                policy.measured_queries(),
+                policy.points().len()
+            );
+            Some(policy)
+        } else {
+            eprintln!(
+                "dense execution policy: {} (none yet; OptimizeDensePolicy installs one)",
+                path.display()
+            );
+            None
+        };
+        coordinator = coordinator.with_dense_execution_policy_at(path.to_path_buf(), policy);
     }
     Ok(coordinator)
 }

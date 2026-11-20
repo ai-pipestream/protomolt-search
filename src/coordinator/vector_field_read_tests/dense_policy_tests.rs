@@ -15,8 +15,45 @@ fn doc_view_policy_point(band: u32, candidates: u32, recall: u32) -> crate::pb::
         output_precision: crate::pb::DenseScorePrecision::Quantized as i32,
         filter_strategy: crate::pb::DenseFilterStrategy::Speed as i32,
         shape: crate::pb::DenseExecutionShape::Unary as i32,
+        approximate_p50_us: 10,
+        approximate_p99_us: 20,
+        exhaustive_p50_us: 100,
+        exhaustive_p99_us: 200,
+        approximate_qps: 1000.0,
+        exhaustive_qps: 100.0,
         ..Default::default()
     }
+}
+
+fn build_doc_view_policy(
+    fingerprint: String,
+    live: &crate::dense_policy::LiveIdentity,
+) -> crate::dense_policy::DenseExecutionPolicy {
+    let host = crate::dense_policy::local_host_profile();
+    crate::dense_policy::DenseExecutionPolicy::from_document(
+        crate::pb::DenseExecutionPolicyDocument {
+            format_version: crate::dense_policy::FORMAT_VERSION,
+            policy_id: "document-view".into(),
+            embedding_model: "test".into(),
+            provider_backend: "fake-ann".into(),
+            scoring_fingerprint: fingerprint,
+            corpus_generation: live.corpus_generation,
+            corpus_rows: live.corpus_rows,
+            deleted_docs: live.deleted_docs,
+            corpus_fingerprint: live.corpus_fingerprint.clone(),
+            dimensions: 16,
+            measured_queries: 20,
+            target_recall_ppm: 950_000,
+            hardware_fingerprint: crate::dense_policy::fleet_fingerprint(&[host]),
+            node_count: 1,
+            hosts: Vec::new(),
+            points: vec![
+                doc_view_policy_point(1_000_000, 1, 990_000),
+                doc_view_policy_point(500_000, 2, 980_000),
+            ],
+        },
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -31,28 +68,7 @@ async fn auto_ann_qualifies_the_document_view_instead_of_the_unfiltered_point() 
     };
     let probe = CoordinatorServiceImpl::with_local_nodes(vec![node]);
     let live = probe.live_dense_identity().await.unwrap();
-    let policy = crate::dense_policy::DenseExecutionPolicy::from_document(
-        crate::pb::DenseExecutionPolicyDocument {
-            format_version: crate::dense_policy::FORMAT_VERSION,
-            policy_id: "document-view".into(),
-            embedding_model: "test".into(),
-            provider_backend: "fake-ann".into(),
-            scoring_fingerprint: fingerprint,
-            corpus_generation: live.corpus_generation,
-            corpus_rows: live.corpus_rows,
-            deleted_docs: live.deleted_docs,
-            corpus_fingerprint: live.corpus_fingerprint,
-            dimensions: 16,
-            measured_queries: 20,
-            target_recall_ppm: 950_000,
-            points: vec![
-                doc_view_policy_point(1_000_000, 1, 990_000),
-                doc_view_policy_point(500_000, 2, 980_000),
-            ],
-        },
-    )
-    .unwrap();
-    let owner = probe.with_dense_execution_policy(policy);
+    let owner = probe.with_dense_execution_policy(build_doc_view_policy(fingerprint, &live));
     let key = DenseRequestKey {
         k: 1,
         candidate_depth: 0,

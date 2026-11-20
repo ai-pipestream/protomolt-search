@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use common::{start_node, unit_vectors};
 use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
 use pipestream_search::coordinator::CoordinatorServiceImpl;
-use pipestream_search::dense_policy::{DenseExecutionPolicy, LiveIdentity};
+use pipestream_search::dense_policy::{
+    fleet_fingerprint, local_host_profile, DenseExecutionPolicy, LiveIdentity,
+};
 use pipestream_search::hnsw::{HnswConfig, HNSW};
 use pipestream_search::metrics::dense_policy_drift_total;
 use pipestream_search::node::NodeConfig;
@@ -183,6 +185,12 @@ fn graph_policy(
         output_precision: DenseScorePrecision::Fp32 as i32,
         filter_strategy: DenseFilterStrategy::Speed as i32,
         shape: shape as i32,
+        approximate_p50_us: 10,
+        approximate_p99_us: 20,
+        exhaustive_p50_us: 100,
+        exhaustive_p99_us: 200,
+        approximate_qps: 1000.0,
+        exhaustive_qps: 100.0,
         ..Default::default()
     };
     DenseExecutionPolicy::from_document(DenseExecutionPolicyDocument {
@@ -198,6 +206,9 @@ fn graph_policy(
         dimensions: live.dimensions,
         measured_queries: 16,
         target_recall_ppm: 950_000,
+        hardware_fingerprint: fleet_fingerprint(&[local_host_profile()]),
+        node_count: 1,
+        hosts: Vec::new(),
         points: vec![
             point(DenseExecutionShape::Unary),
             point(DenseExecutionShape::Streaming),

@@ -20,6 +20,12 @@ fn point(k: u32, candidates: u32, recall: u32) -> DensePolicyPoint {
         output_precision: Precision::Fp32 as i32,
         filter_strategy: Strategy::EnumerateSmall as i32,
         shape: Shape::Unary as i32,
+        approximate_p50_us: 10,
+        approximate_p99_us: 20,
+        exhaustive_p50_us: 100,
+        exhaustive_p99_us: 200,
+        approximate_qps: 1000.0,
+        exhaustive_qps: 100.0,
         ..Default::default()
     }
 }
@@ -39,6 +45,9 @@ fn document(points: Vec<DensePolicyPoint>) -> DenseExecutionPolicyDocument {
         measured_queries: 32,
         target_recall_ppm: 950_000,
         points,
+        hardware_fingerprint: "hw".into(),
+        node_count: 1,
+        hosts: Vec::new(),
     }
 }
 
@@ -93,6 +102,15 @@ fn malformed_header_cases() -> Vec<(Mutation, &'static str)> {
             Box::new(|d| d.corpus_fingerprint = "\t ".into()),
             "corpus_fingerprint",
         ),
+        (
+            Box::new(|d| d.hardware_fingerprint = "  ".into()),
+            "hardware_fingerprint",
+        ),
+        (
+            Box::new(|d| d.hosts = vec![local_host_profile()]),
+            "hardware_fingerprint",
+        ),
+        (Box::new(|d| d.points[0].approximate_qps = 0.0), "qps"),
         (Box::new(|d| d.deleted_docs = 1001), "deleted_docs"),
         (Box::new(|d| d.target_recall_ppm = 0), "target_recall_ppm"),
         (Box::new(|d| d.points.clear()), "at least one point"),
@@ -302,6 +320,61 @@ fn qualification_binds_every_key_field_and_the_recall_target() {
             "{unqualified:?}"
         );
     }
+}
+
+#[test]
+fn a_point_that_meets_recall_but_measured_slower_routes_to_exhaustive() {
+    let mut slow = point(10, 40, 990_000);
+    slow.approximate_p50_us = 150;
+    slow.approximate_p99_us = 300;
+    let mut fewer_but_slower = point(10, 20, 990_000);
+    fewer_but_slower.approximate_p50_us = 60;
+    fewer_but_slower.approximate_p99_us = 90;
+    let mut deeper_but_faster = point(10, 80, 990_000);
+    deeper_but_faster.approximate_p50_us = 15;
+    deeper_but_faster.approximate_p99_us = 30;
+    let policy = DenseExecutionPolicy::from_document(document(vec![slow])).unwrap();
+    let Qualification::Unqualified(reason) = policy.qualify(key(10, 0, UNFILTERED_PPM)) else {
+        panic!("slower than exhaustive")
+    };
+    assert!(reason.contains("faster"), "{reason}");
+    let policy =
+        DenseExecutionPolicy::from_document(document(vec![fewer_but_slower, deeper_but_faster]))
+            .unwrap();
+    let Qualification::Qualified(hit) = policy.qualify(key(10, 0, UNFILTERED_PPM)) else {
+        panic!("qualifies")
+    };
+    assert_eq!(
+        hit.point.candidates, 80,
+        "fastest p50 (15 us) wins over fewer candidates (20 at 60 us)"
+    );
+}
+
+#[test]
+fn concurrent_slot_installs_keep_serving_and_persisted_fingerprints_identical() {
+    use std::sync::Arc;
+    let dir = std::env::temp_dir().join(format!("dense-slot-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("policy.binpb");
+    let slot = Arc::new(PolicySlot::new(None, Some(path.clone())));
+    std::thread::scope(|scope| {
+        for depth in [20u32, 40, 60, 80] {
+            let slot = Arc::clone(&slot);
+            scope.spawn(move || {
+                for i in 0..8u32 {
+                    let mut doc = document(vec![point(10, depth + i, 990_000)]);
+                    doc.policy_id = format!("slot-{depth}-{i}");
+                    let policy = DenseExecutionPolicy::from_document(doc).unwrap();
+                    slot.install(policy).unwrap();
+                }
+            });
+        }
+    });
+    let serving = slot.current().unwrap();
+    let reloaded = DenseExecutionPolicy::load(&path).unwrap();
+    assert_eq!(serving.fingerprint(), reloaded.fingerprint());
+    assert_eq!(serving.document(), reloaded.document());
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
