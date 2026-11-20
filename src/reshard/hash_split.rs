@@ -100,7 +100,7 @@ impl<'a> SplitRequest<'a> {
 /// `[i*bucket_count/n, (i+1)*bucket_count/n)`, replays only those files,
 /// and its hash range is exactly those buckets. A finer split
 /// (`n > bucket_count`) re-partitions every record by
-/// `bucket_of(id, n)` — correct but slower; the WAL bucket count
+/// `bucket_of(id, n)`: correct but slower; the WAL bucket count
 /// caps cheap split granularity.
 ///
 /// All inputs must carry byte-identical provider configurations and one bucket
