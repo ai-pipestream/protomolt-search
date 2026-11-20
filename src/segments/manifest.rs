@@ -89,7 +89,6 @@ pub struct SegmentMetadata {
     pub live_docs: SegmentArtifact,
     /// Optional per-segment column summary used as a pruning accelerator;
     /// segments with `None` remain unpruned and are always scanned.
-    #[serde(default)]
     pub summary: Option<SegmentSummary>,
 }
 
