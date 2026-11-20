@@ -29,12 +29,10 @@ use std::collections::{BTreeSet, HashSet};
 crate::domain_error::domain_error! {
     /// Why a document's derived columns were refused, converted to
     /// transport status only at the RPC edge.
-    #[derive(Debug, Clone)]
     pub enum DerivedError {
         InvalidArgument => invalid_argument,
         FailedPrecondition => failed_precondition,
     }
-    foreign: Timestamp
 }
 
 /// Domain separator of the declaration fingerprint. Bumped only when

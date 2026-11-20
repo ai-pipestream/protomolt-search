@@ -11,7 +11,7 @@
 
 mod common;
 
-use pipestream_search::mapping::derive_plan;
+use pipestream_search::mapping::{derive_plan, MappingError};
 use pipestream_search::pb::{hints, ColumnFamily, MappedKind, MappedRole};
 use prost::Message as _;
 use prost_types::field_descriptor_proto::{Label, Type};
@@ -544,7 +544,7 @@ fn a_chunked_plan_scopes_vector_and_chunk_id() {
 fn expect_refusal(set: &[u8], message_type: &str, needle: &str) {
     let status =
         derive_plan(set, message_type).expect_err("this derivation must refuse rather than guess");
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(matches!(status, MappingError::InvalidArgument(_)));
     assert!(
         status.message().contains(needle),
         "the refusal must name the problem; wanted {needle:?} in: {}",

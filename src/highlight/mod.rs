@@ -45,7 +45,6 @@ pub const MAX_CHARS: u32 = 4096;
 
 crate::domain_error::domain_error! {
     /// A compact domain error, converted to transport status only at the edge.
-    #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum HighlightError {
         InvalidArgument => invalid_argument,
         Internal => internal,

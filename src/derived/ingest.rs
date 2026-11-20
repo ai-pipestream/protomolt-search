@@ -43,7 +43,7 @@ fn scalar_env(doc: &AddDocumentsRequest, env: &mut IngestEnv) -> Result<(), Deri
             )));
         };
         let micros = crate::node::timestamp_to_epoch_micros(&tv.field, instant)
-            .map_err(DerivedError::foreign)?;
+            .map_err(|err| DerivedError::invalid_argument(err.message()))?;
         if env.integers.insert(tv.field.clone(), micros).is_some() {
             return Err(DerivedError::invalid_argument(format!(
                 "integer field {:?} repeats in one document (integers and timestamps name \

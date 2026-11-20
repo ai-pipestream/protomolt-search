@@ -16,7 +16,7 @@ use pipestream_search::coordinator::CoordinatorServiceImpl;
 use pipestream_search::harness::{
     fit_calibration, start_empty_node, start_opened_node, unit_vectors,
 };
-use pipestream_search::mapping::derive_plan;
+use pipestream_search::mapping::{derive_plan, MappingError};
 use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_client::SearchServiceClient;
@@ -1993,7 +1993,7 @@ fn timestamp_projection_rejects_incompatible_named_descriptors() {
         // and described, but their name must not confer Timestamp projection.
         describe_schema(&bytes, "law.v1.Case").unwrap();
         let error = derive_plan(&bytes, "law.v1.Case").expect_err("invalid Timestamp shape");
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(matches!(error, MappingError::InvalidArgument(_)));
         assert!(error.message().contains("created_at"), "{change}: {error}");
         assert!(error.message().contains("Timestamp"), "{change}: {error}");
     }
@@ -2072,7 +2072,7 @@ fn timestamp_projection_validates_instants_and_preserves_message_presence() {
             .extract(&wire)
             .err()
             .expect("invalid Timestamp instant");
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(matches!(error, MappingError::InvalidArgument(_)));
         assert!(error.message().contains("created_at"), "{error}");
     }
 }

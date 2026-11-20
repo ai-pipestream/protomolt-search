@@ -154,7 +154,7 @@ fn project_timestamp(path: &str, v: &DynamicMessage) -> Result<Slot, MappingErro
         .and_then(|v| v.as_i32())
         .ok_or_else(|| refuse_at(path, "Timestamp nanos does not match its descriptor"))?;
     crate::protobuf::validate_timestamp(path, &prost_types::Timestamp { seconds, nanos })
-        .map_err(MappingError::foreign)?;
+        .map_err(|err| MappingError::invalid_argument(err.message()))?;
 
     Ok(Slot::Ts { seconds, nanos })
 }

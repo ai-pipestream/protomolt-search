@@ -344,10 +344,8 @@ pub use self::validate::validate_filter;
 crate::domain_error::domain_error! {
     /// Why a wire filter tree was refused, converted to transport status
     /// only at the RPC edge.
-    #[derive(Debug, Clone)]
     pub enum FilterError {
         InvalidArgument => invalid_argument,
     }
-    foreign: Geo
 }
 pub use self::walk::{edge_of, leaf_count, walk_leaves, LeafRef};

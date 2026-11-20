@@ -100,7 +100,7 @@ fn validate_leaf(leaf: &crate::pb::filter_expr::Expr) -> Result<(), FilterError>
         Expr::Has(p) => named(&p.column, "has"),
         Expr::Geo(g) => crate::node::validate_geo_filter(g)
             .map(|_| ())
-            .map_err(FilterError::foreign),
+            .map_err(|err| FilterError::invalid_argument(err.message())),
         Expr::StringRange(p) | Expr::MapStringRange(p) => validate_string_range(p),
         Expr::StringPrefix(p) | Expr::MapStringPrefix(p) => validate_string_prefix(p),
     }

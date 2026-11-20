@@ -52,7 +52,6 @@ pub use types::{CmpOp, Op, ResolvedValue, Val, ValueType};
 crate::domain_error::domain_error! {
     /// Why a value expression or projection was refused, converted to
     /// transport status only at the RPC edge.
-    #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum ValuesError {
         InvalidArgument => invalid_argument,
         FailedPrecondition => failed_precondition,

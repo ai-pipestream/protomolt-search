@@ -393,7 +393,7 @@ async fn unsigned_filters_agree_across_monolithic_distributed_and_segmented_sear
 #[test]
 fn unsigned_literals_and_fanout_bounds_keep_their_domain() {
     use pipestream_search::{
-        cel::compile_filter,
+        cel::{compile_filter, CelError},
         pb,
         placement::{impossible_under, ColumnBounds},
     };
@@ -417,7 +417,7 @@ fn unsigned_literals_and_fanout_bounds_keep_their_domain() {
         ("u == 1e2u", "uint suffix"),
     ] {
         let error = compile_filter(text).unwrap_err();
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(matches!(error, CelError::InvalidArgument(_)));
         assert!(error.message().contains(reason), "{text}: {error}");
     }
     for (left, right, impossible) in [

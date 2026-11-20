@@ -1,7 +1,7 @@
 mod common;
 
 use pipestream_search::{
-    mapping::{derive_plan, Extractor},
+    mapping::{derive_plan, Extractor, MappingError},
     pb,
 };
 use prost::Message;
@@ -229,7 +229,7 @@ fn ambiguous_column_names_refuse_during_planning() {
         ),
     ] {
         let error = derive_plan(DESCRIPTOR, kind).unwrap_err();
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(matches!(error, MappingError::InvalidArgument(_)));
         assert!(
             error.message().contains(left)
                 && error.message().contains(right)

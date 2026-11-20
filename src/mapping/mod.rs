@@ -93,13 +93,12 @@ const FINGERPRINT_VERSION: &str = "pipestream-search.plan.v3";
 crate::domain_error::domain_error! {
     /// Why a mapping, plan, or projection was refused, converted to
     /// transport status only at the RPC edge.
-    #[derive(Debug, Clone)]
     pub enum MappingError {
         InvalidArgument => invalid_argument,
         Internal => internal,
+        FailedPrecondition => failed_precondition,
         ResourceExhausted => resource_exhausted,
     }
-    foreign: Foreign
 }
 
 /// One refusal, uniformly shaped: every message begins `plan: `.

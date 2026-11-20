@@ -26,7 +26,8 @@ pub(super) fn derive(
     let canonical = pb::IndexDefinition {
         projections: projections.into_values().cloned().collect(),
     };
-    crate::index_contract::validate_definition(&canonical).map_err(MappingError::foreign)?;
+    crate::index_contract::validate_definition(&canonical)
+        .map_err(|err| MappingError::invalid_argument(err.message()))?;
     Ok((fields, canonical))
 }
 

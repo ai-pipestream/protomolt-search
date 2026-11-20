@@ -7,7 +7,7 @@ use pipestream_search::{
     analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND},
     harness::embedded_backend_request,
     index_contract::decode as decode_contract,
-    mapping::{derive_plan, derive_plan_with_definition, Extractor},
+    mapping::{derive_plan, derive_plan_with_definition, Extractor, MappingError},
     node::{self, Layout, NodeConfig},
     pb,
     postings::Bm25Reader,
@@ -363,7 +363,7 @@ fn floating_map_projection_keeps_zero_and_refuses_nonfinite_values() {
                 assert_eq!(row.map_numerics[0].value.to_bits(), number.to_bits());
             } else {
                 let error = result.err().unwrap();
-                assert_eq!(error.code(), tonic::Code::InvalidArgument);
+                assert!(matches!(error, MappingError::InvalidArgument(_)));
                 assert!(error.message().contains("finite"));
             }
         }
@@ -600,7 +600,7 @@ fn integer_map_conversion_rejects_overflow_and_wrong_value_types() {
                 Some(&definition(kind)),
             )
             .unwrap_err();
-            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(matches!(error, MappingError::InvalidArgument(_)));
             assert!(error.message().contains("attributes"), "{error}");
         }
     }
@@ -627,7 +627,7 @@ fn maps_refuse_unimplemented_numeric_or_structural_projections() {
             Some(&definition(kind)),
         )
         .unwrap_err();
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(matches!(error, MappingError::InvalidArgument(_)));
         assert!(error.message().contains("attributes"), "{error}");
     }
     let schema = schema(Type::String, Type::String);
@@ -1187,7 +1187,7 @@ fn message_valued_maps_remain_preserved_without_scalar_flattening() {
         Some(&definition(pb::MappedKind::Keyword)),
     )
     .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(matches!(error, MappingError::InvalidArgument(_)));
     assert!(error.message().contains("cannot flatten"), "{error}");
 }
 

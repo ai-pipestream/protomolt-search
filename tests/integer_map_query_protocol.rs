@@ -35,7 +35,7 @@ fn old_decoders_reject_typed_map_operators_instead_of_reporting_missing_columns(
         assert!(legacy.expr.is_none(), "{text}");
         let forwarded = pb::FilterExpr::decode(legacy.encode_to_vec().as_slice()).unwrap();
         assert_eq!(
-            filter::validate_filter(&forwarded).unwrap_err().code(),
+            tonic::Status::from(filter::validate_filter(&forwarded).unwrap_err()).code(),
             tonic::Code::InvalidArgument
         );
     }
@@ -54,7 +54,7 @@ fn old_decoders_reject_typed_map_operators_instead_of_reporting_missing_columns(
         map_unsigned_integers: &names,
     };
     assert_eq!(
-        values::resolve(&forwarded, &columns).unwrap_err().code(),
+        tonic::Status::from(values::resolve(&forwarded, &columns).unwrap_err()).code(),
         tonic::Code::InvalidArgument
     );
     assert_eq!(

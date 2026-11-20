@@ -3,7 +3,7 @@
 
 use tonic::Code;
 
-use super::{assert_status, DomainError};
+use super::DomainError;
 use crate::cel::CelError;
 use crate::derived::DerivedError;
 use crate::filter::FilterError;
@@ -12,8 +12,20 @@ use crate::ltr::LtrError;
 use crate::mapping::MappingError;
 use crate::values::ValuesError;
 
-fn foreign_status() -> tonic::Status {
-    tonic::Status::out_of_range("helper: bound past the end")
+/// Check exact RPC code and message parity and compact domain storage.
+pub(crate) fn assert_status<E>(error: E, code: tonic::Code, message: &str)
+where
+    E: DomainError + Clone + Eq,
+    tonic::Status: From<E>,
+{
+    assert!(size_of::<E>() <= 24);
+    assert!(size_of::<Result<(), E>>() <= 48);
+    assert_eq!(error.to_string().as_bytes(), message.as_bytes());
+    let status = tonic::Status::from(error);
+    assert_eq!(status.code(), code);
+    assert_eq!(status.message().as_bytes(), message.as_bytes());
+    assert!(status.metadata().is_empty());
+    assert!(status.details().is_empty());
 }
 
 #[test]
@@ -22,11 +34,6 @@ fn filter_variants_keep_code_and_message() {
         FilterError::invalid_argument("filter: refused"),
         Code::InvalidArgument,
         "filter: refused",
-    );
-    assert_status(
-        FilterError::foreign(foreign_status()),
-        Code::OutOfRange,
-        "helper: bound past the end",
     );
     let empty_facet = crate::pb::FilterExpr {
         expr: Some(crate::pb::filter_expr::Expr::Facet(
@@ -53,19 +60,9 @@ fn cel_variants_keep_code_and_message() {
         "filter: refused",
     );
     assert_status(
-        CelError::foreign(foreign_status()),
-        Code::OutOfRange,
-        "helper: bound past the end",
-    );
-    assert_status(
         CelError::from(FilterError::invalid_argument("from filter")),
         Code::InvalidArgument,
         "from filter",
-    );
-    assert_status(
-        CelError::from(FilterError::foreign(foreign_status())),
-        Code::OutOfRange,
-        "helper: bound past the end",
     );
     let refused = crate::cel::compile_value("").unwrap_err();
     assert_status(
@@ -101,11 +98,6 @@ fn ltr_variants_keep_code_and_message() {
         Code::FailedPrecondition,
         "signal absent",
     );
-    assert_status(
-        LtrError::foreign(foreign_status()),
-        Code::OutOfRange,
-        "helper: bound past the end",
-    );
 }
 
 #[test]
@@ -119,11 +111,6 @@ fn derived_variants_keep_code_and_message() {
         DerivedError::failed_precondition("unlogged"),
         Code::FailedPrecondition,
         "unlogged",
-    );
-    assert_status(
-        DerivedError::foreign(foreign_status()),
-        Code::OutOfRange,
-        "helper: bound past the end",
     );
 }
 
@@ -145,9 +132,9 @@ fn mapping_variants_keep_code_and_message() {
         "document projection exceeds max_rows",
     );
     assert_status(
-        MappingError::foreign(foreign_status()),
-        Code::OutOfRange,
-        "helper: bound past the end",
+        MappingError::failed_precondition("invalid binding"),
+        Code::FailedPrecondition,
+        "invalid binding",
     );
     let refused = crate::mapping::derive_plan(b"", "pkg.Missing").unwrap_err();
     let message = refused.message().to_owned();
@@ -180,11 +167,6 @@ fn prefixed_keeps_the_code_and_fronts_the_message() {
         MappingError::resource_exhausted("chunk ordinal exceeds u32").prefixed("chunk 7: "),
         Code::ResourceExhausted,
         "chunk 7: chunk ordinal exceeds u32",
-    );
-    assert_status(
-        MappingError::foreign(foreign_status()).prefixed("document 3: "),
-        Code::OutOfRange,
-        "document 3: helper: bound past the end",
     );
     assert_status(
         DerivedError::failed_precondition("unlogged").prefixed("document 3: "),

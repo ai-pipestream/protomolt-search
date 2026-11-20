@@ -170,7 +170,7 @@ fn definition_refuses_ambiguous_paths_and_unimplemented_value_shapes() {
     for bad in invalid {
         let error = derive_plan_with_definition(&bytes, "explicit.Record", Some(&bad)).unwrap_err();
         assert_eq!(
-            error.code(),
+            tonic::Status::from(error.clone()).code(),
             tonic::Code::InvalidArgument,
             "{bad:?}: {error}"
         );

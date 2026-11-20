@@ -1,4 +1,5 @@
 //! Canonical identity of the vector plane in a descriptor-derived indexing plan.
+use crate::mapping::MappingError;
 use crate::pb::{ColumnFamily, MappedKind, MappedPlan, MappedVectorBinding};
 use prost::Message;
 use tonic::Status;
@@ -7,13 +8,13 @@ const FORMAT_VERSION: u32 = 1;
 
 /// Derive the exact indexed name and source path. A name is not an alias for a
 /// different plane: collisions and built-in text/lineage names are invalid.
-pub fn from_plan(plan: &MappedPlan) -> Result<MappedVectorBinding, Status> {
+pub fn from_plan(plan: &MappedPlan) -> Result<MappedVectorBinding, MappingError> {
     let mut vectors = plan.fields.iter().filter(|field| {
         field.family == ColumnFamily::Vector as i32 || field.kind == MappedKind::Vector as i32
     });
     let vector = vectors
         .next()
-        .ok_or_else(|| Status::invalid_argument("mapped plan has no vector field"))?;
+        .ok_or_else(|| MappingError::invalid_argument("mapped plan has no vector field"))?;
     if !vector.repeated
         || vectors.next().is_some()
         || vector.family != ColumnFamily::Vector as i32
@@ -21,7 +22,7 @@ pub fn from_plan(plan: &MappedPlan) -> Result<MappedVectorBinding, Status> {
         || vector.path != plan.vector_path
         || vector.vector_dims != plan.dim
     {
-        return Err(Status::invalid_argument(
+        return Err(MappingError::invalid_argument(
             "mapped plan has contradictory vector identity",
         ));
     }
@@ -30,7 +31,7 @@ pub fn from_plan(plan: &MappedPlan) -> Result<MappedVectorBinding, Status> {
             && field.family != ColumnFamily::None as i32
             && field.name == vector.name
     }) {
-        return Err(Status::invalid_argument(
+        return Err(MappingError::invalid_argument(
             "mapped vector name collides with another indexed column",
         ));
     }
@@ -47,9 +48,12 @@ pub fn from_plan(plan: &MappedPlan) -> Result<MappedVectorBinding, Status> {
 
 /// Validate a decoded declaration against the fingerprint of its containing
 /// binding. Only a trusted derivation or durable binding establishes ownership.
-pub fn validate(binding: &MappedVectorBinding, expected_fingerprint: &str) -> Result<(), Status> {
+pub fn validate(
+    binding: &MappedVectorBinding,
+    expected_fingerprint: &str,
+) -> Result<(), MappingError> {
     if binding.format_version != FORMAT_VERSION {
-        return Err(Status::failed_precondition(
+        return Err(MappingError::failed_precondition(
             "unsupported mapped vector binding version",
         ));
     }
@@ -57,14 +61,14 @@ pub fn validate(binding: &MappedVectorBinding, expected_fingerprint: &str) -> Re
         || binding.source_path.trim().is_empty()
         || matches!(binding.field.as_str(), "body" | "parent_id" | "group_id")
     {
-        return Err(Status::invalid_argument(
+        return Err(MappingError::invalid_argument(
             "mapped vector binding requires a distinct vector column and source path",
         ));
     }
     if !crate::mapped_analysis::valid_digest(&binding.plan_fingerprint)
         || binding.plan_fingerprint != expected_fingerprint
     {
-        return Err(Status::failed_precondition(
+        return Err(MappingError::failed_precondition(
             "mapped vector binding does not match the plan fingerprint",
         ));
     }

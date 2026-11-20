@@ -146,7 +146,7 @@ fn dim_source(
             // lexical route; a malformed stage refuses by name before
             // anything runs.
             crate::node::parse_score_stages(std::slice::from_ref(stage))
-                .map_err(LtrError::foreign)?;
+                .map_err(|err| LtrError::invalid_argument(err.message()))?;
             stored.push(stage.clone());
             Ok(Source::Stored(stored.len() - 1))
         }

@@ -180,7 +180,7 @@ impl Extractor {
         }
         let mut slots: Vec<Option<Slot>> = (0..self.leaves.len()).map(|_| None).collect();
         let message = crate::protobuf::decode(self.descriptor.clone(), bytes)
-            .map_err(MappingError::foreign)?;
+            .map_err(|err| MappingError::invalid_argument(err.message()))?;
         self.project_message(&message, &self.root, &mut slots)?;
         if self.chunked.is_none() {
             return emit(None, self.assemble(&slots, None)?);

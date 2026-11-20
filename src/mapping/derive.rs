@@ -94,8 +94,7 @@ pub fn derive_plan_with_definition(
         index_definition: canonical_definition,
     };
     plan.fingerprint = fingerprint(&plan, &set, &pool);
-    plan.vector_binding =
-        Some(crate::mapped_vector::from_plan(&plan).map_err(MappingError::foreign)?);
+    plan.vector_binding = Some(crate::mapped_vector::from_plan(&plan)?);
     let skipped_fields = skipped_field_names(&index, &hint_map);
     plan.schema_report = Some(schema_report::build(&plan, &pool, &set, &skipped_fields)?);
     Ok(plan)

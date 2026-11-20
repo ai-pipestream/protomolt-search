@@ -26,12 +26,10 @@ use crate::pb::{
 crate::domain_error::domain_error! {
     /// Why a composite scorer was refused, converted to transport status
     /// only at the RPC edge.
-    #[derive(Debug, Clone)]
     pub enum LtrError {
         InvalidArgument => invalid_argument,
         FailedPrecondition => failed_precondition,
     }
-    foreign: ScoreStage
 }
 
 fn refuse(msg: impl Into<String>) -> LtrError {

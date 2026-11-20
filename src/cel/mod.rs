@@ -79,11 +79,9 @@ pub fn compile_filter(text: &str) -> Result<Option<pb::FilterExpr>, CelError> {
 crate::domain_error::domain_error! {
     /// Why a CEL filter or value expression was refused, converted to
     /// transport status only at the RPC edge.
-    #[derive(Debug, Clone)]
     pub enum CelError {
         InvalidArgument => invalid_argument,
     }
-    foreign: Geo
 }
 
 impl From<crate::filter::FilterError> for CelError {
@@ -91,7 +89,6 @@ impl From<crate::filter::FilterError> for CelError {
         use crate::filter::FilterError;
         match error {
             FilterError::InvalidArgument(message) => Self::InvalidArgument(message),
-            FilterError::Geo(status) => Self::Geo(status),
         }
     }
 }

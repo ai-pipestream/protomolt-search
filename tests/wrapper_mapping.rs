@@ -1,6 +1,6 @@
 mod common;
 use pipestream_search::{
-    mapping::{derive_plan, Extractor},
+    mapping::{derive_plan, Extractor, MappingError},
     pb,
 };
 const DESCRIPTOR: &[u8] = include_bytes!("fixtures/wrapper-mapping/descriptor.bin");
@@ -281,15 +281,12 @@ fn wrapper_projection_matches_generated_message_semantics() {
             ..record(1)
         },
     ] {
-        assert_eq!(
+        assert!(matches!(
             Extractor::new(DESCRIPTOR, "wrapper_fixture.Record", "body")
                 .unwrap()
-                .extract(&invalid.encode_to_vec())
-                .err()
-                .unwrap()
-                .code(),
-            tonic::Code::InvalidArgument
-        );
+                .extract(&invalid.encode_to_vec()),
+            Err(MappingError::InvalidArgument(_))
+        ));
     }
 }
 
@@ -413,7 +410,7 @@ fn incompatible_wrapper_descriptors_refuse_projection_but_remain_describable() {
         pipestream_search::mapping::describe_schema(&bytes, "wrapper_fixture.Record").unwrap();
         let error =
             derive_plan(&bytes, "wrapper_fixture.Record").expect_err("invalid wrapper shape");
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(matches!(error, MappingError::InvalidArgument(_)));
         assert!(
             error.message().contains("signed") && error.message().contains("wrapper"),
             "{change}: {error}"
@@ -476,7 +473,7 @@ fn wrapped_ids_and_bodies_work_in_chunk_scopes() {
     }
     document.chunks[1].id = None;
     let error = extractor.extract(&document.encode_to_vec()).err().unwrap();
-    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(matches!(error, MappingError::InvalidArgument(_)));
     assert!(error.message().contains("chunks.id"), "{error}");
 }
 
@@ -873,7 +870,7 @@ fn identity_roles_require_an_exact_value_projection_during_planning() {
     for name in ["BadId", "BadTextId", "BadChunked"] {
         let error = derive_plan(DESCRIPTOR, &format!("wrapper_fixture.{name}"))
             .expect_err("unusable identity plan");
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(matches!(error, MappingError::InvalidArgument(_)));
         assert!(
             error.message().contains("id") || error.message().contains("ID"),
             "{name}: {error}"
