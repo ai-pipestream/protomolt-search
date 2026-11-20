@@ -25,6 +25,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use common::{fit_calibration, unit_vectors, BIT_WIDTH, DIM};
 use pipestream_search::bm25::{self, CorpusStats};
 use pipestream_search::harness::{build_monolithic, mock_analysis};
 use pipestream_search::node::NodeConfig;
@@ -43,8 +44,6 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Error as TransportError;
-
-use common::{fit_calibration, unit_vectors, BIT_WIDTH, DIM};
 
 const N: usize = 3_000;
 const DOCS: usize = 1_500;

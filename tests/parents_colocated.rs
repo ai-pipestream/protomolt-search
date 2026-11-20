@@ -164,10 +164,10 @@ fn assert_parents_whole(output: &reshard::ReshardOutput) {
     for (parent, children) in &homes {
         assert_eq!(children.len(), 1, "parent {parent} split over {children:?}");
     }
-    assert!(
-        lone_children.len() > 1,
-        "unparented rows still spread by id: {lone_children:?}"
-    );
+    // Unparented rows route by their own stable key when keyed (the
+    // online hash space), by id only when unkeyed; either way each one
+    // is its own group, so no spread shape is asserted for them.
+    let _ = &lone_children;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -191,6 +191,76 @@ async fn routed_parents_reshard_whole_and_keep_their_proof() {
         let child = NodeServiceImpl::open(config(&image.vector_path), None).unwrap();
         assert!(child.parents_colocated(), "a child node serves the proof");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The child a parent's key hash names under the online routing rule:
+/// the child whose hash range holds the key's stable routing hash.
+fn online_child(output: &reshard::ReshardOutput, key: &str) -> usize {
+    let hash = pipestream_search::coordinator::stable_routing_hash(key.as_bytes());
+    output
+        .children
+        .iter()
+        .position(|image| image.hash_lo <= hash && hash <= image.hash_hi)
+        .expect("some child owns every hash")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_reshard_keyed_appends_land_on_the_resharded_home() {
+    let dir = tempdir("post-reshard");
+    let path = dir.join("shard.tv");
+    let (addr, handle) = common::start_empty_node(config(&path)).await;
+    let mut client = NodeServiceClient::connect(addr).await.unwrap();
+    ingest_corpus(&mut client, true).await;
+    handle.abort();
+
+    let output = split_four(&path, &dir.join("split"));
+    assert_parents_whole(&output);
+    // Every parent's resharded home is the child its stable key routes
+    // to online, so a later keyed chunk cannot scatter the parent.
+    let mut homes: BTreeMap<u64, usize> = BTreeMap::new();
+    for (child, image) in output.children.iter().enumerate() {
+        if image.num_documents == 0 {
+            continue;
+        }
+        for parent in parents_of(&catalog(&image.vector_path)) {
+            if parent != u64::MAX {
+                homes.insert(parent, child);
+            }
+        }
+    }
+    assert_eq!(homes.len() as u64, PARENTS);
+    for p in 0..PARENTS {
+        assert_eq!(
+            homes[&parent_id(p)],
+            online_child(&output, &format!("opinion-{p}")),
+            "parent {p} would scatter on its next keyed append"
+        );
+    }
+
+    // Serve parent 0's child and append one more keyed chunk of it: the
+    // new segment keeps the proof and the parent stays whole there.
+    let home = &output.children[homes[&parent_id(0)]];
+    let (addr, handle) = common::start_opened_node(config(&home.vector_path)).await;
+    let mut client = NodeServiceClient::connect(addr).await.unwrap();
+    append(
+        &mut client,
+        "opinion 0 late chunk court".into(),
+        Some(parent_id(0)),
+        Some("opinion-0".into()),
+    )
+    .await;
+    client.flush(FlushRequest {}).await.unwrap();
+    let set = catalog(&home.vector_path);
+    assert!(set.parents_colocated(), "the late chunk keeps the proof");
+    assert_eq!(
+        parents_of(&set)
+            .into_iter()
+            .filter(|&parent| parent == parent_id(0))
+            .count() as u64,
+        CHUNKS + 1
+    );
+    handle.abort();
     let _ = std::fs::remove_dir_all(&dir);
 }
 

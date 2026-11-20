@@ -84,6 +84,27 @@ pub(super) fn replay_buckets(
     replay_buckets_through(gen, buckets, bucket_count, dim, vectors_only, u64::MAX, out)
 }
 
+/// Replay only document records (and the deletes that hide them):
+/// vector batches are neither decoded nor copied. For lineage scans
+/// over whole logs, where FP32 rows would dominate the cost.
+pub(super) fn replay_buckets_documents(
+    gen: &Path,
+    buckets: std::ops::Range<u32>,
+    bucket_count: usize,
+    dim: usize,
+    out: &mut Replay,
+) -> Result<(), String> {
+    let scope = ReplayScope {
+        bucket_count,
+        dim,
+        vectors_only: false,
+        documents_only: true,
+        upto_clock: u64::MAX,
+        check_routing: true,
+    };
+    replay_buckets_routed(gen, buckets, &scope, out)
+}
+
 /// [`replay_buckets`] bounded by the generation clock: records past `upto_clock`
 /// are skipped, which is how an online compaction builds its dense image from a
 /// prefix of a log that keeps growing under it. A legacy unclocked record (clock 0)
@@ -101,6 +122,7 @@ pub(super) fn replay_buckets_through(
         bucket_count,
         dim,
         vectors_only,
+        documents_only: false,
         upto_clock,
         check_routing: true,
     };

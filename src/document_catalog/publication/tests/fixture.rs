@@ -142,6 +142,35 @@ impl Fixture {
             .publish_binding(candidate.segments().unwrap().binding().unwrap())
             .unwrap();
     }
+
+    /// The accepted segment ids a candidate publishes under, in segment order.
+    fn segment_ids(candidate: &StagedDocumentCandidate) -> Vec<String> {
+        (0..candidate.segments().map_or(0, OpenedSegmentSet::len))
+            .map(|i| format!("accepted-{}-{i}", candidate.info().accepted_sequence))
+            .collect()
+    }
+
+    /// The four artifact paths of every segment a candidate carries, in
+    /// segment order: vector, exact vectors, BM25, live overlay.
+    fn segment_paths(candidate: &StagedDocumentCandidate) -> Vec<[std::path::PathBuf; 4]> {
+        candidate
+            .segments()
+            .into_iter()
+            .flat_map(|set| {
+                (0..set.len()).map(move |i| {
+                    let meta = set.metadata(i);
+                    let dir = SegmentCatalog::segment_dir(set.root(), &meta.segment_id);
+                    [
+                        dir.join(&meta.vector.file),
+                        dir.join(&meta.exact_vectors.file),
+                        dir.join(&meta.bm25.file),
+                        dir.join(&meta.live_docs.file),
+                    ]
+                })
+            })
+            .collect()
+    }
+
     pub(super) fn publish(
         &self,
         candidate: &StagedDocumentCandidate,
@@ -163,25 +192,8 @@ impl Fixture {
                 .document_retirements(&candidate.info().document_key, 65536)
                 .unwrap()
         });
-        let ids: Vec<_> = (0..candidate.segments().map_or(0, OpenedSegmentSet::len))
-            .map(|i| format!("accepted-{}-{i}", candidate.info().accepted_sequence))
-            .collect();
-        let paths: Vec<_> = candidate
-            .segments()
-            .into_iter()
-            .flat_map(|set| {
-                (0..set.len()).map(move |i| {
-                    let meta = set.metadata(i);
-                    let dir = SegmentCatalog::segment_dir(set.root(), &meta.segment_id);
-                    [
-                        dir.join(&meta.vector.file),
-                        dir.join(&meta.exact_vectors.file),
-                        dir.join(&meta.bm25.file),
-                        dir.join(&meta.live_docs.file),
-                    ]
-                })
-            })
-            .collect();
+        let ids = Self::segment_ids(candidate);
+        let paths = Self::segment_paths(candidate);
         let mut base = before
             .manifest()
             .segments

@@ -70,6 +70,13 @@ fn freeze_vector_image(
     }
 }
 
+/// In Aligned and Deferred modes a provider-backed tail with
+/// documents but no vectors yet is mid-row: its vectors are still
+/// coming, so it must not seal documents-only.
+fn tail_awaits_vectors(mode: TailSeal, has_provider: bool, vectors: usize) -> bool {
+    matches!(mode, TailSeal::Aligned | TailSeal::Deferred) && has_provider && vectors == 0
+}
+
 impl NodeServiceImpl {
     /// A new, empty vector index in the shard's layout: the tail image of
     /// a segmented provider over the catalog's sealed images when the
@@ -184,9 +191,7 @@ impl NodeServiceImpl {
                 if docs == 0 && vectors == 0 {
                     return Ok(None);
                 }
-                let awaits_vectors = matches!(mode, TailSeal::Aligned | TailSeal::Deferred)
-                    && provider.is_some()
-                    && vectors == 0;
+                let awaits_vectors = tail_awaits_vectors(mode, provider.is_some(), vectors);
                 if docs != 0 && (vectors != 0 || awaits_vectors) && docs != vectors {
                     if mode == TailSeal::Deferred {
                         return Ok(None);

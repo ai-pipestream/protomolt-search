@@ -64,6 +64,7 @@ impl CutBuild<'_> {
             bucket_count: 1,
             dim: self.manifest.dim as usize,
             vectors_only: false,
+            documents_only: false,
             upto_clock: u64::MAX,
             check_routing: false,
         };

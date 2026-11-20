@@ -49,7 +49,6 @@ const BATCHES: [&[(&str, &str)]; 3] = [
         ("a last appeal to the court", "nysd"),
     ],
 ];
-
 fn config(index_path: Option<PathBuf>) -> NodeConfig {
     NodeConfig {
         index_path,
@@ -804,7 +803,6 @@ fn a_mapped_sealed_image_opens_without_the_heap_load() {
         })
         .unwrap();
     drop(catalog);
-
     // Both opens verify every artifact and open the BM25 and exact
     // stores; the image is the difference between them.
     let before = live_heap_bytes();

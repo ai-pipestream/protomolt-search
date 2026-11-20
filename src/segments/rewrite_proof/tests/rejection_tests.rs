@@ -60,7 +60,7 @@ fn rewrite_proof_refuses_duplicate_missing_or_unowned_rows_and_preserves_existin
     assert!(before.verify_source_rewrite(&before, &scratch, 0).is_err());
     let mut manifest = before.published_manifest();
     manifest.source_owner = None;
-    manifest.format = 1;
+    manifest.format = 6;
     let unowned =
         OpenedSegmentSet::open_manifest(before.root().to_path_buf(), manifest, Default::default())
             .unwrap();

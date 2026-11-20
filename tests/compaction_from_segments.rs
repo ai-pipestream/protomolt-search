@@ -25,12 +25,8 @@
 
 mod common;
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
+use common::mock::start_mock_analysis;
+use common::{fit_calibration, start_empty_node, start_opened_node, unit_vectors, BIT_WIDTH, DIM};
 use pipestream_search::analyzer::body_spec;
 use pipestream_search::live_docs::LiveDocs;
 use pipestream_search::mapping::derive_plan;
@@ -47,13 +43,15 @@ use pipestream_search::postings::{Bm25Index, Bm25Reader, StoredBinding};
 use pipestream_search::reshard::{self, PartitionSpec, SegmentCompactionOptions};
 use pipestream_search::segments::{SegmentCatalog, SegmentSetManifest};
 use prost::Message;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tonic::Request;
-
-use common::mock::start_mock_analysis;
-use common::{fit_calibration, start_empty_node, start_opened_node, unit_vectors, BIT_WIDTH, DIM};
 
 const SEED: u64 = 0x5E61_7A11;
 /// Rows per sealed segment of the fixture: several segments per run.

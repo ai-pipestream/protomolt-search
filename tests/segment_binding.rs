@@ -31,11 +31,11 @@ fn binding() -> StoredBinding {
 fn empty_catalog_binding_is_atomic_idempotent_and_validated_on_open() {
     let root = root("empty");
     let catalog = SegmentCatalog::open(&root).unwrap();
-    assert_eq!(catalog.snapshot().manifest().format, 1);
+    assert_eq!(catalog.snapshot().manifest().format, 6);
     let binding = binding();
     let pinned = catalog.publish_binding(&binding).unwrap();
     assert!(pinned.is_empty());
-    assert_eq!(pinned.manifest().format, 2);
+    assert_eq!(pinned.manifest().format, 6);
     assert_eq!(pinned.binding(), Some(&binding));
     assert_eq!(
         catalog.publish_binding(&binding).unwrap().epoch(),
@@ -54,7 +54,7 @@ fn empty_catalog_binding_is_atomic_idempotent_and_validated_on_open() {
         match case {
             0 => bad.format = 1,
             1 => bad.format = 3,
-            2 => bad.binding = None,
+            2 => bad.format = 5,
             3 => bad.binding.as_mut().unwrap().sha256 = "0".repeat(64),
             _ => {
                 let record = bad.binding.as_mut().unwrap();
@@ -142,7 +142,7 @@ fn mixed_bindings_cannot_be_published_and_last_segment_removal_keeps_identity() 
             .unwrap();
         assert!(empty.is_empty());
         assert_eq!(empty.binding(), Some(&expected));
-        assert_eq!(empty.manifest().format, 2);
+        assert_eq!(empty.manifest().format, 6);
         assert_eq!(
             OpenedSegmentSet::open(&directory).unwrap().binding(),
             Some(&expected)

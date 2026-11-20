@@ -19,8 +19,6 @@ impl OpenedSegmentSet {
         Arc::ptr_eq(&self.segments[i], &other.segments[j])
     }
 
-    /// The manifest this set was opened from. Its `epoch` is the epoch at
-    /// open; [`Self::epoch`] is the published one.
     /// Whether every sealed segment proves its parents colocated on this
     /// shard; an empty set proves it trivially.
     pub fn parents_colocated(&self) -> bool {
@@ -30,6 +28,8 @@ impl OpenedSegmentSet {
             .all(|segment| segment.parents_colocated)
     }
 
+    /// The manifest this set was opened from. Its `epoch` is the epoch at
+    /// open; [`Self::epoch`] is the published one.
     pub fn manifest(&self) -> &SegmentSetManifest {
         &self.manifest
     }

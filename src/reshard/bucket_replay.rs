@@ -18,6 +18,9 @@ pub(super) struct ReplayScope {
     pub(super) dim: usize,
     /// Skip document records.
     pub(super) vectors_only: bool,
+    /// Skip vector records without decoding or copying their rows; for
+    /// scans that only read document lineage.
+    pub(super) documents_only: bool,
     /// Skip records past this generation clock; `u64::MAX` reads all.
     pub(super) upto_clock: u64,
     /// Refuse a record whose id does not hash to the file it sits in.
@@ -151,6 +154,9 @@ fn replay_vectors(
             bucket_of(add.first_id, file.scope.bucket_count),
             file.bucket
         ));
+    }
+    if file.scope.documents_only {
+        return Ok(());
     }
     let batch = add.batch.unwrap_or_default();
     if dim == 0 || !batch.vectors.len().is_multiple_of(dim) {

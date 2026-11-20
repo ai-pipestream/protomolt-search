@@ -9,7 +9,7 @@ use crate::node::*;
 const STABLE_ROUTING_KEY_METADATA: &str = "x-protomolt-stable-key-bin";
 
 fn replication_stable_key<T>(request: &Request<T>) -> Result<Option<Vec<u8>>, Status> {
-    request
+    let key = request
         .metadata()
         .get_bin(STABLE_ROUTING_KEY_METADATA)
         .map(|value| {
@@ -22,7 +22,13 @@ fn replication_stable_key<T>(request: &Request<T>) -> Result<Option<Vec<u8>>, St
                     ))
                 })
         })
-        .transpose()
+        .transpose()?;
+    if key.as_deref().is_some_and(<[u8]>::is_empty) {
+        return Err(Status::invalid_argument(
+            "replication stable-key metadata is present but empty; an empty key routes              nothing and proves no colocation",
+        ));
+    }
+    Ok(key)
 }
 
 /// Whether the exact-vector sidecar covers every row the shard serves.

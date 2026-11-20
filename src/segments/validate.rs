@@ -40,25 +40,14 @@ pub(super) fn validate_manifest(manifest: &SegmentSetManifest) -> Result<(), Str
     Ok(())
 }
 
-/// The format number must match what the manifest declares.
+/// Only the current format reads. Older catalogs refuse here, by
+/// version number, before any per-segment file is parsed: a format-5
+/// segment record has no colocation proof to default.
 fn validate_format(manifest: &SegmentSetManifest) -> Result<(), String> {
-    if !(BASE_SET_FORMAT..=RETAINED_SET_FORMAT).contains(&manifest.format)
-        || (manifest.format == BASE_SET_FORMAT && manifest.binding.is_some())
-        || (manifest.format == SET_FORMAT && manifest.binding.is_none())
-        || (manifest.format < SOURCE_SET_FORMAT && manifest.source_owner.is_some())
-        || (manifest.format == SOURCE_SET_FORMAT && manifest.source_owner.is_none())
-        || (manifest.format < RETAINED_SET_FORMAT
-            && ((manifest.format == DECLARED_SET_FORMAT)
-                != manifest.generation_declaration.is_some()))
-        || (manifest.format < RETAINED_SET_FORMAT
-            && manifest
-                .segments
-                .iter()
-                .any(|segment| segment.multi_res.is_some()))
-    {
+    if manifest.format != SET_FORMAT {
         return Err(format!(
-            "segment set format {} or binding declaration is unsupported; expected format \
-             {BASE_SET_FORMAT} without a binding, {SET_FORMAT} with a binding, or {SOURCE_SET_FORMAT} with a source owner, or {DECLARED_SET_FORMAT} with a generation declaration",
+            "segment set format {} is unsupported; this build reads only format \
+             {SET_FORMAT}, so rebuild the catalog through the reshard tool",
             manifest.format
         ));
     }
