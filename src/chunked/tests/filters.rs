@@ -17,17 +17,19 @@ fn batch_matches_solo_bitwise() {
         for (q, &(k, ties)) in queries.iter().zip(&specs) {
             let mut published = Vec::new();
             let (hits, _) = chunked_topk(
-                &index,
-                q,
-                k,
-                chunk_blocks,
+                ChunkedScan {
+                    index: &index,
+                    query: q,
+                    k,
+                    chunk_blocks,
+                    allow: None,
+                },
+                ties,
                 &mut || None,
                 &mut |f| {
                     published.push(f);
                     true
                 },
-                ties,
-                None,
             );
             solo.push((hits, published));
         }
@@ -95,14 +97,16 @@ fn an_allowlist_returns_the_top_k_of_the_survivors() {
 
         for chunk_blocks in [1, 2, 7, 64, 10_000] {
             let (hits, _) = chunked_topk(
-                &index,
-                &query,
-                k,
-                chunk_blocks,
+                ChunkedScan {
+                    index: &index,
+                    query: &query,
+                    k,
+                    chunk_blocks,
+                    allow: Some(Mask::Bools(&allow)),
+                },
+                false,
                 &mut || None,
                 &mut |_| false,
-                false,
-                Some(&allow),
             );
             assert_eq!(hits, expected, "keep 1/{keep}, chunk_blocks {chunk_blocks}");
         }
@@ -119,25 +123,29 @@ fn an_all_true_allowlist_changes_nothing() {
     let query = unit_vectors(1, dim, 0x0A11_0002);
     let allow = vec![true; n];
     let unfiltered = chunked_topk(
-        &index,
-        &query,
-        k,
-        3,
+        ChunkedScan {
+            index: &index,
+            query: &query,
+            k,
+            chunk_blocks: 3,
+            allow: None,
+        },
+        false,
         &mut || None,
         &mut |_| false,
-        false,
-        None,
     )
     .0;
     let allowed = chunked_topk(
-        &index,
-        &query,
-        k,
-        3,
+        ChunkedScan {
+            index: &index,
+            query: &query,
+            k,
+            chunk_blocks: 3,
+            allow: Some(Mask::Bools(&allow)),
+        },
+        false,
         &mut || None,
         &mut |_| false,
-        false,
-        Some(&allow),
     )
     .0;
     assert_eq!(unfiltered, allowed);
@@ -152,14 +160,16 @@ fn an_empty_allowlist_scans_nothing() {
     let query = unit_vectors(1, dim, 0x0A11_0003);
     let allow = vec![false; n];
     let (hits, stats) = chunked_topk(
-        &index,
-        &query,
-        k,
-        2,
+        ChunkedScan {
+            index: &index,
+            query: &query,
+            k,
+            chunk_blocks: 2,
+            allow: Some(Mask::Bools(&allow)),
+        },
+        false,
         &mut || None,
         &mut |_| false,
-        false,
-        Some(&allow),
     );
     assert!(hits.is_empty());
     assert_eq!(stats.chunk_calls, 0);
@@ -191,14 +201,16 @@ fn mixed_allowlists_batch_without_disturbing_each_other() {
         .iter()
         .map(|(q, allow)| {
             chunked_topk(
-                &index,
-                q,
-                k,
-                chunk_blocks,
+                ChunkedScan {
+                    index: &index,
+                    query: q,
+                    k,
+                    chunk_blocks,
+                    allow: allow.map(|a| a.as_slice()).map(Mask::Bools),
+                },
+                false,
                 &mut || None,
                 &mut |_| false,
-                false,
-                allow.map(|a| a.as_slice()),
             )
             .0
         })
@@ -291,14 +303,16 @@ fn collapse_under_an_allowlist_collapses_the_survivors() {
     expected.truncate(k);
 
     let (hits, _) = chunked_topk_collapsed(
-        &index,
-        &query,
-        k,
-        4,
+        ChunkedScan {
+            index: &index,
+            query: &query,
+            k,
+            chunk_blocks: 4,
+            allow: Some(Mask::Bools(&allow)),
+        },
         &parents,
         &mut || None,
         &mut |_| false,
-        Some(&allow),
     );
     assert_eq!(hits, expected);
 }
@@ -314,16 +328,30 @@ fn per_query_floor_stays_isolated() {
     let q1 = unit_vectors(1, dim, 0xBA7C_1001);
     let kth0 = index.search_unfiltered(&q0, k).scores_for_query(0)[k - 1];
 
-    let solo1 = chunked_topk(&index, &q1, k, 2, &mut || None, &mut |_| false, false, None).0;
+    let solo1 = chunked_topk(
+        ChunkedScan {
+            index: &index,
+            query: &q1,
+            k,
+            chunk_blocks: 2,
+            allow: None,
+        },
+        false,
+        &mut || None,
+        &mut |_| false,
+    )
+    .0;
     let solo0 = chunked_topk(
-        &index,
-        &q0,
-        k,
-        2,
+        ChunkedScan {
+            index: &index,
+            query: &q0,
+            k,
+            chunk_blocks: 2,
+            allow: None,
+        },
+        false,
         &mut || Some(kth0),
         &mut |_| false,
-        false,
-        None,
     )
     .0;
 
@@ -377,14 +405,16 @@ fn overhigh_floor_shrinks_results() {
     let top = index.search_unfiltered(&query, k).scores_for_query(0)[0];
 
     let (hits, _) = chunked_topk(
-        &index,
-        &query,
-        k,
-        64,
+        ChunkedScan {
+            index: &index,
+            query: &query,
+            k,
+            chunk_blocks: 64,
+            allow: None,
+        },
+        false,
         &mut || Some(top + 1.0),
         &mut |_| false,
-        false,
-        None,
     );
     assert!(hits.is_empty());
 }

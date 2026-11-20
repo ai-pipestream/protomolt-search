@@ -8,17 +8,17 @@ use crate::pb::{
     BalanceExclusion, BalanceMove, NodeLoad, NodeResidency, PlanBalanceRequest, PlanBalanceResponse,
 };
 
-use super::state::{StoredNodeState, StoredRole, StoredState};
+use super::state::{StoredNode, StoredNodeState, StoredRole, StoredState};
 use super::DurableControlPlane;
 
-/// Defaults of a [`PlanBalanceRequest`] (`docs/bandwidth-budget.md`).
+/// Defaults of a [`PlanBalanceRequest`].
 pub const BALANCE_DEFAULT_MIN_GAIN: f64 = 0.10;
 pub const BALANCE_DEFAULT_MAX_MOVES: u32 = 8;
 pub const BALANCE_DEFAULT_MAX_RATE_AGE_MS: u64 = 10 * 60 * 1000;
 
 /// The nodes a shard's primary may move among: the placement leaf's
 /// node set when the topology has a tree and the leaf names nodes,
-/// otherwise every node (`docs/placement.md`).
+/// otherwise every node.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BalancePool {
     pub leaf: String,
@@ -59,16 +59,14 @@ pub(super) fn bare_addr(addr: &str) -> &str {
         .trim_end_matches('/')
 }
 
-/// The balance dry run (`docs/bandwidth-budget.md`): a pure function of
-/// the durable state, the request, the provider's encoded row bytes, the
-/// per-shard pools, and the clock. It moves nothing.
-fn plan_balance(
-    state: &StoredState,
-    request: &PlanBalanceRequest,
-    row_bytes: u64,
-    pool_of: &dyn Fn(&str) -> BalancePool,
-    now: u64,
-) -> Result<PlanBalanceResponse, Status> {
+/// The request's knobs with their defaults applied.
+struct BalanceLimits {
+    min_gain: f64,
+    max_moves: u32,
+    max_rate_age_ms: u64,
+}
+
+fn balance_limits(request: &PlanBalanceRequest, row_bytes: u64) -> Result<BalanceLimits, Status> {
     if !request.min_gain.is_finite() || !(0.0..=1.0).contains(&request.min_gain) {
         return Err(Status::invalid_argument(format!(
             "plan_balance: min_gain {} is outside [0, 1] (0 selects {BALANCE_DEFAULT_MIN_GAIN})",
@@ -81,50 +79,56 @@ fn plan_balance(
              reported its geometry), so no load can be expressed in the rate's units",
         ));
     }
-    let min_gain = if request.min_gain == 0.0 {
-        BALANCE_DEFAULT_MIN_GAIN
-    } else {
-        request.min_gain
-    };
-    let max_moves = if request.max_moves == 0 {
-        BALANCE_DEFAULT_MAX_MOVES
-    } else {
-        request.max_moves
-    };
-    let max_rate_age_ms = if request.max_rate_age_ms == 0 {
-        BALANCE_DEFAULT_MAX_RATE_AGE_MS
-    } else {
-        request.max_rate_age_ms
-    };
-    let shard_index: BTreeMap<&str, u32> = state
-        .topology
-        .routes
-        .iter()
-        .enumerate()
-        .map(|(i, route)| (bare_addr(&route.addr), i as u32))
-        .collect();
+    Ok(BalanceLimits {
+        min_gain: if request.min_gain == 0.0 {
+            BALANCE_DEFAULT_MIN_GAIN
+        } else {
+            request.min_gain
+        },
+        max_moves: if request.max_moves == 0 {
+            BALANCE_DEFAULT_MAX_MOVES
+        } else {
+            request.max_moves
+        },
+        max_rate_age_ms: if request.max_rate_age_ms == 0 {
+            BALANCE_DEFAULT_MAX_RATE_AGE_MS
+        } else {
+            request.max_rate_age_ms
+        },
+    })
+}
 
-    let mut nodes: BTreeMap<String, BalanceNode> = state
+/// Why a node takes no part in the plan, if anything.
+fn node_exclusion(node: &StoredNode, now: u64, max_rate_age_ms: u64) -> Option<&'static str> {
+    let capacity = &node.capacity;
+    if node.state == StoredNodeState::Expired || node.expires_unix_ms <= now {
+        Some("no-lease")
+    } else if node.state == StoredNodeState::Draining {
+        Some("draining")
+    } else if capacity.residency == NodeResidency::Device as i32 {
+        Some("device")
+    } else if capacity.residency != NodeResidency::Server as i32 {
+        Some("residency-unspecified")
+    } else if capacity.scan_bytes_per_second == 0 {
+        Some("unmeasured")
+    } else if now.saturating_sub(capacity.scan_rate_observed_unix_ms) > max_rate_age_ms {
+        Some("stale")
+    } else {
+        None
+    }
+}
+
+fn balance_nodes(
+    state: &StoredState,
+    now: u64,
+    max_rate_age_ms: u64,
+) -> BTreeMap<String, BalanceNode> {
+    state
         .nodes
         .iter()
         .map(|(node_id, node)| {
             let capacity = &node.capacity;
-            let exclusion = if node.state == StoredNodeState::Expired || node.expires_unix_ms <= now
-            {
-                Some("no-lease")
-            } else if node.state == StoredNodeState::Draining {
-                Some("draining")
-            } else if capacity.residency == NodeResidency::Device as i32 {
-                Some("device")
-            } else if capacity.residency != NodeResidency::Server as i32 {
-                Some("residency-unspecified")
-            } else if capacity.scan_bytes_per_second == 0 {
-                Some("unmeasured")
-            } else if now.saturating_sub(capacity.scan_rate_observed_unix_ms) > max_rate_age_ms {
-                Some("stale")
-            } else {
-                None
-            };
+            let exclusion = node_exclusion(node, now, max_rate_age_ms);
             (
                 node_id.clone(),
                 BalanceNode {
@@ -141,9 +145,18 @@ fn plan_balance(
                 },
             )
         })
-        .collect();
-    // Ready replicas per shard, for the failure-domain rule: a primary
-    // is not moved into the domain of a copy that would then share it.
+        .collect()
+}
+
+/// Place every primary on its node and return the ready replicas' failure
+/// domains per shard, for the failure-domain rule: a primary is not moved
+/// into the domain of a copy that would then share it.
+fn assign_primaries(
+    state: &StoredState,
+    row_bytes: u64,
+    shard_index: &BTreeMap<&str, u32>,
+    nodes: &mut BTreeMap<String, BalanceNode>,
+) -> BTreeMap<String, BTreeSet<String>> {
     let mut replica_domains: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for replica in state.replicas.values() {
         if replica.role == StoredRole::Primary {
@@ -169,88 +182,129 @@ fn plan_balance(
     for node in nodes.values_mut() {
         node.shards.sort_by(|a, b| a.1.cmp(&b.1));
     }
+    replica_domains
+}
 
-    let slowest = |nodes: &BTreeMap<String, BalanceNode>| -> f64 {
-        nodes
-            .values()
-            .filter(|n| n.eligible())
-            .map(BalanceNode::seconds)
-            .fold(0.0, f64::max)
-    };
-    let seconds_before = slowest(&nodes);
+fn slowest(nodes: &BTreeMap<String, BalanceNode>) -> f64 {
+    nodes
+        .values()
+        .filter(|n| n.eligible())
+        .map(BalanceNode::seconds)
+        .fold(0.0, f64::max)
+}
+
+/// The slowest eligible node that holds a primary; ties by id.
+fn slowest_source(nodes: &BTreeMap<String, BalanceNode>) -> Option<String> {
+    nodes
+        .values()
+        .filter(|n| n.eligible() && !n.shards.is_empty())
+        .max_by(|a, b| {
+            a.seconds()
+                .partial_cmp(&b.seconds())
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.node_id.cmp(&a.node_id))
+        })
+        .map(|n| n.node_id.clone())
+}
+
+/// The slowest eligible node's seconds once `bytes` moves from `source_id`
+/// to `target_id`.
+fn seconds_after_move(
+    nodes: &BTreeMap<String, BalanceNode>,
+    source_id: &str,
+    target_id: &str,
+    bytes: u64,
+) -> f64 {
+    nodes
+        .values()
+        .filter(|n| n.eligible())
+        .map(|n| {
+            let bytes_after = if n.node_id == source_id {
+                n.bytes - bytes
+            } else if n.node_id == target_id {
+                n.bytes + bytes
+            } else {
+                n.bytes
+            };
+            bytes_after as f64 / n.rate as f64
+        })
+        .fold(0.0, f64::max)
+}
+
+/// The inputs every move of one plan shares.
+struct MoveContext<'a> {
+    replica_domains: &'a BTreeMap<String, BTreeSet<String>>,
+    pool_of: &'a dyn Fn(&str) -> BalancePool,
+}
+
+/// The best single move off `source`: `(seconds after, target node, position
+/// of the shard in the source's list)`.
+fn best_move(
+    nodes: &BTreeMap<String, BalanceNode>,
+    source: &BalanceNode,
+    context: &MoveContext<'_>,
+) -> Option<(f64, String, usize)> {
+    let source_id = source.node_id.as_str();
+    let mut best: Option<(f64, String, usize)> = None;
+    for (position, (_, shard_id, addr, bytes)) in source.shards.iter().enumerate() {
+        let pool = (context.pool_of)(addr);
+        let domains = context.replica_domains.get(shard_id);
+        for target in nodes.values() {
+            if !target.eligible() || target.node_id == source_id {
+                continue;
+            }
+            if let Some(allowed) = &pool.node_ids {
+                if !allowed.contains(&target.node_id) {
+                    continue;
+                }
+            }
+            if domains.is_some_and(|d| d.contains(&target.failure_domain)) {
+                continue;
+            }
+            let after = seconds_after_move(nodes, source_id, &target.node_id, *bytes);
+            let better = match &best {
+                None => true,
+                Some((best_after, best_target, best_position)) => {
+                    after < *best_after
+                        || (after == *best_after
+                            && (target.node_id.as_str(), shard_id.as_str())
+                                < (
+                                    best_target.as_str(),
+                                    source.shards[*best_position].1.as_str(),
+                                ))
+                }
+            };
+            if better {
+                best = Some((after, target.node_id.clone(), position));
+            }
+        }
+    }
+    best
+}
+
+/// Greedily move primaries off the slowest node while each move gains at
+/// least `min_gain`; returns the moves and the slowest node's final seconds.
+fn plan_moves(
+    nodes: &mut BTreeMap<String, BalanceNode>,
+    context: &MoveContext<'_>,
+    limits: &BalanceLimits,
+    seconds_before: f64,
+) -> (Vec<BalanceMove>, f64) {
     let mut moves = Vec::new();
     let mut current = seconds_before;
-    for _ in 0..max_moves {
-        // The slowest eligible node that holds a primary; ties by id.
-        let Some(source_id) = nodes
-            .values()
-            .filter(|n| n.eligible() && !n.shards.is_empty())
-            .max_by(|a, b| {
-                a.seconds()
-                    .partial_cmp(&b.seconds())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| b.node_id.cmp(&a.node_id))
-            })
-            .map(|n| n.node_id.clone())
-        else {
+    for _ in 0..limits.max_moves {
+        let Some(source_id) = slowest_source(nodes) else {
             break;
         };
         let source = nodes[&source_id].clone();
-        let mut best: Option<(f64, String, usize)> = None;
-        for (position, (_, shard_id, addr, bytes)) in source.shards.iter().enumerate() {
-            let pool = pool_of(addr);
-            let domains = replica_domains.get(shard_id);
-            for target in nodes.values() {
-                if !target.eligible() || target.node_id == source_id {
-                    continue;
-                }
-                if let Some(allowed) = &pool.node_ids {
-                    if !allowed.contains(&target.node_id) {
-                        continue;
-                    }
-                }
-                if domains.is_some_and(|d| d.contains(&target.failure_domain)) {
-                    continue;
-                }
-                let after = nodes
-                    .values()
-                    .filter(|n| n.eligible())
-                    .map(|n| {
-                        let bytes_after = if n.node_id == source_id {
-                            n.bytes - bytes
-                        } else if n.node_id == target.node_id {
-                            n.bytes + bytes
-                        } else {
-                            n.bytes
-                        };
-                        bytes_after as f64 / n.rate as f64
-                    })
-                    .fold(0.0, f64::max);
-                let better = match &best {
-                    None => true,
-                    Some((best_after, best_target, best_position)) => {
-                        after < *best_after
-                            || (after == *best_after
-                                && (target.node_id.as_str(), shard_id.as_str())
-                                    < (
-                                        best_target.as_str(),
-                                        source.shards[*best_position].1.as_str(),
-                                    ))
-                    }
-                };
-                if better {
-                    best = Some((after, target.node_id.clone(), position));
-                }
-            }
-        }
-        let Some((after, target_id, position)) = best else {
+        let Some((after, target_id, position)) = best_move(nodes, &source, context) else {
             break;
         };
-        if after > current * (1.0 - min_gain) {
+        if after > current * (1.0 - limits.min_gain) {
             break;
         }
         let (index, shard_id, addr, bytes) = source.shards[position].clone();
-        let leaf = pool_of(&addr).leaf;
+        let leaf = (context.pool_of)(&addr).leaf;
         {
             let from = nodes.get_mut(&source_id).expect("source exists");
             from.bytes -= bytes;
@@ -272,12 +326,20 @@ fn plan_balance(
             seconds_after: after,
         });
     }
+    (moves, current)
+}
 
-    let loads = state
+/// Per-node loads as of the state BEFORE the moves: what the plan saw.
+fn node_loads(
+    state: &StoredState,
+    nodes: &BTreeMap<String, BalanceNode>,
+    shard_index: &BTreeMap<&str, u32>,
+    row_bytes: u64,
+) -> Vec<NodeLoad> {
+    state
         .nodes
         .keys()
         .map(|node_id| {
-            // Loads report the state BEFORE the moves: what the plan saw.
             let bytes: u64 = state
                 .replicas
                 .values()
@@ -311,7 +373,36 @@ fn plan_balance(
                 residency: node.capacity.residency,
             }
         })
+        .collect()
+}
+
+/// The balance dry run: a pure function of the durable state, the request,
+/// the provider's encoded row bytes, the per-shard pools, and the clock. It
+/// moves nothing.
+fn plan_balance(
+    state: &StoredState,
+    request: &PlanBalanceRequest,
+    row_bytes: u64,
+    pool_of: &dyn Fn(&str) -> BalancePool,
+    now: u64,
+) -> Result<PlanBalanceResponse, Status> {
+    let limits = balance_limits(request, row_bytes)?;
+    let shard_index: BTreeMap<&str, u32> = state
+        .topology
+        .routes
+        .iter()
+        .enumerate()
+        .map(|(i, route)| (bare_addr(&route.addr), i as u32))
         .collect();
+    let mut nodes = balance_nodes(state, now, limits.max_rate_age_ms);
+    let replica_domains = assign_primaries(state, row_bytes, &shard_index, &mut nodes);
+    let seconds_before = slowest(&nodes);
+    let context = MoveContext {
+        replica_domains: &replica_domains,
+        pool_of,
+    };
+    let (moves, current) = plan_moves(&mut nodes, &context, &limits, seconds_before);
+    let loads = node_loads(state, &nodes, &shard_index, row_bytes);
     let excluded = nodes
         .values()
         .filter_map(|n| {
@@ -329,13 +420,13 @@ fn plan_balance(
         seconds_before,
         seconds_after: current,
         excluded,
-        min_gain,
-        max_moves,
+        min_gain: limits.min_gain,
+        max_moves: limits.max_moves,
     })
 }
 
 impl DurableControlPlane {
-    /// The balance dry run over the durable state; see [`plan_balance`].
+    /// The balance dry run over the durable state. It moves nothing.
     pub fn plan_balance(
         &self,
         request: &PlanBalanceRequest,

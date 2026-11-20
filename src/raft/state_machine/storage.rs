@@ -103,6 +103,7 @@ impl RaftStateMachine<ControlRaft> for ControlStateMachine {
             pointer_lock: Arc::clone(&self.pointer_lock),
             #[cfg(any(test, feature = "fault-injection"))]
             gates: Arc::clone(&self.gates),
+            _released: Arc::clone(&self.released),
         }
     }
 

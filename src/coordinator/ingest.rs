@@ -63,13 +63,27 @@ impl CoordinatorServiceImpl {
             )?),
             None => None,
         };
+        let batches = self
+            .route_mapped_documents(&mapped_bind, placer.as_ref(), &mut inbound)
+            .await?;
+        self.send_routed_batches(batches).await
+    }
+
+    /// Route every document of the stream to its shard's batch, each batch
+    /// opening with the bind.
+    async fn route_mapped_documents<S>(
+        &self,
+        mapped_bind: &crate::pb::MappedBind,
+        placer: Option<&PlacementRouter>,
+        inbound: &mut S,
+    ) -> Result<Vec<Vec<crate::pb::IngestMappedRequest>>, Status>
+    where
+        S: tokio_stream::Stream<Item = Result<RoutedIngestMappedRequest, Status>> + Unpin + Send,
+    {
         let mut batches: Vec<Vec<crate::pb::IngestMappedRequest>> =
             vec![Vec::new(); self.node_addrs.len()];
         let mut position = 0u64;
-        while let Some(message) = tokio_stream::StreamExt::next(&mut inbound)
-            .await
-            .transpose()?
-        {
+        while let Some(message) = tokio_stream::StreamExt::next(inbound).await.transpose()? {
             let document = match message.payload {
                 Some(crate::pb::routed_ingest_mapped_request::Payload::Document(document)) => {
                     document
@@ -85,7 +99,7 @@ impl CoordinatorServiceImpl {
                     ))
                 }
             };
-            let leaf = match placer.as_ref() {
+            let leaf = match placer {
                 Some(placer) => {
                     Some(placer.leaf_of(&document.document, position, &document.stable_key)?)
                 }
@@ -108,7 +122,15 @@ impl CoordinatorServiceImpl {
                 )),
             });
         }
+        Ok(batches)
+    }
 
+    /// Send each non-empty batch to its shard and total the answers in shard
+    /// order.
+    async fn send_routed_batches(
+        &self,
+        batches: Vec<Vec<crate::pb::IngestMappedRequest>>,
+    ) -> Result<RoutedIngestMappedResponse, Status> {
         let mut tasks = tokio::task::JoinSet::new();
         for (shard, batch) in batches.into_iter().enumerate() {
             if batch.is_empty() {

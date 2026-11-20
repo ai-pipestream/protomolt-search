@@ -1,4 +1,4 @@
-//! The coordinator's link to one node (`docs/embedded-mobile.md`): the
+//! The coordinator's link to one node: the
 //! generated gRPC client over a channel for a node reached across the
 //! network, or a direct dispatch into a [`NodeServiceImpl`] living in
 //! this process for the embedded runtime. Both go through the same

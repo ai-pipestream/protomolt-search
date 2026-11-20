@@ -1,6 +1,5 @@
 //! Hand-rolled SHA-256 (FIPS 180-4), the digest behind mapping-plan
-//! fingerprints and descriptor-set content addressing
-//! (`docs/descriptor-mappings.md`).
+//! fingerprints and descriptor-set content addressing.
 //!
 //! Hand-rolled for the same reason the CEL front-end and the Prometheus
 //! exporter are: the algorithm is small, frozen since 2002, and pinned

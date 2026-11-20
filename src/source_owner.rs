@@ -107,6 +107,14 @@ pub(crate) fn owner(value: &PreparedSourceOwner) -> Result<(), Status> {
     operation_id(&command.command_id)?;
     let phase = PreparedSourceOwnerPhase::try_from(value.phase)
         .map_err(|_| Status::data_loss("source authority owner phase is unsupported"))?;
+    owner_lifecycle(value, phase)
+}
+
+/// Readiness and activation evidence must agree with the owner's phase.
+fn owner_lifecycle(
+    value: &PreparedSourceOwner,
+    phase: PreparedSourceOwnerPhase,
+) -> Result<(), Status> {
     match phase {
         PreparedSourceOwnerPhase::Prepared | PreparedSourceOwnerPhase::Cancelled => {
             if value.readiness.is_some() || value.activation.is_some() {

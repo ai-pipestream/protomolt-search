@@ -110,8 +110,13 @@ impl RaftLogStore {
                 _file_lock: file,
                 #[cfg(any(test, feature = "fault-injection"))]
                 fault: Mutex::new(None),
+                released: tokio::sync::watch::Sender::new(()),
             }),
         })
+    }
+
+    pub(crate) fn subscribe_release(&self) -> tokio::sync::watch::Receiver<()> {
+        self.inner.released.subscribe()
     }
 
     /// Arm one process-exit fault for the next purge transaction of this

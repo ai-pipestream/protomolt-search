@@ -47,6 +47,16 @@ pub(super) struct HttpRequest {
     pub(super) body: Vec<u8>,
     /// Whether the connection stays open after the reply.
     pub(super) keep_alive: bool,
+    pub(super) headers: Headers,
+}
+
+/// The request headers the routes act on, lowercased.
+#[derive(Debug, Default)]
+pub(super) struct Headers {
+    pub(super) host: Option<String>,
+    pub(super) origin: Option<String>,
+    /// The media type without parameters; empty when absent.
+    pub(super) content_type: String,
 }
 
 pub(super) fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -105,12 +115,17 @@ pub(super) fn reason(status: u16) -> &'static str {
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
+        409 => "Conflict",
         413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         501 => "Not Implemented",
+        499 => "Client Closed Request",
         502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         505 => "HTTP Version Not Supported",
         _ => "Error",
     }
@@ -143,13 +158,35 @@ pub(super) async fn write_reply(
     write_frame(stream, &[&bytes]).await
 }
 
+/// Why an operator route answers 404 on a console without the raw explorer.
+const RAW_OFF: &str = "the raw explorer is off: the browser surface is /bff/v1; an operator \
+    on loopback enables /api, /explorer and /dashboard with --enable-raw-explorer";
+
 pub(super) async fn route(ctx: &Arc<Ctx>, request: &HttpRequest, segments: &[&str]) -> Reply {
+    let raw = matches!(segments.first(), Some(&"api"))
+        || asset_name(&request.path).is_some_and(is_raw_page);
+    if raw && !ctx.raw_explorer {
+        return Reply::error(404, "NOT_FOUND", RAW_OFF);
+    }
+    if raw && request.headers.origin.is_some() && guard_origin(request).is_err() {
+        return Reply::error(
+            403,
+            "PERMISSION_DENIED",
+            "a cross-origin request to the raw explorer",
+        );
+    }
     match (request.method.as_str(), segments) {
         ("GET", []) | ("GET", [_]) if asset_name(&request.path).is_some() => {
             asset_reply(ctx.ui_dir.as_deref(), &request.path).unwrap_or_else(|| {
                 Reply::error(404, "NOT_FOUND", format!("no route for {}", request.path))
             })
         }
+        ("POST", ["bff", "v1", service, method]) => bff_unary(ctx, request, service, method).await,
+        (_, ["bff", ..]) => BffError::new(
+            Code::NotFound,
+            format!("POST Connect calls to /bff/v1/{BFF_SERVICE}/<Method>"),
+        )
+        .reply(),
         ("GET", ["api", "health"]) => match health(ctx).await {
             Ok(v) => Reply::json(200, v),
             Err(e) => Reply::error(502, "UNAVAILABLE", e),

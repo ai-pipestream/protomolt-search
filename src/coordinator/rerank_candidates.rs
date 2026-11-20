@@ -69,25 +69,7 @@ impl CoordinatorServiceImpl {
         if hit_scores.is_empty() {
             return Ok(Vec::new());
         }
-        let shard_count = self.node_addrs.len();
-        let mut per_shard: Vec<Vec<u64>> = vec![Vec::new(); shard_count];
-        let mut seen_per_shard: Vec<HashSet<u64>> = vec![HashSet::new(); shard_count];
-        for &(doc_id, _) in hit_scores {
-            if let Some(&owner) = shard_owners
-                .get(&doc_id)
-                .filter(|&&shard| shard < shard_count)
-            {
-                if seen_per_shard[owner].insert(doc_id) {
-                    per_shard[owner].push(doc_id);
-                }
-            } else {
-                for shard in 0..shard_count {
-                    if seen_per_shard[shard].insert(doc_id) {
-                        per_shard[shard].push(doc_id);
-                    }
-                }
-            }
-        }
+        let per_shard = rerank_fetch_plan(hit_scores, shard_owners, self.node_addrs.len());
 
         let mut tasks = tokio::task::JoinSet::new();
         for (shard, doc_ids) in per_shard.into_iter().enumerate() {
@@ -120,31 +102,66 @@ impl CoordinatorServiceImpl {
             responses.insert(shard, response?);
         }
 
-        let mut docs_by_id = HashMap::with_capacity(hit_scores.len());
-        for (_shard, documents) in responses {
-            for doc in documents {
-                docs_by_id.insert(doc.doc_id, doc);
+        Ok(assemble_rerank_candidates(hit_scores, responses))
+    }
+}
+
+/// The ids each shard is asked for: an id goes to its known owner, or to
+/// every shard when its owner is unknown; each shard sees an id once.
+fn rerank_fetch_plan(
+    hit_scores: &[(u64, f64)],
+    shard_owners: &HashMap<u64, usize>,
+    shard_count: usize,
+) -> Vec<Vec<u64>> {
+    let mut per_shard: Vec<Vec<u64>> = vec![Vec::new(); shard_count];
+    let mut seen_per_shard: Vec<HashSet<u64>> = vec![HashSet::new(); shard_count];
+    for &(doc_id, _) in hit_scores {
+        if let Some(&owner) = shard_owners
+            .get(&doc_id)
+            .filter(|&&shard| shard < shard_count)
+        {
+            if seen_per_shard[owner].insert(doc_id) {
+                per_shard[owner].push(doc_id);
+            }
+        } else {
+            for shard in 0..shard_count {
+                if seen_per_shard[shard].insert(doc_id) {
+                    per_shard[shard].push(doc_id);
+                }
             }
         }
-        Ok(hit_scores
-            .iter()
-            .map(|&(doc_id, prior_score)| {
-                let doc = docs_by_id.get(&doc_id);
-                RerankCandidate {
-                    doc_id,
-                    prior_score,
-                    text: doc.map_or_else(String::new, |doc| doc.text.clone()),
-                    sentence_spans: doc.map_or_else(Vec::new, |doc| {
-                        doc.sentence_spans
-                            .iter()
-                            .map(|span| (span.start, span.end))
-                            .collect()
-                    }),
-                    lineage_span_start: doc
-                        .and_then(|doc| doc.lineage.as_ref())
-                        .map_or(0, |l| l.span_start),
-                }
-            })
-            .collect())
     }
+    per_shard
+}
+
+fn assemble_rerank_candidates(
+    hit_scores: &[(u64, f64)],
+    responses: BTreeMap<usize, Vec<crate::pb::StoredDocument>>,
+) -> Vec<RerankCandidate> {
+    let mut docs_by_id = HashMap::with_capacity(hit_scores.len());
+    for (_shard, documents) in responses {
+        for doc in documents {
+            docs_by_id.insert(doc.doc_id, doc);
+        }
+    }
+    hit_scores
+        .iter()
+        .map(|&(doc_id, prior_score)| {
+            let doc = docs_by_id.get(&doc_id);
+            RerankCandidate {
+                doc_id,
+                prior_score,
+                text: doc.map_or_else(String::new, |doc| doc.text.clone()),
+                sentence_spans: doc.map_or_else(Vec::new, |doc| {
+                    doc.sentence_spans
+                        .iter()
+                        .map(|span| (span.start, span.end))
+                        .collect()
+                }),
+                lineage_span_start: doc
+                    .and_then(|doc| doc.lineage.as_ref())
+                    .map_or(0, |l| l.span_start),
+            }
+        })
+        .collect()
 }

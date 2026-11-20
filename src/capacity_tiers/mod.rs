@@ -1,4 +1,4 @@
-//! Capacity tiers over declared hash partitions (`docs/capacity-tiers.md`):
+//! Capacity tiers over declared hash partitions:
 //! bounded capacity observations and the deterministic tier dry run.
 //!
 //! This module is a pure library. It allocates no protocol fields, opens
@@ -21,7 +21,7 @@
 //!
 //! Every hashed value uses the canonical encoding of §5 (little-endian
 //! integers, length-prefixed strings, fields in specification order), so
-//! the digests here agree byte-for-byte with the independent Python oracle
+//! the digests here agree byte-for-byte with the independent Python checker
 //! `scripts/verify_capacity_tier_fixtures.py` and with the literals pinned
 //! in §10 of the design document. The plan-input encoding is version 2:
 //! it binds the cohort and canonical subdigests of the node registry and

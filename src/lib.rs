@@ -9,12 +9,11 @@
 //!   [`chunked::chunked_topk`].
 //! - [`coordinator`] serves the client-facing
 //!   [`SearchService`](pb::search_service_server::SearchService), fans each
-//!   query out to every node, and merges shard top-k lists with
-//!   [`merge::merge_topk`].
+//!   query out to every node, and merges shard top-k lists.
 //!
 //! Collaborative mid-query floor sharing: nodes publish their current k-th
 //! best score once their top-k heap fills; the coordinator aggregates the
-//! maximum ([`merge::FloorTracker`]) and pushes it back; nodes seed the next
+//! maximum observed floor and pushes it back; nodes seed the next
 //! chunk's `initial_threshold` with it. Because a shard's k-th best is a
 //! lower bound on the global k-th best, pruning at-or-below the shared floor
 //! never drops a true global top-k hit — the mechanism is lossless.
@@ -24,18 +23,16 @@
 // it to satisfy result_large_err would only add allocations.
 #![allow(clippy::result_large_err)]
 
+// Public server and SDK facades.
 pub mod analyzer;
 pub mod authorization;
 pub mod bm25;
 pub mod boolean_bits;
-pub mod calendar;
 pub mod capacity_tiers;
 pub mod cel;
 pub mod chunked;
 pub mod clustered_turbovec;
 pub mod collections;
-mod column_stats;
-pub mod compaction;
 pub mod config;
 #[cfg(feature = "net")]
 pub mod console;
@@ -50,50 +47,25 @@ pub mod document_contract;
 #[cfg(feature = "net")]
 pub mod document_write_service;
 pub mod embedded;
-pub mod error_disclosure;
 pub mod exact_vectors;
-pub mod explain;
-pub mod facet_rows;
-mod field_permissions;
-pub mod filter;
-pub mod filter_bits;
-pub mod fusion;
-pub mod geo;
 #[cfg(feature = "net")]
 pub mod harness;
-pub mod highlight;
 pub mod hnsw;
 pub mod index_contract;
-mod integer_map;
-pub mod interleave;
-mod lineage;
 pub mod link;
 pub mod live_docs;
-pub mod ltr;
-mod mapped_analysis;
 pub mod mapped_vector;
 pub mod mapping;
-pub mod merge;
 pub mod metrics;
-pub(crate) mod multi_res;
-mod multi_res_storage;
-mod multi_res_wal;
 pub mod node;
 #[cfg(feature = "net")]
 pub mod node_agent;
-pub mod number_rows;
 pub mod pb;
 pub mod phrases;
 pub mod placement;
-pub mod placement_plan;
 pub mod postings;
-mod protobuf;
 pub mod proximity;
 pub mod quality;
-pub mod query;
-mod query_cursor;
-mod query_disclosure;
-mod query_identity;
 #[cfg(feature = "raft")]
 pub mod raft;
 #[cfg(not(feature = "raft"))]
@@ -101,41 +73,90 @@ pub mod raft {
     #[path = "reasons.rs"]
     pub mod reasons;
 }
-mod rangefacet;
-pub mod rankdiff;
 pub mod reconcile;
 pub mod relay;
-pub mod replay_journal;
 #[cfg(feature = "net")]
 pub mod replication;
 pub mod reshard;
 pub mod scorefn;
 pub mod security;
-pub mod segment_prune;
 pub mod segmented;
-pub mod segmented_vectors;
 pub mod segments;
 pub mod sha256;
 #[cfg(feature = "net")]
 pub mod snapshot;
 pub mod snapshot_repository;
-pub mod sortkeys;
-pub mod source_archive;
 #[cfg(feature = "net")]
 pub mod source_authority;
-mod source_owner;
-pub mod stats_cache;
-pub mod stats_identity;
-mod stream_signal;
 pub mod synonyms;
-#[cfg(any(test, feature = "fork-guard"))]
-pub mod test_support;
 pub mod turbo_bridge;
-pub mod values;
 pub mod vector;
 pub mod visibility;
 pub mod vocab;
 pub mod wal;
+
+// Implementation modules exposed for integration tests.
+#[doc(hidden)]
+pub mod calendar;
+#[doc(hidden)]
+pub mod compaction;
+#[doc(hidden)]
+pub mod error_disclosure;
+#[doc(hidden)]
+pub mod explain;
+#[doc(hidden)]
+pub mod filter;
+#[doc(hidden)]
+pub mod filter_bits;
+#[doc(hidden)]
+pub mod fusion;
+#[doc(hidden)]
+pub mod geo;
+#[doc(hidden)]
+pub mod replay_journal;
+#[doc(hidden)]
+pub mod segment_prune;
+#[doc(hidden)]
+pub mod segmented_vectors;
+#[doc(hidden)]
+pub mod sortkeys;
+#[doc(hidden)]
+pub mod stats_cache;
+#[doc(hidden)]
+pub mod stats_identity;
+#[doc(hidden)]
+#[cfg(any(test, feature = "fork-guard"))]
+pub mod test_support;
+#[doc(hidden)]
+pub mod values;
+
+// Crate-private implementation details.
+mod column_stats;
+pub(crate) mod facet_rows;
+mod field_permissions;
+pub(crate) mod highlight;
+mod integer_map;
+pub(crate) mod interleave;
+mod lineage;
+pub(crate) mod ltr;
+mod mapped_analysis;
+pub(crate) mod merge;
+pub(crate) mod multi_res;
+mod multi_res_storage;
+mod multi_res_wal;
+pub(crate) mod number_rows;
+pub(crate) mod placement_plan;
+mod protobuf;
+pub(crate) mod query;
+mod query_cursor;
+mod query_disclosure;
+mod query_identity;
+mod rangefacet;
+pub(crate) mod rankdiff;
+pub(crate) mod source_archive;
+mod source_owner;
+mod stream_signal;
+pub(crate) mod vector_read;
 
 /// Max gRPC message size (encoding and decoding) applied to every client
 /// and server this crate builds. Sized by the analysis path, not search:
@@ -155,5 +176,3 @@ pub const MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 pub const H2_STREAM_WINDOW: u32 = 2 * 1024 * 1024;
 /// See [`H2_STREAM_WINDOW`].
 pub const H2_CONN_WINDOW: u32 = 4 * 1024 * 1024;
-
-pub(crate) mod vector_read;

@@ -3,12 +3,12 @@
 use super::groups::KernelGroup;
 use super::*;
 
-/// Scan `index` for the top-`k` of `query` in chunks, adopting external
+/// Scan the index for the query's top-`k` in chunks, adopting external
 /// floors between chunks and publishing the local k-th best once the heap
 /// fills.
 ///
-/// - `query`: a single query vector of the index's dimension.
-/// - `chunk_blocks`: chunk size in SIMD blocks (values < 1 behave as 1).
+/// - `keep_ties`: tie-complete collection (the boundary tie group survives
+///   whole).
 /// - `external_floor`: polled before each chunk; `Some(f)` seeds that
 ///   chunk's threshold with `max(f, local heap floor)`. Return `None` when
 ///   no external floor is known (or floor sharing is disabled).
@@ -16,40 +16,28 @@ use super::*;
 ///   candidates, with the current k-th best score. It returns whether the
 ///   floor was actually sent, so the scan can report offered and
 ///   published separately.
-/// - `allow`: the request's filters as a slot allowlist covering every
-///   slot of the index, or `None` for an unfiltered scan. A filter only
-///   REMOVES documents, so every floor stays a valid lower bound on the
-///   filtered k-th best and no pruning math changes; what changes is
-///   that the kernel never scores a removed slot, so the result is the
-///   exact top-k OF THE SURVIVORS rather than the top-k narrowed
-///   afterwards.
 ///
-/// Returns the shard's local top-k sorted by [`ranks_before`] plus scan
-/// statistics.
-#[allow(clippy::too_many_arguments)]
+/// Returns the shard's local top-k, score descending with ties broken by
+/// ascending slot, plus scan statistics.
 pub fn chunked_topk(
-    index: &VectorIndex,
-    query: &[f32],
-    k: usize,
-    chunk_blocks: usize,
+    scan: ChunkedScan<'_>,
+    keep_ties: bool,
     external_floor: &mut dyn FnMut() -> Option<f32>,
     publish_floor: &mut dyn FnMut(f32) -> bool,
-    keep_ties: bool,
-    allow: Option<&[bool]>,
 ) -> (Vec<ChunkHit>, ScanStats) {
     let queries = [BatchQuery {
-        vector: query,
-        k,
+        vector: scan.query,
+        k: scan.k,
         keep_ties,
-        allow: allow.map(Mask::Bools),
+        allow: scan.allow,
         enumerate_max_rows: None,
         patience: None,
         floor_prune: None,
     }];
     chunked_topk_batch(
-        index,
+        scan.index,
         &queries,
-        chunk_blocks,
+        scan.chunk_blocks,
         &mut |_| external_floor(),
         &mut |_, f| publish_floor(f),
     )
@@ -140,8 +128,7 @@ pub fn chunked_topk_batch_observed(
         for group in &groups {
             let (kernel_floor, chunk_k) =
                 state.seed_floors(queries, &group.members, external_floor);
-            let Some(rows_streamed) = fill_mask(&mut mask, group.allow.as_deref(), start, end)
-            else {
+            let Some(rows_streamed) = fill_mask(&mut mask, group.allow, start, end) else {
                 continue;
             };
             let started = std::time::Instant::now();
@@ -163,30 +150,6 @@ pub fn chunked_topk_batch_observed(
         start = end;
     }
     state.finish()
-}
-
-/// Mark the chunk's allowed slots in `mask`, returning how many rows the
-/// kernel streams. A chunk in which the filters allow nothing is skipped
-/// outright (`None`): no kernel call, no candidates, and nothing to
-/// publish. This is where a selective filter pays for itself, above the
-/// kernel's own all-masked block short-circuit.
-pub(super) fn fill_mask(
-    mask: &mut [bool],
-    allow: Option<&[bool]>,
-    start: usize,
-    end: usize,
-) -> Option<usize> {
-    match allow {
-        None => {
-            mask[start..end].fill(true);
-            Some(end - start)
-        }
-        Some(a) if !a[start..end].iter().any(|&ok| ok) => None,
-        Some(a) => {
-            mask[start..end].copy_from_slice(&a[start..end]);
-            Some(masked_rows(a, start, end))
-        }
-    }
 }
 
 /// A non-scanning provider: one whole-index search per query, its k-th
@@ -216,6 +179,11 @@ fn searched_batch(
 /// current chunk.
 struct BatchState {
     heaps: Vec<Vec<ChunkHit>>,
+    /// Each heap's back buffer: a competitive chunk merges into it and the
+    /// two swap, so no merge allocates once both have grown to the heap.
+    spares: Vec<Vec<ChunkHit>>,
+    /// One kernel call's candidates for one query, reused across calls.
+    chunk: Vec<ChunkHit>,
     out: Vec<(Vec<ChunkHit>, ScanStats)>,
     floors: Vec<f32>,
 }
@@ -224,6 +192,8 @@ impl BatchState {
     fn new(queries: &[BatchQuery<'_>]) -> Self {
         Self {
             heaps: queries.iter().map(|q| Vec::with_capacity(q.k)).collect(),
+            spares: queries.iter().map(|_| Vec::new()).collect(),
+            chunk: Vec::new(),
             out: queries
                 .iter()
                 .map(|_| (Vec::new(), ScanStats::default()))
@@ -290,7 +260,7 @@ impl BatchState {
             if q.k == 0 {
                 continue;
             }
-            let mut chunk_hits = Vec::new();
+            self.chunk.clear();
             for (&score, &slot) in results
                 .scores_for_query(local)
                 .iter()
@@ -304,12 +274,18 @@ impl BatchState {
                     continue;
                 }
                 stats.candidates_collected += 1;
-                chunk_hits.push(ChunkHit {
+                self.chunk.push(ChunkHit {
                     slot: slot as u32,
                     score,
                 });
             }
-            merge_chunk_hits(&mut self.heaps[qi], &mut chunk_hits, q.k, q.keep_ties);
+            merge_chunk_hits(
+                &mut self.heaps[qi],
+                &mut self.spares[qi],
+                &mut self.chunk,
+                q.k,
+                q.keep_ties,
+            );
             if self.heaps[qi].len() >= q.k {
                 self.out[qi].1.floors_offered += 1;
                 if publish_floor(qi, self.heaps[qi][q.k - 1].score) {

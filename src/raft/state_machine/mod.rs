@@ -54,10 +54,11 @@ const STREAM_BUFFER: usize = 1024 * 1024;
 // partial transfer may be staged, but it cannot hand off a third image.
 const MAX_OWNED_RECEIVES: usize = 2;
 
-/// The store behind the state machine. Set once at construction; a
-/// snapshot install swaps the database in place under the store's own
-/// locks (`SourceAuthorityStore::replace_from`), so the slot is never
-/// emptied. The `None` refusal names that impossible state.
+/// The store behind the state machine. Populated at construction, swapped
+/// in place during snapshot installs (`SourceAuthorityStore::replace_from`),
+/// and cleared by `RaftHost::shutdown` once every state-machine and
+/// replication worker has exited so external `store_handle` readers never
+/// retain the database file lock past host shutdown.
 pub type SharedStore = Arc<RwLock<Option<SourceAuthorityStore>>>;
 
 fn sm_error(verb: ErrorVerb, error: impl std::fmt::Display) -> StorageError<NodeId> {
@@ -188,6 +189,9 @@ pub struct ControlStateMachine {
     // A process-exit fault armed for the next install's store replacement.
     #[cfg(any(test, feature = "fault-injection"))]
     install_fault: InstallFault,
+    // Dropped last after `store` when the state-machine worker and every
+    // spawned snapshot builder have exited.
+    released: Arc<tokio::sync::watch::Sender<()>>,
 }
 
 #[cfg(any(test, feature = "fault-injection"))]
@@ -209,6 +213,7 @@ pub struct ControlSnapshotBuilder {
     pointer_lock: Arc<Mutex<()>>,
     #[cfg(any(test, feature = "fault-injection"))]
     gates: Arc<SnapshotGates>,
+    _released: Arc<tokio::sync::watch::Sender<()>>,
 }
 
 /// Length and SHA-256 of an image: an integrity checksum bound into the

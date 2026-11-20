@@ -1,0 +1,70 @@
+name: dependency-gate
+
+# scripts/check-dependencies.sh judges the tree against the outside world:
+# newer compatible crate releases, the live heads of the git dependencies,
+# the newest action majors and the RustSec database. Those change without
+# a commit here, so the gate runs daily and on changes to what it checks,
+# instead of failing unrelated pushes the morning after a crate release.
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - ".forgejo/workflows/**"
+      - ".github/workflows/**"
+      - "scripts/check-dependencies.sh"
+  push:
+    branches:
+      - main
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - ".forgejo/workflows/**"
+      - ".github/workflows/**"
+      - "scripts/check-dependencies.sh"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_NET_RETRY: "5"
+  RUSTUP_MAX_RETRIES: "5"
+
+jobs:
+  gate:
+    if: ${{ github.server_url != 'https://github.com' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install prerequisites
+        run: |
+          set -euo pipefail
+          if command -v sudo >/dev/null 2>&1; then SUDO=sudo; else SUDO=; fi
+          export DEBIAN_FRONTEND=noninteractive
+          $SUDO apt-get update
+          $SUDO apt-get install -y --no-install-recommends ripgrep curl ca-certificates git
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --default-toolchain none
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup default 1.98.0
+          # The release binary, not a from-source build on every run.
+          audit=cargo-audit-x86_64-unknown-linux-gnu-v0.22.2
+          curl -sSfL -o /tmp/$audit.tgz \
+            "https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/$audit.tgz"
+          echo "ab28a1bdb54db4d5d8ad5981cf1f959410370b3d28250dbd35f6a44248620e39  /tmp/$audit.tgz" \
+            | sha256sum -c -
+          tar -xzf /tmp/$audit.tgz -C /tmp
+          install -m 0755 /tmp/$audit/cargo-audit "$HOME/.cargo/bin/cargo-audit"
+          rm -rf /tmp/$audit /tmp/$audit.tgz
+
+      - name: Dependency and provenance gate
+        run: scripts/check-dependencies.sh

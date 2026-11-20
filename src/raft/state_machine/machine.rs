@@ -47,9 +47,14 @@ impl ControlStateMachine {
             gates,
             #[cfg(any(test, feature = "fault-injection"))]
             install_fault: Arc::new(Mutex::new(None)),
+            released: Arc::new(tokio::sync::watch::Sender::new(())),
         };
         machine.sweep()?;
         Ok(machine)
+    }
+
+    pub(crate) fn subscribe_release(&self) -> tokio::sync::watch::Receiver<()> {
+        self.released.subscribe()
     }
 
     /// The staging area the transport receives and validates images in.

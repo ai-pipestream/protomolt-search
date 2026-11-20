@@ -1,4 +1,4 @@
-//! The mobile link gate (`docs/embedded-mobile.md`): the embedded crate
+//! The mobile link gate: the embedded crate
 //! must not link tonic's HTTP/2 transport, `h2`, `hyper`, or Tokio's
 //! networking. `cargo tree` on this package, resolved on its own, is the
 //! evidence; the test fails the moment one of them comes back.

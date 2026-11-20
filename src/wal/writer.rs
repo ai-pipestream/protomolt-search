@@ -56,7 +56,7 @@ pub(super) fn check_geometry(manifest: &WalManifest) -> io::Result<()> {
 /// files can cold-start together. A peer's create is visible (the
 /// generation directory) before it is complete (the manifest rename),
 /// so a NotFound while reading a just-appeared generation is retried
-/// until [`PEER_CREATE_TIMEOUT`] rather than failing the open, and the
+/// until `PEER_CREATE_TIMEOUT` rather than failing the open, and the
 /// create side is claimed atomically — every opener returns a valid
 /// writer onto the SAME well-formed generation.
 pub fn open_or_create(wal_dir: &Path, cutoff: u64, fresh: WalManifest) -> io::Result<WalWriter> {
@@ -187,7 +187,7 @@ impl WalWriter {
     /// for twin nodes sharing shard files.
     ///
     /// A claimed-but-manifestless directory is a create in mid-flight;
-    /// it is polled until [`PEER_CREATE_TIMEOUT`], not mistaken for a
+    /// it is polled until `PEER_CREATE_TIMEOUT`, not mistaken for a
     /// resumable generation (an abandoned one still errors, just
     /// slower). Rotation keeps [`Self::create`]: there a pre-existing
     /// directory is stale state to truncate, not a peer to join.

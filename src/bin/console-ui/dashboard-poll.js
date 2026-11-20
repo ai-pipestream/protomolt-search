@@ -96,7 +96,9 @@ export function setTile(id, value, sub) {
 }
 
 export async function healthTiles() {
-  const health = await refreshStatus();
+  refreshStatus();
+  let health;
+  try { health = await api.get('/api/health'); } catch { health = null; }
   if (!health) { setTile('shards_up', 'unreachable', ''); return; }
   const targets = health.targets || [];
   const up = targets.filter((t) => t.reachable).length;

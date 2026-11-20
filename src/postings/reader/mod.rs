@@ -2,16 +2,20 @@
 
 mod columns;
 mod field_view;
+mod index_impl;
+mod map_columns;
 mod open_v6;
+mod raw;
+mod transpose;
 mod validate;
 
-pub use self::field_view::{FieldTranspose, FieldView};
+pub use self::field_view::FieldView;
+pub use self::transpose::FieldTranspose;
 pub(super) use self::validate::validate_structure_v6;
 
 use std::io;
 use std::path::Path;
 
-use super::codec::ImpactCursor;
 use super::columns::{
     FacetSlice, GeoSlice, IntegerMapSlice, IntegerSlice, MapFacetSlice, MapNumericSlice,
     NumericSlice, StoredBinding, StoredDerived, UnsignedSlice,
@@ -19,7 +23,8 @@ use super::columns::{
 use super::format::{
     integrity_eager, parse_integrity, IntegrityTable, MAGIC_V6, MAGIC_V7, MAGIC_V8,
 };
-use super::{Bm25Index, DocLineage, PostingCallback};
+#[cfg(doc)]
+use super::Bm25Index;
 
 /// Per-field read state of one open `.bm25` file: the field's decoded
 /// doc-length table plus the map offsets of its directory and postings
@@ -339,73 +344,6 @@ impl Bm25Reader {
         Ok(reader)
     }
 
-    /// The 34 B directory entry: `(term bytes, doc_run_off, skip_run_off,
-    /// occ_run_off, df)`, with run offsets rebased to absolute file offsets
-    /// via `field.run_base`.
-    fn directory_entry(&self, field: &FieldSlice, i: u32) -> (&[u8], u64, u64, u64, u32) {
-        let e = field.directory_off as usize + 4 + 34 * i as usize;
-        let doc_run_off =
-            u64::from_le_bytes(self.map[e..e + 8].try_into().unwrap()) + field.run_base;
-        let skip_run_off =
-            u64::from_le_bytes(self.map[e + 8..e + 16].try_into().unwrap()) + field.run_base;
-        let occ_run_off =
-            u64::from_le_bytes(self.map[e + 16..e + 24].try_into().unwrap()) + field.run_base;
-        let df = u32::from_le_bytes(self.map[e + 24..e + 28].try_into().unwrap());
-        let stored = u32::from_le_bytes(self.map[e + 28..e + 32].try_into().unwrap()) as usize;
-        let len = u16::from_le_bytes(self.map[e + 32..e + 34].try_into().unwrap()) as usize;
-        let blob_off = field.directory_off as usize + 4 + 34 * field.n_terms as usize + stored;
-        (
-            &self.map[blob_off..blob_off + len],
-            doc_run_off,
-            skip_run_off,
-            occ_run_off,
-            df,
-        )
-    }
-
-    /// `(doc_run_off, skip_run_off, occ_run_off, df)` for `term` in `field`,
-    /// or `None` when the term is absent.
-    pub(in crate::postings) fn directory_lookup(
-        &self,
-        field: &FieldSlice,
-        term: &str,
-    ) -> Option<(u64, u64, u64, u32)> {
-        let i = self.directory_index(field, term)?;
-        let (_, doc, skip, occ, df) = self.directory_entry(field, i);
-        Some((doc, skip, occ, df))
-    }
-
-    /// Directory entry index of `term` in `field`, by binary search over the
-    /// byte-sorted term directory.
-    fn directory_index(&self, field: &FieldSlice, term: &str) -> Option<u32> {
-        let (mut lo, mut hi) = (0u32, field.n_terms);
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            let (bytes, _, _, _, _) = self.directory_entry(field, mid);
-            match bytes.cmp(term.as_bytes()) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal => return Some(mid),
-            }
-        }
-        None
-    }
-
-    /// Index of the posting for `doc_id` in a term's fixed-stride doc run
-    /// (doc ids ascending), or `None` when absent.
-    fn posting_index(&self, doc_run_off: usize, df: u32, doc_id: u32) -> Option<usize> {
-        let (mut lo, mut hi) = (0usize, df as usize);
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if self.u32_at(doc_run_off + 12 * mid) < doc_id {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        (lo < df as usize && self.u32_at(doc_run_off + 12 * lo) == doc_id).then_some(lo)
-    }
-
     /// Whether field `f` carries a kind-7 positions section.
     pub fn field_has_positions(&self, f: usize) -> bool {
         self.fields[f].positions_off.is_some()
@@ -434,216 +372,5 @@ impl Bm25Reader {
                 .map(|k| (self.u32_at(data + 8 * k), self.u32_at(data + 8 * k + 4)))
                 .collect(),
         )
-    }
-
-    fn u32_at(&self, off: usize) -> u32 {
-        u32::from_le_bytes(self.map[off..off + 4].try_into().unwrap())
-    }
-
-    /// The doc-run entry for posting `i`: `(doc_id, tf, occ_start)`.
-    fn doc_entry(&self, doc_run_off: usize, i: usize) -> (u32, u32, u32) {
-        let e = doc_run_off + 12 * i;
-        (self.u32_at(e), self.u32_at(e + 4), self.u32_at(e + 8))
-    }
-
-    /// The `occ_start` of posting `j`; `j == df` reads the trailing
-    /// sentinel, so any posting's occurrence count is
-    /// `occ_start(j + 1) - occ_start(j)` without a scan.
-    fn occ_start(&self, doc_run_off: usize, df: usize, j: usize) -> u32 {
-        if j < df {
-            self.u32_at(doc_run_off + 12 * j + 8)
-        } else {
-            self.u32_at(doc_run_off + 12 * df)
-        }
-    }
-
-    /// Decode the occurrence pairs `[occ_start, occ_end)` of a term's
-    /// occurrence run.
-    fn occ_slice(&self, occ_run_off: usize, occ_start: u32, occ_end: u32) -> Vec<(u32, u32)> {
-        let mut out = Vec::with_capacity((occ_end - occ_start) as usize);
-        for o in occ_start..occ_end {
-            let e = occ_run_off + 8 * o as usize;
-            out.push((self.u32_at(e), self.u32_at(e + 4)));
-        }
-        out
-    }
-
-    /// Walk the fixed-stride doc run without touching occurrence bytes.
-    fn for_each_doc_tf(&self, doc_run_off: usize, df: u32, f: &mut dyn FnMut(u32, u32)) {
-        for i in 0..df as usize {
-            let (doc_id, tf, _) = self.doc_entry(doc_run_off, i);
-            f(doc_id, tf);
-        }
-    }
-}
-
-impl Bm25Reader {
-    /// The shared stored text of a document, if present.
-    fn read_text(&self, doc_id: u32) -> Option<String> {
-        let slot = doc_id as usize;
-        if slot >= self.n_slots() {
-            return None;
-        }
-        let e = (self.text_index_off + 12 * doc_id as u64) as usize;
-        let offset = u64::from_le_bytes(self.map[e..e + 8].try_into().unwrap()) + self.text_base;
-        let len = u32::from_le_bytes(self.map[e + 8..e + 12].try_into().unwrap());
-        if len == u32::MAX {
-            return None;
-        }
-        let bytes = &self.map[offset as usize..offset as usize + len as usize];
-        String::from_utf8(bytes.to_vec()).ok()
-    }
-
-    /// The shared lineage of a document, if ingested with one.
-    fn read_lineage(&self, doc_id: u32) -> Option<DocLineage> {
-        let slot = doc_id as usize;
-        if slot >= self.n_slots() {
-            return None;
-        }
-        // The lineage section is variable stride (1 B absent marker,
-        // 25 B present), so a fixed 25B-stride read lands anywhere —
-        // correct only for dense all-present lineages. The lazily built
-        // per-slot offset index makes random access exact.
-        let index = self.lineage_index.get_or_init(|| {
-            let base = self.lineages_off as usize;
-            let mut offsets = Vec::with_capacity(self.n_slots());
-            let mut cur = base;
-            for _ in 0..self.n_slots() {
-                offsets.push((cur - base) as u32);
-                cur += if self.map[cur] == 0 { 1 } else { 25 };
-            }
-            offsets
-        });
-        let e = self.lineages_off as usize + index[slot] as usize;
-        if self.map[e] == 0 {
-            return None;
-        }
-        let parent_id = u64::from_le_bytes(self.map[e + 1..e + 9].try_into().unwrap());
-        let group_id = u64::from_le_bytes(self.map[e + 9..e + 17].try_into().unwrap());
-        let span_start = u32::from_le_bytes(self.map[e + 17..e + 21].try_into().unwrap());
-        let span_end = u32::from_le_bytes(self.map[e + 21..e + 25].try_into().unwrap());
-        Some(DocLineage {
-            parent_id,
-            group_id,
-            span_start,
-            span_end,
-        })
-    }
-}
-
-/// The reader itself scores as its body field (field 0) — the surface
-/// every single-field caller uses; multi-field scoring goes through
-/// [`Bm25Reader::field`].
-impl Bm25Index for Bm25Reader {
-    fn doc_count(&self) -> u64 {
-        self.doc_count
-    }
-    fn total_doc_length(&self) -> u64 {
-        self.field(0).total_doc_length()
-    }
-    fn doc_length(&self, doc_id: u32) -> u32 {
-        self.field(0).doc_length(doc_id)
-    }
-    fn df(&self, term: &str) -> u32 {
-        self.field(0).df(term)
-    }
-    fn for_each_posting(&self, term: &str, f: &mut PostingCallback) {
-        self.field(0).for_each_posting(term, f);
-    }
-    fn for_each_doc_tf(&self, term: &str, f: &mut dyn FnMut(u32, u32)) {
-        self.field(0).for_each_doc_tf(term, f);
-    }
-    fn posting_offsets(&self, term: &str, doc_id: u32) -> Vec<(u32, u32)> {
-        self.field(0).posting_offsets(term, doc_id)
-    }
-    fn has_positions(&self) -> bool {
-        self.field(0).has_positions()
-    }
-    fn posting_positions(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
-        self.field(0).posting_positions(term, doc_id)
-    }
-    fn has_pos_lengths(&self) -> bool {
-        self.field(0).has_pos_lengths()
-    }
-    fn posting_pos_lengths(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
-        self.field(0).posting_pos_lengths(term, doc_id)
-    }
-    fn has_splade(&self) -> bool {
-        self.field(0).has_splade()
-    }
-    fn score_splade_with_floor(
-        &self,
-        query_weights: &[(String, f32)],
-        query_l1_slack: f32,
-        initial_floor: f32,
-        k: usize,
-        admitted: &dyn Fn(u32) -> bool,
-    ) -> (
-        Vec<(u32, f32)>,
-        f32,
-        crate::turbo_bridge::splade::SpladeTraversalStats,
-    ) {
-        self.field(0).score_splade_with_floor(
-            query_weights,
-            query_l1_slack,
-            initial_floor,
-            k,
-            admitted,
-        )
-    }
-    fn has_sentences(&self) -> bool {
-        self.field(0).has_sentences()
-    }
-    fn doc_sentences(&self, doc_id: u32) -> Option<Vec<(u32, u32)>> {
-        self.field(0).doc_sentences(doc_id)
-    }
-    fn prefix_terms(&self, prefix: &str) -> Box<dyn Iterator<Item = String> + '_> {
-        self.field(0).prefix_iter(prefix)
-    }
-    fn expand_prefix(&self, prefix: &str, cap: usize) -> Result<Vec<String>, usize> {
-        self.field(0).expand_prefix(prefix, cap)
-    }
-    fn suggest_prefix(&self, prefix: &str, max_scan: usize) -> Result<Vec<(String, u32)>, usize> {
-        self.field(0).suggest_prefix(prefix, max_scan)
-    }
-    fn impacts(&self, term: &str) -> Option<ImpactCursor<'_>> {
-        self.field(0).impacts_inner(term)
-    }
-    fn has_impacts(&self, term: &str) -> bool {
-        self.field(0).has_impacts(term)
-    }
-    fn text(&self, doc_id: u32) -> Option<String> {
-        self.read_text(doc_id)
-    }
-    fn lineage(&self, doc_id: u32) -> Option<DocLineage> {
-        self.read_lineage(doc_id)
-    }
-}
-
-/// A sealed part answers a range from its column sorted by value.
-impl crate::filter_bits::PartNumbers for Bm25Reader {
-    fn int_value(&self, column: usize, row: u32) -> Option<i64> {
-        (column < self.integer_count())
-            .then(|| self.integer_value(column, row))
-            .flatten()
-    }
-    fn uint_value(&self, column: usize, row: u32) -> Option<u64> {
-        (column < self.unsigned_integer_count())
-            .then(|| self.unsigned_integer_value(column, row))
-            .flatten()
-    }
-    fn f64_value(&self, column: usize, row: u32) -> Option<f64> {
-        (column < self.numeric_count())
-            .then(|| self.numeric_value(column, row))
-            .flatten()
-    }
-    fn int_sorted(&self, column: usize) -> Option<&crate::number_rows::NumberRows<i64>> {
-        (column < self.integer_count()).then(|| self.integer_rows(column))
-    }
-    fn uint_sorted(&self, column: usize) -> Option<&crate::number_rows::NumberRows<u64>> {
-        (column < self.unsigned_integer_count()).then(|| self.unsigned_integer_rows(column))
-    }
-    fn f64_sorted(&self, column: usize) -> Option<&crate::number_rows::NumberRows<f64>> {
-        (column < self.numeric_count()).then(|| self.numeric_rows(column))
     }
 }

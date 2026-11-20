@@ -122,14 +122,16 @@ impl NodeServiceImpl {
             )));
         }
         let (hits, scan_stats) = chunked_topk(
-            index,
-            vector,
-            k,
-            self.config.chunk_blocks,
+            crate::chunked::ChunkedScan {
+                index,
+                query: vector,
+                k,
+                chunk_blocks: self.config.chunk_blocks,
+                allow: allow.map(crate::vector::Mask::Bits),
+            },
+            false,
             &mut || None,
             &mut |_| false,
-            false,
-            allow.map(|bits| bits.to_bools()).as_deref(),
         );
         observe_scan(scan_stats.bytes_scanned, scan_stats.scan_nanos);
         Ok(hits

@@ -1,0 +1,53 @@
+name: ivf-eval
+
+# The experimental IVF provider is its own workspace with its own lockfile,
+# so testing it is a second full build of the engine. It runs on request,
+# not on every push.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: "4"
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: never
+  CARGO_NET_RETRY: "5"
+  RUSTUP_MAX_RETRIES: "5"
+  CARGO_TARGET_DIR: /tmp/forgejo-ci/protomolt-ivf-eval-target
+  PIPESTREAM_RUSTC_SLOT_DIR: /tmp/rustc-slots
+  PIPESTREAM_RUSTC_SLOTS: "12"
+
+jobs:
+  test:
+    if: ${{ github.server_url != 'https://github.com' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install build prerequisites
+        run: |
+          set -euo pipefail
+          if command -v sudo >/dev/null 2>&1; then SUDO=sudo; else SUDO=; fi
+          export DEBIAN_FRONTEND=noninteractive
+          $SUDO apt-get update
+          $SUDO apt-get install -y --no-install-recommends \
+            protobuf-compiler libprotobuf-dev curl ca-certificates git \
+            build-essential pkg-config cmake libssl-dev
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --default-toolchain none
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup default 1.98.0
+          echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/scripts/rustc-slot.sh" >> "$GITHUB_ENV"
+
+      - name: Experimental provider tests
+        run: cargo test --locked --no-fail-fast --manifest-path benchmarks/ivf-eval/Cargo.toml
+
+      - name: Remove the target dir
+        if: always()
+        run: rm -rf "$CARGO_TARGET_DIR"

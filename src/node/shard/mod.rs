@@ -18,7 +18,7 @@ pub(crate) use self::facets::{
     timestamp_to_epoch_micros, validate_geo_filter, validate_geo_filters,
     validate_range_facet_fields,
 };
-pub(in crate::node) use self::facets::{unknown_range_counts, validate_lat_lon};
+pub(in crate::node) use self::facets::{unknown_range_counts, validate_lat_lon, FacetCountRequest};
 pub(in crate::node) use self::filters::{
     filter_known_flags, prune_segments, resolve_shard_filters, ResolvedShardFilters, SegmentPrune,
 };

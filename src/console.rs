@@ -1,34 +1,38 @@
-//! The console: a JSON facade over the cluster's gRPC plus the web UI it
-//! serves.
+//! The console: a backend-for-frontend over the cluster's gRPC plus the web
+//! UI it serves.
 //!
-//! The facade is a client of a running cluster and never part of it. It
+//! The console is a client of a running cluster and never part of it. It
 //! holds the TLS material and the bearer token, so a browser carries
-//! neither. Its one real job is transcoding: `POST /api/rpc/<Service>/
-//! <Method>` takes the request message as proto3 JSON, sends it over
-//! gRPC, and answers with the response as proto3 JSON, for every unary
-//! method of `SearchService` and `DiagnosticsService`, plus the one
-//! `ClusterControl` method the dashboard needs (`PlanBalance`, a
-//! read-only dry run); the server-streaming methods are exposed as
-//! server-sent events under `/api/stream/...`. The mapping is built from
-//! the compiled descriptor set at run time, so an RPC added to an
-//! exposed service needs no change here.
+//! neither. A browser reaches one surface, `ai.protomolt.console.bff.v1.
+//! ConsoleBffService`, served under `/bff/v1` as the Connect protocol:
+//! unary calls as `application/json`, server streams as
+//! `application/connect+json` envelopes, and the same streams as
+//! server-sent events under `/bff/v1/sse/<Method>` with `: keepalive`
+//! comments for proxies that buffer. Every method is read-only, goes to the
+//! coordinator, and is listed in one fixed table; no request names a node
+//! or an address, and an upstream failure answers with its code and a generic
+//! message rather than the cluster's addresses.
 //!
-//! A few convenience routes exist for the UI: `/api/health`,
-//! `/api/config`, `/api/embed` (the analysis endpoint's embedding, when
-//! one is configured, dialed with the console's TLS material and bearer
-//! token), and `/api/documents` (stored text from the owning nodes,
-//! routed by the cluster's slot ranges and read from them concurrently).
+//! The operator explorer is the older, raw surface: `POST /api/rpc/
+//! <Service>/<Method>` transcodes proto3 JSON for every unary method of
+//! `SearchService` and `DiagnosticsService` plus `ClusterControl.
+//! PlanBalance`, `/api/stream/...` serves their streams as server-sent
+//! events, `?target=node<i>` routes to a configured node, and `/api/health`,
+//! `/api/config`, `/api/describe`, `/api/embed` and `/api/documents` back
+//! the explorer and dashboard pages. It is off unless
+//! [`Console::with_raw_explorer`] (`--enable-raw-explorer`) turns it on, and
+//! that is refused for a console started with `--allow-remote`.
 //!
 //! The HTTP side is hand-rolled HTTP/1.1: persistent connections with
 //! pipelined requests answered in order, `Content-Length` and chunked
-//! request bodies, deadlines on reading a request's head and body and on
-//! an idle connection, and a cap on open connections. This is an
-//! operator's tool bound to loopback by default, not a product server.
-//! Binding elsewhere needs `--allow-remote`, because whoever reaches the
-//! facade acts as its principal.
+//! request bodies up to 8 MiB, deadlines on reading a request's head and
+//! body and on an idle connection, and a cap on open connections. Binding
+//! a non-loopback address needs `--allow-remote`, because whoever reaches
+//! the console acts as its principal.
 //!
-//! The UI is compiled in. [`Console::with_ui_dir`] serves the files of a
-//! directory instead, read on every request, so UI work needs a reload
+//! The UI is compiled in; `ui/` builds its Connect client into
+//! `src/bin/console-ui/bff.js`. [`Console::with_ui_dir`] serves the files
+//! of a directory instead, read on every request, so UI work needs a reload
 //! rather than a rebuild; a file missing there falls back to the
 //! compiled-in copy.
 
@@ -45,7 +49,7 @@ use prost_reflect::{
     SerializeOptions,
 };
 use serde_json::{json, Value};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
@@ -57,7 +61,7 @@ use tonic::{Code, Request, Status};
 use crate::analyzer::RemoteCallOptions;
 use crate::pb::node_service_client::NodeServiceClient;
 use crate::pb::search_service_client::SearchServiceClient;
-use crate::pb::{ClusterHealthRequest, GetDocumentsRequest};
+use crate::pb::{ClusterHealthRequest, ClusterHealthResponse, GetDocumentsRequest, StoredDocument};
 use crate::security::{Bearer, PublicChannel, ToolClient};
 
 /// The compiled descriptor set (`build.rs`): every service and message
@@ -110,93 +114,8 @@ const STREAM_WRITE_DEADLINE: Duration = Duration::from_secs(10);
 const MAX_CONNECTIONS: usize = 256;
 /// How long one embedding call to the analysis endpoint may take.
 const EMBED_DEADLINE: Duration = Duration::from_secs(30);
-
-/// What the facade needs to run, parsed from the tool flags.
-pub struct ConsoleConfig {
-    pub listen: String,
-    pub coordinator: String,
-    pub nodes: Vec<String>,
-    pub analysis: Option<String>,
-    pub security: ToolClient,
-    pub allow_remote: bool,
-}
-
-fn flag(args: &[String], key: &str) -> Option<String> {
-    let prefix = format!("--{key}=");
-    args.iter()
-        .find_map(|a| a.strip_prefix(&prefix).map(str::to_string))
-}
-
-/// `host:port` -> `http://host:port`; already-schemed addresses pass.
-fn grpc_addr(addr: &str) -> String {
-    if addr.contains("://") {
-        addr.to_string()
-    } else {
-        format!("http://{addr}")
-    }
-}
-
-/// The `--ui-dir` flag, as `--ui-dir=<path>` or `--ui-dir <path>`.
-pub fn ui_dir_arg(args: &[String]) -> Option<PathBuf> {
-    flag(args, "ui-dir").map(PathBuf::from).or_else(|| {
-        let at = args.iter().position(|a| a == "--ui-dir")?;
-        args.get(at + 1).map(PathBuf::from)
-    })
-}
-
-/// The options every embedding call carries: the interactive lane, a
-/// deadline, the tool's bearer token, and, when the tool dials TLS, its
-/// client TLS material. `ToolClient` hands that material over through the
-/// process-wide install, which this performs when nothing is installed
-/// yet; an earlier install in the same process wins.
-fn embed_options(security: &ToolClient) -> RemoteCallOptions {
-    if security.is_tls() && crate::security::process_client_tls().is_none() {
-        security.install();
-    }
-    RemoteCallOptions {
-        bearer_token: security.raw_bearer_token().map(str::to_string),
-        interactive: true,
-        timeout: Some(EMBED_DEADLINE),
-        tls: if security.is_tls() {
-            crate::security::process_client_tls().cloned()
-        } else {
-            None
-        },
-        ..Default::default()
-    }
-}
-
-impl ConsoleConfig {
-    /// Flags, all `--key=value`: `--listen` (default `127.0.0.1:8600`),
-    /// `--coordinator` (default `http://127.0.0.1:50050`), `--nodes`
-    /// (comma-separated, in shard order), `--analysis` (the sidecar,
-    /// for embeddings), `--allow-remote`, and the tool security flags
-    /// `ToolClient` reads.
-    pub fn from_args(args: &[String]) -> Result<Self, String> {
-        let security = ToolClient::from_args(args.iter().cloned())?;
-        let coordinator = security.url(
-            &flag(args, "coordinator").unwrap_or_else(|| "http://127.0.0.1:50050".to_string()),
-        );
-        let nodes = flag(args, "nodes")
-            .map(|list| {
-                list.split(',')
-                    .filter(|s| !s.is_empty())
-                    .map(|s| security.url(s))
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(Self {
-            listen: flag(args, "listen").unwrap_or_else(|| "127.0.0.1:8600".to_string()),
-            coordinator,
-            nodes,
-            // A bare address gets `http://`; with `--tls-ca` the embedding
-            // call dials it as `https://` (see `embed_options`).
-            analysis: flag(args, "analysis").map(|a| grpc_addr(&a)),
-            security,
-            allow_remote: args.iter().any(|a| a == "--allow-remote"),
-        })
-    }
-}
+/// How often an idle server-sent stream carries a `: keepalive` comment.
+const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
 
 struct Ctx {
     coordinator: String,
@@ -207,6 +126,13 @@ struct Ctx {
     embed: RemoteCallOptions,
     /// The canonical `--ui-dir`, when the UI is served from disk.
     ui_dir: Option<PathBuf>,
+    /// Whether the operator's `/api` routes and pages are served.
+    raw_explorer: bool,
+    /// Whether the listener is a loopback address, so `/bff` requests
+    /// must name a loopback host (a rebound DNS name does not).
+    loopback: bool,
+    /// The `: keepalive` period of `/bff/v1/sse` streams.
+    sse_heartbeat: Duration,
     /// One channel per address, connected lazily and reused across
     /// requests (a handshake per request would dominate a TLS fleet).
     channels: Mutex<HashMap<String, Channel>>,
@@ -284,6 +210,7 @@ pub struct Console {
     listener: TcpListener,
     ctx: Arc<Ctx>,
     max_connections: usize,
+    allow_remote: bool,
 }
 
 impl Console {
@@ -312,11 +239,36 @@ impl Console {
                 embed: embed_options(&config.security),
                 security: config.security,
                 ui_dir: None,
+                raw_explorer: false,
+                loopback: crate::security::is_loopback(&addr),
+                sse_heartbeat: SSE_HEARTBEAT,
                 channels: Mutex::new(HashMap::new()),
                 health: Mutex::new(None),
             }),
             max_connections: MAX_CONNECTIONS,
+            allow_remote: config.allow_remote,
         })
+    }
+
+    fn ctx_mut(&mut self) -> &mut Ctx {
+        Arc::get_mut(&mut self.ctx).expect("the context is shared only once serving starts")
+    }
+
+    /// Serves the operator explorer: `/api/...`, `/explorer`, and
+    /// `/dashboard`. Refused for a console bound with `allow_remote`.
+    pub fn with_raw_explorer(mut self) -> Result<Self, String> {
+        if self.allow_remote {
+            return Err(RAW_WITH_REMOTE.to_string());
+        }
+        self.ctx_mut().raw_explorer = true;
+        Ok(self)
+    }
+
+    /// Sets the `: keepalive` period of `/bff/v1/sse` streams (at least
+    /// one millisecond).
+    pub fn with_sse_heartbeat(mut self, period: Duration) -> Self {
+        self.ctx_mut().sse_heartbeat = period.max(Duration::from_millis(1));
+        self
     }
 
     /// Serves the UI files found in `dir`, read on every request, ahead
@@ -330,9 +282,7 @@ impl Console {
         if !dir.is_dir() {
             return Err(format!("--ui-dir {} is not a directory", dir.display()));
         }
-        Arc::get_mut(&mut self.ctx)
-            .expect("the context is shared only once serving starts")
-            .ui_dir = Some(dir);
+        self.ctx_mut().ui_dir = Some(dir);
         Ok(self)
     }
 
@@ -351,7 +301,7 @@ impl Console {
     /// A one-line description for the startup log.
     pub fn describe(&self) -> String {
         format!(
-            "console on http://{} -> coordinator {} ({} node(s), analysis {}, tls {}, bearer {}, ui {})",
+            "console on http://{} -> coordinator {} ({} node(s), analysis {}, tls {}, bearer {}, ui {}, raw explorer {})",
             self.local_addr(),
             self.ctx.coordinator,
             self.ctx.nodes.len(),
@@ -365,6 +315,7 @@ impl Console {
                 .ui_dir
                 .as_deref()
                 .map_or_else(|| "compiled in".to_string(), |d| d.display().to_string()),
+            if self.ctx.raw_explorer { "on" } else { "off" },
         )
     }
 
@@ -388,7 +339,13 @@ impl Console {
 }
 
 mod assets;
+mod bff;
+mod bff_ops;
+mod bff_stream;
+#[cfg(test)]
+mod bff_tests;
 mod codec;
+mod config;
 mod conn;
 mod http;
 #[cfg(test)]
@@ -402,8 +359,13 @@ mod serve_tests;
 mod tests;
 
 use self::assets::*;
+use self::bff::*;
+use self::bff_ops::*;
+use self::bff_stream::*;
 use self::codec::*;
 pub use self::codec::{json_to_message_bytes, message_bytes_to_json};
+use self::config::*;
+pub use self::config::{raw_explorer_arg, ui_dir_arg, ConsoleConfig};
 use self::conn::*;
 use self::http::*;
 use self::routes::*;

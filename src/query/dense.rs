@@ -3,7 +3,7 @@
 
 use tonic::{Request, Status};
 
-use super::pool::{answer_pool, Answer};
+use super::pool::{answer_pool, Answer, Routed};
 use super::rerank::{turbo_rerank, RerankSources};
 use super::response::{leaf_signal, matched, ms, scored_hit};
 use super::run::Run;
@@ -18,7 +18,7 @@ pub(super) async fn execute_dense(
     mut run: Run<'_>,
     id: &str,
     query: &DenseQuery,
-) -> Result<QueryResponse, Status> {
+) -> Result<Routed, Status> {
     let base = run.base;
     let t_sel = std::time::Instant::now();
     let request = search_request(&mut run, query);
@@ -33,10 +33,6 @@ pub(super) async fn execute_dense(
         p.segments_skipped = response.segments_skipped;
     }
     report_shard_regimes(&mut run, &response);
-    let mut sources = RerankSources::default();
-    for h in &response.hits {
-        sources.note_candidate(h.vector_id, h.rerank_candidate.as_ref());
-    }
     let matched = matched(vec![id.to_string()], &base.plan.filter_ids);
     let mut hits: Vec<QueryHit> = response
         .hits
@@ -63,15 +59,16 @@ pub(super) async fn execute_dense(
         }
         "search"
     };
+    let sources = rerank_sources(base.coordinator.rerank_spec(), &hits, &response);
     if turbo_rerank(&base, &base.req.request_id, &sources, &mut hits).await? {
         route = "search:turbo_rerank";
     }
     let mut answer = match answer_pool(&mut run, hits, route, response.request_id).await? {
-        Answer::Deepened(response) => return Ok(response),
-        Answer::Paged(response) => response,
+        Answer::Deepen(depth) => return Ok(Routed::Deepen(depth)),
+        Answer::Paged(response) => *response,
     };
     report_dense(run, &mut answer);
-    Ok(answer)
+    Ok(Routed::Done(Box::new(answer)))
 }
 
 fn search_request(run: &mut Run<'_>, query: &DenseQuery) -> SearchRequest {
@@ -103,6 +100,24 @@ fn report_shard_regimes(run: &mut Run<'_>, response: &SearchResponse) {
         outcome.shards_finished_early = response.shards_finished_early;
         outcome.shards_floor_pruned = response.shards_floor_pruned;
     }
+}
+
+fn rerank_sources(
+    spec: Option<&crate::turbo_bridge::rerank::RerankSpec>,
+    hits: &[QueryHit],
+    response: &SearchResponse,
+) -> RerankSources {
+    let mut sources = RerankSources::for_shortlist(spec, hits);
+    if !sources.is_enabled() {
+        return sources;
+    }
+    for h in &response.hits {
+        sources.note_candidate(h.vector_id, h.rerank_candidate.as_ref());
+        if sources.has_all_inline() {
+            break;
+        }
+    }
+    sources
 }
 
 /// Rescore the candidate pool against the stored FP32 vectors and

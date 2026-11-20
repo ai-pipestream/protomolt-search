@@ -74,14 +74,16 @@ fn collapsed_matches_brute_force_reference() {
         let want = signature(&collapse_reference(&index, &query, &parents, k));
         for chunk_blocks in [1, 2, 7, 64, 10_000] {
             let (hits, stats) = chunked_topk_collapsed(
-                &index,
-                &query,
-                k,
-                chunk_blocks,
+                ChunkedScan {
+                    index: &index,
+                    query: &query,
+                    k,
+                    chunk_blocks,
+                    allow: None,
+                },
                 &parents,
                 &mut || None,
                 &mut |_| false,
-                None,
             );
             assert_eq!(
                 signature(&hits),
@@ -119,14 +121,16 @@ fn collapsed_survives_a_monster_parent() {
     let want = signature(&collapse_reference(&index, &query, &parents, k));
     for chunk_blocks in [2, 8, 64, 10_000] {
         let (hits, _stats) = chunked_topk_collapsed(
-            &index,
-            &query,
-            k,
-            chunk_blocks,
+            ChunkedScan {
+                index: &index,
+                query: &query,
+                k,
+                chunk_blocks,
+                allow: None,
+            },
             &parents,
             &mut || None,
             &mut |_| false,
-            None,
         );
         assert_eq!(signature(&hits), want, "chunk_blocks={chunk_blocks}");
         assert_eq!(
@@ -147,20 +151,19 @@ fn collapsed_floors_are_sound_and_external_floor_is_lossless() {
     let query = unit_vectors(1, dim, 0xC0AC_0001);
     let parents = run_parents(n, 9);
 
-    let mut published = Vec::new();
-    let (hits, stats) = chunked_topk_collapsed(
-        &index,
-        &query,
+    let scan = ChunkedScan {
+        index: &index,
+        query: &query,
         k,
-        8,
-        &parents,
-        &mut || None,
-        &mut |f| {
-            published.push(f);
-            true
-        },
-        None,
-    );
+        chunk_blocks: 8,
+        allow: None,
+    };
+
+    let mut published = Vec::new();
+    let (hits, stats) = chunked_topk_collapsed(scan, &parents, &mut || None, &mut |f| {
+        published.push(f);
+        true
+    });
     assert!(!published.is_empty());
     assert!(
         published.windows(2).all(|w| w[0] <= w[1]),
@@ -178,41 +181,15 @@ fn collapsed_floors_are_sound_and_external_floor_is_lossless() {
     // a debounce interval produces at the node. The scan still OFFERS
     // every floor; only the wire count drops. Reporting one number
     // for both is what made those knobs measure as inert.
-    let (_, muted) = chunked_topk_collapsed(
-        &index,
-        &query,
-        k,
-        8,
-        &parents,
-        &mut || None,
-        &mut |_| false,
-        None,
-    );
+    let (_, muted) = chunked_topk_collapsed(scan, &parents, &mut || None, &mut |_| false);
     assert_eq!(muted.floors_offered, stats.floors_offered);
     assert_eq!(muted.floors_published, 0);
 
     // Seed the true k-th best as an external floor: results identical,
     // strictly fewer candidates collected.
-    let (unseeded, base) = chunked_topk_collapsed(
-        &index,
-        &query,
-        k,
-        8,
-        &parents,
-        &mut || None,
-        &mut |_| false,
-        None,
-    );
-    let (seeded, pruned) = chunked_topk_collapsed(
-        &index,
-        &query,
-        k,
-        8,
-        &parents,
-        &mut || Some(kth),
-        &mut |_| false,
-        None,
-    );
+    let (unseeded, base) = chunked_topk_collapsed(scan, &parents, &mut || None, &mut |_| false);
+    let (seeded, pruned) =
+        chunked_topk_collapsed(scan, &parents, &mut || Some(kth), &mut |_| false);
     assert_eq!(signature(&unseeded), signature(&seeded));
     assert!(pruned.candidates_collected < base.candidates_collected);
 }

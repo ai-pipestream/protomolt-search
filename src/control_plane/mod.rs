@@ -147,8 +147,8 @@ impl DurableControlPlane {
         }
     }
 
-    /// Bind this plane to a collection (`docs/collections.md`). State
-    /// written before collections is adopted and written; state that
+    /// Bind this plane to a collection. State written before
+    /// collections is adopted and written; state that
     /// names another collection is refused, because its shards are that
     /// dataset's.
     pub fn with_collection(self, name: &str) -> Result<Self, String> {

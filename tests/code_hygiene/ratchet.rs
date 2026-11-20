@@ -51,18 +51,6 @@ impl ModuleAllowance {
         }
     }
 
-    pub(crate) const fn fn_lines(mut self, max_lines: usize, over_count: usize) -> Self {
-        self.max_fn_lines = max_lines;
-        self.over_80_fns = over_count;
-        self
-    }
-
-    pub(crate) const fn test_fn_lines(mut self, max_lines: usize, over_count: usize) -> Self {
-        self.max_test_fn_lines = max_lines;
-        self.over_120_test_fns = over_count;
-        self
-    }
-
     pub(crate) const fn params(mut self, max_params: usize, over_count: usize) -> Self {
         self.max_params = max_params;
         self.over_7_params = over_count;
@@ -72,12 +60,6 @@ impl ModuleAllowance {
     pub(crate) const fn allows(mut self, too_many_args: usize, dead_code: usize) -> Self {
         self.too_many_args_allows = too_many_args;
         self.dead_code_allows = dead_code;
-        self
-    }
-
-    pub(crate) const fn comments(mut self, breadcrumbs: usize, slop: usize) -> Self {
-        self.doc_breadcrumbs = breadcrumbs;
-        self.slop_comments = slop;
         self
     }
 
@@ -99,52 +81,9 @@ const fn base(module: &'static str) -> ModuleAllowance {
 /// Non-increasing per-module allowances on the stabilization baseline.
 /// Modules already within every default ceiling are omitted.
 pub(crate) const RATCHET: &[ModuleAllowance] = &[
-    base("crates/protomolt-search-embedded/tests/dependency_gate").comments(1, 0),
-    base("crates/protomolt-search-embedded/tests/document_grants").test_fn_lines(126, 1),
-    base("src/boolean_bits").comments(3, 0),
-    base("src/calendar").comments(1, 0),
-    base("src/capacity_tiers").comments(1, 1),
-    base("src/chunked").params(8, 2).allows(2, 0),
-    base("src/column_stats").fn_lines(109, 1),
-    base("src/compaction")
-        .fn_lines(211, 3)
-        .test_fn_lines(188, 1),
-    base("src/control_plane")
-        .fn_lines(299, 4)
-        .test_fn_lines(130, 1)
-        .comments(8, 0),
-    base("src/coordinator")
-        .fn_lines(273, 28)
-        .test_fn_lines(177, 2)
-        .params(11, 5)
-        .allows(5, 0),
-    base("src/demo").comments(1, 0),
-    base("src/facet_rows").comments(1, 0),
-    base("src/geo").comments(3, 0),
+    base("src/coordinator").params(11, 4).allows(4, 0),
     base("src/hnsw").params(14, 2).allows(2, 0),
-    base("src/index_contract").fn_lines(98, 1),
-    base("src/index_definition").fn_lines(128, 1),
-    base("src/link").comments(1, 0),
-    base("src/live_docs").comments(1, 0),
-    base("src/node")
-        .fn_lines(389, 34)
-        .test_fn_lines(230, 1)
-        .params(14, 5)
-        .allows(5, 0)
-        .comments(4, 0),
-    base("src/number_rows").comments(1, 0),
-    base("src/pb").comments(1, 0),
-    base("src/placement_plan").comments(1, 0),
-    base("src/query_disclosure")
-        .fn_lines(115, 1)
-        .test_fn_lines(151, 1),
+    base("src/node").params(14, 4).allows(4, 0),
     base("src/raft").params(10, 1).allows(1, 0),
-    base("src/schema_report").fn_lines(118, 3),
     base("src/segments").params(8, 1).allows(1, 0),
-    base("src/sha256").comments(1, 0),
-    base("src/sortkeys").comments(1, 0),
-    base("src/source_owner").fn_lines(83, 1),
-    base("src/stats_cache").comments(1, 0),
-    base("src/stream_signal").comments(1, 0),
-    base("src/synonyms").fn_lines(107, 1).comments(1, 0),
 ];

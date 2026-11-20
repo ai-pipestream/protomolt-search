@@ -2,6 +2,7 @@
 // or `node --test tests/console_ui.mjs` from the repository root. No
 // dependencies. query-state.js is pure; the page modules load under the
 // minimal document below and their DOM-free helpers are checked directly.
+// bff.js is the bundle ui/ builds; its own tests run under `bun test` in ui/.
 import assert from 'node:assert/strict';
 import {
   splitTopLevel, splitConjuncts, toggleConjunct, isIdentifier, celString, rangeColumn,
@@ -205,4 +206,20 @@ assert.deepEqual(tree, {
 assert.deepEqual(cluster.parseTree(' {"column": "c"} '), { column: 'c' });
 assert.throws(() => cluster.parseTree('[[placement.nodes.children]]\nname = "x"'), /no parent node/);
 assert.throws(() => cluster.parseTree('[other]'), /unknown table/);
+
+// The search page reaches the cluster only through the BFF bundle: no
+// module it loads names a raw /api route.
+const { readFileSync, readdirSync } = await import('node:fs');
+const uiDir = new URL('../src/bin/console-ui/', import.meta.url);
+const raw = readdirSync(uiDir).filter((f) => /^search.*\.js$/.test(f) && readFileSync(new URL(f, uiDir), 'utf8').includes('/api/'));
+assert.deepEqual(raw, []);
+const bundle = await import('../src/bin/console-ui/bff.js');
+assert.equal(bundle.BFF_BASE, '/bff/v1');
+assert.equal(bundle.bffMethod('Query', 'unary').parent.typeName, 'ai.protomolt.console.bff.v1.ConsoleBffService');
+assert.equal(bundle.bffMethod('QueryStream', 'server_streaming').name, 'QueryStream');
+assert.throws(() => bundle.bffMethod('RoutedIngestMapped', 'unary'), (e) => e.code === 'NOT_FOUND');
+assert.equal(bundle.codeName(3), 'INVALID_ARGUMENT');
+// Without the raw explorer's config the grpcurl line names placeholders.
+assert.equal(common.grpcurlFor({ analysis: false }, 'SearchService', 'Query', {}),
+  `grpcurl $GRPCURL_FLAGS -d '{}' $COORDINATOR ai.protomolt.search.v1.SearchService/Query`);
 console.log('console_ui: ok');

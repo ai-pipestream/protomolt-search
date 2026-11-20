@@ -6,8 +6,19 @@
 //! before cursor persistence causes the retry to skip rows already present,
 //! while gaps and partial rows fail loudly. Deletes and replacements already
 //! have idempotent node contracts.
+//!
+//! Consecutive unkeyed append records share one stream (`batch`); a record
+//! is admitted against the tips, and every document checked for fresh
+//! ingest, before it is held, so nothing a record refuses was sent for it.
+//! A keyed row travels alone under the single-key entry every receiver
+//! accepts; `keyed` defines the per-row key value and stream plan a
+//! receiver must advertise before a sender may put several keyed rows in
+//! one stream.
 
+mod append;
+mod batch;
 mod cutover;
+mod keyed;
 mod live;
 mod sync;
 
@@ -19,6 +30,10 @@ use tonic::transport::Channel;
 use crate::pb::node_service_client::NodeServiceClient;
 
 pub use self::cutover::atomic_live_cutover;
+pub use self::keyed::{
+    decode_stable_keys, encode_stable_keys, plan_keyed_streams, MAX_STREAM_KEY_BYTES,
+    STABLE_KEYS_METADATA,
+};
 pub use self::live::{catch_up_children_once, initialize_live_reshard};
 pub use self::sync::sync_once;
 
@@ -176,7 +191,10 @@ fn keyed_request<T>(
 /// AddDocuments is a fresh-ingest contract. A fingerprint is not
 /// authority to bypass derivation; forwarding a logged derived row needs
 /// a distinct, authenticated replay contract that retains its
-/// already-computed values.
+/// already-computed values. Derived-column WAL replay therefore refuses
+/// here: the check runs on every document of a record before any of the
+/// record is held or sent, on the batched and the keyed path alike, and a
+/// refusal ends the catch-up without advancing the cursor.
 fn require_fresh_ingest_replay(document: &crate::pb::AddDocumentsRequest) -> Result<(), String> {
     if !document.derived_fingerprint.is_empty() {
         return Err("derived-column WAL replication requires a trusted replay RPC; AddDocuments accepts fresh ingest, not carried derived values".to_string());

@@ -22,7 +22,7 @@ pub struct ClusterControlService {
     plane: DurableControlPlane,
     coordinator: Option<CoordinatorServiceImpl>,
     /// Whether every call must present a client certificate from the
-    /// cluster CA (`docs/security.md`): membership, which a bearer
+    /// cluster CA: membership, which a bearer
     /// token is not. Set when the listener runs TLS with a client CA.
     require_client_cert: bool,
 }
@@ -59,7 +59,7 @@ impl ClusterControlService {
         self
     }
 
-    /// The collection this plane governs (`docs/collections.md`).
+    /// The collection this plane governs.
     pub fn collection(&self) -> String {
         self.plane.collection()
     }
@@ -152,30 +152,7 @@ impl ClusterControlService {
         )
         .await?
         .into_inner();
-        let mut geometry: Option<(u32, u32)> = None;
-        for target in &health.targets {
-            let Some(shard_health) = target.health.as_ref().filter(|_| target.reachable) else {
-                continue;
-            };
-            if shard_health.dim == 0 || shard_health.bits_per_dimension == 0 {
-                continue;
-            }
-            let seen = (shard_health.dim, shard_health.bits_per_dimension);
-            match geometry {
-                None => geometry = Some(seen),
-                Some(first) if first != seen => {
-                    return Err(Status::failed_precondition(format!(
-                        "plan_balance: shard {} at {} reports geometry {}x{} bits but another \
-                         shard reports {}x{} bits; one provider geometry is required",
-                        target.shard, target.addr, seen.0, seen.1, first.0, first.1
-                    )));
-                }
-                Some(_) => {}
-            }
-        }
-        let row_bytes = geometry.map_or(0, |(dim, bits)| {
-            crate::chunked::encoded_row_bytes(dim as usize, bits as usize)
-        });
+        let row_bytes = provider_row_bytes(&health)?;
         let mut pools = BTreeMap::new();
         if let Some(placement) = coordinator.current_placement() {
             let node_ids_by_addr: BTreeMap<String, String> = {
@@ -215,6 +192,35 @@ impl ClusterControlService {
         }
         Ok((row_bytes, pools))
     }
+}
+
+/// The encoded row bytes of the one provider geometry the reachable shards
+/// report; `0` when none reports one.
+fn provider_row_bytes(health: &crate::pb::ClusterHealthResponse) -> Result<u64, Status> {
+    let mut geometry: Option<(u32, u32)> = None;
+    for target in &health.targets {
+        let Some(shard_health) = target.health.as_ref().filter(|_| target.reachable) else {
+            continue;
+        };
+        if shard_health.dim == 0 || shard_health.bits_per_dimension == 0 {
+            continue;
+        }
+        let seen = (shard_health.dim, shard_health.bits_per_dimension);
+        match geometry {
+            None => geometry = Some(seen),
+            Some(first) if first != seen => {
+                return Err(Status::failed_precondition(format!(
+                    "plan_balance: shard {} at {} reports geometry {}x{} bits but another \
+                     shard reports {}x{} bits; one provider geometry is required",
+                    target.shard, target.addr, seen.0, seen.1, first.0, first.1
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(geometry.map_or(0, |(dim, bits)| {
+        crate::chunked::encoded_row_bytes(dim as usize, bits as usize)
+    }))
 }
 
 #[tonic::async_trait]
@@ -329,7 +335,7 @@ impl ClusterControl for ClusterControlService {
         .await
     }
 
-    /// Balance dry run (`docs/bandwidth-budget.md`): the provider's row
+    /// Balance dry run: the provider's row
     /// geometry from the live shards' health and the placement pools
     /// from the coordinator, then the pure planner over the durable
     /// state. Cluster trust, like the other control routes.

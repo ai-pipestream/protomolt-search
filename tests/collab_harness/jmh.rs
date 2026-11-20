@@ -13,9 +13,9 @@
 //! `CLOCK_MONOTONIC_RAW` (wall) and `CLOCK_THREAD_CPUTIME_ID` (CPU of the
 //! calling thread only: work a call hands to other threads is not
 //! counted, so a ratio well under 1.0 means the call blocked or
-//! offloaded). The batch is doubled until it lasts `target_batch_ns`,
-//! which keeps clock overhead out of sub-microsecond calls. Every input
-//! and result passes through [`std::hint::black_box`].
+//! offloaded). The batch doubles until its fastest of three timings lasts
+//! `target_batch_ns`, keeping clock overhead out of sub-microsecond calls.
+//! Every input and result passes through [`std::hint::black_box`].
 //!
 //! Plain `cargo test` measures the unoptimized test profile, which the
 //! receipt records as `debug_assertions: true`; use `cargo test --release`
@@ -135,7 +135,11 @@ impl ForkSamples {
 pub fn measure<S, R>(config: &TrialConfig, state: &S, mut op: impl FnMut(&S) -> R) -> ForkSamples {
     let mut batch_ops = 1;
     while batch_ops < MAX_BATCH_OPS {
-        if time_batch(state, &mut op, batch_ops).0 >= config.target_batch_ns {
+        // Fastest of three, so one preempted sample cannot end calibration early.
+        let fastest = (0..3)
+            .map(|_| time_batch(state, &mut op, batch_ops).0)
+            .min();
+        if fastest.unwrap_or(0) >= config.target_batch_ns {
             break;
         }
         batch_ops *= 2;

@@ -287,12 +287,90 @@ pub(crate) struct ScoreStageSpec {
     pub(in crate::node) typed_map: bool,
 }
 
+/// The validated operation of wire stage `i`.
+fn parse_stage_op(
+    i: usize,
+    stage: &crate::pb::ScoreStage,
+) -> Result<crate::scorefn::StageOp, Status> {
+    use crate::scorefn::StageOp;
+    Ok(match crate::pb::ScoreOp::try_from(stage.operation_code()) {
+        Ok(crate::pb::ScoreOp::MultExpDecay) => {
+            if !(stage.scale.is_finite() && stage.scale > 0.0) || !stage.origin.is_finite() {
+                return Err(Status::invalid_argument(format!(
+                    "score stage {i}: MULT_EXP_DECAY needs finite origin and scale > 0"
+                )));
+            }
+            StageOp::MultExpDecay {
+                origin: stage.origin,
+                scale: stage.scale,
+            }
+        }
+        Ok(crate::pb::ScoreOp::MultLog) => {
+            if !stage.weight.is_finite() || stage.weight < 0.0 {
+                return Err(Status::invalid_argument(format!(
+                    "score stage {i}: MULT_LOG needs a finite weight >= 0 (a negative \
+                     weight could turn the factor negative, breaking monotonicity)"
+                )));
+            }
+            StageOp::MultLog {
+                weight: stage.weight,
+            }
+        }
+        Ok(crate::pb::ScoreOp::AddLinear) => {
+            if !stage.weight.is_finite() {
+                return Err(Status::invalid_argument(format!(
+                    "score stage {i}: ADD_LINEAR needs a finite weight"
+                )));
+            }
+            StageOp::AddLinear {
+                weight: stage.weight,
+            }
+        }
+        Ok(
+            op @ (crate::pb::ScoreOp::MultGeoDecayHaversine
+            | crate::pb::ScoreOp::MultGeoDecayManhattan),
+        ) => {
+            if !(stage.scale.is_finite() && stage.scale > 0.0) {
+                return Err(Status::invalid_argument(format!(
+                    "score stage {i}: MULT_GEO_DECAY needs a finite scale > 0 (meters)"
+                )));
+            }
+            validate_lat_lon(
+                &format!("score stage {i}"),
+                stage.origin_lat,
+                stage.origin_lon,
+            )?;
+            if stage.map_key().is_some() {
+                return Err(Status::invalid_argument(format!(
+                    "score stage {i}: MULT_GEO_DECAY reads a geo-point column, which \
+                     has no keys; use the plain `op` selector with `key` empty"
+                )));
+            }
+            StageOp::MultGeoDecay {
+                metric: if op == crate::pb::ScoreOp::MultGeoDecayHaversine {
+                    crate::geo::GeoMetric::Haversine
+                } else {
+                    crate::geo::GeoMetric::Manhattan
+                },
+                origin_lat: stage.origin_lat,
+                origin_lon: stage.origin_lon,
+                scale: stage.scale,
+            }
+        }
+        Ok(crate::pb::ScoreOp::Unspecified) | Err(_) => {
+            return Err(Status::invalid_argument(format!(
+                "score stage {i}: unknown op {}",
+                stage.operation_code()
+            )));
+        }
+    })
+}
+
 /// Parse and validate wire score stages into shard-independent stage specs,
 /// refusing unknown ops, empty column names, or out-of-range parameters.
 pub(crate) fn parse_score_stages(
     stages: &[crate::pb::ScoreStage],
 ) -> Result<Vec<ScoreStageSpec>, Status> {
-    use crate::scorefn::StageOp;
     stages
         .iter()
         .enumerate()
@@ -311,78 +389,7 @@ pub(crate) fn parse_score_stages(
                     "score stage {i}: an explicit map operation carries its own key; leave the legacy key empty"
                 )));
             }
-            let op = match crate::pb::ScoreOp::try_from(stage.operation_code()) {
-                Ok(crate::pb::ScoreOp::MultExpDecay) => {
-                    if !(stage.scale.is_finite() && stage.scale > 0.0) || !stage.origin.is_finite()
-                    {
-                        return Err(Status::invalid_argument(format!(
-                            "score stage {i}: MULT_EXP_DECAY needs finite origin and scale > 0"
-                        )));
-                    }
-                    StageOp::MultExpDecay {
-                        origin: stage.origin,
-                        scale: stage.scale,
-                    }
-                }
-                Ok(crate::pb::ScoreOp::MultLog) => {
-                    if !stage.weight.is_finite() || stage.weight < 0.0 {
-                        return Err(Status::invalid_argument(format!(
-                            "score stage {i}: MULT_LOG needs a finite weight >= 0 (a negative \
-                             weight could turn the factor negative, breaking monotonicity)"
-                        )));
-                    }
-                    StageOp::MultLog {
-                        weight: stage.weight,
-                    }
-                }
-                Ok(crate::pb::ScoreOp::AddLinear) => {
-                    if !stage.weight.is_finite() {
-                        return Err(Status::invalid_argument(format!(
-                            "score stage {i}: ADD_LINEAR needs a finite weight"
-                        )));
-                    }
-                    StageOp::AddLinear {
-                        weight: stage.weight,
-                    }
-                }
-                Ok(
-                    op @ (crate::pb::ScoreOp::MultGeoDecayHaversine
-                    | crate::pb::ScoreOp::MultGeoDecayManhattan),
-                ) => {
-                    if !(stage.scale.is_finite() && stage.scale > 0.0) {
-                        return Err(Status::invalid_argument(format!(
-                            "score stage {i}: MULT_GEO_DECAY needs a finite scale > 0 (meters)"
-                        )));
-                    }
-                    validate_lat_lon(
-                        &format!("score stage {i}"),
-                        stage.origin_lat,
-                        stage.origin_lon,
-                    )?;
-                    if stage.map_key().is_some() {
-                        return Err(Status::invalid_argument(format!(
-                            "score stage {i}: MULT_GEO_DECAY reads a geo-point column, which \
-                             has no keys; use the plain `op` selector with `key` empty"
-                        )));
-                    }
-                    StageOp::MultGeoDecay {
-                        metric: if op == crate::pb::ScoreOp::MultGeoDecayHaversine {
-                            crate::geo::GeoMetric::Haversine
-                        } else {
-                            crate::geo::GeoMetric::Manhattan
-                        },
-                        origin_lat: stage.origin_lat,
-                        origin_lon: stage.origin_lon,
-                        scale: stage.scale,
-                    }
-                }
-                Ok(crate::pb::ScoreOp::Unspecified) | Err(_) => {
-                    return Err(Status::invalid_argument(format!(
-                        "score stage {i}: unknown op {}",
-                        stage.operation_code()
-                    )));
-                }
-            };
+            let op = parse_stage_op(i, stage)?;
             Ok(ScoreStageSpec {
                 op,
                 column: stage.column.clone(),

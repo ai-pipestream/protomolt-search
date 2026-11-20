@@ -156,7 +156,7 @@ pub(super) struct ActionSpec<'a> {
 #[serde(deny_unknown_fields)]
 pub(super) struct StoredState {
     pub(super) format: u32,
-    /// The collection this plane governs (docs/collections.md); empty in
+    /// The collection this plane governs; empty in
     /// state written before collections, written on the first open under
     /// a named collection.
     #[serde(default)]

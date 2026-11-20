@@ -5,7 +5,7 @@ use tonic::{Request, Status};
 
 use super::boosts::{weight_or_one, BoostPlan};
 use super::composite_shape::leg_options;
-use super::pool::{answer_pool, Answer};
+use super::pool::{answer_pool, Answer, Routed};
 use super::rerank::{turbo_rerank, RerankSources};
 use super::response::{matched, ms, scored_hit};
 use super::run::Run;
@@ -13,7 +13,7 @@ use super::selection::Strategy;
 use crate::pb::search_service_server::SearchService;
 use crate::pb::{
     BoostRescore, DenseQuery, FusionMode, HybridLegOptions, HybridSearchRequest,
-    HybridSearchResponse, LexicalQuery, QueryHit, QueryResponse, QuerySignal,
+    HybridSearchResponse, LexicalQuery, QueryHit, QuerySignal,
 };
 
 /// The composite's two scoring leaves with their request ids, and the
@@ -62,10 +62,7 @@ impl Provenance {
     }
 }
 
-pub(super) async fn execute_composite(
-    mut run: Run<'_>,
-    legs: Legs<'_>,
-) -> Result<QueryResponse, Status> {
+pub(super) async fn execute_composite(mut run: Run<'_>, legs: Legs<'_>) -> Result<Routed, Status> {
     let base = run.base;
     let (mode, leg_opts) = leg_options(legs.strategy, run.depths.selection_k);
     let legacy = match &run.boosts {
@@ -82,7 +79,6 @@ pub(super) async fn execute_composite(
     if let Some(p) = run.prof.as_mut() {
         p.selection_ms = ms(t_sel);
     }
-    let sources = rerank_sources(&response);
     let boost_id = legacy.as_ref().map(|(id, _)| id.as_str());
     let filter_ids = &base.plan.filter_ids;
     let cascade = matches!(legs.strategy, Strategy::Cascade);
@@ -101,12 +97,13 @@ pub(super) async fn execute_composite(
         let fusion = crate::explain::Fusion::resolve(mode, &leg_opts);
         explain_hits(&mut hits, &response, &legs, &fusion, legacy.as_ref())?;
     }
+    let sources = rerank_sources(base.coordinator.rerank_spec(), &hits, &response);
     if turbo_rerank(&base, &legs.lexical.text, &sources, &mut hits).await? {
         route = "hybrid_search:turbo_rerank";
     }
     let mut answer = match answer_pool(&mut run, hits, route, response.request_id).await? {
-        Answer::Deepened(response) => return Ok(response),
-        Answer::Paged(response) => response,
+        Answer::Deepen(depth) => return Ok(Routed::Deepen(depth)),
+        Answer::Paged(response) => *response,
     };
     answer.dense_execution = run.dense.execution;
     if let Some(bound) = &run.one_pass {
@@ -114,7 +111,7 @@ pub(super) async fn execute_composite(
             .synonym_expansions
             .extend(bound.synonym_expansions.iter().cloned());
     }
-    Ok(answer)
+    Ok(Routed::Done(Box::new(answer)))
 }
 
 /// The route request. The selection phase runs selection_k deep; the
@@ -150,10 +147,17 @@ fn hybrid_request(
     }
 }
 
-/// The owning shard and inline candidate payload of every hit, the
-/// cascade hits' report taking precedence.
-fn rerank_sources(response: &HybridSearchResponse) -> RerankSources {
-    let mut sources = RerankSources::default();
+/// The owning shard and inline candidate payload of every shortlisted
+/// hit, the cascade hits' report taking precedence.
+fn rerank_sources(
+    spec: Option<&crate::turbo_bridge::rerank::RerankSpec>,
+    hits: &[QueryHit],
+    response: &HybridSearchResponse,
+) -> RerankSources {
+    let mut sources = RerankSources::for_shortlist(spec, hits);
+    if !sources.is_enabled() {
+        return sources;
+    }
     for h in &response.cascade_hits {
         sources.note_owner(h.doc_id, h.shard as usize);
         sources.note_candidate(h.doc_id, h.rerank_candidate.as_ref());

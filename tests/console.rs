@@ -153,6 +153,8 @@ async fn start() -> Cluster {
         allow_remote: false,
     })
     .await
+    .unwrap()
+    .with_raw_explorer()
     .unwrap();
     let console_addr = console.local_addr();
     tokio::spawn(async move {
