@@ -1,139 +1,363 @@
-# pipestream-search
+# Protomolt Search
 
-Provider-neutral distributed lexical, vector, and hybrid search. The product
-owns BM25, CEL selection, document semantics, fusion, generations, and public
-quality claims. Vector engines plug in behind one descriptor/configuration
-contract. The shipped `embedded-turbovec` adapter provides exhaustive
-TurboQuant scoring and collaborative live-floor streaming.
+**A search engine for protobufs: the search arm of Protomolt, and a standalone search engine in its own right.**
 
-New here? The user manual is [docs/manual/README.md](docs/manual/README.md).
+Protomolt Search is a gRPC-based distributed search engine for protobufs.
+(Protobuf is a compact, schema-defined record format. A `.proto` file
+describes the fields, and code in almost any language can read and write
+them.) Send the engine a protobuf and it indexes the text, metadata, and
+embeddings inside it together, deriving the index layout from the schema
+itself. You can then search by words, by meaning, by metadata, or by all
+three at once, across data spread over as many machines as you need, and
+get back the same answer a single machine would have given.
 
-## Repository map
+It is the search arm of [Protomolt](https://github.com/ai-pipestream/protomolt),
+a gRPC integration platform. **Protomolt is the coordinator between all
+the pieces**: it moves work between services and tracks every document
+as it flows. gRParse does the parsing and pushes structured protobuf
+documents onward, tracked in Protomolt. turboembed adds language
+understanding and embeddings. Protomolt Search indexes and searches.
+And because the engine searches protobufs, **any document our parser can
+handle becomes searchable, and so does any protobuf you send the engine
+directly**, no parser required:
 
-| Repository | Role | Depends on |
-|---|---|---|
-| [RyanCodrai/turbovec](https://github.com/RyanCodrai/turbovec) | Upstream vector index library: 4-bit TurboQuant encoding, SIMD top-k search | — |
-| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `main` | Patch fork carrying the seedable top-k floor, live-floor streaming collector, and mapped-image reader, rebased onto upstream `main` | upstream `main` |
-| [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) | Network and sharding facade for the local turbovec engine | fork branch `main` |
-| [Pipestream Search](https://github.com/ai-pipestream/protomolt-search) (this repository) | Full search product: distributed vector, BM25, CEL selection, hybrid ranking, document semantics, persistence, and operations | fork branch `main` |
-| [ai-pipestream/turboembed](https://github.com/ai-pipestream/turboembed) | Unified Rust analysis, multi-resolution embeddings, quantized SPLADE, calibrated reranking, and vocabulary service (`turbo-client` in-process or `turbo-kserve` over gRPC/mTLS) | — |
+```mermaid
+flowchart TB
+    coord["Protomolt<br/>coordinator: moves work between<br/>services, tracks every document"]
+    files["Your files<br/>PDF, Office, email,<br/>HTML, scans"] --> parse["gRParse<br/>document processor:<br/>files become protobuf documents<br/>(text, structure, layout, metadata)"]
+    parse -->|pushes protobuf documents| embed["turboembed<br/>language services:<br/>text analysis, embeddings,<br/>learned sparse search, reranking"]
+    embed --> search["Protomolt Search (this project)<br/>search engine for protobufs:<br/>indexes text, metadata, embeddings;<br/>searches them together, exactly"]
+    yours["Your own protobufs<br/>(sent directly, no parser needed)"] --> search
+    search --> answer["Answers<br/>ranked, filtered,<br/>counted, explained"]
+    coord -.-> parse
+    coord -.-> embed
+    coord -.-> search
+```
 
-The in-repository [`protomolt-analyzer`](crates/protomolt-analyzer) crate is
-the portable Rust lexical core. It runs the product's whitespace, Porter,
-normalization, and term-vector contract in-process on servers and native
-clients. [`turboembed`](https://github.com/ai-pipestream/turboembed) (`turbo-client`
-in-process or `turbo-kserve` over gRPC) supplies full linguistic analysis,
-aligned-view source offsets, `(pos, pos_len)` token lattices, multi-resolution
-and sentence embeddings, quantized SPLADE impacts, calibrated Stage-2
-reranking, and surface-form/spellcheck lexicons. See
-[Native lexical analysis](docs/native-analysis.md) for the exact boundary and
-Android/iOS build checks.
+That combination is the point. A document that arrives through the parser
+can be found with the strongest technique from each world at the same
+time: classic keyword relevance, exact vector (meaning) search, learned
+sparse search, second-stage reranking, and hybrid combinations of all of
+them, finished with metadata filters, exact counts, and an explanation
+for every score. Every box is also optional. **Protomolt Search stands
+alone**: run just this project with your own document pipeline, your own
+protobufs, or even plain text with named fields. There is a built-in
+analyzer if you have no turboembed, and no Protomolt platform is required.
 
-The [`protomolt-search-embedded`](crates/protomolt-search-embedded) package
-runs the same public `SearchService` contract over private local shards through
-an in-process coordinator. It binds and dials no sockets, forces the native
-analyzer, and supports create/open, protobuf-mapped ingest, vector ingest,
-delete/replace, `Query`, `QueryStream`, health, and flush on Android, iOS, and
-desktop. Its coordinator reaches shards through an in-process link
-(`src/link.rs`), the same handlers the network serves, so the crate links
-no HTTP/2, hyper, or Tokio networking — a `cargo tree` gate in its tests
-keeps it that way. See
-[Embedded and mobile Protomolt Search](docs/embedded-mobile.md).
-The proposed [device-shard contract](docs/device-shards.md) describes shared
-searches with indexes retained on iOS and Android phones and the remaining
-transport, embedding, and availability work.
+It is written in Rust, ships as a single server binary plus a small web
+console, and also runs embedded inside an app (desktop, Android, iOS)
+with no network at all. One naming note so the commands below make
+sense: the server binary is currently built under its older name,
+`pipestream-search`, so the examples call it that.
 
-Exact signed and unsigned map storage and document transport support typed
-document entries, descriptor-driven integer map projection, WAL replay and
-segment transplant. Exact map filters, typed expressions, expression-based aggregates
-and [map sorting/collapse](docs/integer-map-order.md) are supported.
-[Bounded map scoring](docs/score-functions.md#signed-and-unsigned-map-scoring-2026-09-07)
-uses explicit double conversion. [Integer map range facets](docs/range-facets.md#integer-map-entries-2026-09-07)
-preserve exact values and typed edges; column statistics remain incomplete. See
-[integer map queries](docs/integer-map-queries.md) and
-[integer map storage](docs/integer-map-storage.md) for the compatibility gates
-and current validation scope.
-The derived-column implementation is reconciled with this storage; its
-[reconciliation note](docs/derived-column-reconciliation.md) covers durable
-metadata, evaluator semantics and reserved wire/storage allocations.
+New here? Start with [Try it in five minutes](#try-it-in-five-minutes),
+then the [user manual](docs/manual/README.md). You do not need to know
+any of the jargon below before you start. Each term is explained the
+first time it appears.
 
-The current embedded adapter pins the fork branch recorded in `Cargo.toml` and
-uses TurboVec's current `.tv` persistence format. Provider images are opaque to
-the product and are selected by manifest/config identity, never by extension.
-See [the Pipestream Search migration note](docs/pipestream-search-migration.md)
-for renamed surfaces, compatibility aliases, and rebuild impact.
+## Try it in five minutes
 
-Engine internals and measured numbers: [docs/optimizations.md](docs/optimizations.md).
-The implemented public query contract is [docs/query-api.md](docs/query-api.md):
-selection first, candidate-scoped boosts second, then a named-signal composite
-scorer, with multi-key sort and collapse over the result. Query-time synonyms
-and did-you-mean are [docs/synonyms.md](docs/synonyms.md); the per-hit
-explain tree is [docs/explain.md](docs/explain.md). [`SearchService.QueryStream`](docs/streaming-query.md) adds exact
-provisional replacement revisions and an explicit terminal certificate.
-`DENSE_EXECUTION_MODE_AUTO` chooses a dense traversal only through the
-generation-bound policy in
-[docs/dense-execution-policy.md](docs/dense-execution-policy.md): exhaustive
-providers resolve to `EXACT`, a configured ANN provider only at a measured
-point, and the response reports which. The optional `hnsw` provider
-(`vector_backend = "hnsw"`) is such a configured ANN engine: a from-scratch
-HNSW graph over FP32 rows with a parallel build, mmap serving and a query beam
-taken from the request's candidate depth; see [docs/hnsw.md](docs/hnsw.md).
-A cased A/B column costs no second analysis:
-[docs/dual-cased.md](docs/dual-cased.md) — `AddDocumentsRequest.cased_field`
-takes the body's cased identity from the same pass, sidecar or native.
-Sealed segments serve their vector images from disk through memory maps,
-bit for bit the heap scores, and the coordinator refuses a fleet that scores
-in two provider states before any shard is asked:
-[docs/mmap-vectors.md](docs/mmap-vectors.md).
-Block-max pruning, designed for the lexical leg and measured dead on the
-vector leg: [README-block-max.md](README-block-max.md) (overview) and
-[docs/block-max.md](docs/block-max.md) (design doc).
-The reproducible cross-engine gate is
-[deploy/opensearch-challenge](deploy/opensearch-challenge/README.md); it records
-quality, latency, throughput, resources, startup, and crash recovery without
-turning a synthetic run into a marketing claim.
+### 1. One process, no setup
 
-The network binary retains three roles (`node`, `coordinator`, `both`). Plain
-node lists are static; versioned shard maps hot-swap atomically. The embedded
-package uses the same node and coordinator implementations without a network
-listener.
+```bash
+cargo build --release
 
-## Quickstart: dockerized end-to-end demo (CourtListener)
+# One process that is both the search node and the front door (the
+# "coordinator"). It invents a small demo corpus and runs one search.
+./target/release/pipestream-search --role=both \
+    --demo-vectors=20000 --dim=128 --bit-width=4 --allow-plaintext \
+    --nodes=127.0.0.1:50051 --demo-query
+```
 
-A one-command installer that syncs real data and exercises the whole stack:
-CourtListener bulk opinions (public S3) → [rustfs](https://rustfs.com)
-object store → Rust extraction → chunk + static-embedding via the
-[turbo-kserve](https://github.com/ai-pipestream/turboembed)
-(Rust, Model2Vec bundle) → a 4-shard pipestream-search
-cluster → an automated search-verification gate. No Python anywhere.
+### 2. Real documents, real cluster (Docker)
+
+A one-command demo over a large corpus of real public documents
+(about 50,000 documents, 500,000 searchable passages) on a 4-server
+cluster, using the included CourtListener dataset:
 
 ```bash
 cd deploy/court-e2e
-cp .env.example .env            # defaults work out of the box
-./e2e.sh                        # or ./e2e.sh --clean to wipe and reseed
+cp .env.example .env            # the defaults work as-is
+./e2e.sh                        # add --clean to wipe and start over
 ```
 
-`e2e.sh` exits 0 only after indexing ~50k opinions (~500k chunks) across
-4 shards and passing both gates: a vector self-match through the
-coordinator and a distributed BM25 query. On success the cluster stays
-up — coordinator on `localhost:50050`, rustfs console on
-`localhost:19001`. Details, scale knobs, and architecture:
-[deploy/court-e2e/README.md](deploy/court-e2e/README.md).
+When it finishes, the cluster stays up and has already verified itself.
+A meaning-based search and a keyword search both have to pass before the
+script reports success. Details: [deploy/court-e2e/README.md](deploy/court-e2e/README.md).
 
-Query it with any gRPC client generated from
-[search.proto](proto/ai/protomolt/search/v1/search.proto) — `Query` or
-`QueryStream` for the public contract, plus `Search` (vector top-k with floor
-sharing), `Bm25Search` (distributed lexical), and `HybridSearch` (cascade,
-RRF, or score-blend fusion) — or with the
-bundled probe tool:
+### 3. Look at it in a browser
 
-```bash
-docker run --rm --network court-e2e_default -v court-e2e_corpus-data:/corpus \
-  --entrypoint court_query court-e2e-pipeline \
-  --nodes=node1:50051,node2:50051,node3:50051,node4:50051 \
-  --analysis-addr=http://analysis:50051 --embeddings=/corpus/embeddings.bin \
-  --probe-ids=12345 --docs-per-shard=128500
+The `console` binary is a small web UI and JSON bridge in front of a
+running cluster, so you can click around, run searches, and inspect
+results without writing any client code. See
+[the console](docs/console-facade.md).
+
+When you are ready to run it for real (declare your fields, load your
+documents, run a coordinator and a few nodes), walk through
+[Getting started](docs/manual/01-getting-started.md).
+
+## What you can search
+
+**Words.** Classic keyword search (the ranking formula is called BM25,
+the same family Lucene, Solr, and OpenSearch use), plus exact phrases
+("climate change" in that order), near-phrases, prefixes for
+autocomplete, synonyms, and "did you mean?" suggestions.
+
+**Meaning.** Every document can carry an embedding: a list of numbers,
+produced by a machine-learning model, that captures what the text is
+about, so documents about the same idea land near each other even when
+they share no words. Protomolt Search stores these compactly (4 bits per
+number) and compares your query against every document, so you get the
+true closest matches instead of an approximation with a recall caveat
+attached. If you want approximation for speed, an optional graph index
+(HNSW) is there too, and the response tells you which one answered.
+
+**Both at once.** Hybrid search runs the keyword side and the meaning
+side together and merges them into one ranked list: documents that are
+about the right topic and mention the exact phrase, for example. You
+pick how the two lists combine. The manual walks through the choices in
+plain terms.
+
+**Streaming answers.** A query can stream its results: you see the
+current best results as soon as they are known, revisions replace them
+as better ones arrive, and a final message certifies that the answer is
+complete and exact. Good for interfaces that should feel instant without
+ever showing a wrong final answer.
+
+**An explanation for every hit.** Turn on `explain` and each result
+carries the arithmetic that produced its score, term by term and stage
+by stage, and it adds up to the score you were served. If you have ever
+had to defend a ranking to a customer or to your future self, this is
+the feature.
+
+## Your metadata is first-class, not an afterthought
+
+Real documents are never just text. A document has an owner, a
+department, a date, a status, a location. Because Protomolt documents
+arrive as protobuf structures, those facts arrive as named, typed fields
+next to the text. In Protomolt Search they live in typed columns: text
+labels ("facets"), whole numbers, decimals, dates, key/value maps, and
+map points. You declare them up front, like a database schema, so a
+misspelled field name is an error at load time instead of a silently
+empty result later.
+
+With columns declared you can, in the same request:
+
+- **Filter** with conditions that read like the sentence you would say
+  out loud:
+
+  ```
+  department == "legal" && year >= 2020
+  created >= timestamp("2024-01-01T00:00:00Z") && status == "published"
+  ```
+
+  (The little language is Google's CEL, short for Common Expression
+  Language. If you can read the two lines above, you already know enough
+  to start. The coordinator checks and compiles the condition once. A
+  condition the engine cannot run safely and quickly is refused with a
+  message saying why, never silently approximated.)
+
+- **Count and summarize** the matches: how many per department
+  (facets), counts per year or per size band (histograms and range
+  facets), and exact totals, averages, distinct counts, and percentiles
+  (aggregations). Exact is literal here: results are computed over the
+  entire match set across every server, not estimated from a sample, so
+  the same request returns the same numbers every run.
+
+- **Sort and group**: order by date, then by a second field; or show one
+  best passage per document with the runners-up tucked inside
+  (collapse).
+
+- **Derive columns during indexing**: the same analysis pass that reads
+  your text can also record quality signals (how noisy or damaged the
+  text looks) and geography (the place a document is about, as a map
+  point and a country code) as ordinary columns you can then filter and
+  aggregate on.
+
+The protobuf structure does real work here. Hand the engine your
+`.proto` schema and it derives the whole index layout from it: which
+fields become searchable text, which become metadata columns, which
+become the embedding. You describe your record once, in gRParse or in
+your own document processor, and every search server derives the
+identical plan from that description. No schema yet? Plain text plus
+named fields works fine, and you can adopt one later.
+
+## Text understanding is built in, and built here
+
+Search quality lives or dies on how text is broken into searchable
+terms: splitting words, folding accents and case ("Résumé" becomes
+"resume"), reducing words to a common root ("running" becomes "run").
+Protomolt Search does this with its own from-scratch Rust analyzer
+([`protomolt-analyzer`](crates/protomolt-analyzer)) that runs inside the
+server process. No sidecar service, no JVM, no Python, no network hop.
+It handles Unicode word boundaries (the UAX #29 standard, so Japanese,
+Thai, emoji, and mixed-script text tokenize sensibly), Porter stemming,
+and case and accent normalization. It produces the same terms on a
+server, on a laptop, and inside a phone app, so an index means the same
+thing everywhere.
+
+When you need more than that (embeddings, richer language models,
+learned sparse representations such as SPLADE, a second-stage reranker,
+named places and entities), the companion
+[turboembed](https://github.com/ai-pipestream/turboembed) service
+provides it, in-process or over the network as `turbo-kserve`. An Apache
+OpenNLP sidecar remains supported for model-backed analysis. The
+boundary is documented in [Native lexical analysis](docs/native-analysis.md).
+One rule everywhere: if the analysis you asked for is not available, the
+engine refuses by name instead of quietly substituting a different one
+and changing what your index means.
+
+## Who owns what, and who may see what
+
+"Who may do what" is a property of the engine, not something each client
+application has to re-implement and eventually get wrong:
+
+- **Collections and workspaces.** A collection is one dataset (say,
+  "product docs"). One cluster can serve several, each with its own
+  servers, statistics, and settings. Collections live in workspaces,
+  and access is granted per workspace and collection.
+- **Named clients with separate permissions.** Each application or user
+  group connects as a named principal with its own token. Permission to
+  search, to load data, and to administer are granted separately.
+  Having one never implies the others. Each principal can carry its own
+  limits (largest result set, how many queries at once, how fast it may
+  ingest). Going over a limit is a clear error, never a quietly
+  truncated answer.
+- **Document-level access.** A grant can restrict a principal to a slice
+  of a collection, for example only documents where
+  `audience == "shared"`. That restriction is enforced inside the
+  engine: matching, ranking statistics, facet counts, snippets, and
+  explanations are all computed as if the other documents did not exist,
+  and no clever query from the client can widen it.
+- **Field-level access.** Grants can go finer still. A principal may be
+  allowed to search on a field without being allowed to see its values
+  (rank by a private quality score, never disclose it), and raw document
+  identity can be withheld independently.
+- **Encrypted, authenticated plumbing.** Clients connect over TLS.
+  Servers inside the cluster prove membership to each other with
+  certificates (mutual TLS), so a client token buys nothing inside the
+  cluster. A server accidentally started without encryption on a public
+  interface refuses to start rather than serve plaintext by mistake.
+
+An honest boundary, stated here because READMEs should state boundaries:
+document-level and field-level grants are fully enforced today on the
+embedded, in-process deployment. On network clusters, restricted
+collections currently refuse rather than risk a bypass through a direct
+node connection, until per-principal delegation to nodes lands. Refusing
+loudly is the design's default answer everywhere it cannot yet keep a
+promise. The full model is in [Security](docs/manual/12-security.md).
+
+## How it works (the short version)
+
 ```
+                you (any gRPC or JSON client)
+                            │
+                    ┌───────▼────────┐
+                    │  Coordinator   │  checks permissions, compiles
+                    │  (front door)  │  filters, merges, explains
+                    └──┬──────┬──────┬─┘
+                       │      │      │      ▲ "my 10th-best so far
+                    ┌──▼──┐ ┌─▼───┐ ┌▼────┐  │  scores 0.83"
+                    │Node │ │Node │ │Node │──┘
+                    │  0  │ │  1  │ │  N  │  each node holds one slice
+                    └─────┘ └─────┘ └─────┘  ("shard") of the corpus
+```
+
+One binary, three hats: a node owns a slice of the data (a shard), a
+coordinator is the front door clients talk to, and `--role=both` does
+both for small setups. (Two levels of coordination share a word here.
+Protomolt the platform coordinates services and tracks documents, as in
+the chart at the top. The coordinator in this section is smaller: it is
+the search engine's own front door, fanning one query out to the shards
+and merging what comes back.) The API between them, and to clients, is gRPC,
+defined by ordinary `.proto` schema files in
+[`proto/`](proto/ai/protomolt/search/v1/), from which clients can be
+generated for essentially any language. If "gRPC" and "`.proto`" mean
+nothing to you, think of a typed API contract, like OpenAPI or Swagger
+but binary and streaming-friendly. The [console](docs/console-facade.md)
+speaks plain JSON over HTTP, and the examples in the manual use JSON with
+`grpcurl`, so you can do everything in this README without generating a
+single client.
+
+**The trick worth stealing: shards coach each other while a query runs.**
+Suppose you asked for the top 10. The moment any shard has found 10
+candidates, its 10th-best score becomes a floor. Nothing scoring below
+it can possibly make the global top 10, because 10 documents already
+beat it. The coordinator collects every shard's floor, takes the
+highest, and immediately broadcasts it back to all shards while they are
+still scanning. From then on, a vector shard can drop below-floor
+candidates before they cost any real work, and a keyword shard can skip
+whole index blocks whose best possible score cannot clear the floor. The
+shards are, in effect, pruning each other's searches live.
+
+Nothing correct is ever dropped in the process. That is a theorem about
+floors (any shard's 10th-best is a lower bound on the whole corpus's
+10th-best), not a heuristic, and the test suite proves it by checking
+the distributed top 10 against a single-machine top 10 exactly: same
+documents, same order, bit-identical scores. This collaborative
+streaming floor-sharing, plus keyword scores computed from statistics
+gathered across all shards (so scores are comparable and mergeable), is
+what makes "the distributed answer is the single-machine answer" true
+instead of aspirational. The full design, proof sketch, and measurements
+are in [Design](#design) below and [docs/optimizations.md](docs/optimizations.md).
+The measured headline there is an 86.6-million-passage corpus served
+exactly from 8 shards on one machine.
+
+## Also: search inside your app, and on phones
+
+The same engine links into a single process as a Rust library
+([`protomolt-search-embedded`](crates/protomolt-search-embedded)): no
+sockets, no server, same query API, same on-disk behavior, running on
+desktop, Android, and iOS. The longer-term design has a phone own its
+shard of a shared index and take part in searches over the union. What
+exists today, and what remains to finish that, is in
+[Embedded and mobile use](docs/manual/13-embedded-and-mobile.md).
+
+## Documentation map
+
+| If you want to… | Read |
+|---|---|
+| Learn the product end to end | [The user manual](docs/manual/README.md) (13 short chapters) |
+| Get a cluster running | [Getting started](docs/manual/01-getting-started.md), then [Operating a cluster](docs/manual/11-operating-a-cluster.md) |
+| Write queries, filters, facets | Manual chapters [2](docs/manual/02-the-query-request.md) to [5](docs/manual/05-facets-range-facets-and-aggregations.md) |
+| Tune relevance, debug a ranking | [Explain and profile](docs/manual/06-explain-and-profile.md), [Relevance tuning](docs/manual/08-relevance-tuning.md) |
+| Model your metadata | [Columns and mappings](docs/manual/09-columns-and-mappings.md) |
+| Load and update data | [Writing data](docs/manual/10-writing-data.md) |
+| Lock it down (tokens, grants, TLS) | [Security](docs/manual/12-security.md) |
+| Embed it in an app or on a phone | [Embedded and mobile use](docs/manual/13-embedded-and-mobile.md) |
+| Understand the internals | [Architecture](docs/architecture.md), [Engine optimizations](docs/optimizations.md), [Query API contract](docs/query-api.md) |
+| Find the exact API definition | [`proto/ai/protomolt/search/v1/search.proto`](proto/ai/protomolt/search/v1/search.proto) (the field comments are the contract) |
+
+Everything after this point in this README is the deep reference: the
+coordination design and its correctness argument, runbooks, benchmark
+harnesses, and subsystem detail. It assumes the vocabulary above.
+
+## Related projects
+
+Protomolt Search is the search arm of a small family. It also stands on
+its own: every companion below is an option, not a requirement.
+
+| Project | What it is, in one sentence |
+|---|---|
+| [Protomolt](https://github.com/ai-pipestream/protomolt) | The gRPC integration platform and coordinator: moves work between services and tracks every document as it flows. |
+| [gRParse](https://github.com/ai-pipestream/gRParse) | The document processor: turns PDF, Office, email, HTML, and scanned files into structured protobuf documents and pushes them onward. |
+| [turboembed](https://github.com/ai-pipestream/turboembed) | The language services: text analysis, embeddings, learned sparse search (SPLADE), and reranking. |
+| [turbovec](https://github.com/RyanCodrai/turbovec) (upstream) and the [ai-pipestream fork](https://github.com/ai-pipestream/turbovec) | The vector library underneath the shipped vector engine: stores embeddings at 4 bits per number (TurboQuant) and finds exact nearest neighbours fast. Our fork adds the live floor described above. |
+| [turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) | That vector library as a network service, for deployments that shard vectors separately. |
+| **This repository (Protomolt Search)** | The search engine itself: keyword index, ranking, filters, hybrid merging, distributed coordination, security, storage, operations, console, and the embedded library. Vector engines plug in behind a small contract; turbovec is the one that ships in the box. |
+
+Inside this repository, [`crates/protomolt-analyzer`](crates/protomolt-analyzer)
+is the built-in text analyzer and
+[`crates/protomolt-search-embedded`](crates/protomolt-search-embedded) is
+the in-app engine. Naming and compatibility history lives in
+[the naming and migration note](docs/pipestream-search-migration.md).
+
+## License
+
+MIT. See [LICENSE](LICENSE) (individual crates state their license in
+their `Cargo.toml`).
+
+---
 
 ## Design
 
