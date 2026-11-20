@@ -4,13 +4,8 @@
 //!
 //! Pinned here:
 //!
-//! - Writes are not frozen: a concurrent task appends, deletes, and
-//!   replaces through the public RPCs for the whole compaction; its
-//!   calls complete in a small fraction of the compaction's wall time,
-//!   and the tail applied its records (`tail_records_applied > 0`).
-//! - The write-lock hold is bounded (< 500 ms on this fixture) and
-//!   reported; the work directory is gone afterwards; the old generation
-//!   is gone; the rewritten WAL generation is full history.
+//! - Concurrent writes continue; the tail applies them and the cutover's
+//!   write-lock hold stays below 500 ms.
 //! - A quiescent second compaction reclaims every tombstone: `Health`
 //!   shows `deleted_docs = 0` and live rows equal to the tracked set.
 //! - Every read path (lexical, dense, hybrid, facets, sorted browse,
@@ -127,6 +122,11 @@ async fn calibrate(addr: &str, shift: &[f32], scale: &[f32]) {
 /// answered with an old-generation id and the vector with the new one,
 /// and the row sits at the vector's id in the new generation (the tail
 /// applied the document at the shadow's tip, where the vector landed).
+fn stable_metadata(key: &[u8]) -> tonic::metadata::MetadataValue<tonic::metadata::Binary> {
+    let encoded = pipestream_search::replication::encode_stable_keys(&[key.to_vec()]).unwrap();
+    tonic::metadata::MetadataValue::from_bytes(&encoded)
+}
+
 async fn append(client: &mut NodeServiceClient<Channel>, row: &Row) -> (u64, u64) {
     let documents = add_document(client, row).await;
     let vectors = add_vector(client, row).await;
@@ -181,8 +181,8 @@ async fn add_document(client: &mut NodeServiceClient<Channel>, row: &Row) -> Add
     };
     let mut request = Request::new(tokio_stream::iter([doc]));
     request.metadata_mut().insert_bin(
-        "x-protomolt-stable-key-bin",
-        tonic::metadata::MetadataValue::from_bytes(row.key.as_bytes()),
+        pipestream_search::replication::STABLE_KEYS_METADATA,
+        stable_metadata(row.key.as_bytes()),
     );
     client.add_documents(request).await.unwrap().into_inner()
 }
@@ -195,8 +195,8 @@ async fn add_vector(client: &mut NodeServiceClient<Channel>, row: &Row) -> AddVe
         dim: DIM as u32,
     }]));
     request.metadata_mut().insert_bin(
-        "x-protomolt-stable-key-bin",
-        tonic::metadata::MetadataValue::from_bytes(row.key.as_bytes()),
+        pipestream_search::replication::STABLE_KEYS_METADATA,
+        stable_metadata(row.key.as_bytes()),
     );
     client.add_vectors(request).await.unwrap().into_inner()
 }
@@ -1953,8 +1953,8 @@ async fn append_without_num(client: &mut NodeServiceClient<Channel>, i: usize) -
     };
     let mut request = Request::new(tokio_stream::iter([doc]));
     request.metadata_mut().insert_bin(
-        "x-protomolt-stable-key-bin",
-        tonic::metadata::MetadataValue::from_bytes(bare.key.as_bytes()),
+        pipestream_search::replication::STABLE_KEYS_METADATA,
+        stable_metadata(bare.key.as_bytes()),
     );
     client.add_documents(request).await.unwrap();
     add_vector(client, &bare).await;
