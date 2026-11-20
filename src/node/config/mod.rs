@@ -1,4 +1,4 @@
-//! Shard node configuration, layout selection, and column table validation.
+//! Shard node configuration and column table validation.
 
 use crate::node::*;
 
@@ -14,6 +14,10 @@ pub(in crate::node) use self::knobs::node_knobs;
 
 pub const MAX_RERANK_PARALLEL: usize = 64;
 
+/// The layout diagnostics report for a shard with no index path: its
+/// heap store never reaches disk.
+pub const LAYOUT_MEMORY: &str = "memory";
+
 pub(in crate::node) fn resolved_rerank_parallel(configured: usize) -> usize {
     if configured == 0 {
         std::thread::available_parallelism()
@@ -22,18 +26,6 @@ pub(in crate::node) fn resolved_rerank_parallel(configured: usize) -> usize {
     } else {
         configured.min(MAX_RERANK_PARALLEL)
     }
-}
-
-/// Persisted on-disk shard layout for documents and vectors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Layout {
-    /// The segment catalog under `<index>.segments/` plus a heap tail
-    /// sealed into a new segment on every flush: the default for a new
-    /// persisted shard.
-    #[default]
-    Segments,
-    /// One vector image, one `.bm25` file, rewritten on every flush.
-    SingleImage,
 }
 
 /// How a node scans and whether it participates in floor sharing.
@@ -134,11 +126,8 @@ pub struct NodeConfig {
     /// HMAC key authenticating UDP floor and cancel datagrams; when `None`,
     /// unsigned datagrams are accepted on loopback listeners only.
     pub udp_hmac_key: Option<crate::security::UdpKey>,
-    /// On-disk layout for newly created persisted shards; existing shards keep
-    /// the layout of their persisted files.
-    pub layout: Layout,
     /// Memory-map sealed segment vector images when `true`, or load into heap
-    /// when `false` (tail and single-image shards remain heap-owned).
+    /// when `false` (the tail remains heap-owned).
     pub vector_mmap: bool,
     /// On a segmented shard, seal the tail into a segment once it holds
     /// this many documents, so a bulk ingest stays bounded in heap
@@ -237,7 +226,6 @@ impl Default for NodeConfig {
             sentence_fields: Vec::new(),
             collection: String::new(),
             udp_hmac_key: None,
-            layout: Layout::Segments,
             vector_mmap: true,
             seal_tail_docs: 500_000,
             bigram_fields: Vec::new(),

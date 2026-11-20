@@ -1,6 +1,6 @@
-//! Online shard compaction across single-image and segmented layouts.
+//! Online compaction of a shard's segment catalog.
 //!
-//! Fixes a cutoff, replays live rows into a dense generation (rewriting full WAL
+//! Fixes a cutoff, replays live rows into dense segments (rewriting full WAL
 //! history when a log is present so later compactions and splits remain valid),
 //! tails concurrent appends without holding the shard write lock, and swaps the
 //! serving `ShardState` behind a crash-recoverable commit marker.
@@ -13,7 +13,8 @@ mod shadow;
 #[cfg(all(test, feature = "net"))]
 mod tests;
 
-pub(crate) use self::recovery::{recover_interrupted, PendingCommit};
+pub use self::recovery::recover_interrupted;
+pub(crate) use self::recovery::PendingCommit;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -45,13 +46,6 @@ const CUTOVER_RETRIES: usize = 16;
 /// makes no progress and no later pass will: the refusal names it at
 /// once instead of after the pass cap.
 const STALLED_TAIL_PASSES: u64 = 8;
-/// How long a segment seal waits for a two-call append (AddDocuments,
-/// then AddVectors for the same rows) caught between its calls to land
-/// its vectors before the misaligned tail is refused by name. A loaded
-/// host can stretch the gap between the two calls well past a second.
-const PAIRED_APPEND_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-/// The pause between those checks.
-const PAIRED_APPEND_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
 /// Concurrent analysis streams the build and tail open per spec.
 const ANALYSIS_STREAMS: usize = 2;
 /// The commit marker's format, for a reader that finds a newer one.
@@ -104,7 +98,6 @@ impl Drop for CompactingGuard {
 struct Preflight {
     index_path: PathBuf,
     work_dir: PathBuf,
-    segmented: bool,
     gen_dir: PathBuf,
     cutoff_generation: u64,
     cutoff_clock: u64,
@@ -160,8 +153,8 @@ struct SegmentPreflight {
     stats_epoch: u64,
 }
 
-/// A segment-layout tail caught between the two calls of a legacy append:
-/// the documents count and the vectors count differ.
+/// A tail whose documents count and vectors count differ: compaction cuts
+/// only at a row boundary.
 struct MidRow {
     documents: usize,
     vectors: usize,
@@ -195,21 +188,14 @@ struct Shadow {
     state: ShardState,
     /// Source global id -> shadow global id.
     id_map: BTreeMap<u64, u64>,
-    /// Segments layout: the staged outputs and the live inputs they
-    /// replace.
+    /// The staged outputs.
     staged: Vec<SegmentMetadata>,
-    replaced: Vec<String>,
     tail_records: u64,
     epoch_at_open: u64,
 }
 
-fn layout_name(segmented: bool) -> &'static str {
-    if segmented {
-        "segments"
-    } else {
-        "single-image"
-    }
-}
+/// The layout every compaction response reports.
+const LAYOUT: &str = crate::snapshot_repository::LAYOUT_SEGMENTS;
 
 impl NodeServiceImpl {
     /// Compact this shard online: the blocking entry point behind
@@ -246,7 +232,7 @@ impl NodeServiceImpl {
                 tombstones_reclaimed: preflight.tombstones_now,
                 wal_generation: preflight.cutoff_generation + 1,
                 cutoff_clock: preflight.cutoff_clock,
-                layout: layout_name(preflight.segmented).to_string(),
+                layout: LAYOUT.to_string(),
                 dry_run: true,
                 stats_epoch: preflight.stats_epoch,
                 partition_column: preflight.partition.clone().unwrap_or_default(),

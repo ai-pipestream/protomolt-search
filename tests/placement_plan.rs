@@ -13,7 +13,7 @@ use common::mock::start_mock_analysis;
 use common::{fit_calibration, start_empty_node, unit_vectors, BIT_WIDTH, DIM};
 use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
 use pipestream_search::coordinator::CoordinatorServiceImpl;
-use pipestream_search::node::{Layout, NodeConfig};
+use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
@@ -146,7 +146,6 @@ fn config(shard: usize) -> NodeConfig {
         analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
         facet_fields: vec!["court".to_string()],
         integer_fields: integers,
-        layout: Layout::SingleImage,
         wal: false,
         ..Default::default()
     }
@@ -394,7 +393,7 @@ fn topk(
     hits
 }
 
-/// A WAL-backed single-image shard with the placement column, the
+/// A WAL-backed shard with the placement column, the
 /// corpus ingested and flushed; returns the index path and the parent
 /// image loaded for reference.
 async fn logged_shard(dir: &Path, analysis_addr: &str, corpus: &[f32]) -> (PathBuf, VectorIndex) {
@@ -402,7 +401,6 @@ async fn logged_shard(dir: &Path, analysis_addr: &str, corpus: &[f32]) -> (PathB
     let index_path = dir.join("shard.tv");
     let (addr, _handle) = start_empty_node(NodeConfig {
         index_path: Some(index_path.clone()),
-        layout: Layout::SingleImage,
         analysis_addr: Some(analysis_addr.to_string()),
         wal: true,
         wal_buckets: 8,
@@ -472,7 +470,8 @@ async fn logged_shard(dir: &Path, analysis_addr: &str, corpus: &[f32]) -> (PathB
             .into_inner()
             .written
     );
-    let mut parent = VectorIndex::load(EMBEDDED_TURBOVEC, &index_path).unwrap();
+    let image = common::catalog::segment_vector(&index_path, 0);
+    let mut parent = VectorIndex::load(EMBEDDED_TURBOVEC, &image).unwrap();
     parent.prepare().unwrap();
     (index_path, parent)
 }
@@ -587,7 +586,8 @@ async fn a_placement_split_routes_by_code_and_reconstructs_the_parent() {
         .children
         .iter()
         .map(|c| {
-            let mut index = VectorIndex::load(EMBEDDED_TURBOVEC, &c.vector_path).unwrap();
+            let image = common::catalog::segment_vector(&c.vector_path, 0);
+            let mut index = VectorIndex::load(EMBEDDED_TURBOVEC, &image).unwrap();
             index.prepare().unwrap();
             (c, index)
         })
@@ -662,7 +662,6 @@ async fn banded_shard(dir: &Path, corpus: &[f32]) -> PathBuf {
     let index_path = dir.join("archive.tv");
     let (addr, _handle) = start_empty_node(NodeConfig {
         index_path: Some(index_path.clone()),
-        layout: Layout::SingleImage,
         analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
         wal: true,
         wal_buckets: 4,
@@ -828,7 +827,6 @@ async fn a_re_placement_split_puts_each_row_in_its_new_leaf() {
     // child is a catalog of one segment per non-empty bucket, and the
     // largest replay is one bucket, not one child. Each segment's sealed
     // summary shows the rewritten code and a year range inside the band.
-    assert_eq!(out.layout, reshard::TreeChildLayout::Segmented);
     assert_eq!(out.spill_bucket_count, 4);
     let largest_child = *expected.iter().max().unwrap();
     assert!(
@@ -908,7 +906,6 @@ async fn a_re_placement_split_puts_each_row_in_its_new_leaf() {
         let (addr, handle) = pipestream_search::harness::start_opened_node(NodeConfig {
             index_path: Some(image.vector_path.clone()),
             slot_offset: image.slot_offset,
-            layout: Layout::Segments,
             analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
             integer_fields: vec!["year".to_string(), "placement".to_string()],
             placement_column: Some("placement".into()),
@@ -1023,59 +1020,6 @@ async fn a_re_placement_split_puts_each_row_in_its_new_leaf() {
     .unwrap_err();
     assert!(
         err.contains("carries no stable key") && err.contains("\"recent\", which has 2 shards"),
-        "{err}"
-    );
-
-    // One image per child on request: the spill in one bucket, the
-    // largest replay is the largest child, the images carry the id maps,
-    // and a bound below a child's size is refused before any image.
-    let single = reshard::split_placement_tree_logs(
-        std::slice::from_ref(&gen),
-        &tree,
-        &dir.join("single"),
-        &[0, 1_000, 2_000],
-        None,
-        reshard::TreeSplitOptions {
-            layout: reshard::TreeChildLayout::SingleImage {
-                max_child_rows: largest_child,
-            },
-            spill_bucket_bits: Some(0),
-            ..Default::default()
-        },
-        &mut replay_analyzer(NATIVE_ANALYSIS_BACKEND),
-    )
-    .unwrap();
-    assert_eq!(single.spill_bucket_count, 1);
-    assert_eq!(single.peak_replay_rows, largest_child);
-    assert_eq!(single.segments, vec![1, 1, 1]);
-    assert_eq!(single.placed, expected.to_vec());
-    for (index, child) in single.images.children.iter().enumerate() {
-        assert_eq!(child.num_documents, expected[index], "child {index}");
-        assert_eq!(child.row_parent_ids.len() as u64, expected[index]);
-        for &parent in &child.row_parent_ids {
-            assert_eq!(band_of(band_year(parent as usize)), index, "row {parent}");
-        }
-        assert!(child.vector_path.ends_with(format!("shard-{index}.vector")));
-    }
-    let err = reshard::split_placement_tree_logs(
-        std::slice::from_ref(&gen),
-        &tree,
-        &dir.join("bounded"),
-        &[0, 1_000, 2_000],
-        None,
-        reshard::TreeSplitOptions {
-            layout: reshard::TreeChildLayout::SingleImage {
-                max_child_rows: largest_child - 1,
-            },
-            spill_bucket_bits: None,
-            ..Default::default()
-        },
-        &mut replay_analyzer(NATIVE_ANALYSIS_BACKEND),
-    )
-    .unwrap_err();
-    assert!(
-        err.contains("above the single-image bound")
-            && !dir.join("bounded").join("shard-0.vector").exists(),
         "{err}"
     );
 

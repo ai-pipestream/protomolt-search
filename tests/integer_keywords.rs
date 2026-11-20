@@ -151,7 +151,6 @@ async fn large_keyword_values_survive_mapped_ingest_queries_and_persistence() {
     let path = root.join("shard.tv");
     let config = pipestream_search::node::NodeConfig {
         index_path: Some(path.clone()),
-        layout: pipestream_search::node::Layout::SingleImage,
         analysis_addr: Some(analysis.clone()),
         facet_fields: plan
             .fields
@@ -228,10 +227,9 @@ async fn large_keyword_values_survive_mapped_ingest_queries_and_persistence() {
     }
     server.abort();
     let _ = server.await;
-    let stored = pipestream_search::postings::Bm25Store::load(
-        &pipestream_search::node::bm25_sidecar_path(&path),
-    )
-    .unwrap();
+    let stored =
+        pipestream_search::postings::Bm25Store::load(&common::catalog::segment_bm25(&path, 0))
+            .unwrap();
     let column = stored.facet_index("unsigned_value").unwrap();
     for (row, value) in values.iter().enumerate() {
         let ordinal = stored.facet_ord(column, row as u32).unwrap();

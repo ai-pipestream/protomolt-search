@@ -172,7 +172,7 @@ async fn query(service: &CollectionSet, cursor: &str) -> Result<QueryResponse, t
 #[tokio::test]
 async fn real_cutover_renumbers_rows_preserves_grants_and_rejects_old_read_claims() {
     let fixture = Fixture::new();
-    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap());
+    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None).unwrap());
     version(&fixture, node.clone(), 1, Some(2)).await;
     let active = version(&fixture, node.clone(), 2, Some(2)).await;
     assert_active_rows(&node, &active, &[2, 3]).await;
@@ -296,7 +296,7 @@ async fn real_cutover_renumbers_rows_preserves_grants_and_rejects_old_read_claim
 #[tokio::test]
 async fn invalid_rewrites_and_stale_builds_leave_the_active_manifest_and_claim_intact() {
     let fixture = Fixture::new();
-    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap());
+    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None).unwrap());
     let first = version(&fixture, node.clone(), 1, Some(2)).await;
     let manifest = fixture.manifest();
     assert!(cutover(&fixture, node.clone(), &first, vec![], "missing")

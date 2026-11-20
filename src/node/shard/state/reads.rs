@@ -124,11 +124,6 @@ impl ShardState {
     ) -> Result<Vec<usize>, Status> {
         let restricted = visibility.is_some();
         let store = self.bm25.as_ref();
-        if restricted && store.is_some_and(|store| store.as_index().is_none()) {
-            return Err(Status::failed_precondition(
-                "bm25 bulk build in progress; Flush before scoped candidate scoring",
-            ));
-        }
         let predicate = visibility.and_then(|view| view.filter.as_ref());
         let filter = crate::filter::DocFilter {
             pred: match (predicate, store) {

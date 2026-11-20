@@ -209,8 +209,8 @@ fn open_source_shard(gen: &Path, pinned: &mut PinnedSources) -> Result<SegmentSo
     let root = segments_root_of_gen(gen)?;
     if !root.exists() {
         return Err(format!(
-            "{}: no segment catalog at {}; the source is a single image (or was never \
-             flushed on the segment layout), split it from the logs",
+            "{}: no segment catalog at {}; the source was never flushed, split it from \
+             the logs",
             gen.display(),
             root.display()
         ));

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use common::{mock::start_mock_analysis, start_empty_node};
 use pipestream_search::analyzer::{self, body_spec, NATIVE_ANALYSIS_BACKEND};
 use pipestream_search::coordinator::CoordinatorServiceImpl;
-use pipestream_search::node::{bm25_sidecar_path, Bm25Shard, NodeConfig, NodeServiceImpl};
+use pipestream_search::node::{NodeConfig, NodeServiceImpl};
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
@@ -590,7 +590,7 @@ fn verify_replayed_positions_and_bigrams(index_path: &Path, bm25_path: &Path, ou
     let mut seen_docs = 0usize;
     let mut bigram_df = 0u32;
     for child in &output.children {
-        let path = child.bm25_path.as_ref().expect("children hold documents");
+        let path = &common::catalog::segment_bm25(&child.vector_path, 0);
         let reader = Bm25Reader::open(path).unwrap();
         assert!(reader.field_has_positions(0), "child keeps body positions");
         let bigrams = reader
@@ -628,7 +628,6 @@ async fn positions_and_bigrams_survive_flush_reopen_and_wal_replay() {
     let index_path = dir.join("shard.tv");
     let config = NodeConfig {
         index_path: Some(index_path.clone()),
-        layout: pipestream_search::node::Layout::SingleImage,
         wal: true,
         wal_buckets: 8,
         ..proximity_config(0, NATIVE_ANALYSIS_BACKEND)
@@ -673,13 +672,12 @@ async fn positions_and_bigrams_survive_flush_reopen_and_wal_replay() {
     assert_eq!(live[1].len(), 5);
     handle.abort();
 
-    let bm25_path = bm25_sidecar_path(&index_path);
+    let bm25_path = common::catalog::segment_bm25(&index_path, 0);
     verify_persisted_positions_sidecar(&bm25_path);
 
-    let shard = Bm25Shard::open(&bm25_path).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr2 = format!("http://{}", listener.local_addr().unwrap());
-    let service = NodeServiceImpl::new(None, config.clone()).with_bm25(Some(shard));
+    let service = NodeServiceImpl::open(config.clone(), None).unwrap();
     let handle2 = tokio::spawn(
         tonic::transport::Server::builder()
             .add_service(service.into_server(pipestream_search::MAX_MESSAGE_BYTES))
@@ -704,16 +702,14 @@ async fn positions_and_bigrams_survive_flush_reopen_and_wal_replay() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ingest_refuses_a_positional_field_the_active_file_never_declared() {
-    // A shard flushed WITHOUT positions, then reopened by a node
-    // configured with them: old queries serve, positional ingest refuses,
-    // and the phrase refuses by name instead of matching new documents
-    // only.
+async fn a_catalog_without_positions_refuses_a_positional_node_and_phrases_by_name() {
+    // A shard flushed WITHOUT positions: a node configured with them
+    // refuses the catalog at open, and the node that serves it answers
+    // old queries and refuses the phrase by name.
     let dir = tempdir("predates");
     let index_path = dir.join("shard.tv");
     let old = NodeConfig {
         index_path: Some(index_path.clone()),
-        layout: pipestream_search::node::Layout::SingleImage,
         analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
         bm25_fields: vec!["body".to_string()],
         ..Default::default()
@@ -733,22 +729,30 @@ async fn ingest_refuses_a_positional_field_the_active_file_never_declared() {
     );
     handle.abort();
 
-    let bm25_path = bm25_sidecar_path(&index_path);
-    let shard = Bm25Shard::open(&bm25_path).unwrap();
+    // A node declaring positions refuses the catalog at open: the storage
+    // declares none, and half a column would lie.
+    let positional = NodeConfig {
+        index_path: Some(index_path.clone()),
+        analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
+        bm25_fields: vec!["body".to_string()],
+        ..Default::default()
+    };
+    let declared = NodeServiceImpl::open(
+        NodeConfig {
+            position_fields: vec!["body".to_string()],
+            ..positional.clone()
+        },
+        None,
+    )
+    .err()
+    .expect("a position declaration the catalog lacks refuses");
+    assert!(
+        declared.contains("declares a field or column table"),
+        "{declared}"
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr2 = format!("http://{}", listener.local_addr().unwrap());
-    let service = NodeServiceImpl::new(
-        None,
-        NodeConfig {
-            index_path: Some(index_path.clone()),
-            layout: pipestream_search::node::Layout::SingleImage,
-            analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
-            bm25_fields: vec!["body".to_string()],
-            position_fields: vec!["body".to_string()],
-            ..Default::default()
-        },
-    )
-    .with_bm25(Some(shard));
+    let service = NodeServiceImpl::open(positional, None).unwrap();
     let handle2 = tokio::spawn(
         tonic::transport::Server::builder()
             .add_service(service.into_server(pipestream_search::MAX_MESSAGE_BYTES))
@@ -780,22 +784,6 @@ async fn ingest_refuses_a_positional_field_the_active_file_never_declared() {
         error.message()
     );
 
-    let mut client = NodeServiceClient::connect(addr2).await.unwrap();
-    let (tx, rx) = mpsc::channel(1);
-    tx.send(doc("new york again", "", Some(body_spec())))
-        .await
-        .unwrap();
-    drop(tx);
-    let error = client
-        .add_documents(ReceiverStream::new(rx))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), Code::FailedPrecondition);
-    assert!(
-        error.message().contains("predates token positions"),
-        "{}",
-        error.message()
-    );
     handle2.abort();
     let _ = std::fs::remove_dir_all(&dir);
 }

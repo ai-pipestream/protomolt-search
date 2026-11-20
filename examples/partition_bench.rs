@@ -23,7 +23,7 @@ use pipestream_search::coordinator::CoordinatorServiceImpl;
 use pipestream_search::harness::{
     fit_calibration, start_empty_node, start_opened_node, unit_vectors,
 };
-use pipestream_search::node::{segments_root, Layout, NodeConfig};
+use pipestream_search::node::{segments_root, NodeConfig};
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
@@ -124,7 +124,6 @@ fn config(index_path: PathBuf, bound: u32, segment_pruning: bool) -> NodeConfig 
         index_path: Some(index_path),
         analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
         integer_fields: vec!["year".to_string()],
-        layout: Layout::Segments,
         seal_tail_docs: bound,
         segment_pruning,
         wal: true,

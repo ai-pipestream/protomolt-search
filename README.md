@@ -667,13 +667,12 @@ manifest, and in health). Unknown names refuse, and an unnamed request
 gets to a named collection only through a configured default. See
 [`docs/collections.md`](docs/collections.md).
 
-Segments are the default layout of a new persisted shard
+Segments are the layout of every persisted shard
 (`docs/immutable-segments.md`): the catalog under `<index>.segments/` plus
 a heap tail that each flush (or `--seal-tail-docs`) seals into a new
 immutable segment; queries read every segment and the tail as one shard
 with global statistics, chained block-max cursors, and union
-dictionaries. `--layout=single-image` keeps the one-file layout, existing
-single-image shards keep theirs, and nothing converts on open.
+dictionaries.
 
 Security (`docs/security.md`): `--tls-cert`/`--tls-key` put every
 listener on TLS (rustls; plaintext is then refused, and off loopback it
@@ -1097,37 +1096,10 @@ shutdown), a restart with the same config comes back with all vectors
 and the provider configuration. An empty but configured shard also persists
 on shutdown. Resetting provider identity requires a new generation.
 
-### Bulk load: InstallSnapshot
+### Bulk load: snapshot repositories
 
-For pre-computed corpora, skip per-node ingest entirely: build the
-shard image once (with the cluster's shared provider configuration) and push the
-FINISHED index to every shard owner over one client stream —
-`NodeService.InstallSnapshot`. The bundled
-`snapshot::install_snapshot_generation(addr, vector_path, exact_path,
-bm25_path, live_docs_path)` client sends all four aligned artifacts;
-`install_snapshot_with_exact` sends an all-live generation; the compatibility
-`install_snapshot` helper sends a native-only generation.
-
-The node stages the image in a generation directory
-(`<index path>.snap/`), validates it (well-formed provider image, exact-vector
-checksum and shape when present, BM25 sidecar opens, and scoring fingerprint
-matches the configured shard). A mismatch is rejected,
-keeping scores comparable cluster-wide. The node then swaps it live
-under the write lock. All files travel inside ONE directory rename, so
-the generation is installed atomically; a crash mid-swap is recovered
-deterministically at startup (see `recover_generation`). Once a shard
-serves from a generation, Flush and restart loading follow it — the
-legacy layout and the generation never split-brain.
-
-Rules of thumb: configure the provider first (or let an empty shard adopt
-the image's state), replace every shard together on scoring changes, and expect
-an image without a `.bm25` sidecar to wholesale-replace the postings
-store. An image without `vectors.f32` remains valid for provider-native
-queries but cannot serve FP32 rerank. Covered by `tests/snapshot.rs` (eight
-cases, including restart survival and crash recovery).
-
-A node can also fetch an image itself ([docs/snapshots.md](docs/snapshots.md)):
-`ExportSnapshot(directory)` copies the shard's generation to a repository
+A node fetches a catalog itself ([docs/snapshots.md](docs/snapshots.md)):
+`ExportSnapshot(directory)` copies the shard's catalog to a repository
 directory (a NAS path) under the shard's read lock and writes
 `snapshot-manifest.json` — provider descriptor, slot offset, collection,
 row counts, analysis fingerprints, the WAL cutoff the image contains, and
@@ -1136,8 +1108,8 @@ repository from a `directory`, an HTTP(S) `url` (with `Range` resume and
 an optional bearer), or a `peer_addr` (the peer's `StreamSnapshot`),
 verifies every artifact against the manifest, and runs the same install;
 a tampered artifact, the wrong manifest digest, another shard's slot
-offset, or a layout the shard cannot adopt refuses by name. Both layouts
-export and install. The manifest's cutoff is where `replication::sync_once`
+offset, or a layout other than `segments` refuses by name. The streamed
+`InstallSnapshot` RPC refuses `UNIMPLEMENTED`. The manifest's cutoff is where `replication::sync_once`
 resumes a replica. Covered by `tests/snapshot_repository.rs` and
 `tests/snapshot_https.rs`.
 
@@ -1194,11 +1166,11 @@ growth in mind.
 This is what makes split/merge of live shards replay-from-log instead of
 re-embed:
 
-1. **Snapshot** the shard (InstallSnapshot) — the base image.
+1. **Snapshot** the shard (ExportSnapshot) — the base catalog.
 2. **Catch up** by replaying the WAL generation(s) written after the
    snapshot.
-3. **Swap** the reshaped images in (InstallSnapshot again) and point the
-   coordinator at the new topology with `--shard-map`.
+3. **Serve** each reshaped child catalog (the reshard tool writes one per
+   child) and point the coordinator at the new topology with `--shard-map`.
 
 The `reshard` example is the offline tool for step 2:
 
@@ -1466,8 +1438,7 @@ live in page cache shared across all consumers, not per-process heap.
 The product-owned original-FP32 rerank sidecar is mmap-backed after flush or
 load and faults only the candidate rows used by reranking. Sealed TurboVec v7
 segment images are mmap-backed by default and populate a bounded blocked-layout
-cache as searches touch them; writable tails and explicit single-image shards
-remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
+cache as searches touch them; writable tails remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 

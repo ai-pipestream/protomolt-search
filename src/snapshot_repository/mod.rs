@@ -29,8 +29,6 @@ pub const MANIFEST_FILE: &str = "snapshot-manifest.json";
 pub const FORMAT_VERSION: u32 = 1;
 /// Retained vector artifacts require readers that preserve materialized tiers.
 pub const RETAINED_FORMAT_VERSION: u32 = 2;
-/// The `layout` of a repository holding one provider image plus sidecars.
-pub const LAYOUT_SINGLE_IMAGE: &str = "single-image";
 /// The `layout` of a repository holding a segment catalog tree.
 pub const LAYOUT_SEGMENTS: &str = "segments";
 /// The directory a segment-layout repository keeps the catalog under.
@@ -91,10 +89,9 @@ impl RepositoryManifest {
                 self.format_version
             ));
         }
-        if self.layout != LAYOUT_SINGLE_IMAGE && self.layout != LAYOUT_SEGMENTS {
+        if self.layout != LAYOUT_SEGMENTS {
             return Err(format!(
-                "{MANIFEST_FILE} names layout {:?}; this build knows {LAYOUT_SINGLE_IMAGE:?} and \
-                 {LAYOUT_SEGMENTS:?}",
+                "{MANIFEST_FILE} names layout {:?}; this build reads only {LAYOUT_SEGMENTS:?}",
                 self.layout
             ));
         }
@@ -103,14 +100,6 @@ impl RepositoryManifest {
         });
         if has_retained && self.format_version < RETAINED_FORMAT_VERSION {
             return Err("retained vector snapshot requires repository format 2".into());
-        }
-        if self.layout == LAYOUT_SINGLE_IMAGE
-            && (self.artifact("vectors.multi").is_some()
-                != self.artifact("vectors.multi.json").is_some())
-        {
-            return Err(
-                "retained vector snapshot requires payload and declaration together".into(),
-            );
         }
         let mut seen = std::collections::BTreeSet::new();
         for artifact in &self.artifacts {

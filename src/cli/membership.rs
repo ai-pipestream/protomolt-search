@@ -53,7 +53,6 @@ fn agent_template(
     NodeConfig {
         max_k: cfg.max_k,
         udp_hmac_key: cfg.udp_hmac_key.clone(),
-        layout: cfg.layout,
         vector_mmap: cfg.vector_mmap,
         seal_tail_docs: cfg.seal_tail_docs,
         chunk_blocks: cfg.chunk_blocks,
@@ -146,7 +145,6 @@ fn agent_config(
             ..template.clone()
         },
         phrase_index: startup.phrase_index.clone(),
-        allow_missing_bm25: cfg.allow_missing_bm25,
         tls: cfg.tls.clone(),
         max_message_bytes: cfg.max_message_bytes,
     }

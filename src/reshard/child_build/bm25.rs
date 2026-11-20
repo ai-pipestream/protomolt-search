@@ -39,7 +39,9 @@ impl Bm25Build<'_> {
             None => MappedAnalysisContract::default(),
         };
         let tables = ChildTables::derive(&mapped.rows, schema, &contract)?;
-        let path = crate::node::bm25_sidecar_path(self.vector_path);
+        let rows = u32::try_from(mapped.row_parent_ids.len())
+            .map_err(|_| "a child's rows exceed u32".to_string())?;
+        let path = documents_path(self.vector_path);
         let mut builder = open_builder(&path, &tables)?;
         pin_fingerprints(&mut builder, &tables, schema.pinned_fingerprints, &contract)?;
         let mut i = 0;
@@ -61,6 +63,11 @@ impl Bm25Build<'_> {
         // The children stay bound to the plan the parents were written
         // under, and to the derived-column declaration (the kind-15
         // entry); replay must not launder either away.
+        // Rows past the last document carry vectors only: empty slots keep
+        // the store covering every row of the child, as a segment requires.
+        builder
+            .reserve_slots(rows)
+            .map_err(|e| format!("reserve {rows} rows in {}: {e}", path.display()))?;
         builder.set_binding(schema.binding.cloned());
         builder.set_derived(schema.derived.cloned());
         builder
@@ -205,4 +212,68 @@ fn add_row(
     document::set_fingerprints(builder, &tables.fields, doc)?;
     document::add_document(builder, local, doc, fields)?;
     super::columns::set_columns(builder, &tables.columns, local, doc)
+}
+
+/// Rewrite rows `[lo, hi)` of an already-built child store as a standalone
+/// store renumbered from 0, through the same transplant path a segment
+/// compaction uses (no re-analysis). `stem` names the output the way
+/// [`Bm25Build::write`] does: the file lands at `<stem>.bm25`.
+/// `parent_ids` is the child's full row-to-parent table.
+pub(in crate::reshard) fn write_store_range(
+    stem: &Path,
+    reader: &crate::postings::Bm25Reader,
+    parent_ids: &[u64],
+    lo: u32,
+    hi: u32,
+) -> Result<PathBuf, String> {
+    use crate::postings::Bm25Index;
+    let tables = crate::reshard::segment_sources::segment_tables(reader);
+    let context = || "split child store".to_string();
+    let transposes = super::super::reconstruct::transpose_segment(reader, &context)?;
+    let mut rows = Vec::new();
+    let mut parent_of_local = BTreeMap::new();
+    let mut transplanted: BTreeMap<u64, Vec<AnalyzedField>> = BTreeMap::new();
+    for row in lo..hi {
+        if Bm25Index::text(reader, row).is_none() {
+            continue;
+        }
+        let parent = parent_ids[row as usize];
+        let local = row - lo;
+        let doc = super::super::reconstruct::reconstruct_document(reader, row, &tables, true)?;
+        transplanted.insert(
+            parent,
+            super::super::reconstruct::transposed_fields(&transposes, row, &context)?,
+        );
+        parent_of_local.insert(local, parent);
+        rows.push((local, doc));
+    }
+    let mapped = MappedDocuments {
+        rows,
+        row_parent_ids: parent_ids[lo as usize..hi as usize].to_vec(),
+        parent_of_local,
+    };
+    let schema = ChildSchema {
+        bm25_fields: Some(&tables.fields),
+        pinned_fingerprints: Some(&tables.fingerprints),
+        binding: reader.binding(),
+        derived: reader.derived(),
+        columns: Some(&tables.columns),
+        hnsw_sources: None,
+    };
+    let mut no_analyze = |_: &[(&str, Option<&AnalysisSpec>, SessionLayers)]| {
+        Err("a store-range split transplants analysis; it never re-analyzes".to_string())
+    };
+    Bm25Build {
+        vector_path: stem,
+        schema: &schema,
+        transplanted: Some(transplanted),
+    }
+    .write(mapped, &mut no_analyze)
+}
+
+/// Where a child image's documents are written: `<vector path>.bm25`.
+fn documents_path(vector_path: &std::path::Path) -> std::path::PathBuf {
+    let mut path = vector_path.as_os_str().to_owned();
+    path.push(".bm25");
+    std::path::PathBuf::from(path)
 }

@@ -106,35 +106,24 @@ pub(crate) fn wal_manifest(
     }
 }
 
-/// The persisted document tip of a shard: `next_doc_id` of the on-disk
-/// BM25 sidecar (generation-aware), 0 when none exists. Opened read-only
-/// and dropped — the serving copy is attached separately (`with_bm25`);
-/// this exists so WAL reconciliation can know the applied tip without
-/// depending on attachment order.
-fn persisted_doc_tip(index_path: &Path) -> u64 {
-    // Panic, like the rest of the WAL open path: a retired generation must
-    // not read as "no documents". Check before recovery can remove its files.
-    if let Err(error) = refuse_retired_generation(index_path) {
-        panic!("{error}");
-    }
-    let generation = try_recover_generation(index_path)
+/// The rows the shard's catalog has sealed: the applied tip of its log.
+/// Read straight from the manifest so WAL reconciliation does not depend
+/// on attachment order. Panics, like the rest of the WAL open path, on a
+/// manifest it cannot read: guessing a tip of 0 would truncate every
+/// sealed record from the log.
+fn catalog_row_tip(index_path: &Path) -> u64 {
+    let manifest = crate::segments::SegmentCatalog::read_manifest(&segments_root(index_path))
         .unwrap_or_else(|error| panic!("wal reconciliation: {error}"));
-    let (_, _, bm25_path) = storage_paths(index_path, generation.as_ref());
-    match probe_path_exists(&bm25_path, "persisted BM25 sidecar") {
-        Ok(false) => return 0,
-        Ok(true) => {}
-        Err(error) => panic!("wal reconciliation: {error}"),
-    }
-    match Bm25Shard::open(&bm25_path) {
-        Ok(store) => u64::from(store.next_doc_id()),
-        // Panic, like the rest of the WAL open path: guessing a tip of 0
-        // would truncate legitimate document records, and the binary
-        // would refuse to serve this sidecar at attach time anyway.
-        Err(e) => panic!(
-            "wal reconciliation: cannot read {}: {e}",
-            bm25_path.display()
-        ),
-    }
+    manifest
+        .map(|manifest| {
+            manifest
+                .segments
+                .iter()
+                .map(|segment| segment.base_label.saturating_add(segment.rows))
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
 }
 
 /// The WAL-resume table check as a returned error: a log whose
@@ -165,8 +154,7 @@ pub(in crate::node) fn check_wal_tables(
     let held = wal::read_manifest(&gen_dir)
         .map_err(|e| format!("read WAL manifest at {}: {e}", gen_dir.display()))?;
     let vector_tip = index.map_or(0, |i| i.len() as u64);
-    let doc_tip = persisted_doc_tip(index_path);
-    let fresh = wal_manifest(index, config, 0, (vector_tip, doc_tip));
+    let fresh = wal_manifest(index, config, 0, (vector_tip, catalog_row_tip(index_path)));
     wal::check_manifest_tables(&held, &fresh).map_err(|e| format!("WAL at {}: {e}", dir.display()))
 }
 
@@ -186,7 +174,7 @@ pub(in crate::node) fn open_wal(
         .as_ref()
         .expect("wal requires an index path");
     let vector_tip = index.map_or(0, |i| i.len() as u64);
-    let doc_tip = persisted_doc_tip(index_path);
+    let doc_tip = catalog_row_tip(index_path);
     let dir = wal::wal_dir(index_path);
     let cutoff = config.slot_offset + vector_tip.max(doc_tip);
     let fresh = wal_manifest(index, config, 0, (vector_tip, doc_tip));

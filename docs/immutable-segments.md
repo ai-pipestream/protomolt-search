@@ -1,14 +1,11 @@
 # Immutable aligned segments
 
-Status (2026-09-02): the segment catalog is the **default layout of a new
-persisted shard**. `NodeService` serves a `SegmentedShard`
-(`src/segmented.rs`): the catalog's sealed segments plus one heap tail, read
-as one shard, with the vector side as a `SegmentedProvider`
-(`src/segmented_vectors.rs`) over the segments' images plus a tail image.
-The single-image layout remains available (`--layout=single-image`) and
-every existing single-image shard keeps it: a shard has the layout its files
-have, and nothing converts on open — a path with both a single image and a
-catalog refuses by name.
+The segment catalog is the **only layout of a persisted shard**.
+`NodeService` serves a `SegmentedShard` (`src/segmented.rs`): the catalog's
+sealed segments plus one heap tail, read as one shard, with the vector side
+as a `SegmentedProvider` (`src/segmented_vectors.rs`) over the segments'
+images plus a tail image. A shard without an index path keeps a heap store
+that never reaches disk.
 
 ## Publication recovery (foundation branch)
 
@@ -114,14 +111,13 @@ seals a full tail before applying the next one, so one long AddDocuments
 stream produces segments of at most that many rows without waiting for the
 stream's end (a vectors-only stream checks between batches). 0 seals on
 flush only. A tail that holds both documents and vectors seals at the
-bound only at a moment when the two counts agree: the legacy two-call
-append (AddDocuments, then AddVectors for the same rows) is between its
-calls otherwise, and the seal waits for the vectors rather than sealing a
-document-only segment they could never join, so a driver that sends its
-rows in blocks (the rebuild driver's `--ingest-block`) never waits longer
-than one block. A flush with disagreeing counts refuses by name (a
-segment's artifacts cover the same rows); mapped ingest keeps them
-aligned. Vectors that arrive after document-only rows were sealed are
+bound only at a moment when the two counts agree: AddVectors has not yet
+caught up with AddDocuments otherwise, and the seal waits for the vectors
+rather than sealing a document-only segment they could never join, so a
+driver that sends its rows in blocks (the rebuild driver's
+`--ingest-block`) never waits longer than one block. A flush or a
+compaction with disagreeing counts refuses by name at once (a segment's
+artifacts cover the same rows); mapped ingest keeps them aligned. Vectors that arrive after document-only rows were sealed are
 refused by name ("rows are sealed in segments without vectors"). A
 documents-only shard seals documents-only segments (no vector artifact);
 the catalog and its collectors accept them.
@@ -140,13 +136,11 @@ and the WAL, and compaction replays the WAL, so a segment's own bitmap is its
 state at seal time by design. `CompactShard` reclaims them online
 (`docs/mutations.md`).
 
-`tests/segment_layout.rs` pins: a fresh shard writes a catalog and no single
-image; two sealed segments plus a tail answer every probe (df, live bitmap
-after a delete, facets, CEL ranges over the union dictionary, sentence
-highlights, prefix expansion, phrases) bitwise as one image of the same rows,
-before and after reopening from disk; an old single-image fixture serves
-under the default and is never converted; both layouts on one path refuse;
-the tail auto-seals at the bound; one stream longer than twice the bound
+`tests/segment_layout.rs` pins: two sealed segments plus a tail answer every
+probe (df, live bitmap after a delete, facets, CEL ranges over the union
+dictionary, sentence highlights, prefix expansion, phrases) bitwise as one
+segment of the same rows, before and after reopening from disk; the tail
+auto-seals at the bound; one stream longer than twice the bound
 seals as it goes and every segment stays within it; and the union read
 surface (df, postings, positions, sentences, the chained cursor,
 dictionaries) equals one store, through a frozen part included.
@@ -291,8 +285,8 @@ keeps its key, that segment has no partition range (its column summary
 still counts), and the next partitioned compaction folds it in. A
 compaction without the column returns the shard to the bucket layout and
 clears the key. Rejected by name before any work: a double or facet
-column, a name that is not a column, a column no document of the shard
-carries, and the single-image layout. Global ids, lineage, statistics, and
+column, a name that is not a column, and a column no document of the
+shard carries. Global ids, lineage, statistics, and
 every read path are unchanged by the layout; `tests/compaction.rs` pins
 the partitioned outputs and their summaries against a shard built fresh
 from the same rows.

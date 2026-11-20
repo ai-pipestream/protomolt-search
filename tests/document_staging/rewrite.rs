@@ -81,7 +81,7 @@ fn scratch_count(f: &Fixture) -> usize {
 #[tokio::test]
 async fn rebuild_merges_sources_then_reclaims_partial_segments_without_changing_identity() {
     let f = Fixture::new();
-    let node = Arc::new(NodeServiceImpl::open(f.config.clone(), None, false).unwrap());
+    let node = Arc::new(NodeServiceImpl::open(f.config.clone(), None).unwrap());
     publish_key(&f, node.clone(), b"a", 1, Some(3)).await;
     publish_key(&f, node.clone(), b"b", 1, Some(2)).await;
     let original = opened(&f);
@@ -162,7 +162,7 @@ async fn rebuild_merges_sources_then_reclaims_partial_segments_without_changing_
 #[tokio::test]
 async fn rebuild_budget_failures_leave_source_and_serving_state_unchanged() {
     let f = Fixture::new();
-    let node = Arc::new(NodeServiceImpl::open(f.config.clone(), None, false).unwrap());
+    let node = Arc::new(NodeServiceImpl::open(f.config.clone(), None).unwrap());
     let active = publish_key(&f, node.clone(), KEY, 1, Some(3)).await;
     let manifest = f.manifest();
     let receipt = f.catalog.get(KEY, Some(1)).unwrap();

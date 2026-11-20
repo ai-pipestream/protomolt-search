@@ -24,7 +24,7 @@ use pipestream_search::coordinator::{
     MAX_SUGGEST_SCAN,
 };
 use pipestream_search::harness::start_empty_phrase_node;
-use pipestream_search::node::{bm25_sidecar_path, Layout, NodeConfig};
+use pipestream_search::node::{segments_root, NodeConfig};
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
@@ -520,18 +520,17 @@ async fn the_cased_twin_and_the_glossary_field_complete() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_segmented_shard_equals_one_image_and_reopens_from_disk() {
+async fn many_segments_equal_one_segment_and_reopen_from_disk() {
     let dir = tempdir("segments");
     let seg_path = dir.join("segmented.tv");
     let one_path = dir.join("single.tv");
-    let node_config = |path: PathBuf, layout: Layout| NodeConfig {
+    let node_config = |path: PathBuf| NodeConfig {
         index_path: Some(path),
-        layout,
         wal: false,
         ..config(0)
     };
-    let (seg, hs) = start_empty_node(node_config(seg_path.clone(), Layout::Segments)).await;
-    let (one, ho) = start_empty_node(node_config(one_path.clone(), Layout::SingleImage)).await;
+    let (seg, hs) = start_empty_node(node_config(seg_path.clone())).await;
+    let (one, ho) = start_empty_node(node_config(one_path.clone())).await;
     // Two flushes seal two segments; the third batch stays in the tail.
     for (i, batch) in [&CORPUS[..3], &CORPUS[3..6], &CORPUS[6..]]
         .into_iter()
@@ -551,7 +550,7 @@ async fn a_segmented_shard_equals_one_image_and_reopens_from_disk() {
     for prefix in prefixes {
         let a = suggest(&segmented, all(prefix)).await;
         let b = suggest(&single, all(prefix)).await;
-        assert_eq!(a, b, "{prefix}: segments must equal one image");
+        assert_eq!(a, b, "{prefix}: many segments must equal one");
         assert_eq!(ranked(&a), oracle(&corpus, prefix), "{prefix}");
     }
     // Seal the tail too, then reopen both from disk through the mmap
@@ -563,16 +562,18 @@ async fn a_segmented_shard_equals_one_image_and_reopens_from_disk() {
     }
     hs.abort();
     ho.abort();
-    let (seg, hs) = start_opened_node(node_config(seg_path.clone(), Layout::Segments)).await;
-    let (one, ho) = start_opened_node(node_config(one_path.clone(), Layout::SingleImage)).await;
+    let (seg, hs) = start_opened_node(node_config(seg_path.clone())).await;
+    let (one, ho) = start_opened_node(node_config(one_path.clone())).await;
     let segmented = coordinator(vec![seg]);
     let single = coordinator(vec![one]);
     for (prefix, want) in prefixes.iter().zip(&before) {
         assert_eq!(&suggest(&segmented, all(prefix)).await, want, "{prefix}");
         assert_eq!(&suggest(&single, all(prefix)).await, want, "{prefix}");
     }
-    // The single image's reader answers the same through the trait.
-    let reader = Bm25Reader::open(&bm25_sidecar_path(&one_path)).unwrap();
+    // The one segment's reader answers the same through the trait.
+    let set =
+        pipestream_search::segments::OpenedSegmentSet::open(segments_root(&one_path)).unwrap();
+    let reader = set.bm25(0);
     let want: Vec<(String, u32)> = {
         let mut entries: Vec<(String, u32)> = oracle(&corpus, "cou")
             .into_iter()
@@ -750,7 +751,6 @@ async fn past_the_scan_bound_refuses_with_the_count_and_materializes_nothing() {
     let index_path = dir.join("shard.tv");
     let (addr, handle) = start_empty_node(NodeConfig {
         index_path: Some(index_path.clone()),
-        layout: Layout::SingleImage,
         wal: false,
         ..config(0)
     })
@@ -813,7 +813,7 @@ async fn past_the_scan_bound_refuses_with_the_count_and_materializes_nothing() {
         .all(|s: &Suggestion| s.df == 1 && s.shards == 1));
 
     // Both stores count past the bound without materializing.
-    let reader = Bm25Reader::open(&bm25_sidecar_path(&index_path)).unwrap();
+    let reader = Bm25Reader::open(&common::catalog::segment_bm25(&index_path, 0)).unwrap();
     assert_eq!(reader.suggest_prefix("t", 100), Err(5000));
     assert_eq!(reader.suggest_prefix("t", 4999), Err(5000));
     let mut store = Bm25Store::new();

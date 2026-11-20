@@ -62,12 +62,11 @@ impl NodeServiceImpl {
         guard: &mut ShardState,
         req: DocumentCommit<'_>,
     ) -> Result<(), Status> {
-        guard.check_legacy_mutation()?;
+        guard.check_index_owned_write()?;
         validate_source_and_identity(&req.doc)?;
         // Invalidate before any fallible mutation, including builder/provider
         // creation; a refused append must not leave old files marked current.
         guard.advance_stats_epoch();
-        self.reload_resident_bm25(guard)?;
 
         let vector_tip = guard.index.as_ref().map_or(0, |i| i.len() as u32);
         let prepared_vector = self.prepare_mapped_vector(guard, req.vector, vector_tip)?;
@@ -98,33 +97,16 @@ impl NodeServiceImpl {
         Ok(())
     }
 
-    /// Reload a disk-resident BM25 sidecar into an in-memory [`Bm25Store`]
-    /// builder before appending documents.
-    fn reload_resident_bm25(&self, guard: &mut ShardState) -> Result<(), Status> {
-        if !matches!(guard.bm25, Some(Bm25Shard::Resident(_))) {
-            return Ok(());
-        }
-        let bm25_path = self
-            .config
-            .index_path
-            .as_ref()
-            .map(|p| storage_paths(p, guard.generation.as_ref()).2)
-            .ok_or_else(|| {
-                Status::failed_precondition("resident shard has no index path to reload from")
-            })?;
-        let store = Bm25Store::load(&bm25_path)
-            .map_err(|e| Status::internal(format!("reload {}: {e}", bm25_path.display())))?;
-        guard.bm25 = Some(Bm25Shard::Building(store));
-        Ok(())
-    }
-
     /// Ensure `guard.bm25` holds an active builder, adopting any pre-existing
-    /// plain vector index as the segmented provider's tail when on segment layout.
-    fn ensure_bm25_builder(&self, guard: &mut ShardState) -> Result<(), Status> {
+    /// plain vector index as the segmented provider's tail on a persisted shard.
+    pub(in crate::node) fn ensure_bm25_builder(
+        &self,
+        guard: &mut ShardState,
+    ) -> Result<(), Status> {
         if guard.bm25.is_some() {
             return Ok(());
         }
-        let builder = self.new_builder(guard.generation.as_ref())?;
+        let builder = self.new_builder()?;
         guard.bm25 = Some(builder);
         let snapshot = match guard.bm25.as_ref() {
             Some(Bm25Shard::Segmented(g)) => Some(g.snapshot().clone()),

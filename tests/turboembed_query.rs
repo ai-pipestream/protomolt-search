@@ -726,8 +726,9 @@ async fn quantized_u8_and_u16_splade_128_doc_block_max_matches_exhaustive_oracle
                 shard_store.add_document(local as u32, format!("doc {local}"), doc.clone());
             }
             let idx_base = dir.join(format!("s{shard_idx}_{bits}.idx"));
-            let sidecar_path = pipestream_search::node::bm25_sidecar_path(&idx_base);
+            let sidecar_path = dir.join(format!("s{shard_idx}_{bits}.bm25"));
             shard_store.save(&sidecar_path).unwrap();
+            common::catalog::seal_bm25_file(&idx_base, &sidecar_path);
             let opened = Arc::new(
                 NodeServiceImpl::open(
                     NodeConfig {
@@ -736,7 +737,6 @@ async fn quantized_u8_and_u16_splade_128_doc_block_max_matches_exhaustive_oracle
                         ..Default::default()
                     },
                     None,
-                    true,
                 )
                 .unwrap(),
             );

@@ -81,10 +81,7 @@ impl NodeServiceImpl {
                     String::new(),
                 ),
             };
-        let (bm25_docs, bm25_building) = match guard.bm25.as_ref() {
-            Some(shard) => (shard.doc_count(), matches!(shard, Bm25Shard::Spilling(_))),
-            None => (0, false),
-        };
+        let bm25_docs = guard.bm25.as_ref().map_or(0, Bm25Shard::doc_count);
         let document_slots = guard
             .bm25
             .as_ref()
@@ -110,7 +107,7 @@ impl NodeServiceImpl {
             bits_per_dimension: bit_width,
             slot_offset: self.config.slot_offset,
             bm25_docs,
-            bm25_building,
+            bm25_building: false,
             ingest_active: self.ingest_busy.load(std::sync::atomic::Ordering::Acquire),
             vector_backend,
             scoring_fingerprint,
@@ -228,7 +225,7 @@ impl NodeServiceImpl {
         if let Some(endpoint) = self.config.vocab_kserve_endpoint.as_deref() {
             let export_batch = {
                 let guard = read_shard(&self.state);
-                let bm25_view = guard.bm25.as_ref().and_then(|s| s.field_view(0));
+                let bm25_view = guard.bm25.as_ref().map(|s| s.field_view(0));
                 let shard_docs = guard.bm25.as_ref().map_or(0, |s| s.doc_count());
                 self.vocab.as_ref().and_then(|vocab| {
                     let stats = vocab.live_stats();

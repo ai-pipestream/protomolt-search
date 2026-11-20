@@ -1,7 +1,7 @@
-//! Staging and shadow-state opening for single-image and segmented compaction.
+//! Staging and shadow-state opening for segmented compaction.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use tonic::Status;
@@ -115,173 +115,7 @@ pub(in crate::compaction) fn open_segmented_vectors(
     Ok(Some((VectorIndex::from_provider(provider), exact)))
 }
 
-fn move_artifact(from: &Path, to: &Path) -> Result<(), Status> {
-    std::fs::rename(from, to)
-        .map_err(|e| Status::internal(format!("move {} -> {}: {e}", from.display(), to.display())))
-}
-
-fn stage_single_image_dir(
-    pre: &Preflight,
-    image: &crate::reshard::ChildImage,
-) -> Result<(PathBuf, crate::multi_res::MultiResVectors), Status> {
-    let gen = pre.work_dir.join("generation");
-    std::fs::create_dir_all(&gen)
-        .map_err(|e| Status::internal(format!("mkdir {}: {e}", gen.display())))?;
-    let rows = image.row_parent_ids.len() as u64;
-    if image.num_vectors > 0 {
-        move_artifact(&image.vector_path, &crate::node::generation_vector(&gen))?;
-        move_artifact(
-            &image.exact_vector_path,
-            &crate::node::generation_exact_vectors(&gen),
-        )?;
-    }
-    if let Some(path) = &image.bm25_path {
-        move_artifact(path, &crate::node::generation_bm25(&gen))?;
-    }
-    let retained_path = gen.join(crate::multi_res::FILE_NAME);
-    if let Some(path) = &image.multi_res_path {
-        move_artifact(path, &retained_path)?;
-        move_artifact(
-            &crate::multi_res_storage::declaration_path(path),
-            &crate::multi_res_storage::declaration_path(&retained_path),
-        )?;
-    }
-    let multi_res_vectors = crate::multi_res_storage::open(&retained_path, rows)
-        .map_err(|error| Status::internal(format!("open compacted retained vectors: {error}")))?;
-    let live_path = crate::node::generation_live_docs(&gen);
-    let live = if multi_res_vectors.is_empty() {
-        LiveDocs::default()
-    } else {
-        LiveDocs::default().with_retained_vectors()
-    };
-    live.write(&live_path, rows)
-        .map_err(|e| Status::internal(format!("write {}: {e}", live_path.display())))?;
-    crate::postings::fsync_parent(&live_path)
-        .map_err(|e| Status::internal(format!("fsync {}: {e}", gen.display())))?;
-    Ok((gen, multi_res_vectors))
-}
-
 impl NodeServiceImpl {
-    fn open_single_shadow_vectors(
-        &self,
-        pre: &Preflight,
-        has_vectors: bool,
-        vector_path: &Path,
-        exact_path: &Path,
-    ) -> Result<(Option<VectorIndex>, Option<ExactVectorStore>), Status> {
-        let index = if !has_vectors {
-            self.empty_configured_index(pre)?
-        } else {
-            let mut loaded = VectorIndex::load(&self.config.vector_backend, vector_path)
-                .map_err(|e| Status::internal(format!("load {}: {e}", vector_path.display())))?;
-            loaded
-                .prepare()
-                .map_err(|e| Status::internal(format!("prepare {}: {e}", vector_path.display())))?;
-            let d = loaded.descriptor();
-            if d.backend_kind != pre.backend_kind
-                || d.scoring_fingerprint != pre.scoring_fingerprint
-            {
-                return Err(Status::failed_precondition(format!(
-                    "the compacted image scores under {}/{} but the shard serves {}/{}; the WAL \
-                     manifest's provider state does not reproduce the live generation",
-                    d.backend_kind,
-                    d.scoring_fingerprint,
-                    pre.backend_kind,
-                    pre.scoring_fingerprint
-                )));
-            }
-            Some(loaded)
-        };
-        let exact_vectors = if has_vectors {
-            Some(
-                ExactVectorStore::open(exact_path)
-                    .map_err(|e| Status::internal(format!("open {}: {e}", exact_path.display())))?,
-            )
-        } else {
-            index
-                .as_ref()
-                .and_then(VectorIndex::dim_opt)
-                .map(|dim| ExactVectorStore::spilling(exact_path, Some(dim)))
-                .transpose()
-                .map_err(|e| {
-                    Status::internal(format!(
-                        "exact-vector builder {}: {e}",
-                        exact_path.display()
-                    ))
-                })?
-        };
-        Ok((index, exact_vectors))
-    }
-
-    pub(super) fn open_single_image_shadow(
-        &self,
-        pre: &Preflight,
-        build: &crate::reshard::CompactionBuild,
-        new_wal: WalWriter,
-    ) -> Result<Shadow, Status> {
-        let [image] = build.images.as_slice() else {
-            return Err(Status::internal(format!(
-                "a single-image compaction built {} images",
-                build.images.len()
-            )));
-        };
-        let (gen, multi_res_vectors) = stage_single_image_dir(pre, image)?;
-        let vector_path = crate::node::generation_vector(&gen);
-        let exact_path = crate::node::generation_exact_vectors(&gen);
-        let bm25_path = crate::node::generation_bm25(&gen);
-        let live_path = crate::node::generation_live_docs(&gen);
-        let (index, exact_vectors) =
-            self.open_single_shadow_vectors(pre, image.num_vectors > 0, &vector_path, &exact_path)?;
-        let bm25 = self.open_single_shadow_bm25(pre, image.bm25_path.is_some(), &bm25_path)?;
-        let live_docs = LiveDocs::open(&live_path)
-            .map_err(|e| Status::internal(format!("open {}: {e}", live_path.display())))?;
-        let mapped_binding = bm25.as_ref().and_then(|b| b.binding().cloned());
-        Ok(Shadow {
-            state: ShardState {
-                multi_res_vectors,
-                index,
-                exact_vectors,
-                bm25,
-                live_docs,
-                generation: Some(gen),
-                wal: Some(new_wal),
-                parents: None,
-                mapped_binding,
-                stats_epoch: 0,
-                files_current: false,
-                stats_incarnation: Default::default(),
-                pending_compaction: None,
-            },
-            id_map: BTreeMap::new(),
-            staged: Vec::new(),
-            replaced: Vec::new(),
-            tail_records: 0,
-            epoch_at_open: 0,
-        })
-    }
-
-    fn open_single_shadow_bm25(
-        &self,
-        pre: &Preflight,
-        has_bm25: bool,
-        bm25_path: &Path,
-    ) -> Result<Option<Bm25Shard>, Status> {
-        if has_bm25 {
-            let shard = Bm25Shard::open(bm25_path)
-                .map_err(|e| Status::internal(format!("open {}: {e}", bm25_path.display())))?;
-            self.check_shadow_fingerprints(pre.fields.as_ref(), &shard)?;
-            Ok(Some(shard))
-        } else {
-            let mut store =
-                crate::node::heap_store(&self.config).map_err(Status::failed_precondition)?;
-            store.set_binding(
-                crate::reshard::read_generation_binding(&pre.gen_dir)
-                    .map_err(Status::failed_precondition)?,
-            );
-            Ok(Some(Bm25Shard::Building(store)))
-        }
-    }
-
     pub(super) fn open_segmented_shadow(
         &self,
         pre: &Preflight,
@@ -292,11 +126,6 @@ impl NodeServiceImpl {
         let live_manifest = SegmentCatalog::read_manifest(&root)
             .map_err(Status::internal)?
             .unwrap_or_default();
-        let replaced: Vec<String> = live_manifest
-            .segments
-            .iter()
-            .map(|s| s.segment_id.clone())
-            .collect();
         let epoch_at_open = {
             let guard = crate::node::read_shard(&self.state);
             match guard.bm25.as_ref() {
@@ -312,14 +141,7 @@ impl NodeServiceImpl {
             backend_kind: &pre.backend_kind,
             partition_column: pre.partition.as_deref(),
         })?;
-        match self.open_staged_segmented_shadow(
-            pre,
-            &root,
-            &staged,
-            replaced,
-            epoch_at_open,
-            new_wal,
-        ) {
+        match self.open_staged_segmented_shadow(pre, &root, &staged, epoch_at_open, new_wal) {
             Ok(shadow) => Ok(shadow),
             Err(status) => {
                 crate::segments::remove_segment_dirs(&root, &staged);
@@ -333,7 +155,6 @@ impl NodeServiceImpl {
         pre: &Preflight,
         root: &Path,
         staged: &[SegmentMetadata],
-        replaced: Vec<String>,
         epoch_at_open: u64,
         new_wal: WalWriter,
     ) -> Result<Shadow, Status> {
@@ -385,7 +206,6 @@ impl NodeServiceImpl {
                 exact_vectors,
                 bm25: Some(bm25),
                 live_docs: LiveDocs::default(),
-                generation: None,
                 wal: Some(new_wal),
                 parents: None,
                 mapped_binding,
@@ -396,7 +216,6 @@ impl NodeServiceImpl {
             },
             id_map: BTreeMap::new(),
             staged: staged.to_vec(),
-            replaced,
             tail_records: 0,
             epoch_at_open,
         })

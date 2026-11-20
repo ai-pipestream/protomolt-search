@@ -23,7 +23,7 @@ use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
 use pipestream_search::control_plane::{ClusterControlService, ControlPolicy, DurableControlPlane};
 use pipestream_search::coordinator::CoordinatorServiceImpl;
 use pipestream_search::harness::serve_node;
-use pipestream_search::node::{Layout, NodeConfig, NodeServiceImpl};
+use pipestream_search::node::{NodeConfig, NodeServiceImpl};
 use pipestream_search::node_agent::{rows_of, NodeAgent, NodeAgentConfig, ServedShard};
 use pipestream_search::pb::cluster_control_client::ClusterControlClient;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
@@ -49,15 +49,11 @@ fn tempdir(tag: &str) -> PathBuf {
     dir
 }
 
-/// The single-image layout keeps a flush independent of an ingest stream
-/// in flight (a segment seal wants the tail's documents and vectors
-/// aligned, which the two-stream ingest below is not between streams).
 fn shard_config(index_path: PathBuf) -> NodeConfig {
     NodeConfig {
         index_path: Some(index_path),
         analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
         facet_fields: vec!["court".to_string()],
-        layout: Layout::SingleImage,
         wal: true,
         ..Default::default()
     }
@@ -86,7 +82,6 @@ fn agent_config(
         scan_parallel: 2,
         template: shard_config(PathBuf::new()),
         phrase_index: None,
-        allow_missing_bm25: false,
         tls: None,
         max_message_bytes: pipestream_search::MAX_MESSAGE_BYTES,
     }
@@ -110,6 +105,29 @@ async fn client(addr: &str) -> NodeServiceClient<tonic::transport::Channel> {
 
 /// Documents `from..to` with a court facet, then the matching vectors.
 async fn ingest(addr: &str, from: usize, to: usize) {
+    ingest_documents(addr, from, to).await;
+    let mut c = client(addr).await;
+    let corpus = unit_vectors(to, DIM, 0x5EED_CA11);
+    let (tx, rx) = mpsc::channel(8);
+    tokio::spawn(async move {
+        let _ = tx
+            .send(AddVectorsRequest {
+                materialized_rows: Vec::new(),
+                vectors: corpus[from * DIM..to * DIM].to_vec(),
+                dim: DIM as u32,
+            })
+            .await;
+    });
+    let added = c
+        .add_vectors(ReceiverStream::new(rx))
+        .await
+        .unwrap()
+        .into_inner()
+        .added;
+    assert_eq!(added as usize, to - from);
+}
+
+async fn ingest_documents(addr: &str, from: usize, to: usize) {
     let mut c = client(addr).await;
     let (tx, rx) = mpsc::channel(8);
     tokio::spawn(async move {
@@ -129,24 +147,6 @@ async fn ingest(addr: &str, from: usize, to: usize) {
     });
     let added = c
         .add_documents(ReceiverStream::new(rx))
-        .await
-        .unwrap()
-        .into_inner()
-        .added;
-    assert_eq!(added as usize, to - from);
-    let corpus = unit_vectors(to, DIM, 0x5EED_CA11);
-    let (tx, rx) = mpsc::channel(8);
-    tokio::spawn(async move {
-        let _ = tx
-            .send(AddVectorsRequest {
-                materialized_rows: Vec::new(),
-                vectors: corpus[from * DIM..to * DIM].to_vec(),
-                dim: DIM as u32,
-            })
-            .await;
-    });
-    let added = c
-        .add_vectors(ReceiverStream::new(rx))
         .await
         .unwrap()
         .into_inner()
@@ -288,7 +288,7 @@ fn record<'a>(
 async fn a_replica_bootstraps_from_the_primary_and_takes_over() {
     let dir = tempdir("bootstrap");
     // Node A: shard s0, seeded, DOCS rows, flushed.
-    let node_a = NodeServiceImpl::open(shard_config(dir.join("a/shard")), None, false).unwrap();
+    let node_a = NodeServiceImpl::open(shard_config(dir.join("a/shard")), None).unwrap();
     let (addr_a, handle_a) = serve_node(node_a.clone()).await;
     let corpus = unit_vectors(2_000, DIM, 0xCA11_0001);
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &corpus);
@@ -392,7 +392,7 @@ async fn a_replica_bootstraps_from_the_primary_and_takes_over() {
                 && agent_b.stats().installs.load(Ordering::Relaxed) == 0
             {
                 let i = ingested.load(Ordering::Relaxed) as usize;
-                ingest(&addr, i, i + 1).await;
+                ingest_documents(&addr, i, i + 1).await;
                 ingested.store(i as u64 + 1, Ordering::Relaxed);
                 tokio::time::sleep(Duration::from_millis(15)).await;
             }
@@ -439,7 +439,7 @@ async fn a_replica_bootstraps_from_the_primary_and_takes_over() {
                     let _ = handle.await;
                 }
                 let i = ingested.load(Ordering::Relaxed) as usize;
-                ingest(&addr, i, i + 3).await;
+                ingest_documents(&addr, i, i + 3).await;
                 ingested.store(i as u64 + 3, Ordering::Relaxed);
                 flush(&addr).await;
             })

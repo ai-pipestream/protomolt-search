@@ -104,7 +104,7 @@ async fn captured_backup_survives_source_compaction_and_keeps_unpublished_backlo
             .unwrap()
             .join("index"),
     );
-    let restored = NodeServiceImpl::open(config, None, false).unwrap();
+    let restored = NodeServiceImpl::open(config, None).unwrap();
     let activation = tokio::task::spawn_blocking(move || {
         restored.recover_document_projection_blocking(&source, INDEX)
     })
@@ -254,7 +254,7 @@ async fn backup_captures_two_owned_indexes_in_key_order() {
     let (_, candidate) = f.stage(KEY, 1, Some(2)).await;
     let mut config = f.node.config.clone();
     config.index_path = Some(f.root.join("second-node"));
-    let second = NodeServiceImpl::open(config, None, false).unwrap();
+    let second = NodeServiceImpl::open(config, None).unwrap();
     let second_candidate = second
         .stage_document_projection(
             f.source.clone(),

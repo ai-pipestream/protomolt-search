@@ -15,7 +15,7 @@ use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
 use pipestream_search::collections::CollectionSet;
 use pipestream_search::coordinator::CoordinatorServiceImpl;
 use pipestream_search::metrics;
-use pipestream_search::node::{Layout, NodeConfig, NodeServiceImpl};
+use pipestream_search::node::{NodeConfig, NodeServiceImpl};
 use pipestream_search::pb::diagnostics_service_client::DiagnosticsServiceClient;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_client::SearchServiceClient;
@@ -48,13 +48,12 @@ fn tempdir(tag: &str) -> PathBuf {
     dir
 }
 
-fn config(index_path: PathBuf, layout: Layout) -> NodeConfig {
+fn config(index_path: PathBuf) -> NodeConfig {
     NodeConfig {
         index_path: Some(index_path),
         analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
         facet_fields: vec!["court".to_string()],
         integer_fields: vec!["year".to_string()],
-        layout,
         seal_tail_docs: PER_YEAR as u32,
         wal: false,
         ..Default::default()
@@ -229,7 +228,7 @@ fn skipped(response: &QueryResponse) -> (u32, u32) {
 /// A sealed, summarized shard plus a coordinator over it.
 async fn fleet(tag: &str) -> (String, String) {
     let dir = tempdir(tag);
-    let (node, _handle) = start_empty_node(config(dir.join("d.tv"), Layout::Segments)).await;
+    let (node, _handle) = start_empty_node(config(dir.join("d.tv"))).await;
     ingest(&node).await;
     let coord = serve_set(CollectionSet::single(coordinator(&node))).await;
     (node, coord)
@@ -336,7 +335,7 @@ async fn knobs_list_and_flip_live() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn immutable_unknown_and_malformed_knobs_are_rejected() {
     let dir = tempdir("reject");
-    let (node, _handle) = start_empty_node(config(dir.join("r.tv"), Layout::Segments)).await;
+    let (node, _handle) = start_empty_node(config(dir.join("r.tv"))).await;
     let mut diag = DiagnosticsServiceClient::new(channel(&node).await);
     let set = |name: &str, value: &str| SetRuntimeKnobRequest {
         name: name.into(),
@@ -463,7 +462,7 @@ fn check_snapshot_against_page(snapshot: &MetricsSnapshot, page: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_snapshot_equals_the_rendered_page() {
     let dir = tempdir("snapshot");
-    let node = NodeServiceImpl::new(None, config(dir.join("s.tv"), Layout::Segments));
+    let node = NodeServiceImpl::new(None, config(dir.join("s.tv")));
     let gauges = vec![node.metrics_provider()];
     // Move the registry off zero so the comparison is not trivial.
     metrics::inc_request(metrics::Route::Query);
@@ -492,7 +491,7 @@ async fn the_snapshot_equals_the_rendered_page() {
     );
 
     // Over the wire, the node's snapshot is the same shape.
-    let (addr, _handle) = start_empty_node(config(dir.join("w.tv"), Layout::Segments)).await;
+    let (addr, _handle) = start_empty_node(config(dir.join("w.tv"))).await;
     let mut diag = DiagnosticsServiceClient::new(channel(&addr).await);
     let wire = diag
         .get_metrics_snapshot(MetricsSnapshotRequest {})
@@ -506,7 +505,7 @@ async fn the_snapshot_equals_the_rendered_page() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_stream_delivers_at_its_interval() {
     let dir = tempdir("stream");
-    let (addr, _handle) = start_empty_node(config(dir.join("t.tv"), Layout::Segments)).await;
+    let (addr, _handle) = start_empty_node(config(dir.join("t.tv"))).await;
     let mut diag = DiagnosticsServiceClient::new(channel(&addr).await);
     let too_fast = diag
         .stream_metrics(StreamMetricsRequest { interval_ms: 50 })
@@ -550,7 +549,7 @@ async fn the_stream_delivers_at_its_interval() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn shard_diagnostics_describe_both_layouts() {
+async fn shard_diagnostics_describe_the_catalog_and_a_heap_shard() {
     let (node, coord) = fleet("layout").await;
     let mut diag = DiagnosticsServiceClient::new(channel(&node).await);
     let out = diag
@@ -586,7 +585,6 @@ async fn shard_diagnostics_describe_both_layouts() {
     assert!(shard.segments.iter().all(|s| s.partition.is_none()));
     assert_eq!(shard.tail_rows, 0, "flushed");
     assert!(shard.segment_pruning && shard.floor_sharing);
-
     // The coordinator fans out to its node and stamps shard and address.
     let mut cdiag = DiagnosticsServiceClient::new(channel(&coord).await);
     let fan = cdiag
@@ -604,22 +602,24 @@ async fn shard_diagnostics_describe_both_layouts() {
         .unwrap()
         .into_inner();
     assert!(none.shards.is_empty());
-
-    // A single-image shard reports its layout and no segments.
-    let dir = tempdir("single");
-    let (single, _handle) = start_empty_node(config(dir.join("one.tv"), Layout::SingleImage)).await;
-    ingest(&single).await;
-    let mut sdiag = DiagnosticsServiceClient::new(channel(&single).await);
+    // A shard without an index path reports the memory layout and no
+    // segments.
+    let memory_config = NodeConfig {
+        index_path: None,
+        ..config(PathBuf::new())
+    };
+    let (memory, _handle) = start_empty_node(memory_config).await;
+    ingest(&memory).await;
+    let mut sdiag = DiagnosticsServiceClient::new(channel(&memory).await);
     let out = sdiag
         .get_shard_diagnostics(ShardDiagnosticsRequest { shard: None })
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(out.shards[0].layout, "single-image");
+    assert_eq!(out.shards[0].layout, pipestream_search::node::LAYOUT_MEMORY);
     assert!(out.shards[0].segments.is_empty());
     assert_eq!(out.shards[0].rows, rows().len() as u64);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_ring_holds_recent_requests_newest_first() {
     let (node, coord) = fleet("ring").await;
@@ -719,7 +719,7 @@ fn principals() -> Arc<Principals> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_coordinator_service_needs_an_admin_principal() {
     let dir = tempdir("admin");
-    let (node, _handle) = start_empty_node(config(dir.join("a.tv"), Layout::Segments)).await;
+    let (node, _handle) = start_empty_node(config(dir.join("a.tv"))).await;
     ingest(&node).await;
     let guarded =
         serve_set(CollectionSet::single(coordinator(&node)).with_principals(principals())).await;

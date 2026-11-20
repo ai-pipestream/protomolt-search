@@ -1,7 +1,7 @@
 mod common;
 
 use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
-use pipestream_search::node::{Layout, NodeConfig};
+use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::*;
 use pipestream_search::visibility::VisibilityScope;
@@ -171,65 +171,57 @@ async fn membership_intersects_user_predicates_and_keeps_views_separate() {
 
 #[tokio::test]
 async fn scoped_membership_survives_delete_compaction_and_reopen() {
-    for layout in [Layout::SingleImage, Layout::Segments] {
-        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("membership-{layout:?}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let cfg = NodeConfig {
-            index_path: Some(dir.join("shard.tv")),
-            layout,
-            seal_tail_docs: 2,
-            wal: true,
-            ..config()
-        };
-        let (addr, server) = common::start_empty_node(cfg.clone()).await;
-        let mut client = NodeServiceClient::connect(addr).await.unwrap();
-        seed(&mut client, 4).await;
-        if layout == Layout::SingleImage {
-            client.flush(FlushRequest {}).await.unwrap();
-        }
-        let (initial, before) =
-            membership(&mut client, Some(view("audience == 'public'")), None).await;
-        assert_eq!(initial, [0, 2].into_iter().collect());
-        client
-            .delete_documents(DeleteDocumentsRequest {
-                doc_ids: vec![0],
-                expected_wal_generation: None,
-            })
-            .await
-            .unwrap();
-        let (deleted, after) =
-            membership(&mut client, Some(view("audience == 'public'")), None).await;
-        assert_eq!(deleted, [2].into_iter().collect());
-        assert!(after.stats_epoch > before.stats_epoch);
-        client.flush(FlushRequest {}).await.unwrap();
-        client
-            .compact_shard(CompactShardRequest::default())
-            .await
-            .unwrap();
-        let (compacted, compact) =
-            membership(&mut client, Some(view("audience == 'public'")), None).await;
-        assert_eq!(compacted.len(), 1);
-        assert_eq!(
-            compacted,
-            ids(compact.base_label, compact.label_count, &compact.bits)
-        );
-        assert!(compact.stats_epoch > after.stats_epoch);
-        client.flush(FlushRequest {}).await.unwrap();
-        drop(client);
-        server.abort();
-        let _ = server.await;
-        let (addr, server) = common::start_opened_node(cfg).await;
-        let mut client = NodeServiceClient::connect(addr).await.unwrap();
-        let (reopened, current) =
-            membership(&mut client, Some(view("audience == 'public'")), None).await;
-        assert_eq!(reopened, compacted);
-        assert_ne!(current.stats_incarnation, compact.stats_incarnation);
-        server.abort();
-        let _ = server.await;
-        std::fs::remove_dir_all(dir).unwrap();
-    }
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("membership-segments-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = NodeConfig {
+        index_path: Some(dir.join("shard.tv")),
+        seal_tail_docs: 2,
+        wal: true,
+        ..config()
+    };
+    let (addr, server) = common::start_empty_node(cfg.clone()).await;
+    let mut client = NodeServiceClient::connect(addr).await.unwrap();
+    seed(&mut client, 4).await;
+    let (initial, before) = membership(&mut client, Some(view("audience == 'public'")), None).await;
+    assert_eq!(initial, [0, 2].into_iter().collect());
+    client
+        .delete_documents(DeleteDocumentsRequest {
+            doc_ids: vec![0],
+            expected_wal_generation: None,
+        })
+        .await
+        .unwrap();
+    let (deleted, after) = membership(&mut client, Some(view("audience == 'public'")), None).await;
+    assert_eq!(deleted, [2].into_iter().collect());
+    assert!(after.stats_epoch > before.stats_epoch);
+    client.flush(FlushRequest {}).await.unwrap();
+    client
+        .compact_shard(CompactShardRequest::default())
+        .await
+        .unwrap();
+    let (compacted, compact) =
+        membership(&mut client, Some(view("audience == 'public'")), None).await;
+    assert_eq!(compacted.len(), 1);
+    assert_eq!(
+        compacted,
+        ids(compact.base_label, compact.label_count, &compact.bits)
+    );
+    assert!(compact.stats_epoch > after.stats_epoch);
+    client.flush(FlushRequest {}).await.unwrap();
+    drop(client);
+    server.abort();
+    let _ = server.await;
+    let (addr, server) = common::start_opened_node(cfg).await;
+    let mut client = NodeServiceClient::connect(addr).await.unwrap();
+    let (reopened, current) =
+        membership(&mut client, Some(view("audience == 'public'")), None).await;
+    assert_eq!(reopened, compacted);
+    assert_ne!(current.stats_incarnation, compact.stats_incarnation);
+    server.abort();
+    let _ = server.await;
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test]

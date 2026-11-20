@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use common::{fit_calibration, start_empty_node, unit_vectors};
 use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
 use pipestream_search::coordinator::CoordinatorServiceImpl;
-use pipestream_search::node::{Layout, NodeConfig};
+use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
@@ -45,7 +45,6 @@ fn config(index_path: PathBuf) -> NodeConfig {
     NodeConfig {
         index_path: Some(index_path),
         analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
-        layout: Layout::Segments,
         seal_tail_docs: SEAL as u32,
         wal: false,
         ..Default::default()

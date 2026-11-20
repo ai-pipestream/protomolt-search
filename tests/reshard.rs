@@ -83,42 +83,10 @@ async fn start_wal_node(
     PathBuf,
     JoinHandle<Result<(), TransportError>>,
 ) {
-    // These fixtures ingest documents and vectors at different counts,
-    // which the segment layout refuses to seal by name; they exercise
-    // the WAL, so the single-image layout serves them.
-    start_wal_node_with_layout(
-        pipestream_search::node::Layout::SingleImage,
-        dir,
-        name,
-        slot_offset,
-        wal_buckets,
-        analysis_addr,
-        shift,
-        scale,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn start_wal_node_with_layout(
-    layout: pipestream_search::node::Layout,
-    dir: &Path,
-    name: &str,
-    slot_offset: u64,
-    wal_buckets: u32,
-    analysis_addr: &str,
-    shift: &[f32],
-    scale: &[f32],
-) -> (
-    NodeServiceClient<tonic::transport::Channel>,
-    PathBuf,
-    JoinHandle<Result<(), TransportError>>,
-) {
     let index_path = dir.join(name);
     let (addr, handle) = common::start_empty_node(NodeConfig {
         slot_offset,
         index_path: Some(index_path.clone()),
-        layout,
         analysis_addr: Some(analysis_addr.to_string()),
         wal: true,
         wal_buckets,
@@ -186,10 +154,24 @@ async fn ingest(
     let resp = client.add_documents(ReceiverStream::new(rx)).await.unwrap();
     assert_eq!(resp.into_inner().added as usize, docs);
 
+    assert!(docs <= vectors, "fixtures hold vector-only rows only");
+    for rows in [0..docs, docs..vectors] {
+        if rows.is_empty() {
+            continue;
+        }
+        add_vector_rows(client, &corpus[rows.start * DIM..rows.end * DIM]).await;
+        let flushed = client.flush(FlushRequest {}).await.unwrap().into_inner();
+        assert!(flushed.written);
+    }
+}
+
+/// Append `rows` (row-major) in batches of 500 vectors.
+async fn add_vector_rows(client: &mut NodeServiceClient<tonic::transport::Channel>, rows: &[f32]) {
     let (tx, rx) = mpsc::channel(8);
-    let corpus = corpus.to_vec();
+    let rows = rows.to_vec();
+    let count = rows.len() / DIM;
     tokio::spawn(async move {
-        for chunk in corpus[..vectors * DIM].chunks(500 * DIM) {
+        for chunk in rows.chunks(500 * DIM) {
             tx.send(AddVectorsRequest {
                 materialized_rows: Vec::new(),
                 vectors: chunk.to_vec(),
@@ -200,10 +182,7 @@ async fn ingest(
         }
     });
     let resp = client.add_vectors(ReceiverStream::new(rx)).await.unwrap();
-    assert_eq!(resp.into_inner().added as usize, vectors);
-
-    let flushed = client.flush(FlushRequest {}).await.unwrap().into_inner();
-    assert!(flushed.written);
+    assert_eq!(resp.into_inner().added as usize, count);
 }
 
 /// The batch analyzer closure for reshard replay: the same mock sidecar
@@ -285,7 +264,11 @@ fn assert_children_reconstruct_topk(
     let children: Vec<(&reshard::ChildImage, VectorIndex)> = child_images
         .iter()
         .map(|c| {
-            let mut index = VectorIndex::load(EMBEDDED_TURBOVEC, &c.vector_path).unwrap();
+            let mut index = VectorIndex::load(
+                EMBEDDED_TURBOVEC,
+                &common::catalog::segment_vector(&c.vector_path, 0),
+            )
+            .unwrap();
             index.prepare().unwrap();
             (c, index)
         })
@@ -317,7 +300,10 @@ async fn split_reconstructs_parent_topk() {
         start_wal_node(&dir, "shard.tv", 0, 64, &analysis_addr, &shift, &scale).await;
     ingest(&mut client, &corpus, N, DOCS).await;
 
-    let mut parent = VectorIndex::load(EMBEDDED_TURBOVEC, &index_path).unwrap();
+    // The parent sealed two segments (the rows with documents, then the
+    // vector-only rows); the reference is the whole corpus in one image.
+    let mut parent = pipestream_search::harness::seeded_index(DIM, BIT_WIDTH, &shift, &scale);
+    parent.add(&corpus[..N * DIM], DIM).unwrap();
     parent.prepare().unwrap();
 
     let out_dir = dir.join("split");
@@ -345,9 +331,11 @@ async fn split_reconstructs_parent_topk() {
                 .all(|&id| reshard::bucket_of(id, 64) / 32 == i),
             "child {i} holds ids outside its bucket range"
         );
-        let exact =
-            pipestream_search::exact_vectors::ExactVectorStore::open(&child.exact_vector_path)
-                .unwrap();
+        let set = pipestream_search::segments::OpenedSegmentSet::open(
+            pipestream_search::node::segments_root(&child.vector_path),
+        )
+        .unwrap();
+        let exact = set.exact_vectors(0).unwrap();
         assert!(exact.is_mapped());
         assert_eq!(exact.len(), child.parent_ids.len());
         exact.verify_payload().unwrap();
@@ -416,7 +404,11 @@ async fn merge_reproduces_monolithic() {
 
     // Vector side: merged image == monolithic reference, bitwise.
     let reference = build_monolithic(&corpus, DIM, BIT_WIDTH, &shift, &scale);
-    let mut merged = VectorIndex::load(EMBEDDED_TURBOVEC, &child.vector_path).unwrap();
+    let mut merged = VectorIndex::load(
+        EMBEDDED_TURBOVEC,
+        &common::catalog::segment_vector(&child.vector_path, 0),
+    )
+    .unwrap();
     merged.prepare().unwrap();
     for q in 0..8u64 {
         let query = unit_vectors(1, DIM, 0xB0B0_0000 + q);
@@ -437,8 +429,8 @@ async fn merge_reproduces_monolithic() {
         let analyzed = analyze_one(&mut analyze, &text);
         reference_store.add_document(i as u32, text, analyzed);
     }
-    let bm25_path = child.bm25_path.as_ref().expect("merged image has docs");
-    let merged_store = Bm25Reader::open(bm25_path).unwrap();
+    let bm25_path = common::catalog::segment_bm25(&child.vector_path, 0);
+    let merged_store = Bm25Reader::open(&bm25_path).unwrap();
     let merged_index = &merged_store as &dyn Bm25Index;
     let terms = vec!["alpha".to_string(), "gamma".to_string()];
     let stats = CorpusStats {
@@ -546,7 +538,11 @@ async fn split_consumes_each_bucket_once() {
     )
     .await;
     ingest(&mut client, &corpus, n, 0).await;
-    let mut parent = VectorIndex::load(EMBEDDED_TURBOVEC, &index_path).unwrap();
+    let mut parent = VectorIndex::load(
+        EMBEDDED_TURBOVEC,
+        &common::catalog::segment_vector(&index_path, 0),
+    )
+    .unwrap();
     parent.prepare().unwrap();
 
     let gen = reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap();
@@ -600,7 +596,11 @@ async fn split_finer_than_buckets_repartitions() {
     let (mut client, index_path, _node) =
         start_wal_node(&dir, "shard.tv", 0, 2, &analysis_addr, &shift, &scale).await;
     ingest(&mut client, &corpus, n, 0).await;
-    let mut parent = VectorIndex::load(EMBEDDED_TURBOVEC, &index_path).unwrap();
+    let mut parent = VectorIndex::load(
+        EMBEDDED_TURBOVEC,
+        &common::catalog::segment_vector(&index_path, 0),
+    )
+    .unwrap();
     parent.prepare().unwrap();
 
     let gen = reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap();
@@ -742,7 +742,11 @@ fn assert_segmented_topk_matches_compacted(
     child: &reshard::ChildImage,
     segments: &[reshard::SegmentedChildImage],
 ) {
-    let mut compacted = VectorIndex::load(EMBEDDED_TURBOVEC, &child.vector_path).unwrap();
+    let mut compacted = VectorIndex::load(
+        EMBEDDED_TURBOVEC,
+        &common::catalog::segment_vector(&child.vector_path, 0),
+    )
+    .unwrap();
     compacted.prepare().unwrap();
     let physical: Vec<(&reshard::ChildImage, VectorIndex)> = segments
         .iter()
@@ -780,6 +784,14 @@ fn verify_segmented_wal_compaction_tombstones(
     rows: usize,
     analysis_addr: &str,
 ) {
+    // The node's one sealed segment, re-staged as the parent of a catalog
+    // the compaction may rewrite while the node keeps its own.
+    let root = pipestream_search::node::segments_root(index_path);
+    let manifest = SegmentCatalog::read_manifest(&root).unwrap().unwrap();
+    let [sealed] = manifest.segments.as_slice() else {
+        panic!("one flush seals one segment: {:?}", manifest.segments);
+    };
+    let sealed_dir = SegmentCatalog::segment_dir(&root, &sealed.segment_id);
     let catalog = SegmentCatalog::open(dir.join("catalog")).unwrap();
     catalog
         .append(SegmentSource {
@@ -788,11 +800,9 @@ fn verify_segmented_wal_compaction_tombstones(
             generation: 0,
             base_label: 0,
             backend_kind: EMBEDDED_TURBOVEC,
-            vector_path: Some(index_path),
-            exact_vector_path: Some(&pipestream_search::node::exact_vector_sidecar_path(
-                index_path,
-            )),
-            bm25_path: &pipestream_search::node::bm25_sidecar_path(index_path),
+            vector_path: Some(&sealed_dir.join(&sealed.vector.file)),
+            exact_vector_path: Some(&sealed_dir.join(&sealed.exact_vectors.file)),
+            bm25_path: &sealed_dir.join(&sealed.bm25.file),
             live_docs_path: &pipestream_search::node::live_docs_sidecar_path(index_path),
             partition_column: None,
         })
@@ -846,17 +856,8 @@ async fn one_child_reshard_compacts_generation_tombstones() {
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &corpus);
     let (analysis_addr, analysis) = mock_analysis::start_mock_analysis().await;
     std::mem::forget(analysis);
-    let (mut client, index_path, _node) = start_wal_node_with_layout(
-        pipestream_search::node::Layout::SingleImage,
-        &dir,
-        "parent.tv",
-        0,
-        8,
-        &analysis_addr,
-        &shift,
-        &scale,
-    )
-    .await;
+    let (mut client, index_path, _node) =
+        start_wal_node(&dir, "parent.tv", 0, 8, &analysis_addr, &shift, &scale).await;
     ingest(&mut client, &corpus, rows, rows).await;
     client
         .delete_documents(DeleteDocumentsRequest {
@@ -1001,8 +1002,7 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
     )
     .await;
 
-    let parent =
-        Bm25Reader::open(&pipestream_search::node::bm25_sidecar_path(&index_path)).unwrap();
+    let parent = Bm25Reader::open(&common::catalog::segment_bm25(&index_path, 0)).unwrap();
     assert_eq!(parent.field_count(), 3);
     assert_eq!(parent.field_name(1), "case_name");
     assert_eq!(parent.field_name(2), "phrases");
@@ -1047,7 +1047,6 @@ async fn ingest_multifield_parent(
     let cfg = NodeConfig {
         slot_offset: 0,
         index_path: Some(index_path.to_path_buf()),
-        layout: pipestream_search::node::Layout::SingleImage,
         analysis_addr: Some(analysis_addr.to_string()),
         bm25_fields: vec!["body".into(), "case_name".into(), "phrases".into()],
         wal: true,
@@ -1106,7 +1105,8 @@ fn verify_multifield_children<'a>(
     let children: Vec<(&reshard::ChildImage, Bm25Reader)> = raw_children
         .iter()
         .map(|c| {
-            let reader = Bm25Reader::open(c.bm25_path.as_ref().unwrap()).unwrap();
+            let reader =
+                Bm25Reader::open(&common::catalog::segment_bm25(&c.vector_path, 0)).unwrap();
             assert_eq!(reader.field_count(), 3, "children must derive all fields");
             assert_eq!(reader.field_name(0), "body");
             assert_eq!(reader.field_name(1), "case_name");

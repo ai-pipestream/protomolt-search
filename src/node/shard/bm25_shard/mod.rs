@@ -6,40 +6,28 @@ mod chain;
 mod map_columns;
 mod scalar_columns;
 
-/// The BM25 half's two storage shapes: the heap builder used during
-/// ingest, and the disk-resident mmap reader used after Flush and on
-/// startup. Once resident, a shard holds no postings or document texts
-/// in heap — only the small per-doc tables.
+/// The BM25 half's two storage shapes: the heap store of a shard with no
+/// index path, and the segment catalog plus heap tail of a persisted shard.
 #[allow(clippy::large_enum_variant)]
 pub enum Bm25Shard {
-    /// Heap builder (small or append ingests; searchable mid-build).
+    /// Heap store of a shard with no index path; nothing reaches disk.
     Building(Bm25Store),
-    /// Disk-spilling bulk builder (fresh persisted shards): bounded heap,
-    /// NOT searchable until flushed.
-    Spilling(SpillBuilder),
-    /// Disk-resident mmap reader over a saved `.bm25` file.
-    Resident(Bm25Reader),
-    /// Segment catalog plus searchable heap tail (default persisted layout).
+    /// Segment catalog plus searchable heap tail of a persisted shard.
     Segmented(SegmentedShard),
 }
 
 impl Bm25Shard {
-    /// The searchable read surface; `None` while bulk-building (a spill
-    /// builder cannot answer term lookups without scanning every run).
-    pub(in crate::node) fn as_index(&self) -> Option<&dyn Bm25Index> {
+    /// The searchable read surface.
+    pub(in crate::node) fn as_index(&self) -> &dyn Bm25Index {
         match self {
-            Bm25Shard::Building(s) => Some(s),
-            Bm25Shard::Spilling(_) => None,
-            Bm25Shard::Resident(r) => Some(r),
-            Bm25Shard::Segmented(g) => Some(g),
+            Bm25Shard::Building(s) => s,
+            Bm25Shard::Segmented(g) => g,
         }
     }
 
     pub(crate) fn next_doc_id(&self) -> u32 {
         match self {
             Bm25Shard::Building(s) => s.next_doc_id(),
-            Bm25Shard::Spilling(s) => s.next_doc_id(),
-            Bm25Shard::Resident(r) => r.next_doc_id(),
             Bm25Shard::Segmented(g) => g.next_doc_id(),
         }
     }
@@ -47,8 +35,6 @@ impl Bm25Shard {
     pub(in crate::node) fn doc_count(&self) -> u64 {
         match self {
             Bm25Shard::Building(s) => s.doc_count(),
-            Bm25Shard::Spilling(s) => s.doc_count(),
-            Bm25Shard::Resident(r) => Bm25Index::doc_count(r),
             Bm25Shard::Segmented(g) => Bm25Index::doc_count(g),
         }
     }
@@ -57,8 +43,6 @@ impl Bm25Shard {
     pub(crate) fn field_count(&self) -> usize {
         match self {
             Bm25Shard::Building(s) => s.field_count(),
-            Bm25Shard::Spilling(s) => s.field_count(),
-            Bm25Shard::Resident(r) => r.field_count(),
             Bm25Shard::Segmented(g) => g.field_count(),
         }
     }
@@ -67,8 +51,6 @@ impl Bm25Shard {
     pub(crate) fn field_name(&self, f: usize) -> &str {
         match self {
             Bm25Shard::Building(s) => s.field_name(f),
-            Bm25Shard::Spilling(s) => s.field_name(f),
-            Bm25Shard::Resident(r) => r.field_name(f),
             Bm25Shard::Segmented(g) => g.field_name(f),
         }
     }
@@ -77,8 +59,6 @@ impl Bm25Shard {
     pub(crate) fn binding(&self) -> Option<&crate::postings::StoredBinding> {
         match self {
             Bm25Shard::Building(s) => s.binding(),
-            Bm25Shard::Spilling(s) => s.binding(),
-            Bm25Shard::Resident(r) => r.binding(),
             Bm25Shard::Segmented(g) => g.binding(),
         }
     }
@@ -87,8 +67,6 @@ impl Bm25Shard {
     pub(crate) fn derived(&self) -> Option<&crate::postings::StoredDerived> {
         match self {
             Bm25Shard::Building(s) => s.derived(),
-            Bm25Shard::Spilling(s) => s.derived(),
-            Bm25Shard::Resident(r) => r.derived(),
             Bm25Shard::Segmented(g) => g.derived(),
         }
     }
@@ -99,8 +77,6 @@ impl Bm25Shard {
     ) -> std::io::Result<Option<(crate::pb::ProtobufSource, Option<u32>)>> {
         match self {
             Bm25Shard::Building(s) => s.protobuf_source(doc),
-            Bm25Shard::Spilling(s) => s.protobuf_source(doc),
-            Bm25Shard::Resident(s) => s.protobuf_source(doc),
             Bm25Shard::Segmented(s) => s.protobuf_source(doc),
         }
     }
@@ -109,8 +85,6 @@ impl Bm25Shard {
     pub fn identity_snapshot(&self) -> Result<crate::source_archive::IdentitySnapshot, String> {
         match self {
             Bm25Shard::Building(s) => Ok(s.identity_snapshot()),
-            Bm25Shard::Spilling(s) => Ok(s.identity_snapshot()),
-            Bm25Shard::Resident(s) => Ok(s.identity_snapshot()),
             Bm25Shard::Segmented(s) => s.identity_snapshot(),
         }
     }
@@ -118,8 +92,6 @@ impl Bm25Shard {
     pub fn document_identity(&self, doc: u32) -> Option<crate::pb::DocumentIdentity> {
         match self {
             Bm25Shard::Building(s) => s.document_identity(doc),
-            Bm25Shard::Spilling(s) => s.document_identity(doc),
-            Bm25Shard::Resident(s) => s.document_identity(doc),
             Bm25Shard::Segmented(s) => s.document_identity(doc),
         }
     }
@@ -129,8 +101,6 @@ impl Bm25Shard {
     pub(crate) fn analysis_fingerprint(&self, f: usize) -> u64 {
         match self {
             Bm25Shard::Building(s) => s.analysis_fingerprint(f),
-            Bm25Shard::Spilling(s) => s.analysis_fingerprint(f),
-            Bm25Shard::Resident(r) => r.analysis_fingerprint(f),
             Bm25Shard::Segmented(g) => g.analysis_fingerprint(f),
         }
     }
@@ -139,8 +109,6 @@ impl Bm25Shard {
     pub(in crate::node) fn field_has_positions(&self, f: usize) -> bool {
         match self {
             Bm25Shard::Building(s) => s.field_has_positions(f),
-            Bm25Shard::Spilling(s) => s.field_has_positions(f),
-            Bm25Shard::Resident(r) => r.field_has_positions(f),
             Bm25Shard::Segmented(g) => g.field_has_positions(f),
         }
     }
@@ -149,8 +117,6 @@ impl Bm25Shard {
     pub(in crate::node) fn field_has_sentences(&self, f: usize) -> bool {
         match self {
             Bm25Shard::Building(s) => s.field_has_sentences(f),
-            Bm25Shard::Spilling(s) => s.field_has_sentences(f),
-            Bm25Shard::Resident(r) => r.field_has_sentences(f),
             Bm25Shard::Segmented(g) => g.field_has_sentences(f),
         }
     }
@@ -165,47 +131,35 @@ impl Bm25Shard {
     ) -> Result<(), String> {
         match self {
             Bm25Shard::Building(s) => s.set_analysis_fingerprint(f, fingerprint),
-            Bm25Shard::Spilling(s) => s.set_analysis_fingerprint(f, fingerprint),
-            Bm25Shard::Resident(_) => Ok(()),
             Bm25Shard::Segmented(g) => g.set_analysis_fingerprint(f, fingerprint),
         }
     }
 
-    /// The table index of the field named `name`, if present. `None`
-    /// while bulk-building (no searchable surface to resolve against).
+    /// The table index of the field named `name`, if present.
     pub(in crate::node) fn field_index(&self, name: &str) -> Option<usize> {
         match self {
             Bm25Shard::Building(s) => s.field_index(name),
-            Bm25Shard::Spilling(_) => None,
-            Bm25Shard::Resident(r) => r.field_index(name),
             Bm25Shard::Segmented(g) => g.field_index(name),
         }
     }
-    /// Field `f` as its own searchable [`Bm25Index`]; `None` while
-    /// bulk-building, exactly like [`Self::as_index`].
-    pub(in crate::node) fn field_view(&self, f: usize) -> Option<Box<dyn Bm25Index + '_>> {
+    /// Field `f` as its own searchable [`Bm25Index`].
+    pub(in crate::node) fn field_view(&self, f: usize) -> Box<dyn Bm25Index + '_> {
         match self {
-            Bm25Shard::Building(s) => Some(Box::new(s.field(f))),
-            Bm25Shard::Spilling(_) => None,
-            Bm25Shard::Resident(r) => Some(Box::new(r.field(f))),
-            Bm25Shard::Segmented(g) => Some(Box::new(g.field(f))),
+            Bm25Shard::Building(s) => Box::new(s.field(f)),
+            Bm25Shard::Segmented(g) => Box::new(g.field(f)),
         }
     }
 
     /// [`Self::field_view`] restricted to sealed parts admitted by `mask` on a
-    /// segmented shard (falling back to [`Self::field_view`] on other layouts).
+    /// segmented shard; a heap store has no sealed parts to mask.
     pub(in crate::node) fn field_view_masked(
         &self,
         f: usize,
         mask: &Arc<[bool]>,
-    ) -> Option<Box<dyn Bm25Index + '_>> {
+    ) -> Box<dyn Bm25Index + '_> {
         match self {
-            Bm25Shard::Segmented(g) => Some(Box::new(g.field_masked(f, Arc::clone(mask)))),
-            _ => self.field_view(f),
+            Bm25Shard::Segmented(g) => Box::new(g.field_masked(f, Arc::clone(mask))),
+            Bm25Shard::Building(_) => self.field_view(f),
         }
-    }
-    /// Open a saved `.bm25` file (`v6` through `v8`) as a disk-resident mmap reader.
-    pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
-        Bm25Reader::open(path).map(Bm25Shard::Resident)
     }
 }

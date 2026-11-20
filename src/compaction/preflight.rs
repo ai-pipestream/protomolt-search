@@ -20,30 +20,20 @@ use self::checks::{
 use super::{MidRow, Preflight, PreflightKind, SegmentPreflight};
 
 impl NodeServiceImpl {
-    /// Preflight at a row boundary. Legacy two-RPC appends (`AddDocuments`
-    /// followed by `AddVectors`) can momentarily leave documents ahead of
-    /// vectors; wait up to a bounded window before refusing by count.
+    /// Preflight at a row boundary: a tail whose documents and vectors
+    /// counts differ refuses by count.
     pub(super) fn preflight_at_row_boundary(
         &self,
         request: &CompactShardRequest,
     ) -> Result<PreflightKind, Status> {
-        const ATTEMPTS: usize = 200;
-        const PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
-        for attempt in 1..=ATTEMPTS {
-            match self.preflight(request)? {
-                Ok(preflight) => return Ok(preflight),
-                Err(_) if attempt < ATTEMPTS => std::thread::sleep(PAUSE),
-                Err(MidRow { documents, vectors }) => {
-                    return Err(Status::failed_precondition(format!(
-                        "the tail has {documents} documents and {vectors} vectors after {:?}; \
-                         compaction cuts at a row boundary, so finish the append (AddVectors \
-                         after AddDocuments) or ingest through the mapped path, then retry",
-                        PAUSE * ATTEMPTS as u32
-                    )))
-                }
-            }
-        }
-        unreachable!("the last attempt returns")
+        self.preflight(request)?
+            .map_err(|MidRow { documents, vectors }| {
+                Status::failed_precondition(format!(
+                    "the tail has {documents} documents and {vectors} vectors; compaction cuts at \
+                 a row boundary, so send AddVectors for each AddDocuments batch or ingest \
+                 through the mapped path, then retry"
+                ))
+            })
     }
 
     fn preflight(
@@ -57,7 +47,7 @@ impl NodeServiceImpl {
             )
         })?;
         let guard = crate::node::read_shard(&self.state);
-        guard.check_legacy_mutation()?;
+        guard.check_index_owned_write()?;
         if guard.pending_compaction.is_some() {
             return Err(Status::failed_precondition(
                 "a compaction cutover is pending its closing flush on this shard; call Flush",
@@ -69,45 +59,28 @@ impl NodeServiceImpl {
                 .map(|r| r.map(|p| PreflightKind::Segments(Box::new(p))));
         };
         let manifest = wal.manifest().clone();
-        let segmented = matches!(guard.bm25, Some(Bm25Shard::Segmented(_)));
-        let fields = guard.bm25.as_ref().map(shard_field_fingerprints);
-        validate_wal_preconditions(
-            request,
-            &manifest,
-            &guard,
-            fields.is_some(),
-            self.config.analysis_addr.as_deref(),
-        )?;
-        let partition = resolve_wal_partition_column(
-            segmented,
-            guard.bm25.as_ref(),
-            &request.partition_column,
-        )?;
+        let Some(bm25 @ Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
+            return Err(Status::internal(
+                "a persisted shard serves its segment catalog",
+            ));
+        };
+        let fields = Some(shard_field_fingerprints(bm25));
+        validate_wal_preconditions(request, &manifest, self.config.analysis_addr.as_deref())?;
+        let partition = resolve_wal_partition_column(bm25, shard, &request.partition_column)?;
         let columns = extract_column_tables(guard.bm25.as_ref());
         let (backend_kind, scoring_fingerprint) = provider_descriptor(&guard);
         let work_dir = resolve_empty_work_dir(&index_path, &request.work_dir)?;
         let cutoff_generation = wal.generation();
-        if segmented {
-            let prefix = format!("cmp-{:06}-", cutoff_generation + 1);
-            check_unclaimed_staged_segments(&index_path, |name| name.starts_with(&prefix))?;
+        let prefix = format!("cmp-{:06}-", cutoff_generation + 1);
+        check_unclaimed_staged_segments(&index_path, |name| name.starts_with(&prefix))?;
+        if let Some(mid) = check_tail_row_alignment(shard, &guard) {
+            return Ok(Err(mid));
         }
-        if let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() {
-            if let Some(mid) = check_tail_row_alignment(shard, &guard) {
-                return Ok(Err(mid));
-            }
-        }
-        let hnsw_sources = resolve_hnsw_sources(
-            self.config.slot_offset,
-            &backend_kind,
-            segmented,
-            &guard,
-            &index_path,
-        );
+        let hnsw_sources = resolve_hnsw_sources(self.config.slot_offset, &backend_kind, &guard);
         let rows_now = crate::node::physical_rows(&guard);
         Ok(Ok(PreflightKind::Wal(Box::new(Preflight {
             index_path,
             work_dir,
-            segmented,
             gen_dir: wal.dir().to_path_buf(),
             cutoff_generation,
             cutoff_clock: wal.high_watermark(),

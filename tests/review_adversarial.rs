@@ -244,7 +244,7 @@ async fn remote_shard_splade_over_tcp_propagates_running_floor_and_filter() {
             .enumerate()
     {
         let idx_path = dir.join(format!("shard_{shard_idx}.idx"));
-        let bm25_path = pipestream_search::node::bm25_sidecar_path(&idx_path);
+        let bm25_path = dir.join(format!("shard_{shard_idx}.bm25"));
         let mut store = Bm25Store::with_fields(&["body"]);
         store.add_document(
             0,
@@ -261,6 +261,7 @@ async fn remote_shard_splade_over_tcp_propagates_running_floor_and_filter() {
             },
         );
         store.save(&bm25_path).unwrap();
+        common::catalog::seal_bm25_file(&idx_path, &bm25_path);
         let node = Arc::new(
             NodeServiceImpl::open(
                 NodeConfig {
@@ -269,7 +270,6 @@ async fn remote_shard_splade_over_tcp_propagates_running_floor_and_filter() {
                     ..Default::default()
                 },
                 None,
-                true,
             )
             .unwrap(),
         );

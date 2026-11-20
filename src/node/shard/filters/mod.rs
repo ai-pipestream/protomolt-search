@@ -232,11 +232,6 @@ pub(in crate::node) fn resolve_shard_filters(
         }
         return Ok((None, Some(Bits::empty(n)), total(bm25)));
     };
-    if store.as_index().is_none() {
-        return Err(Status::failed_precondition(
-            "bm25 bulk build in progress; Flush before filtering the vector leg",
-        ));
-    }
     let doc_filter = crate::filter::DocFilter {
         deleted,
         geo: store.resolve_geo_filters(geo_filters, geo_regions),

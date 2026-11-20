@@ -354,11 +354,6 @@ impl NodeServiceImpl {
         let Some(store) = guard.bm25.as_ref() else {
             return empty_aggregate_response(guard, &req, meta, leaves.len());
         };
-        if store.as_index().is_none() {
-            return Err(Status::failed_precondition(
-                "bm25 bulk build in progress; Flush before aggregating",
-            ));
-        }
         let expr_leaves_known = leaves
             .iter()
             .map(|l| crate::values::leaf_known(l, store))

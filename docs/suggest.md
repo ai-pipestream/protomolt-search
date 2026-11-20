@@ -90,8 +90,8 @@ and the summed df is exactly that image's posting df, so two shards equal
 one shard bitwise (df, count, order); the `shards` tally is the only field
 that depends on layout. `tests/suggest.rs` pins the fleet against a
 monolithic node and both against a brute-force ranked scan of the analyzed
-corpus, and a two-segment-plus-tail shard against a single image before and
-after an mmap reopen.
+corpus, and a two-segment-plus-tail shard against a one-segment shard before
+and after an mmap reopen.
 
 ## The cap
 
@@ -160,7 +160,7 @@ maximum; the refusal table (per-shard and fleet-wide bound with counts, the
 absolute maximum, empty prefix, a prefix that normalizes to nothing, unknown
 and empty field, unknown collection, absent spec); case and accent folding
 and the stemmer not applied; the cased twin and the glossary phrase field;
-a segmented shard against a single image and both reopened from disk
+a many-segment shard against a one-segment shard and both reopened from disk
 through the mmap reader; the tombstone flag before and after a delete with
 df unchanged; two collections with different df for the same term and the
 unnamed-request refusal on a named set; the bearer gate; and the cost gate.

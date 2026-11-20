@@ -2,7 +2,7 @@ mod common;
 
 use pipestream_search::{
     analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND},
-    node::{Layout, NodeConfig},
+    node::NodeConfig,
     pb::{node_service_client::NodeServiceClient, *},
     visibility::VisibilityScope,
 };
@@ -27,7 +27,7 @@ impl Drop for Fixture {
     }
 }
 
-async fn fixture(layout: Layout, coalesce: bool) -> Fixture {
+async fn fixture(coalesce: bool) -> Fixture {
     let binding = pipestream_search::mapping::derive_plan(
         include_bytes!("fixtures/vector-binding/descriptor.bin"),
         "vector_binding.Named",
@@ -46,7 +46,6 @@ async fn fixture(layout: Layout, coalesce: bool) -> Fixture {
     let (addr, task) = common::start_empty_node(NodeConfig {
         index_path: Some(root.join("shard.tv")),
         seal_tail_docs: 2,
-        layout,
         coalesce,
         slot_offset: 100,
         chunk_blocks: 1,
@@ -117,9 +116,6 @@ async fn fixture(layout: Layout, coalesce: bool) -> Fixture {
         })
         .await
         .unwrap();
-    if matches!(layout, Layout::SingleImage) {
-        client.flush(FlushRequest {}).await.unwrap();
-    }
     let visibility = DocumentVisibility {
         filter: pipestream_search::cel::compile_filter("audience == 'public'").unwrap(),
     };
@@ -283,66 +279,64 @@ async fn streaming_scan(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_scan_path_certifies_its_view_before_emitting_and_filters_before_scoring() {
-    for layout in [Layout::SingleImage, Layout::Segments] {
-        for coalesce in [false, true] {
-            let fixture = fixture(layout, coalesce).await;
-            let (_, reference) = shard_scan(&fixture, None, false, "").await.unwrap();
-            assert_eq!(reference.len(), 3); // includes private and vector-only rows
-            let score = reference
-                .iter()
-                .find(|hit| hit.vector_id == 100)
-                .unwrap()
-                .score
-                .to_bits();
-            for collapse in [false, true] {
-                for filter in [
-                    "",
-                    "audience == 'public' || audience == 'private'",
-                    "audience == 'private'",
-                ] {
-                    let (receipt, hits) =
-                        shard_scan(&fixture, Some(fixture.context.clone()), collapse, filter)
-                            .await
-                            .unwrap();
-                    check_receipt(&receipt.unwrap(), &fixture);
-                    let actual: Vec<_> = hits
-                        .iter()
-                        .map(|hit| (hit.vector_id, hit.score.to_bits()))
-                        .collect();
-                    let expected = if filter == "audience == 'private'" {
-                        vec![]
-                    } else {
-                        vec![(100, score)]
-                    };
-                    assert_eq!(actual, expected);
-                    let (receipt, hits) =
-                        streaming_scan(&fixture, Some(fixture.context.clone()), collapse, filter)
-                            .await
-                            .unwrap();
-                    check_receipt(&receipt.unwrap(), &fixture);
-                    assert_eq!(hits, expected);
-                }
+    for coalesce in [false, true] {
+        let fixture = fixture(coalesce).await;
+        let (_, reference) = shard_scan(&fixture, None, false, "").await.unwrap();
+        assert_eq!(reference.len(), 3); // includes private and vector-only rows
+        let score = reference
+            .iter()
+            .find(|hit| hit.vector_id == 100)
+            .unwrap()
+            .score
+            .to_bits();
+        for collapse in [false, true] {
+            for filter in [
+                "",
+                "audience == 'public' || audience == 'private'",
+                "audience == 'private'",
+            ] {
+                let (receipt, hits) =
+                    shard_scan(&fixture, Some(fixture.context.clone()), collapse, filter)
+                        .await
+                        .unwrap();
+                check_receipt(&receipt.unwrap(), &fixture);
+                let actual: Vec<_> = hits
+                    .iter()
+                    .map(|hit| (hit.vector_id, hit.score.to_bits()))
+                    .collect();
+                let expected = if filter == "audience == 'private'" {
+                    vec![]
+                } else {
+                    vec![(100, score)]
+                };
+                assert_eq!(actual, expected);
+                let (receipt, hits) =
+                    streaming_scan(&fixture, Some(fixture.context.clone()), collapse, filter)
+                        .await
+                        .unwrap();
+                check_receipt(&receipt.unwrap(), &fixture);
+                assert_eq!(hits, expected);
             }
-            // A missing-value authority predicate must not admit vector-only row 103.
-            let mut missing = fixture.context.clone();
-            missing.visibility.as_mut().unwrap().filter =
-                pipestream_search::cel::compile_filter("!has(audience)").unwrap();
-            let (_, hits) = shard_scan(&fixture, Some(missing.clone()), false, "")
-                .await
-                .unwrap();
-            assert!(hits.is_empty());
-            let (_, hits) = streaming_scan(&fixture, Some(missing), false, "")
-                .await
-                .unwrap();
-            assert!(hits.is_empty());
         }
+        // A missing-value authority predicate must not admit vector-only row 103.
+        let mut missing = fixture.context.clone();
+        missing.visibility.as_mut().unwrap().filter =
+            pipestream_search::cel::compile_filter("!has(audience)").unwrap();
+        let (_, hits) = shard_scan(&fixture, Some(missing.clone()), false, "")
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
+        let (_, hits) = streaming_scan(&fixture, Some(missing), false, "")
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn invalid_or_stale_scan_contexts_refuse_before_any_receipt_or_hit() {
     for coalesce in [false, true] {
-        let mut fixture = fixture(Layout::SingleImage, coalesce).await;
+        let mut fixture = fixture(coalesce).await;
         for case in 0..4 {
             let mut context = fixture.context.clone();
             match case {
@@ -400,7 +394,7 @@ async fn invalid_or_stale_scan_contexts_refuse_before_any_receipt_or_hit() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn streamed_identity_resolution_cannot_escape_the_scans_authority_view() {
-    let fixture = fixture(Layout::SingleImage, false).await;
+    let fixture = fixture(false).await;
     let mut client = fixture.client.clone();
     let (tx, rx) = mpsc::channel(4);
     tx.send(StreamSearchRequest {
@@ -475,7 +469,7 @@ async fn relay_refuses_a_scoped_scan_before_dialing_any_children() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relay_read_routes_preserve_scoped_receipts_through_two_levels() {
-    let mut fixture = fixture(Layout::SingleImage, false).await;
+    let mut fixture = fixture(false).await;
     let (first, _, first_task) =
         pipestream_search::harness::start_relay(vec![fixture.address.clone()]).await;
     let (second, _, second_task) =
@@ -717,7 +711,7 @@ async fn public_named_dense_selection_matches_the_legacy_field_and_refuses_an_al
     use pipestream_search::{
         coordinator::CoordinatorServiceImpl, pb::search_service_server::SearchService,
     };
-    let fixture = fixture(Layout::SingleImage, false).await;
+    let fixture = fixture(false).await;
     for streaming in [false, true] {
         let coordinator = CoordinatorServiceImpl::new(vec![fixture.address.clone()])
             .with_stream_search(streaming)

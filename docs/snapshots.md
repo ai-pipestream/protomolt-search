@@ -2,32 +2,27 @@
 
 Landed 2026-09-04. A node can publish its shard as a directory of hashed
 artifacts and pull such a directory back from a NAS path, an HTTP(S)
-server, or another node — without an operator holding the files.
-`InstallSnapshot` (the client stream, `README.md` "Bulk load") is
-unchanged; this is the second way an image reaches a shard, and it ends
-in the same install.
+server, or another node — without an operator holding the files. This
+is the way a catalog reaches a shard from outside its own log.
 
 ## The repository
 
 `NodeService.ExportSnapshot(directory)` flushes the shard and copies its
 current generation into `directory`, which must be empty (a non-empty
-one is refused naming its entry count). What lands there depends on the
-shard's layout (`docs/immutable-segments.md`):
+one is refused naming its entry count). What lands there is the shard's
+segment catalog (`docs/immutable-segments.md`):
 
 ```
-single-image                        segments
-  vector.index                        catalog/segments.json
-  vectors.f32          (when kept)    catalog/segments/<id>/segment.json
-  documents.bm25       (when kept)    catalog/segments/<id>/vector.index
-  live-docs.bin        (when kept)    catalog/segments/<id>/...
-  snapshot-manifest.json              vectors.f32, live-docs.bin, vector.index (when kept)
-                                      snapshot-manifest.json
+catalog/segments.json
+catalog/segments/<id>/segment.json
+catalog/segments/<id>/vector.index
+catalog/segments/<id>/...
+vectors.f32, live-docs.bin, vector.index (when kept)
+snapshot-manifest.json
 ```
 
-A single-image repository is exactly a staging generation directory:
-the names are the ones `InstallSnapshot` writes. A segment repository
-is the catalog tree under `catalog/` plus the shard-level sidecars the
-node keeps beside the catalog (the serving live bitmap and exact-vector
+A repository is the catalog tree under `catalog/` plus the shard-level
+sidecars the node keeps beside the catalog (the serving live bitmap and exact-vector
 copy; a plain vector image when the shard had one before its first
 document).
 
@@ -86,18 +81,16 @@ and compared to the manifest's size and SHA-256 (the first mismatch is
 refused naming the artifact and both values); the manifest's digest is
 compared to `expected_manifest_sha256` when one was given; the
 manifest's `slot_offset` and `collection` must be this shard's (a
-repository image describes one shard; the client stream stays the way
-to place a prebuilt image at any offset); and the layout must be one
-the shard can adopt. What passes goes through the same install as the
-client stream: the single-image path is `apply_snapshot` itself, with
-its provider-identity checks (a foreign backend kind or another scoring
-fingerprint refuses `FAILED_PRECONDITION` naming both, calibration
-included) and its atomic generation rename. The response carries the
-manifest, so the caller knows the WAL cutoff the image contains.
+repository describes one shard); and the layout must be
+`segments`. The response carries the manifest, so the caller knows the
+WAL cutoff the image contains. The streamed `InstallSnapshot` RPC carries
+a bare provider image and refuses `UNIMPLEMENTED` by name; repositories
+install through `InstallSnapshotFrom`.
 
-The segment layout installs through its own swap: the staged catalog is
-opened and validated (the catalog verifies its own per-segment hashes
-and fingerprints), the provider identity is checked the same way, then
+The install swaps catalogs: the staged catalog is opened and validated
+(the catalog verifies its own per-segment hashes and fingerprints), the
+provider identity is checked (a foreign backend kind or another scoring
+fingerprint refuses `FAILED_PRECONDITION` naming both), then
 under the write lock the live catalog is renamed to
 `<index>.segments.snap-old`, the staged one into `<index>.segments/`,
 the shard-level sidecars are moved after it, and the shard reopens over
@@ -108,10 +101,6 @@ between the catalog rename and the sidecar moves leaves sidecars that
 disagree with the catalog, which the next open refuses by name rather
 than serving.
 
-Layouts do not mix: a segment repository refuses a `--layout=single-image`
-shard or one serving an installed generation, and a single-image
-repository refuses a segment shard that holds rows (an empty one adopts
-the single-image layout, the same way an `InstallSnapshot` stream does).
 After any install the WAL rotates to a fresh generation with a snapshot
 marker, as it always has, so the installed image is recorded as
 preexisting state the log does not contain (`docs/resharding.md`).

@@ -56,7 +56,6 @@ pub(super) struct FileConfig {
     pub(super) allow_plaintext: Option<bool>,
     pub(super) bearer_tokens: Option<String>,
     pub(super) udp_hmac_key: Option<String>,
-    pub(super) layout: Option<String>,
     pub(super) seal_tail_docs: Option<u32>,
     pub(super) vector_mmap: Option<bool>,
     pub(super) role: Option<String>,
@@ -84,7 +83,6 @@ pub(super) struct FileConfig {
     pub(super) derived_columns: Option<String>,
     /// The declaration inline (`[[derived]]` in this file).
     pub(super) derived: Vec<crate::derived::DerivedColumnConfig>,
-    pub(super) allow_missing_bm25: Option<bool>,
     pub(super) coalesce: Option<bool>,
     pub(super) scan_parallel: Option<usize>,
     pub(super) rerank_parallel: Option<usize>,

@@ -47,12 +47,38 @@ impl SpillBuilder {
         Ok(())
     }
 
+    /// Allocate empty slots up to `slots`, so the store covers rows that
+    /// carry no document (a vector-only tail of a reshard child). Empty
+    /// slots hold no text and count toward no statistic.
+    pub fn reserve_slots(&mut self, slots: u32) -> io::Result<()> {
+        self.fill_gaps_to(slots as usize)
+    }
+
     fn advance_to_slot(
         &mut self,
         slot: usize,
         text: &str,
         lineage: Option<DocLineage>,
     ) -> io::Result<()> {
+        self.fill_gaps_to(slot)?;
+        write_u32(&mut self.texts, text.len() as u32)?;
+        self.texts.write_all(text.as_bytes())?;
+        self.texts_bytes += 4 + text.len() as u64;
+        self.text_lens.push(text.len() as u32);
+        self.lineages.push(lineage);
+        for field in &mut self.fields {
+            if let Some(stage) = field.sentence_stage.as_mut() {
+                stage
+                    .bases
+                    .push(u32::try_from(stage.total).expect("sentences exceed u32"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Open the sentence stages, then push empty slots until `slot` is the
+    /// next one.
+    fn fill_gaps_to(&mut self, slot: usize) -> io::Result<()> {
         for (fi, field) in self.fields.iter_mut().enumerate() {
             if field.sentences && field.sentence_stage.is_none() {
                 let path = self.dir.join(format!("sentences-f{fi:03}.stage"));
@@ -77,18 +103,6 @@ impl SpillBuilder {
                 }
             }
             self.lineages.push(None);
-        }
-        write_u32(&mut self.texts, text.len() as u32)?;
-        self.texts.write_all(text.as_bytes())?;
-        self.texts_bytes += 4 + text.len() as u64;
-        self.text_lens.push(text.len() as u32);
-        self.lineages.push(lineage);
-        for field in &mut self.fields {
-            if let Some(stage) = field.sentence_stage.as_mut() {
-                stage
-                    .bases
-                    .push(u32::try_from(stage.total).expect("sentences exceed u32"));
-            }
         }
         Ok(())
     }

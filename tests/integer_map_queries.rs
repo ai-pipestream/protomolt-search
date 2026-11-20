@@ -3,7 +3,7 @@ mod common;
 use pipestream_search::{
     analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND},
     coordinator::CoordinatorServiceImpl,
-    node::{Layout, NodeConfig},
+    node::NodeConfig,
     pb::{self, node_service_client::NodeServiceClient, search_service_server::SearchService},
 };
 use tonic::Request;
@@ -359,69 +359,66 @@ async fn exact_map_queries_survive_sealing_reopen_and_nested_relays() {
     std::fs::create_dir_all(&root).unwrap();
     let vectors = common::unit_vectors(SIGNED.len(), 8, 23411);
     let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 23412));
-    for layout in [Layout::SingleImage, Layout::Segments] {
-        let config = NodeConfig {
-            index_path: Some(root.join(format!("{layout:?}.tv"))),
-            layout,
-            wal: true,
-            wal_buckets: 2,
-            analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
-            facet_fields: vec!["row".into()],
-            map_integer_fields: vec!["signed".into()],
-            map_unsigned_integer_fields: vec!["unsigned".into()],
-            integer_fields: vec!["signed_copy".into()],
-            unsigned_integer_fields: vec!["unsigned_copy".into(), "unsigned_overflow".into()],
-            ..Default::default()
-        };
-        let (mut address, mut server) = common::start_empty_node(config.clone()).await;
-        let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
+    let config = NodeConfig {
+        index_path: Some(root.join("segments.tv")),
+        wal: true,
+        wal_buckets: 2,
+        analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
+        facet_fields: vec!["row".into()],
+        map_integer_fields: vec!["signed".into()],
+        map_unsigned_integer_fields: vec!["unsigned".into()],
+        integer_fields: vec!["signed_copy".into()],
+        unsigned_integer_fields: vec!["unsigned_copy".into(), "unsigned_overflow".into()],
+        ..Default::default()
+    };
+    let (mut address, mut server) = common::start_empty_node(config.clone()).await;
+    let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
+    client
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            8, 4, &shift, &scale,
+        ))
+        .await
+        .unwrap();
+    let input = materialized_docs();
+    for range in [0..2, 2..6] {
         client
-            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-                8, 4, &shift, &scale,
-            ))
+            .add_documents(tokio_stream::iter(input[range.clone()].to_vec()))
             .await
             .unwrap();
-        let input = materialized_docs();
-        for range in [0..2, 2..6] {
-            client
-                .add_documents(tokio_stream::iter(input[range.clone()].to_vec()))
-                .await
-                .unwrap();
-            client
-                .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
-                    materialized_rows: Vec::new(),
-                    dim: 8,
-                    vectors: vectors[range.start * 8..range.end * 8].to_vec(),
-                }]))
-                .await
-                .unwrap();
-            if range.end == 2 {
-                client.flush(pb::FlushRequest {}).await.unwrap();
-            }
+        client
+            .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
+                materialized_rows: Vec::new(),
+                dim: 8,
+                vectors: vectors[range.start * 8..range.end * 8].to_vec(),
+            }]))
+            .await
+            .unwrap();
+        if range.end == 2 {
+            client.flush(pb::FlushRequest {}).await.unwrap();
         }
-        for phase in 0..3 {
-            if phase == 1 {
-                client.flush(pb::FlushRequest {}).await.unwrap();
-            }
-            if phase == 2 {
-                server.abort();
-                let _ = server.await;
-                (address, server) = common::start_opened_node(config.clone()).await;
-                client = NodeServiceClient::connect(address.clone()).await.unwrap();
-            }
-            verify_queries(&coordinator(address.clone())).await;
-            let (relay, _, relay_task) =
-                pipestream_search::harness::start_relay(vec![address.clone()]).await;
-            let (top, _, top_task) = pipestream_search::harness::start_relay(vec![relay]).await;
-            verify_queries(&coordinator(top)).await;
-            top_task.abort();
-            relay_task.abort();
-            let _ = top_task.await;
-            let _ = relay_task.await;
-        }
-        server.abort();
-        let _ = server.await;
     }
+    for phase in 0..3 {
+        if phase == 1 {
+            client.flush(pb::FlushRequest {}).await.unwrap();
+        }
+        if phase == 2 {
+            server.abort();
+            let _ = server.await;
+            (address, server) = common::start_opened_node(config.clone()).await;
+            client = NodeServiceClient::connect(address.clone()).await.unwrap();
+        }
+        verify_queries(&coordinator(address.clone())).await;
+        let (relay, _, relay_task) =
+            pipestream_search::harness::start_relay(vec![address.clone()]).await;
+        let (top, _, top_task) = pipestream_search::harness::start_relay(vec![relay]).await;
+        verify_queries(&coordinator(top)).await;
+        top_task.abort();
+        relay_task.abort();
+        let _ = top_task.await;
+        let _ = relay_task.await;
+    }
+    server.abort();
+    let _ = server.await;
     std::fs::remove_dir_all(root).unwrap();
 }
 

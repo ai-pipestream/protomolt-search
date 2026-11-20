@@ -124,7 +124,6 @@ impl NodeServiceImpl {
                 multi_res_vectors: Default::default(),
                 bm25: None,
                 live_docs: LiveDocs::default(),
-                generation: None,
                 wal,
                 parents: None,
                 mapped_binding,
@@ -312,7 +311,7 @@ impl NodeServiceImpl {
                     return Ok(cached.clone());
                 }
             }
-            let store = guard.bm25.as_ref().and_then(|b| b.as_index());
+            let store = guard.bm25.as_ref().map(Bm25Shard::as_index);
             let rows = (0..n)
                 .map(|slot| {
                     store
@@ -343,16 +342,15 @@ impl NodeServiceImpl {
         Self::adopt_layout(bm25, created)
     }
 
-    /// Create an empty exact-vector store: disk-spilling beside the generation
+    /// Create an empty exact-vector store: disk-spilling at the tail's exact
     /// sidecar path on persisted shards, or heap-backed for in-memory shards.
     pub(in crate::node) fn fresh_exact_store(
         &self,
-        generation: Option<&PathBuf>,
         dim: usize,
     ) -> Result<ExactVectorStore, Status> {
         match self.config.index_path.as_ref() {
             Some(index_path) => {
-                let (_, exact_path, _) = storage_paths(index_path, generation);
+                let exact_path = exact_vector_sidecar_path(index_path);
                 ExactVectorStore::spilling(&exact_path, Some(dim)).map_err(|e| {
                     Status::internal(format!(
                         "exact-vector builder {}: {e}",

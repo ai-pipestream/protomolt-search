@@ -72,8 +72,8 @@ binding and source-rebuild requirements are described in the storage note.
 
 ## Evidence
 
-`tests/vector_field_reads.rs` uses real gRPC nodes in both single-image and
-segmented layouts. It checks exact names versus source-path and body aliases,
+`tests/vector_field_reads.rs` uses real gRPC nodes over segment catalogs. It
+checks exact names versus source-path and body aliases,
 public/private/deleted/vector-only rows, duplicate and foreign candidates,
 filtering before FP32 byte limits, scoped/native score equality, complete empty
 receipts and refusal after a deletion invalidates the admitted physical version.

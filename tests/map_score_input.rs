@@ -237,7 +237,11 @@ async fn map_score_bounds_explanations_and_fetches_agree_through_relays() {
         } else {
             let path = root.join("mapped.bm25");
             data.save(&path).unwrap();
-            Bm25Shard::open(&path).unwrap()
+            common::catalog::sealed_shard(
+                &root.join("mapped.tv"),
+                &path,
+                Bm25Store::new().with_map_numerics(&["metrics"]),
+            )
         };
         let node = NodeServiceImpl::new(
             None,
@@ -402,44 +406,5 @@ async fn map_score_bounds_explanations_and_fetches_agree_through_relays() {
         handle.abort();
         let _ = handle.await;
     }
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[tokio::test]
-async fn score_queries_on_a_spilling_shard_refuse_without_reading_bounds() {
-    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("map-score-spill-{}", std::process::id()));
-    std::fs::create_dir_all(&root).unwrap();
-    let builder = pipestream_search::postings::SpillBuilder::create(&root.join("spill"))
-        .unwrap()
-        .with_numeric_fields(&["metric"]);
-    let node = NodeServiceImpl::new(
-        None,
-        NodeConfig {
-            numeric_fields: vec!["metric".into()],
-            ..Default::default()
-        },
-    )
-    .with_bm25(Some(Bm25Shard::Spilling(builder)));
-    for k in [0, 1] {
-        let err = node
-            .bm25_query(tonic::Request::new(pb::Bm25QueryRequest {
-                k,
-                score_stages: vec![pb::ScoreStage {
-                    column: "metric".into(),
-                    weight: 1.0,
-                    operation: Some(pb::score_stage::Operation::Op(
-                        pb::ScoreOp::AddLinear as i32,
-                    )),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
-        assert!(err.message().contains("Flush"));
-    }
-    drop(node);
     std::fs::remove_dir_all(root).unwrap();
 }

@@ -211,7 +211,7 @@ async fn flush_persists_and_reload_matches() {
     // The reloaded index must search identically to a freshly built one.
     let loaded = pipestream_search::vector::VectorIndex::load(
         pipestream_search::vector::EMBEDDED_TURBOVEC,
-        &path,
+        &common::catalog::segment_vector(&path, 0),
     )
     .unwrap();
     assert_eq!(loaded.len(), 1_500);

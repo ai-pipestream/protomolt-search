@@ -3,7 +3,7 @@ mod common;
 use pipestream_search::{
     analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND},
     coordinator::CoordinatorServiceImpl,
-    node::{Layout, NodeConfig},
+    node::NodeConfig,
     pb::{self, node_service_client::NodeServiceClient, search_service_server::SearchService},
 };
 use prost::Message;
@@ -238,70 +238,94 @@ async fn verify(coordinator: &CoordinatorServiceImpl) {
 #[tokio::test]
 async fn unsigned_sort_collapse_and_cursors_survive_reopen_and_compaction() {
     let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 37195));
-    for layout in [Layout::SingleImage, Layout::Segments] {
-        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("unsigned_order_{layout:?}_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut configs = Vec::new();
-        let mut addresses = Vec::new();
-        let mut servers = Vec::new();
-        for range in [0..5, 5..VALUES.len()] {
-            let config = NodeConfig {
-                index_path: Some(dir.join(format!("{}.tv", range.start))),
-                layout,
-                wal: true,
-                wal_buckets: 2,
-                seal_tail_docs: 2,
-                slot_offset: range.start as u64,
-                analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
-                unsigned_integer_fields: vec!["value".into()],
-                facet_fields: vec!["key".into()],
-                ..Default::default()
-            };
-            let (address, server) = common::start_empty_node(config.clone()).await;
-            let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("unsigned_order_segments_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut configs = Vec::new();
+    let mut addresses = Vec::new();
+    let mut servers = Vec::new();
+    for range in [0..5, 5..VALUES.len()] {
+        let config = NodeConfig {
+            index_path: Some(dir.join(format!("{}.tv", range.start))),
+            wal: true,
+            wal_buckets: 2,
+            seal_tail_docs: 2,
+            slot_offset: range.start as u64,
+            analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
+            unsigned_integer_fields: vec!["value".into()],
+            facet_fields: vec!["key".into()],
+            ..Default::default()
+        };
+        let (address, server) = common::start_empty_node(config.clone()).await;
+        let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
+        client
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                8, 4, &shift, &scale,
+            ))
+            .await
+            .unwrap();
+        for row in range {
             client
-                .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-                    8, 4, &shift, &scale,
-                ))
+                .add_documents(tokio_stream::iter([pb::AddDocumentsRequest {
+                    text: "word".into(),
+                    analysis: Some(body_spec()),
+                    facets: vec![pb::FacetValue {
+                        field: "key".into(),
+                        value: row.to_string(),
+                    }],
+                    unsigned_integers: VALUES[row]
+                        .map(|value| pb::UnsignedIntegerValue {
+                            field: "value".into(),
+                            value,
+                        })
+                        .into_iter()
+                        .collect(),
+                    lineage: Some(pb::DocLineage {
+                        parent_id: VALUES[row].unwrap_or(42),
+                        group_id: VALUES[row].unwrap_or(42),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]))
                 .await
                 .unwrap();
-            for row in range {
+            client
+                .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
+                    materialized_rows: Vec::new(),
+                    dim: 8,
+                    vectors: common::unit_vectors(1, 8, 57890 + row as u64),
+                }]))
+                .await
+                .unwrap();
+        }
+        client.flush(pb::FlushRequest {}).await.unwrap();
+        configs.push(config);
+        addresses.push(address);
+        servers.push(server);
+    }
+    verify(
+        &CoordinatorServiceImpl::new(addresses)
+            .with_bm25(Some(NATIVE_ANALYSIS_BACKEND.into()), Default::default()),
+    )
+    .await;
+    for server in servers.drain(..) {
+        server.abort();
+        let _ = server.await;
+    }
+    for round in 0..2 {
+        let mut addresses = Vec::new();
+        for (index, config) in configs.iter().enumerate() {
+            let (address, server) = common::start_opened_node(config.clone()).await;
+            let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
+            if round == 0 {
                 client
-                    .add_documents(tokio_stream::iter([pb::AddDocumentsRequest {
-                        text: "word".into(),
-                        analysis: Some(body_spec()),
-                        facets: vec![pb::FacetValue {
-                            field: "key".into(),
-                            value: row.to_string(),
-                        }],
-                        unsigned_integers: VALUES[row]
-                            .map(|value| pb::UnsignedIntegerValue {
-                                field: "value".into(),
-                                value,
-                            })
-                            .into_iter()
-                            .collect(),
-                        lineage: Some(pb::DocLineage {
-                            parent_id: VALUES[row].unwrap_or(42),
-                            group_id: VALUES[row].unwrap_or(42),
-                            ..Default::default()
-                        }),
+                    .compact_shard(pb::CompactShardRequest {
+                        work_dir: dir.join(format!("compact-{index}")).display().to_string(),
                         ..Default::default()
-                    }]))
-                    .await
-                    .unwrap();
-                client
-                    .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
-                        materialized_rows: Vec::new(),
-                        dim: 8,
-                        vectors: common::unit_vectors(1, 8, 57890 + row as u64),
-                    }]))
+                    })
                     .await
                     .unwrap();
             }
-            client.flush(pb::FlushRequest {}).await.unwrap();
-            configs.push(config);
             addresses.push(address);
             servers.push(server);
         }
@@ -314,35 +338,8 @@ async fn unsigned_sort_collapse_and_cursors_survive_reopen_and_compaction() {
             server.abort();
             let _ = server.await;
         }
-        for round in 0..2 {
-            let mut addresses = Vec::new();
-            for (index, config) in configs.iter().enumerate() {
-                let (address, server) = common::start_opened_node(config.clone()).await;
-                let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
-                if round == 0 {
-                    client
-                        .compact_shard(pb::CompactShardRequest {
-                            work_dir: dir.join(format!("compact-{index}")).display().to_string(),
-                            ..Default::default()
-                        })
-                        .await
-                        .unwrap();
-                }
-                addresses.push(address);
-                servers.push(server);
-            }
-            verify(
-                &CoordinatorServiceImpl::new(addresses)
-                    .with_bm25(Some(NATIVE_ANALYSIS_BACKEND.into()), Default::default()),
-            )
-            .await;
-            for server in servers.drain(..) {
-                server.abort();
-                let _ = server.await;
-            }
-        }
-        std::fs::remove_dir_all(dir).unwrap();
     }
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

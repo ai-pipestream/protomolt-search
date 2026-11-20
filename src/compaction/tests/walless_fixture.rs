@@ -40,12 +40,10 @@ pub(super) fn walless_fixture(label: &str, rows: usize) -> (PathBuf, NodeService
             index_path: Some(index_path.clone()),
             analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
             wal: false,
-            layout: crate::node::Layout::Segments,
             integer_fields: vec!["num".into()],
             ..Default::default()
         },
         None,
-        false,
     )
     .unwrap();
     let sample = crate::harness::unit_vectors(rows.max(64), 64, 7);

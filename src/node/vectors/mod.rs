@@ -103,7 +103,7 @@ impl NodeServiceImpl {
                 .map_err(|e| Status::invalid_argument(format!("invalid backend config: {e}")))
         };
         let mut guard = write_shard(&self.state);
-        guard.check_legacy_mutation()?;
+        guard.check_index_owned_write()?;
         let result = match guard.index.as_ref() {
             Some(index) if !index.is_empty() => Err(Status::failed_precondition(format!(
                 "shard holds {} vectors; vector backend configuration is locked for the generation",
@@ -132,7 +132,7 @@ impl NodeServiceImpl {
             if guard.exact_vectors.is_none()
                 && guard.index.as_ref().is_some_and(VectorIndex::is_empty)
             {
-                let store = self.fresh_exact_store(guard.generation.as_ref(), dim)?;
+                let store = self.fresh_exact_store(dim)?;
                 guard.exact_vectors = Some(store);
             }
             if let Some(wal) = guard.wal.as_mut() {

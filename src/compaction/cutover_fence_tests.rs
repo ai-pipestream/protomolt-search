@@ -3,7 +3,7 @@
 use super::super::super::{marker_path, PreflightKind};
 use super::*;
 use crate::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
-use crate::node::{Layout, NodeConfig};
+use crate::node::NodeConfig;
 use crate::pb::{AddDocumentsRequest, CompactShardRequest};
 use crate::postings::AnalyzedDoc;
 use crate::vector::EMBEDDED_TURBOVEC;
@@ -33,7 +33,6 @@ impl Fixture {
         let config = NodeConfig {
             index_path: Some(directory.join("shard.vector")),
             analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
-            layout: Layout::Segments,
             wal: true,
             ..Default::default()
         };
@@ -208,7 +207,7 @@ fn verify_cutover(
                     .generation(),
                 1
             );
-            let reopened = NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap();
+            let reopened = NodeServiceImpl::open(fixture.config.clone(), None).unwrap();
             assert_eq!(
                 Fixture::texts(&reopened),
                 ["seed document", "replayed tail"]

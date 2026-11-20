@@ -3,7 +3,7 @@ mod common;
 use pipestream_search::{
     analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND},
     coordinator::CoordinatorServiceImpl,
-    node::{Layout, NodeConfig},
+    node::NodeConfig,
     pb::{self, node_service_client::NodeServiceClient, search_service_server::SearchService},
 };
 
@@ -262,135 +262,132 @@ async fn integer_map_order_survives_tail_sealing_reopen_compaction_and_relay_gro
         .join(format!("map-order-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 62871));
-    for layout in [Layout::SingleImage, Layout::Segments] {
-        let mut configs = Vec::new();
-        let mut addresses = Vec::new();
-        let mut servers = Vec::new();
-        for range in [0..5, 5..10] {
-            let config = NodeConfig {
-                index_path: Some(dir.join(format!("{layout:?}-{}.tv", range.start))),
-                layout,
-                wal: true,
-                wal_buckets: 2,
-                slot_offset: range.start as u64,
-                analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
-                facet_fields: vec!["row".into()],
-                map_integer_fields: vec!["signed".into()],
-                map_unsigned_integer_fields: vec!["unsigned".into()],
-                ..Default::default()
-            };
-            let (address, server) = common::start_empty_node(config.clone()).await;
-            let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
+    let mut configs = Vec::new();
+    let mut addresses = Vec::new();
+    let mut servers = Vec::new();
+    for range in [0..5, 5..10] {
+        let config = NodeConfig {
+            index_path: Some(dir.join(format!("segments-{}.tv", range.start))),
+            wal: true,
+            wal_buckets: 2,
+            slot_offset: range.start as u64,
+            analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
+            facet_fields: vec!["row".into()],
+            map_integer_fields: vec!["signed".into()],
+            map_unsigned_integer_fields: vec!["unsigned".into()],
+            ..Default::default()
+        };
+        let (address, server) = common::start_empty_node(config.clone()).await;
+        let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
+        client
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                8, 4, &shift, &scale,
+            ))
+            .await
+            .unwrap();
+        let first = range.start;
+        for row in range {
+            let mut keys = vec!["", QUOTED_KEY, "z"];
+            if row > first + 1 {
+                keys.push("a");
+            }
             client
-                .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-                    8, 4, &shift, &scale,
-                ))
+                .add_documents(tokio_stream::iter([pb::AddDocumentsRequest {
+                    text: "word".into(),
+                    analysis: Some(body_spec()),
+                    facets: vec![pb::FacetValue {
+                        field: "row".into(),
+                        value: row.to_string(),
+                    }],
+                    map_integers: keys
+                        .iter()
+                        .flat_map(|key| {
+                            SIGNED[row].map(|value| pb::MapIntegerEntry {
+                                field: "signed".into(),
+                                key: (*key).into(),
+                                value,
+                            })
+                        })
+                        .collect(),
+                    map_unsigned_integers: keys
+                        .iter()
+                        .flat_map(|key| {
+                            UNSIGNED[row].map(|value| pb::MapUnsignedIntegerEntry {
+                                field: "unsigned".into(),
+                                key: (*key).into(),
+                                value,
+                            })
+                        })
+                        .collect(),
+                    ..Default::default()
+                }]))
                 .await
                 .unwrap();
-            let first = range.start;
-            for row in range {
-                let mut keys = vec!["", QUOTED_KEY, "z"];
-                if row > first + 1 {
-                    keys.push("a");
-                }
-                client
-                    .add_documents(tokio_stream::iter([pb::AddDocumentsRequest {
-                        text: "word".into(),
-                        analysis: Some(body_spec()),
-                        facets: vec![pb::FacetValue {
-                            field: "row".into(),
-                            value: row.to_string(),
-                        }],
-                        map_integers: keys
-                            .iter()
-                            .flat_map(|key| {
-                                SIGNED[row].map(|value| pb::MapIntegerEntry {
-                                    field: "signed".into(),
-                                    key: (*key).into(),
-                                    value,
-                                })
-                            })
-                            .collect(),
-                        map_unsigned_integers: keys
-                            .iter()
-                            .flat_map(|key| {
-                                UNSIGNED[row].map(|value| pb::MapUnsignedIntegerEntry {
-                                    field: "unsigned".into(),
-                                    key: (*key).into(),
-                                    value,
-                                })
-                            })
-                            .collect(),
-                        ..Default::default()
-                    }]))
-                    .await
-                    .unwrap();
-                client
-                    .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
-                        materialized_rows: Vec::new(),
-                        dim: 8,
-                        vectors: common::unit_vectors(1, 8, 62880 + row as u64),
-                    }]))
-                    .await
-                    .unwrap();
-                if row == first + 1 {
-                    client.flush(pb::FlushRequest {}).await.unwrap();
-                }
+            client
+                .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
+                    materialized_rows: Vec::new(),
+                    dim: 8,
+                    vectors: common::unit_vectors(1, 8, 62880 + row as u64),
+                }]))
+                .await
+                .unwrap();
+            if row == first + 1 {
+                client.flush(pb::FlushRequest {}).await.unwrap();
             }
-            configs.push(config);
+        }
+        configs.push(config);
+        addresses.push(address);
+        servers.push(server);
+    }
+    // Frozen segment dictionaries and the unsealed tail must agree.
+    verify_relays(addresses.clone(), 10).await;
+    for address in &addresses {
+        NodeServiceClient::connect(address.clone())
+            .await
+            .unwrap()
+            .flush(pb::FlushRequest {})
+            .await
+            .unwrap();
+    }
+    for server in servers.drain(..) {
+        server.abort();
+        let _ = server.await;
+    }
+    for phase in 0..2 {
+        addresses.clear();
+        for (i, config) in configs.iter().enumerate() {
+            let (address, server) = common::start_opened_node(config.clone()).await;
+            if phase == 0 {
+                let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
+                if i == 1 {
+                    let deleted = client
+                        .delete_documents(pb::DeleteDocumentsRequest {
+                            doc_ids: vec![5],
+                            expected_wal_generation: Some(0),
+                        })
+                        .await
+                        .unwrap()
+                        .into_inner();
+                    assert_eq!(deleted.deleted, 1);
+                }
+                client
+                    .compact_shard(pb::CompactShardRequest {
+                        work_dir: dir
+                            .join(format!("compact-segments-{i}"))
+                            .display()
+                            .to_string(),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+            }
             addresses.push(address);
             servers.push(server);
         }
-        // Frozen segment dictionaries and the unsealed tail must agree.
-        verify_relays(addresses.clone(), 10).await;
-        for address in &addresses {
-            NodeServiceClient::connect(address.clone())
-                .await
-                .unwrap()
-                .flush(pb::FlushRequest {})
-                .await
-                .unwrap();
-        }
+        verify_relays(addresses.clone(), 9).await;
         for server in servers.drain(..) {
             server.abort();
             let _ = server.await;
-        }
-        for phase in 0..2 {
-            addresses.clear();
-            for (i, config) in configs.iter().enumerate() {
-                let (address, server) = common::start_opened_node(config.clone()).await;
-                if phase == 0 {
-                    let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
-                    if i == 1 {
-                        let deleted = client
-                            .delete_documents(pb::DeleteDocumentsRequest {
-                                doc_ids: vec![5],
-                                expected_wal_generation: Some(0),
-                            })
-                            .await
-                            .unwrap()
-                            .into_inner();
-                        assert_eq!(deleted.deleted, 1);
-                    }
-                    client
-                        .compact_shard(pb::CompactShardRequest {
-                            work_dir: dir
-                                .join(format!("compact-{layout:?}-{i}"))
-                                .display()
-                                .to_string(),
-                            ..Default::default()
-                        })
-                        .await
-                        .unwrap();
-                }
-                addresses.push(address);
-                servers.push(server);
-            }
-            verify_relays(addresses.clone(), 9).await;
-            for server in servers.drain(..) {
-                server.abort();
-                let _ = server.await;
-            }
         }
     }
     std::fs::remove_dir_all(dir).unwrap();

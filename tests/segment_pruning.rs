@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use common::{fit_calibration, start_empty_node, start_opened_node, unit_vectors};
 use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
 use pipestream_search::coordinator::CoordinatorServiceImpl;
-use pipestream_search::node::{segments_root, Layout, NodeConfig};
+use pipestream_search::node::{segments_root, NodeConfig};
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
@@ -51,7 +51,6 @@ fn config(index_path: PathBuf, segment_pruning: bool) -> NodeConfig {
         analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
         facet_fields: vec!["court".to_string()],
         integer_fields: vec!["year".to_string(), "pages".to_string()],
-        layout: Layout::Segments,
         seal_tail_docs: PER_YEAR as u32,
         segment_pruning,
         wal: false,

@@ -1,6 +1,7 @@
 //! Building one child image from replayed records, and the steps that seal it.
 
 mod bm25;
+pub(super) use bm25::write_store_range;
 mod columns;
 mod document;
 mod tables;

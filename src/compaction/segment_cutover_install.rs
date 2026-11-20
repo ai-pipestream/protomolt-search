@@ -49,7 +49,6 @@ fn install_fenced(
         exact_vectors: prepared.exact_vectors.take(),
         bm25: Some(Bm25Shard::Segmented(shard)),
         live_docs: prepared.overlay.clone(),
-        generation: None,
         wal: None,
         parents: None,
         mapped_binding,
@@ -79,13 +78,10 @@ fn prepare_marker(
         .map_err(Status::internal)?;
     Ok(CommitMarker {
         format: MARKER_FORMAT,
-        layout: layout_name(true).to_string(),
         old_wal_generation: 0,
         new_wal_generation: 0,
         walless: true,
         work_dir: pre.work_dir.clone(),
-        previous_snapshot: false,
-        legacy_files: Vec::new(),
         staged_segments: prepared.staged_ids.clone(),
         replaced_segments: prepared.replaced_ids.clone(),
     })

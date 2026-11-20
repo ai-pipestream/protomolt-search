@@ -86,9 +86,8 @@ and the kernel short-circuits fully masked blocks, as before
 - The phrase route, the hybrid legs' response counters, and the
   `QueryStream` completion: the pruning applies there, and the counts do not
   ride those responses yet.
-- Segments of a shard that has no segment catalog (the single-image layout
-  and the heap builder): there are no segments to skip, and the counters
-  report zero.
+- A shard without an index path (the heap store): there are no segments
+  to skip, and the counters report zero.
 
 ## The flag
 

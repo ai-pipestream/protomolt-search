@@ -79,8 +79,8 @@ source format changes; this increment alone requires no reindexing.
 
 `tests/vector_scan_views.rs` compares each scan mode's scoped scores against
 unrestricted reference scores, with caller predicates that conflict with or
-attempt to widen the authority view. It exercises single-image storage and a
-sealed segment plus active tail, deleted/private/vector-only rows, empty results,
+attempt to widen the authority view. It exercises a sealed segment plus
+active tail, deleted/private/vector-only rows, empty results,
 malformed contexts, stale versions and the ordering of the initial receipt.
 It also proves that streamed identity resolution refuses an excluded row and
 that a relay refuses the context before dialing a child.

@@ -33,7 +33,7 @@ mod tests;
 mod vectors;
 
 pub use self::boolean::BOOLEAN_MUST_SHORT_CIRCUIT_SKIPS;
-pub use self::config::{Layout, NodeConfig, MAX_RERANK_PARALLEL};
+pub use self::config::{NodeConfig, LAYOUT_MEMORY, MAX_RERANK_PARALLEL};
 pub use self::projection::StagedDocumentCandidate;
 pub use self::scan::{
     observe_scan, scan_batch_counters, scan_rate, ScanRate, ScanWindow, SCAN_WINDOW_MIN_SAMPLES,
@@ -43,10 +43,7 @@ pub use self::service::NodeServiceImpl;
 pub use self::shard::Bm25Shard;
 pub use self::snapshot::SNAPSHOT_STREAM_CHUNK;
 pub use self::storage::{
-    bm25_build_dir, bm25_sidecar_path, exact_vector_sidecar_path, generation_bm25, generation_dir,
-    generation_exact_vectors, generation_live_docs, generation_vector, live_docs_sidecar_path,
-    recover_generation, recover_segments_swap, refuse_retired_generation, segments_root,
-    try_recover_generation,
+    exact_vector_sidecar_path, live_docs_sidecar_path, recover_segments_swap, segments_root,
 };
 
 pub(crate) use self::aggregate::{agg_op_name, agg_op_of};
@@ -68,8 +65,7 @@ pub(crate) use self::shard::{
     ShardState,
 };
 pub(crate) use self::storage::{
-    generation_old_dir, generation_tmp_dir, heap_store, live_docs_storage_path, storage_paths,
-    wal_append_or_degrade, wal_manifest,
+    generation_tmp_dir, heap_store, wal_append_or_degrade, wal_manifest,
 };
 
 pub(in crate::node) use self::aggregate::{rankable_bits, resolve_rankable};
@@ -150,18 +146,18 @@ pub(in crate::node) use crate::pb::{
     LexicalBitmapRequest, MembershipBitmapResponse, OffsetSpan, RawLegHit, ReadWalRequest,
     ReadWalResponse, Replacement, ResolveParentsRequest, ResolveParentsResponse, ResolvedParent,
     ScoredHit, SearchShardDone, SearchShardRequest, SearchShardResponse, ShardLegsRequest,
-    ShardLegsResponse, ShardScanStats, SnapshotChunk, SnapshotManifest, StartShardSearch,
-    StoredDocument, StreamSearchBatch, StreamSearchRequest, StreamSearchResponse,
-    StreamSearchSummary, StreamSnapshotRequest, TermOccurrences, TermStatsRequest,
-    TermStatsResponse, VectorBackendConfig as WireVectorBackendConfig,
+    ShardLegsResponse, ShardScanStats, SnapshotChunk, StartShardSearch, StoredDocument,
+    StreamSearchBatch, StreamSearchRequest, StreamSearchResponse, StreamSearchSummary,
+    StreamSnapshotRequest, TermOccurrences, TermStatsRequest, TermStatsResponse,
+    VectorBackendConfig as WireVectorBackendConfig,
     VectorBackendDescriptor as WireVectorBackendDescriptor, VectorBitmapRequest,
     VectorQualityContract, VectorRescoreRequest, VectorRescoreResponse, VectorScoreDirection,
 };
-pub(in crate::node) use crate::postings::{Bm25Index, Bm25Reader, Bm25Store, SpillBuilder};
+pub(in crate::node) use crate::postings::{Bm25Index, Bm25Reader, Bm25Store};
 pub(in crate::node) use crate::segmented::SegmentedShard;
 pub(in crate::node) use crate::segmented_vectors::SegmentedProvider;
 pub(in crate::node) use crate::snapshot_repository::{
-    self as repo, RepositoryManifest, CATALOG_DIR, LAYOUT_SEGMENTS, LAYOUT_SINGLE_IMAGE,
+    self as repo, RepositoryManifest, CATALOG_DIR, LAYOUT_SEGMENTS,
 };
 pub(in crate::node) use crate::vector::{
     first_invalid_coordinate, QualityContract, ScoreDirection, VectorBackendConfig, VectorIndex,

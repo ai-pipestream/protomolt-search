@@ -17,7 +17,7 @@ use crate::pb::wal::{wal_record, LoggedAddDocuments, LoggedAddVectors, LoggedBin
 use crate::pb::{AddVectorsRequest, CompactShardResponse};
 use crate::wal::WalWriter;
 
-use super::{layout_name, Analyze, Preflight, Shadow, ANALYSIS_STREAMS};
+use super::{Analyze, Preflight, Shadow, ANALYSIS_STREAMS, LAYOUT};
 
 fn create_rewritten_wal(
     pre: &Preflight,
@@ -165,7 +165,7 @@ impl NodeServiceImpl {
                 analyze,
                 &mut sink,
             ),
-            None => crate::reshard::compact_log(&request, pre.segmented, analyze, &mut sink),
+            None => crate::reshard::compact_log(&request, analyze, &mut sink),
         };
         built.map_err(|e| Status::failed_precondition(format!("compaction build: {e}")))
     }
@@ -188,11 +188,7 @@ impl NodeServiceImpl {
         new_wal
             .flush()
             .map_err(|e| Status::internal(format!("fsync the rewritten WAL generation: {e}")))?;
-        let mut shadow = if pre.segmented {
-            self.open_segmented_shadow(pre, &build, new_wal)?
-        } else {
-            self.open_single_image_shadow(pre, &build, new_wal)?
-        };
+        let mut shadow = self.open_segmented_shadow(pre, &build, new_wal)?;
         shadow.id_map = build.id_map;
         match self.tail_and_cut_over(pre, &mut shadow, tail_bound, analyze, flush_shadow) {
             Ok((locked_records, write_lock_ms, tail_passes)) => {
@@ -212,7 +208,7 @@ impl NodeServiceImpl {
                     write_lock_ms,
                     wal_generation: pre.cutoff_generation + 1,
                     cutoff_clock: pre.cutoff_clock,
-                    layout: layout_name(pre.segmented).to_string(),
+                    layout: LAYOUT.to_string(),
                     dry_run: false,
                     closing_flush_ms,
                     tail_passes,
@@ -221,45 +217,27 @@ impl NodeServiceImpl {
                 })
             }
             Err(status) => {
-                if pre.segmented {
-                    let root = crate::node::segments_root(&pre.index_path);
-                    crate::segments::remove_segment_dirs(&root, &shadow.staged);
-                }
+                let root = crate::node::segments_root(&pre.index_path);
+                crate::segments::remove_segment_dirs(&root, &shadow.staged);
                 Err(status)
             }
         }
     }
 
-    /// Runs the post-cutover flush, briefly polling past mid-row paired appends
-    /// before surfacing any remaining seal refusal.
+    /// Runs the post-cutover flush, which leaves a tail caught mid-row for
+    /// the next flush; a refusal leaves the cutover pending for the next
+    /// `Flush` to complete.
     pub(in crate::compaction) fn closing_flush(&self) -> Result<(), Status> {
-        const ATTEMPTS: usize = 200;
-        const PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
-        for attempt in 1..=ATTEMPTS {
-            match self.flush_index() {
-                Ok(_) => return Ok(()),
-                Err(status)
-                    if attempt < ATTEMPTS
-                        && status.code() == tonic::Code::FailedPrecondition
-                        && status
-                            .message()
-                            .contains("a segment's artifacts cover the same rows") =>
-                {
-                    std::thread::sleep(PAUSE);
-                }
-                Err(status) => {
-                    return Err(Status::new(
-                        status.code(),
-                        format!(
-                            "the compaction cut over and is pending its closing flush, which \
-                             refused: {}; the next Flush completes it",
-                            status.message()
-                        ),
-                    ))
-                }
-            }
-        }
-        unreachable!("the last attempt returns")
+        self.flush_closing_cutover().map(drop).map_err(|status| {
+            Status::new(
+                status.code(),
+                format!(
+                    "the compaction cut over and is pending its closing flush, which refused: \
+                     {}; the next Flush completes it",
+                    status.message()
+                ),
+            )
+        })
     }
 
     /// Verifies that the compacted BM25 store matches the live shard's field table

@@ -3,51 +3,16 @@
 use crate::node::*;
 
 impl NodeServiceImpl {
+    /// A streamed provider image has no segment catalog to install; a
+    /// shard installs a repository through `InstallSnapshotFrom`.
     pub(in crate::node::rpc) async fn handle_install_snapshot(
         &self,
-        request: Request<Streaming<SnapshotChunk>>,
+        _request: Request<Streaming<SnapshotChunk>>,
     ) -> Result<Response<InstallSnapshotResponse>, Status> {
-        let path = self.config.index_path.clone().ok_or_else(|| {
-            Status::failed_precondition(
-                "shard has no persistence path (index_path); a snapshot install IS persistence",
-            )
-        })?;
-        let tmp_dir = generation_tmp_dir(&path);
-
-        let mut inbound = request.into_inner();
-        // Protocol: the first message must be the manifest.
-        let manifest = match inbound.message().await? {
-            Some(SnapshotChunk {
-                payload: Some(snapshot_chunk::Payload::Manifest(m)),
-            }) if m.vector_bytes > 0 => m,
-            _ => {
-                return Err(Status::invalid_argument(
-                    "first SnapshotChunk must be a SnapshotManifest with vector_bytes > 0",
-                ))
-            }
-        };
-
-        if let Err(e) = Self::receive_image(&mut inbound, &manifest, &tmp_dir).await {
-            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-            return Err(e);
-        }
-
-        let service = self.clone();
-        let cleanup = tmp_dir.clone();
-        let with_exact_vectors = manifest.exact_vector_bytes > 0;
-        let with_bm25 = manifest.bm25_bytes > 0;
-        let with_live_docs = manifest.live_docs_bytes > 0;
-        let result = tokio::task::spawn_blocking(move || {
-            service.apply_snapshot(&tmp_dir, with_exact_vectors, with_bm25, with_live_docs)
-        })
-        .await
-        .map_err(|e| Status::internal(format!("install task failed: {e}")))?;
-        if result.is_err() {
-            // Rejected AFTER receive (bad image, calibration mismatch):
-            // leave no staging dir behind either.
-            let _ = tokio::fs::remove_dir_all(&cleanup).await;
-        }
-        result.map(Response::new)
+        Err(Status::unimplemented(
+            "InstallSnapshot streams a bare provider image, which no shard serves; install a \
+             segment repository with InstallSnapshotFrom (directory, url or peer_addr)",
+        ))
     }
 
     pub(in crate::node::rpc) async fn handle_export_snapshot(

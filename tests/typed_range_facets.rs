@@ -3,7 +3,7 @@ use pipestream_search::{
     analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND},
     coordinator::CoordinatorServiceImpl,
     harness::start_relay,
-    node::{Layout, NodeConfig},
+    node::NodeConfig,
     pb::{
         self, filter_bound::Value as V, node_service_client::NodeServiceClient,
         search_service_server::SearchService,
@@ -213,111 +213,132 @@ async fn verify(addresses: Vec<String>) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn typed_ranges_match_numeric_oracle_through_nested_relays_and_storage_lifecycle() {
     let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 53881));
-    for layout in [Layout::SingleImage, Layout::Segments] {
-        let temp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("typed_ranges_{layout:?}_{}", std::process::id()));
-        std::fs::create_dir_all(&temp).unwrap();
-        let mut configs = Vec::new();
-        let mut servers = Vec::new();
-        let mut addresses = Vec::new();
-        for (shard, rows) in ROWS.iter().enumerate() {
-            let config = NodeConfig {
-                index_path: Some(temp.join(format!("{shard}.tv"))),
-                layout,
-                wal: true,
-                wal_buckets: 2,
-                seal_tail_docs: 2,
-                slot_offset: shard as u64 * 6,
-                analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
-                facet_fields: vec!["keep".into()],
-                integer_fields: if shard == 0 {
-                    vec!["value".into()]
-                } else {
-                    vec![]
-                },
-                unsigned_integer_fields: if shard == 1 {
-                    vec!["value".into()]
-                } else {
-                    vec![]
-                },
-                numeric_fields: if shard == 2 {
-                    vec!["value".into()]
-                } else {
-                    vec![]
-                },
-                ..Default::default()
-            };
-            let (addr, server) = common::start_empty_node(config.clone()).await;
-            let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+    let temp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("typed_ranges_segments_{}", std::process::id()));
+    std::fs::create_dir_all(&temp).unwrap();
+    let mut configs = Vec::new();
+    let mut servers = Vec::new();
+    let mut addresses = Vec::new();
+    for (shard, rows) in ROWS.iter().enumerate() {
+        let config = NodeConfig {
+            index_path: Some(temp.join(format!("{shard}.tv"))),
+            wal: true,
+            wal_buckets: 2,
+            seal_tail_docs: 2,
+            slot_offset: shard as u64 * 6,
+            analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
+            facet_fields: vec!["keep".into()],
+            integer_fields: if shard == 0 {
+                vec!["value".into()]
+            } else {
+                vec![]
+            },
+            unsigned_integer_fields: if shard == 1 {
+                vec!["value".into()]
+            } else {
+                vec![]
+            },
+            numeric_fields: if shard == 2 {
+                vec!["value".into()]
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        };
+        let (addr, server) = common::start_empty_node(config.clone()).await;
+        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+        client
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                8, 4, &shift, &scale,
+            ))
+            .await
+            .unwrap();
+        // Direct empty shards must reject malformed edges before reading a store.
+        let mut bad = fields().0[0].clone();
+        bad.typed_edges[0].exclusive = true;
+        assert_eq!(
             client
-                .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-                    8, 4, &shift, &scale,
-                ))
+                .bm25_query(pb::Bm25QueryRequest {
+                    range_facet_fields: vec![bad],
+                    k: 0,
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+        for (row, value) in rows.iter().enumerate() {
+            client
+                .add_documents(tokio_stream::iter([pb::AddDocumentsRequest {
+                    text: "word".into(),
+                    analysis: Some(body_spec()),
+                    facets: vec![pb::FacetValue {
+                        field: "keep".into(),
+                        value: if row % 2 == 0 { "yes" } else { "no" }.into(),
+                    }],
+                    integers: value
+                        .filter(|_| shard == 0)
+                        .map(|v| pb::IntegerValue {
+                            field: "value".into(),
+                            value: (v / 2) as i64,
+                        })
+                        .into_iter()
+                        .collect(),
+                    unsigned_integers: value
+                        .filter(|_| shard == 1)
+                        .map(|v| pb::UnsignedIntegerValue {
+                            field: "value".into(),
+                            value: (v / 2) as u64,
+                        })
+                        .into_iter()
+                        .collect(),
+                    numerics: value
+                        .filter(|_| shard == 2)
+                        .map(|v| pb::NumericValue {
+                            field: "value".into(),
+                            value: v as f64 / 2.0,
+                        })
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                }]))
                 .await
                 .unwrap();
-            // Direct empty shards must reject malformed edges before reading a store.
-            let mut bad = fields().0[0].clone();
-            bad.typed_edges[0].exclusive = true;
-            assert_eq!(
-                client
-                    .bm25_query(pb::Bm25QueryRequest {
-                        range_facet_fields: vec![bad],
-                        k: 0,
+            client
+                .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
+                    materialized_rows: Vec::new(),
+                    dim: 8,
+                    vectors: common::unit_vectors(1, 8, 615 + row as u64),
+                }]))
+                .await
+                .unwrap();
+        }
+        client.flush(pb::FlushRequest {}).await.unwrap();
+        configs.push(config);
+        addresses.push(addr);
+        servers.push(server);
+    }
+    verify(addresses).await;
+    for h in servers.drain(..) {
+        h.abort();
+        let _ = h.await;
+    }
+    for round in 0..2 {
+        let mut addresses = Vec::new();
+        for (shard, config) in configs.iter().enumerate() {
+            let (addr, server) = common::start_opened_node(config.clone()).await;
+            if round == 0 {
+                NodeServiceClient::connect(addr.clone())
+                    .await
+                    .unwrap()
+                    .compact_shard(pb::CompactShardRequest {
+                        work_dir: temp.join(format!("compact-{shard}")).display().to_string(),
                         ..Default::default()
                     })
                     .await
-                    .unwrap_err()
-                    .code(),
-                Code::InvalidArgument
-            );
-            for (row, value) in rows.iter().enumerate() {
-                client
-                    .add_documents(tokio_stream::iter([pb::AddDocumentsRequest {
-                        text: "word".into(),
-                        analysis: Some(body_spec()),
-                        facets: vec![pb::FacetValue {
-                            field: "keep".into(),
-                            value: if row % 2 == 0 { "yes" } else { "no" }.into(),
-                        }],
-                        integers: value
-                            .filter(|_| shard == 0)
-                            .map(|v| pb::IntegerValue {
-                                field: "value".into(),
-                                value: (v / 2) as i64,
-                            })
-                            .into_iter()
-                            .collect(),
-                        unsigned_integers: value
-                            .filter(|_| shard == 1)
-                            .map(|v| pb::UnsignedIntegerValue {
-                                field: "value".into(),
-                                value: (v / 2) as u64,
-                            })
-                            .into_iter()
-                            .collect(),
-                        numerics: value
-                            .filter(|_| shard == 2)
-                            .map(|v| pb::NumericValue {
-                                field: "value".into(),
-                                value: v as f64 / 2.0,
-                            })
-                            .into_iter()
-                            .collect(),
-                        ..Default::default()
-                    }]))
-                    .await
-                    .unwrap();
-                client
-                    .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
-                        materialized_rows: Vec::new(),
-                        dim: 8,
-                        vectors: common::unit_vectors(1, 8, 615 + row as u64),
-                    }]))
-                    .await
                     .unwrap();
             }
-            client.flush(pb::FlushRequest {}).await.unwrap();
-            configs.push(config);
             addresses.push(addr);
             servers.push(server);
         }
@@ -326,32 +347,8 @@ async fn typed_ranges_match_numeric_oracle_through_nested_relays_and_storage_lif
             h.abort();
             let _ = h.await;
         }
-        for round in 0..2 {
-            let mut addresses = Vec::new();
-            for (shard, config) in configs.iter().enumerate() {
-                let (addr, server) = common::start_opened_node(config.clone()).await;
-                if round == 0 {
-                    NodeServiceClient::connect(addr.clone())
-                        .await
-                        .unwrap()
-                        .compact_shard(pb::CompactShardRequest {
-                            work_dir: temp.join(format!("compact-{shard}")).display().to_string(),
-                            ..Default::default()
-                        })
-                        .await
-                        .unwrap();
-                }
-                addresses.push(addr);
-                servers.push(server);
-            }
-            verify(addresses).await;
-            for h in servers.drain(..) {
-                h.abort();
-                let _ = h.await;
-            }
-        }
-        std::fs::remove_dir_all(temp).unwrap();
     }
+    std::fs::remove_dir_all(temp).unwrap();
 }
 #[test]
 fn relay_refuses_forged_bucket_edges_even_with_one_child() {

@@ -282,7 +282,6 @@ impl NodeLink {
 
     client_streaming! {
         add_vectors: AddVectorsRequest => AddVectorsResponse,
-        install_snapshot: SnapshotChunk => InstallSnapshotResponse,
         add_documents: AddDocumentsRequest => AddDocumentsResponse,
         ingest_mapped: IngestMappedRequest => IngestMappedResponse,
     }

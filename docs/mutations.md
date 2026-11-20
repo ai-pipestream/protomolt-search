@@ -59,26 +59,23 @@ The shape is the live reshard's, in one process:
 1. **Cutoff.** Under the read lock the node fixes `(WAL generation, high
    watermark)` and the row and tombstone counts, then fsyncs the log through
    that clock. Writes keep landing on the live shard. The cut sits at a row
-   boundary: on the segment layout a legacy two-RPC append (AddDocuments,
-   then AddVectors) can be halfway through at that instant, and a replay
-   through such a cut would build a bucket with one document more than
-   vectors, which the layout refuses to seal; the preflight waits for the
-   row to complete (up to two seconds), then refuses naming the counts.
+   boundary: a tail whose documents and vectors counts differ (AddVectors
+   has not caught up with AddDocuments) would build a bucket with more
+   documents than vectors, which a segment refuses to seal, so the
+   preflight refuses at once naming the counts.
 2. **Build.** `reshard::compact_log` replays the generation through the
    cutoff with its deletes and replacements applied and writes the dense
    all-live image under the work directory (`<index>.compact/` by default;
    `work_dir` overrides it; it must be empty and on the index's filesystem).
-   For the segment layout the output is one sealed segment per non-empty WAL
-   bucket, so the build holds one bucket's rows at a time; for the
-   single-image layout it is one image. The replay also yields the old-to-new
+   The output is one sealed segment per non-empty WAL bucket, so the build
+   holds one bucket's rows at a time. The replay also yields the old-to-new
    id map (`ChildImage::row_parent_ids`) and hands every live row to a sink
    that writes the **rewritten WAL generation**: the same records with dense
    new ids, tombstoned rows gone, the binding first.
-3. **Shadow.** The image opens as a second shard state whose WAL is that new
-   generation: for the single-image layout the image laid out as a
-   generation directory; for the segment layout the outputs staged (hashed,
-   fsynced, unpublished) under the live catalog root with a fresh heap tail,
-   plus the dense FP32 sidecar assembled from the segments' rows.
+3. **Shadow.** The outputs open as a second shard state whose WAL is that new
+   generation: the outputs staged (hashed, fsynced, unpublished) under the
+   live catalog root with a fresh heap tail, plus the dense FP32 sidecar
+   assembled from the segments' rows.
 4. **Tail.** With no lock held, the node fsyncs the live log, reads the
    records after the applied clock (incrementally: only new frames), and
    applies them to the shadow through the SAME functions ingest uses —
@@ -98,21 +95,18 @@ The shape is the live reshard's, in one process:
    release the lock and prepare the new records before retrying (16 attempts,
    then refuse with "writes outpace compaction"). A generation change aborts.
    Once caught up, fsync the shadow, write the commit marker, move the rewritten
-   generation into `<index>.wal/`, swap the files (the single-image layout takes
-   the same
-   rename dance a snapshot install takes, `adopt_generation`; the segment
-   layout swaps `segments.json`), swap the state, bump the stats epoch, and
+   generation into `<index>.wal/`, swap `segments.json`, swap the state, bump the stats epoch, and
    release both locks and the reservation. Analysis never runs under the live
    shard's write lock. Queries that
    snapshotted the old state finish on it.
 6. **Closing flush.** The call then runs `Flush`, which writes the new
-   generation's images, removes the marker, and retires the replaced files:
-   `<index>.snap-old` and the legacy single-image files, or the replaced
-   segment directories. Any `Flush` completes a pending cutover the same way.
-   On the segment layout a flush that meets a legacy two-RPC append mid-row
-   (documents one ahead of vectors) refuses to seal by the layout's rule;
-   the closing flush waits that out for up to two seconds, then returns the
-   refusal and names the pending cutover.
+   generation's images, removes the marker, and retires the replaced segment
+   directories. Any `Flush` completes a pending cutover the same way. A
+   plain flush that meets a tail mid-row (documents ahead of vectors with
+   some vectors present) refuses to seal; the closing flush instead leaves
+   such a tail in place, documents ahead of their vectors included, for the
+   next flush once the vectors land, and persists only the sealed rows'
+   live overlay.
 
 The response reports rows before and after, tombstones reclaimed, tail
 records applied (and how many under the lock), the write-lock hold and the
@@ -130,8 +124,8 @@ tail that arrives after the cutoff is sealed unordered as usual, and the
 next partitioned compaction folds it in. An empty column keeps the bucket
 layout; a request without it on a partitioned shard returns the shard to
 the bucket layout. A double or facet column, a name that is not a column,
-a column no document carries, and the single-image layout are each
-rejected by name before any work. A child of a segmented re-placement
+and a column no document carries are each rejected by name before any
+work. A child of a segmented re-placement
 split has no log to replay; cut its spill by the column at the split
 (`docs/replay-from-segments.md`, "Cutting the spill") and it comes out
 partitioned — and when such a child later needs the compaction (deletes
@@ -145,18 +139,16 @@ flush — with `wal_generation` and `cutoff_clock` reported as 0, since no
 log is rewritten.
 
 Refused by name: an in-memory shard; a shard without a WAL whose catalog
-does not qualify for the from-segments path (the single-image layout, no
-sealed segments, or no generation binding — `docs/replay-from-segments.md`
+does not qualify for the from-segments path (no sealed segments or no
+generation binding — `docs/replay-from-segments.md`
 has the path and its qualification); a generation that began with preexisting
 state its log does not hold (a snapshot install's; compaction would drop the
-image); a compaction already running on the shard; a bulk BM25 build in
-progress; no analysis backend; a non-empty work directory or a leftover
+image); a compaction already running on the shard; no analysis backend; a non-empty work directory or a leftover
 staged segment; a work directory on another filesystem; a compacted store
 whose field table or analyzer fingerprints differ from the shard's; a
 snapshot installed during the run (the WAL rotates under the tail, and the
 compaction aborts with the live shard untouched); a pending cutover whose
-closing flush has not run; a segment-layout tail still mid-row after the
-wait.
+closing flush has not run; a tail still mid-row at the cutover.
 
 ### Why the log is rewritten
 
@@ -206,8 +198,7 @@ for inspection after a rollback and refused by name until removed.
   The concurrent-write fixture still refuses lock holds above 500 ms.
 - The closing flush costs what any flush on the layout costs: a segmented
   flush seals the tail rows into one small segment and rewrites the
-  whole-shard FP32 sidecar; a single-image flush rewrites the image. It is
-  reported apart from the lock hold.
+  whole-shard FP32 sidecar. It is reported apart from the lock hold.
 - Tombstones written after the cutoff are carried into the new generation
   as tombstones; the next compaction takes them. A quiescent compaction ends
   with `deleted_docs = 0`.

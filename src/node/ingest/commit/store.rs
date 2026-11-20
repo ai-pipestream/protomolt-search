@@ -1,4 +1,4 @@
-//! Unified BM25 row and column insertion across `Segmented`, `Building`, and `Spilling` shards.
+//! Unified BM25 row and column insertion across `Segmented` and `Building` shards.
 
 use std::io;
 
@@ -7,7 +7,7 @@ use crate::node::*;
 use crate::postings::{AnalyzedDoc, DocLineage};
 use crate::source_archive::SourceArchive;
 
-/// Uniform row sink over [`Bm25Store`] (heap build or segmented tail) and [`SpillBuilder`].
+/// Row sink over [`Bm25Store`]: a path-less heap store or a segmented tail.
 trait Bm25RowSink {
     fn source_archive_mut(&mut self) -> &mut SourceArchive;
     fn add_row(
@@ -93,65 +93,6 @@ impl Bm25RowSink for Bm25Store {
     }
 }
 
-impl Bm25RowSink for SpillBuilder {
-    fn source_archive_mut(&mut self) -> &mut SourceArchive {
-        SpillBuilder::source_archive_mut(self)
-    }
-
-    fn add_row(
-        &mut self,
-        row_id: u32,
-        text: String,
-        analyzed: AnalyzedDoc,
-        lineage: Option<DocLineage>,
-    ) -> Result<(), Status> {
-        self.add_document_with_lineage(row_id, text, analyzed, lineage)
-            .map_err(|e| Status::internal(format!("spill write: {e}")))
-    }
-
-    fn set_facet(&mut self, fi: usize, row_id: u32, value: &str) {
-        SpillBuilder::set_facet(self, fi, row_id, value);
-    }
-
-    fn set_numeric(&mut self, ni: usize, row_id: u32, value: f64) {
-        SpillBuilder::set_numeric(self, ni, row_id, value);
-    }
-
-    fn set_map_facet(&mut self, ci: usize, row_id: u32, key: &str, value: &str) {
-        SpillBuilder::set_map_facet(self, ci, row_id, key, value);
-    }
-
-    fn set_map_numeric(&mut self, ci: usize, row_id: u32, key: &str, value: f64) {
-        SpillBuilder::set_map_numeric(self, ci, row_id, key, value);
-    }
-
-    fn set_map_integer(&mut self, ci: usize, row_id: u32, key: &str, value: i64) -> io::Result<()> {
-        SpillBuilder::set_map_integer(self, ci, row_id, key, value)
-    }
-
-    fn set_map_unsigned_integer(
-        &mut self,
-        ci: usize,
-        row_id: u32,
-        key: &str,
-        value: u64,
-    ) -> io::Result<()> {
-        SpillBuilder::set_map_unsigned_integer(self, ci, row_id, key, value)
-    }
-
-    fn set_integer(&mut self, ii: usize, row_id: u32, value: i64) {
-        SpillBuilder::set_integer(self, ii, row_id, value);
-    }
-
-    fn set_unsigned_integer(&mut self, ii: usize, row_id: u32, value: u64) {
-        SpillBuilder::set_unsigned_integer(self, ii, row_id, value);
-    }
-
-    fn set_geo(&mut self, gi: usize, row_id: u32, lat: f64, lon: f64) {
-        SpillBuilder::set_geo(self, gi, row_id, lat, lon);
-    }
-}
-
 /// Apply a validated document and its typed column slots to `shard`.
 pub(super) fn apply_bm25_row(
     shard: &mut Bm25Shard,
@@ -168,8 +109,6 @@ pub(super) fn apply_bm25_row(
             Ok(())
         }
         Bm25Shard::Building(store) => write_row_to_sink(store, doc_id, doc, analyzed, columns),
-        Bm25Shard::Spilling(builder) => write_row_to_sink(builder, doc_id, doc, analyzed, columns),
-        Bm25Shard::Resident(_) => Err(Status::internal("shard builder unavailable")),
     }
 }
 

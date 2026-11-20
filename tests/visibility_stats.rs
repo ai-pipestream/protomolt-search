@@ -347,121 +347,108 @@ async fn empty_and_malformed_views_cannot_become_an_unrestricted_request() {
 
 #[tokio::test]
 async fn visibility_survives_tombstones_flush_compaction_and_reopen() {
-    use pipestream_search::node::Layout;
     const DIM: usize = 16;
-    for layout in [Layout::SingleImage, Layout::Segments] {
-        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("visibility-{layout:?}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let cfg = NodeConfig {
-            index_path: Some(dir.join("shard.tv")),
-            layout,
-            seal_tail_docs: 2,
-            wal: true,
-            ..config()
-        };
-        let vectors = common::unit_vectors(ROWS.len(), DIM, 9026);
-        let (shift, scale) = common::fit_calibration(DIM, 4, &vectors);
-        let (addr, handle) = common::start_empty_node(cfg.clone()).await;
-        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("visibility-segments-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = NodeConfig {
+        index_path: Some(dir.join("shard.tv")),
+        seal_tail_docs: 2,
+        wal: true,
+        ..config()
+    };
+    let vectors = common::unit_vectors(ROWS.len(), DIM, 9026);
+    let (shift, scale) = common::fit_calibration(DIM, 4, &vectors);
+    let (addr, handle) = common::start_empty_node(cfg.clone()).await;
+    let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+    client
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, 4, &shift, &scale,
+        ))
+        .await
+        .unwrap();
+    for (i, rows) in ROWS.chunks(2).enumerate() {
+        ingest(&addr, rows).await;
         client
-            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-                DIM, 4, &shift, &scale,
-            ))
+            .add_vectors(tokio_stream::iter([AddVectorsRequest {
+                materialized_rows: Vec::new(),
+                vectors: vectors[i * 2 * DIM..(i + 1) * 2 * DIM].to_vec(),
+                dim: DIM as u32,
+            }]))
             .await
             .unwrap();
-        for (i, rows) in ROWS.chunks(2).enumerate() {
-            ingest(&addr, rows).await;
-            client
-                .add_vectors(tokio_stream::iter([AddVectorsRequest {
-                    materialized_rows: Vec::new(),
-                    vectors: vectors[i * 2 * DIM..(i + 1) * 2 * DIM].to_vec(),
-                    dim: DIM as u32,
-                }]))
-                .await
-                .unwrap();
-        }
-        client.flush(FlushRequest {}).await.unwrap();
-        let initial = stats(&addr, Some(visibility("public"))).await;
-        assert_eq!(initial.doc_count, 2);
-        client
-            .delete_documents(DeleteDocumentsRequest {
-                doc_ids: vec![0],
-                expected_wal_generation: None,
-            })
-            .await
-            .unwrap();
-        let after_delete = stats(&addr, Some(visibility("public"))).await;
-        assert_eq!(after_delete.doc_count, 1);
-        assert_eq!(after_delete.total_doc_length, 0);
-        assert_eq!(after_delete.doc_frequencies, vec![0, 0]);
-        assert_eq!(after_delete.field_stats[0].total_doc_length, 1);
-        assert_eq!(after_delete.field_stats[0].doc_frequencies, vec![1, 0]);
-        assert!(after_delete.stats_epoch > initial.stats_epoch);
-        client
-            .delete_documents(DeleteDocumentsRequest {
-                doc_ids: vec![1],
-                expected_wal_generation: None,
-            })
-            .await
-            .unwrap();
-        same_statistics(
-            &stats(&addr, Some(visibility("public"))).await,
-            &after_delete,
-        );
-        client.flush(FlushRequest {}).await.unwrap();
-        same_statistics(
-            &stats(&addr, Some(visibility("public"))).await,
-            &after_delete,
-        );
-        let compacted = client
-            .compact_shard(CompactShardRequest::default())
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(compacted.tombstones_reclaimed, 2);
-        same_statistics(
-            &stats(&addr, Some(visibility("public"))).await,
-            &after_delete,
-        );
-        client.flush(FlushRequest {}).await.unwrap();
-        drop(client);
-        handle.abort();
-        let _ = handle.await;
-        let (reopened, handle) = common::start_opened_node(cfg).await;
-        same_statistics(
-            &stats(&reopened, Some(visibility("public"))).await,
-            &after_delete,
-        );
-        handle.abort();
-        let _ = handle.await;
-        std::fs::remove_dir_all(&dir).unwrap();
     }
+    client.flush(FlushRequest {}).await.unwrap();
+    let initial = stats(&addr, Some(visibility("public"))).await;
+    assert_eq!(initial.doc_count, 2);
+    client
+        .delete_documents(DeleteDocumentsRequest {
+            doc_ids: vec![0],
+            expected_wal_generation: None,
+        })
+        .await
+        .unwrap();
+    let after_delete = stats(&addr, Some(visibility("public"))).await;
+    assert_eq!(after_delete.doc_count, 1);
+    assert_eq!(after_delete.total_doc_length, 0);
+    assert_eq!(after_delete.doc_frequencies, vec![0, 0]);
+    assert_eq!(after_delete.field_stats[0].total_doc_length, 1);
+    assert_eq!(after_delete.field_stats[0].doc_frequencies, vec![1, 0]);
+    assert!(after_delete.stats_epoch > initial.stats_epoch);
+    client
+        .delete_documents(DeleteDocumentsRequest {
+            doc_ids: vec![1],
+            expected_wal_generation: None,
+        })
+        .await
+        .unwrap();
+    same_statistics(
+        &stats(&addr, Some(visibility("public"))).await,
+        &after_delete,
+    );
+    client.flush(FlushRequest {}).await.unwrap();
+    same_statistics(
+        &stats(&addr, Some(visibility("public"))).await,
+        &after_delete,
+    );
+    let compacted = client
+        .compact_shard(CompactShardRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(compacted.tombstones_reclaimed, 2);
+    same_statistics(
+        &stats(&addr, Some(visibility("public"))).await,
+        &after_delete,
+    );
+    client.flush(FlushRequest {}).await.unwrap();
+    drop(client);
+    handle.abort();
+    let _ = handle.await;
+    let (reopened, handle) = common::start_opened_node(cfg).await;
+    same_statistics(
+        &stats(&reopened, Some(visibility("public"))).await,
+        &after_delete,
+    );
+    handle.abort();
+    let _ = handle.await;
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[tokio::test]
-async fn version_probe_works_during_bulk_build_and_rejects_statistics_inputs() {
+async fn version_probe_carries_the_version_and_rejects_statistics_inputs() {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("version-probe-bulk-{}", std::process::id()));
+        .join(format!("version-probe-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let (addr, handle) = common::start_empty_node(NodeConfig {
         index_path: Some(dir.join("shard.tv")),
-        layout: pipestream_search::node::Layout::SingleImage,
         ..config()
     })
     .await;
     ingest(&addr, &ROWS).await;
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
-    assert_eq!(
-        client
-            .term_stats(TermStatsRequest::default())
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::FailedPrecondition
-    );
     let probe = client
         .term_stats(TermStatsRequest {
             version_only: true,

@@ -114,30 +114,6 @@ fn segment_sources(
     Ok(sources)
 }
 
-/// The single-image generation's files that exist, as `(snapshot name, path)`.
-fn image_sources(guard: &ShardState, index_path: &Path) -> Vec<(String, PathBuf)> {
-    let mut sources: Vec<(String, PathBuf)> = Vec::new();
-    let (vector, exact, bm25) = storage_paths(index_path, guard.generation.as_ref());
-    let live = live_docs_storage_path(index_path, guard.generation.as_ref());
-    let retained = crate::multi_res::storage_path(index_path, guard.generation.as_ref());
-    for (name, path) in [
-        ("vector.index", vector),
-        ("vectors.f32", exact),
-        ("documents.bm25", bm25),
-        ("live-docs.bin", live),
-        (
-            "vectors.multi.json",
-            crate::multi_res_storage::declaration_path(&retained),
-        ),
-        ("vectors.multi", retained),
-    ] {
-        if path.is_file() {
-            sources.push((name.to_string(), path));
-        }
-    }
-    sources
-}
-
 /// Copy and hash every source into `directory`, then fsync each directory
 /// written. Returns the artifacts and their total bytes.
 fn copy_sources(
@@ -166,22 +142,6 @@ fn copy_sources(
 }
 
 impl NodeServiceImpl {
-    /// The layout the shard's files form: the segment catalog, or one
-    /// image plus sidecars (an installed generation is always the latter).
-    pub(in crate::node) fn served_layout(guard: &ShardState) -> &'static str {
-        if guard.generation.is_none()
-            && (matches!(guard.bm25, Some(Bm25Shard::Segmented(_)))
-                || guard
-                    .index
-                    .as_ref()
-                    .is_some_and(|index| index.as_segmented().is_some()))
-        {
-            LAYOUT_SEGMENTS
-        } else {
-            LAYOUT_SINGLE_IMAGE
-        }
-    }
-
     /// Per-field analysis fingerprints of the BM25 store, in field-table
     /// order (empty without a store).
     pub fn analysis_fingerprints(&self) -> Vec<u64> {
@@ -197,14 +157,12 @@ impl NodeServiceImpl {
         })
     }
 
-    /// Sealed immutable segments of the shard: the catalog's parts for
-    /// the segment layout, one for a disk-resident single image, zero
-    /// for a heap builder or an empty shard.
+    /// Sealed immutable segments of the shard: the catalog's parts, zero
+    /// for a heap store or an empty shard.
     pub fn immutable_segments(&self) -> u32 {
         let guard = read_shard(&self.state);
         match guard.bm25.as_ref() {
             Some(Bm25Shard::Segmented(shard)) => shard.sealed_parts() as u32,
-            Some(Bm25Shard::Resident(_)) => 1,
             _ => 0,
         }
     }
@@ -216,7 +174,7 @@ impl NodeServiceImpl {
         &self,
         directory: &Path,
     ) -> Result<ExportSnapshotResponse, Status> {
-        read_shard(&self.state).check_legacy_mutation()?;
+        read_shard(&self.state).check_index_owned_write()?;
         let index_path = self.config.index_path.clone().ok_or_else(|| {
             Status::failed_precondition(
                 "shard has no persistence path (index_path); a snapshot export needs one",
@@ -240,18 +198,22 @@ impl NodeServiceImpl {
         }
         self.flush_index()?;
         let started = std::time::Instant::now();
-        let mut attempts = 0u32;
-        let (manifest, bytes) = loop {
-            attempts += 1;
-            if let Some(copy) = self.export_if_flushed(&index_path, directory)? {
-                break copy;
+        // Attempt 1 is lock-free. A seal writes with the shard lock free,
+        // so steady ingest can dirty a fresh tail during every seal and
+        // starve a flush-then-check loop forever; when that happens, one
+        // retry holds the mutation gate across its seal and copy, so
+        // appends pause for a single small seal instead.
+        let (manifest, bytes) = match self.export_if_flushed(&index_path, directory)? {
+            Some(copy) => copy,
+            None => {
+                let _mutation = self.mutation_gate.blocking_write();
+                self.flush_index()?;
+                self.export_if_flushed(&index_path, directory)?.ok_or_else(|| {
+                    Status::aborted(
+                        "shard stayed dirty under an ingest drain; a snapshot copies a                          flushed generation, retry when ingest pauses",
+                    )
+                })?
             }
-            if attempts >= 8 {
-                return Err(Status::aborted(format!(
-                    "shard kept writing through {attempts} flushes; a snapshot copies a flushed generation, retry when ingest pauses"
-                )));
-            }
-            self.flush_index()?;
         };
         let copy_millis = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         let (manifest_path, manifest_sha256) = repo::write_manifest(directory, &manifest)
@@ -276,7 +238,7 @@ impl NodeServiceImpl {
     ) -> Result<Option<(RepositoryManifest, u64)>, Status> {
         let _sealing = self.seal_lock.lock().expect("seal lock poisoned");
         let guard = read_shard(&self.state);
-        guard.check_legacy_mutation()?;
+        guard.check_index_owned_write()?;
         guard.check_catalog_publication()?;
         if !guard.files_current || guard.wal.as_ref().is_some_and(|wal| wal.is_dirty()) {
             return Ok(None);
@@ -291,13 +253,8 @@ impl NodeServiceImpl {
         index_path: &Path,
         directory: &Path,
     ) -> Result<(RepositoryManifest, u64), Status> {
-        guard.check_legacy_mutation()?;
-        let layout = Self::served_layout(guard);
-        let sources = if layout == LAYOUT_SEGMENTS {
-            segment_sources(guard, index_path)?
-        } else {
-            image_sources(guard, index_path)
-        };
+        guard.check_index_owned_write()?;
+        let sources = segment_sources(guard, index_path)?;
         let (artifacts, bytes) = copy_sources(&sources, directory)?;
         let (backend_kind, scoring_fingerprint, dim) = match guard.index.as_ref() {
             Some(index) => {
@@ -325,7 +282,7 @@ impl NodeServiceImpl {
                 } else {
                     repo::FORMAT_VERSION
                 },
-                layout: layout.to_string(),
+                layout: LAYOUT_SEGMENTS.to_string(),
                 backend_kind,
                 scoring_fingerprint,
                 dim,

@@ -18,15 +18,6 @@ impl NodeServiceImpl {
         let scope = crate::visibility::VisibilityScope::new(visibility)?;
         let filter = visibility.and_then(|view| view.filter.as_ref());
         let guard = read_shard(&self.state);
-        if guard
-            .bm25
-            .as_ref()
-            .is_some_and(|store| store.as_index().is_none())
-        {
-            return Err(Status::failed_precondition(
-                "bm25 bulk build in progress; Flush first",
-            ));
-        }
         let (_, columns_known) = filter_known_flags(guard.bm25.as_ref(), &[], filter);
         let mut response = crate::pb::SuggestTermsResponse {
             visibility_fingerprint: scope.fingerprint().to_vec(),
@@ -44,7 +35,7 @@ impl NodeServiceImpl {
         let Some(fi) = store.field_index(field) else {
             return Ok(response);
         };
-        let index = store.field_view(fi).expect("searchability checked above");
+        let index = store.field_view(fi);
         let entries = if visibility.is_some() {
             let (_, allow, _) = resolve_shard_filters(
                 Some(store),

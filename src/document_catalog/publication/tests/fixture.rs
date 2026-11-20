@@ -62,7 +62,6 @@ impl Fixture {
                 ..Default::default()
             },
             None,
-            false,
         )
         .unwrap();
         Self {

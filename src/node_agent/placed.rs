@@ -100,12 +100,10 @@ impl NodeAgent {
         config.collection = placed.collection.clone();
         config.wal = true;
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-        Ok(NodeServiceImpl::open(
-            config,
-            self.inner.config.phrase_index.clone(),
-            self.inner.config.allow_missing_bm25,
-        )?
-        .with_flush_notify(Arc::clone(&self.inner.flush_notify)))
+        Ok(
+            NodeServiceImpl::open(config, self.inner.config.phrase_index.clone())?
+                .with_flush_notify(Arc::clone(&self.inner.flush_notify)),
+        )
     }
 
     /// The shard's listener: the port it bound before, else the next one

@@ -159,7 +159,8 @@ pub fn merge_shard_layouts(
     let mut placement: Option<(bool, u64)> = None;
     for (child, layout) in layouts.iter().enumerate() {
         let addr = children.get(child).map_or("", String::as_str);
-        let served = layout.layout == "segments" || layout.layout == "single-image";
+        let served = layout.layout == crate::snapshot_repository::LAYOUT_SEGMENTS
+            || layout.layout == crate::node::LAYOUT_MEMORY;
         if !served {
             notes.push(format!(
                 "child {child} ({addr}) unserved: {}",

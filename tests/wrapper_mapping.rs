@@ -508,11 +508,7 @@ fn explicit_bind() -> pb::MappedBind {
         ..bind()
     }
 }
-fn inspect_sources(
-    path: &std::path::Path,
-    layout: pipestream_search::node::Layout,
-    expected: &std::collections::BTreeMap<u64, Vec<u8>>,
-) {
+fn inspect_sources(path: &std::path::Path, expected: &std::collections::BTreeMap<u64, Vec<u8>>) {
     use pipestream_search::{node, postings::Bm25Reader, segments::OpenedSegmentSet};
     let mut found = std::collections::BTreeMap::new();
     let mut inspect = |reader: &Bm25Reader| {
@@ -546,23 +542,11 @@ fn inspect_sources(
             assert!(found.insert(id, source.payload).is_none());
         }
     };
-    match layout {
-        node::Layout::SingleImage => {
-            let generation = node::generation_dir(path);
-            let image = if generation.exists() {
-                node::generation_bm25(&generation)
-            } else {
-                node::bm25_sidecar_path(path)
-            };
-            inspect(&Bm25Reader::open(&image).unwrap());
-        }
-        node::Layout::Segments => {
-            let segments = OpenedSegmentSet::open(node::segments_root(path)).unwrap();
-            for part in 0..segments.len() {
-                inspect(segments.bm25(part));
-            }
-        }
+    let segments = OpenedSegmentSet::open(node::segments_root(path)).unwrap();
+    for part in 0..segments.len() {
+        inspect(segments.bm25(part));
     }
+
     assert_eq!(&found, expected);
 }
 #[tokio::test]
@@ -584,7 +568,7 @@ async fn wrapper_lifecycle(explicit: bool) {
     use pipestream_search::{
         analyzer::body_spec,
         coordinator::CoordinatorServiceImpl,
-        node::{Layout, NodeConfig},
+        node::NodeConfig,
         pb::{
             node_service_client::NodeServiceClient, projected_value::Value,
             search_service_server::SearchService,
@@ -619,79 +603,193 @@ async fn wrapper_lifecycle(explicit: bool) {
         },
     ];
     let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 94217));
-    for (label, layout) in [
-        ("single", Layout::SingleImage),
-        ("segments", Layout::Segments),
-    ] {
-        let directory = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-            "wrapper_mapping_{explicit}_{label}_{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("shard.tv");
-        let config = NodeConfig {
-            index_path: Some(path.clone()),
-            layout,
-            wal: true,
-            wal_buckets: 2,
-            seal_tail_docs: 2,
-            analysis_addr: Some(analysis.clone()),
-            bm25_fields: vec!["body".into(), "nested_caption".into()],
-            facet_fields: ["enabled", "status", "keyword_id"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-            integer_fields: [
-                "signed",
-                "small_signed",
-                "selected",
-                "total",
-                "nested_number",
-            ]
+    let label = "segments";
+    let directory = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "wrapper_mapping_{explicit}_{label}_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("shard.tv");
+    let config = NodeConfig {
+        index_path: Some(path.clone()),
+        wal: true,
+        wal_buckets: 2,
+        seal_tail_docs: 2,
+        analysis_addr: Some(analysis.clone()),
+        bm25_fields: vec!["body".into(), "nested_caption".into()],
+        facet_fields: ["enabled", "status", "keyword_id"]
             .into_iter()
             .map(str::to_owned)
             .collect(),
-            unsigned_integer_fields: ["id", "unsigned", "small_unsigned"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-            numeric_fields: vec!["ratio".into(), "weight".into()],
-            ..Default::default()
-        };
-        let (mut address, mut server) = common::start_empty_node(config.clone()).await;
-        let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
+        integer_fields: [
+            "signed",
+            "small_signed",
+            "selected",
+            "total",
+            "nested_number",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        unsigned_integer_fields: ["id", "unsigned", "small_unsigned"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        numeric_fields: vec!["ratio".into(), "weight".into()],
+        ..Default::default()
+    };
+    let (mut address, mut server) = common::start_empty_node(config.clone()).await;
+    let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
+    client
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            8, 4, &shift, &scale,
+        ))
+        .await
+        .unwrap();
+    if explicit {
+        let mut invalid = binding.clone();
+        invalid.field_analysis[1]
+            .analysis
+            .as_mut()
+            .unwrap()
+            .tokenizer = 2;
+        let error = client
+            .ingest_mapped(tokio_stream::iter(vec![pb::IngestMappedRequest {
+                payload: Some(pb::ingest_mapped_request::Payload::Bind(invalid)),
+            }]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
         client
-            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-                8, 4, &shift, &scale,
-            ))
+            .ingest_mapped(tokio_stream::iter(vec![pb::IngestMappedRequest {
+                payload: Some(pb::ingest_mapped_request::Payload::Bind(binding.clone())),
+            }]))
             .await
             .unwrap();
-        if explicit {
-            let mut invalid = binding.clone();
-            invalid.field_analysis[1]
-                .analysis
-                .as_mut()
+        client.flush(pb::FlushRequest {}).await.unwrap();
+        drop(client);
+        server.abort();
+        let _ = server.await;
+        (address, server) = common::start_opened_node(config.clone()).await;
+        client = NodeServiceClient::connect(address.clone()).await.unwrap();
+        let mut changed = binding.clone();
+        changed.field_analysis[1].analysis = Some(body_spec());
+        let error = client
+            .ingest_mapped(tokio_stream::iter(vec![pb::IngestMappedRequest {
+                payload: Some(pb::ingest_mapped_request::Payload::Bind(changed)),
+            }]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+    let mut expected = std::collections::BTreeMap::new();
+    let mut requests = vec![pb::IngestMappedRequest {
+        payload: Some(pb::ingest_mapped_request::Payload::Bind(binding.clone())),
+    }];
+    for doc in &documents {
+        let mut bytes = doc.encode_to_vec();
+        bytes.extend([0xa0, 0x06, 0x7b]); // Unknown field 100.
+        expected.insert(doc.id.unwrap(), bytes.clone());
+        requests.push(pb::IngestMappedRequest {
+            payload: Some(pb::ingest_mapped_request::Payload::Document(bytes)),
+        });
+    }
+    assert_eq!(
+        client
+            .ingest_mapped(tokio_stream::iter(requests))
+            .await
+            .unwrap()
+            .into_inner()
+            .added,
+        3
+    );
+    client.flush(pb::FlushRequest {}).await.unwrap();
+    inspect_sources(&path, &expected);
+    for pass in 0..3 {
+        drop(client);
+        server.abort();
+        let _ = server.await;
+        (address, server) = common::start_opened_node(config.clone()).await;
+        client = NodeServiceClient::connect(address.clone()).await.unwrap();
+        let coordinator = CoordinatorServiceImpl::new(vec![address.clone()])
+            .with_bm25(Some(analysis.clone()), Default::default());
+        for (&id, bytes) in &expected {
+            let original = Record::decode(bytes.as_slice()).unwrap();
+            let filter = match original.unsigned {
+                Some(v) => format!("id == {id}u && unsigned == {v}u"),
+                None => format!("id == {id}u && !has(unsigned)"),
+            };
+            let filter = match &original.status {
+                Some(value) => format!(
+                    "{filter} && has(status) && status == {}",
+                    serde_json::to_string(value).unwrap()
+                ),
+                None => format!("{filter} && !has(status)"),
+            };
+            let result = coordinator
+                .bm25_search(tonic::Request::new(pb::Bm25SearchRequest {
+                    text: "word".into(),
+                    analysis: Some(body_spec()),
+                    k: 3,
+                    filter,
+                    projections: [
+                        "signed",
+                        "unsigned",
+                        "total",
+                        "enabled",
+                        "status",
+                        "ratio",
+                        "nested_number",
+                    ]
+                    .into_iter()
+                    .map(|name| pb::NamedProjection {
+                        name: name.into(),
+                        expression: name.into(),
+                    })
+                    .collect(),
+                    ..Default::default()
+                }))
+                .await
                 .unwrap()
-                .tokenizer = 2;
-            let error = client
-                .ingest_mapped(tokio_stream::iter(vec![pb::IngestMappedRequest {
-                    payload: Some(pb::ingest_mapped_request::Payload::Bind(invalid)),
-                }]))
-                .await
-                .unwrap_err();
-            assert_eq!(error.code(), tonic::Code::InvalidArgument);
-            client
-                .ingest_mapped(tokio_stream::iter(vec![pb::IngestMappedRequest {
-                    payload: Some(pb::ingest_mapped_request::Payload::Bind(binding.clone())),
-                }]))
-                .await
-                .unwrap();
-            client.flush(pb::FlushRequest {}).await.unwrap();
-            drop(client);
-            server.abort();
-            let _ = server.await;
-            (address, server) = common::start_opened_node(config.clone()).await;
-            client = NodeServiceClient::connect(address.clone()).await.unwrap();
+                .into_inner();
+            assert_eq!(result.hits.len(), 1);
+            let values: Vec<_> = result.hits[0]
+                .projected
+                .iter()
+                .map(|v| v.value.clone())
+                .collect();
+            assert_eq!(
+                values,
+                vec![
+                    original.signed.map(Value::IntValue),
+                    original.unsigned.map(Value::UintValue),
+                    original.renamed.map(Value::IntValue),
+                    original.enabled.map(|v| Value::StringValue(v.to_string())),
+                    original.status.map(Value::StringValue),
+                    original.ratio.map(|v| Value::DoubleValue(f64::from(v))),
+                    original.nested.and_then(|v| v.number).map(Value::IntValue)
+                ]
+            );
+        }
+        if explicit {
+            for (text, count) in [("NESTED", 1), ("nested", 0)] {
+                let result = coordinator
+                    .bm25_search(tonic::Request::new(pb::Bm25SearchRequest {
+                        text: text.into(),
+                        k: 3,
+                        fields: vec![pb::QueryField {
+                            field: "nested_caption".into(),
+                            weight: 1.0,
+                            analysis: Some(pipestream_search::analyzer::cased_body_spec()),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(result.hits.len(), count);
+            }
             let mut changed = binding.clone();
             changed.field_analysis[1].analysis = Some(body_spec());
             let error = client
@@ -701,169 +799,49 @@ async fn wrapper_lifecycle(explicit: bool) {
                 .await
                 .unwrap_err();
             assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-        }
-        let mut expected = std::collections::BTreeMap::new();
-        let mut requests = vec![pb::IngestMappedRequest {
-            payload: Some(pb::ingest_mapped_request::Payload::Bind(binding.clone())),
-        }];
-        for doc in &documents {
-            let mut bytes = doc.encode_to_vec();
-            bytes.extend([0xa0, 0x06, 0x7b]); // Unknown field 100.
-            expected.insert(doc.id.unwrap(), bytes.clone());
-            requests.push(pb::IngestMappedRequest {
-                payload: Some(pb::ingest_mapped_request::Payload::Document(bytes)),
-            });
-        }
-        assert_eq!(
-            client
-                .ingest_mapped(tokio_stream::iter(requests))
-                .await
+            let generation =
+                pipestream_search::reshard::resolve_gen(&pipestream_search::wal::wal_dir(&path))
+                    .unwrap();
+            let bound = pipestream_search::reshard::read_generation_binding(&generation)
                 .unwrap()
-                .into_inner()
-                .added,
-            3
-        );
-        client.flush(pb::FlushRequest {}).await.unwrap();
-        inspect_sources(&path, layout, &expected);
-        for pass in 0..3 {
-            drop(client);
-            server.abort();
-            let _ = server.await;
-            (address, server) = common::start_opened_node(config.clone()).await;
-            client = NodeServiceClient::connect(address.clone()).await.unwrap();
-            let coordinator = CoordinatorServiceImpl::new(vec![address.clone()])
-                .with_bm25(Some(analysis.clone()), Default::default());
-            for (&id, bytes) in &expected {
-                let original = Record::decode(bytes.as_slice()).unwrap();
-                let filter = match original.unsigned {
-                    Some(v) => format!("id == {id}u && unsigned == {v}u"),
-                    None => format!("id == {id}u && !has(unsigned)"),
-                };
-                let filter = match &original.status {
-                    Some(value) => format!(
-                        "{filter} && has(status) && status == {}",
-                        serde_json::to_string(value).unwrap()
-                    ),
-                    None => format!("{filter} && !has(status)"),
-                };
-                let result = coordinator
-                    .bm25_search(tonic::Request::new(pb::Bm25SearchRequest {
-                        text: "word".into(),
-                        analysis: Some(body_spec()),
-                        k: 3,
-                        filter,
-                        projections: [
-                            "signed",
-                            "unsigned",
-                            "total",
-                            "enabled",
-                            "status",
-                            "ratio",
-                            "nested_number",
-                        ]
-                        .into_iter()
-                        .map(|name| pb::NamedProjection {
-                            name: name.into(),
-                            expression: name.into(),
-                        })
-                        .collect(),
-                        ..Default::default()
-                    }))
-                    .await
-                    .unwrap()
-                    .into_inner();
-                assert_eq!(result.hits.len(), 1);
-                let values: Vec<_> = result.hits[0]
-                    .projected
-                    .iter()
-                    .map(|v| v.value.clone())
-                    .collect();
-                assert_eq!(
-                    values,
-                    vec![
-                        original.signed.map(Value::IntValue),
-                        original.unsigned.map(Value::UintValue),
-                        original.renamed.map(Value::IntValue),
-                        original.enabled.map(|v| Value::StringValue(v.to_string())),
-                        original.status.map(Value::StringValue),
-                        original.ratio.map(|v| Value::DoubleValue(f64::from(v))),
-                        original.nested.and_then(|v| v.number).map(Value::IntValue)
-                    ]
-                );
-            }
-            if explicit {
-                for (text, count) in [("NESTED", 1), ("nested", 0)] {
-                    let result = coordinator
-                        .bm25_search(tonic::Request::new(pb::Bm25SearchRequest {
-                            text: text.into(),
-                            k: 3,
-                            fields: vec![pb::QueryField {
-                                field: "nested_caption".into(),
-                                weight: 1.0,
-                                analysis: Some(pipestream_search::analyzer::cased_body_spec()),
-                                ..Default::default()
-                            }],
-                            ..Default::default()
-                        }))
-                        .await
-                        .unwrap()
-                        .into_inner();
-                    assert_eq!(result.hits.len(), count);
-                }
-                let mut changed = binding.clone();
-                changed.field_analysis[1].analysis = Some(body_spec());
-                let error = client
-                    .ingest_mapped(tokio_stream::iter(vec![pb::IngestMappedRequest {
-                        payload: Some(pb::ingest_mapped_request::Payload::Bind(changed)),
-                    }]))
-                    .await
-                    .unwrap_err();
-                assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-                let generation = pipestream_search::reshard::resolve_gen(
-                    &pipestream_search::wal::wal_dir(&path),
-                )
                 .unwrap();
-                let bound = pipestream_search::reshard::read_generation_binding(&generation)
+            assert_eq!(bound.analysis_sha.len(), 64);
+            assert!(!bound.vector_binding.is_empty());
+            assert!(
+                pipestream_search::wal::read_manifest(&generation)
                     .unwrap()
-                    .unwrap();
-                assert_eq!(bound.analysis_sha.len(), 64);
-                assert!(!bound.vector_binding.is_empty());
-                assert!(
-                    pipestream_search::wal::read_manifest(&generation)
-                        .unwrap()
-                        .format_version
-                        >= 5
-                );
-            }
-            if pass == 0 {
-                client
-                    .delete_documents(pb::DeleteDocumentsRequest {
-                        doc_ids: vec![1],
-                        ..Default::default()
-                    })
-                    .await
-                    .unwrap();
-                expected.remove(&1);
-            }
-            if pass < 2 {
-                client
-                    .compact_shard(pb::CompactShardRequest {
-                        work_dir: directory
-                            .join(format!("compact-{pass}"))
-                            .display()
-                            .to_string(),
-                        ..Default::default()
-                    })
-                    .await
-                    .unwrap();
-            }
-            inspect_sources(&path, layout, &expected);
+                    .format_version
+                    >= 5
+            );
         }
-        server.abort();
-        let _ = server.await;
-        drop(client);
-        std::fs::remove_dir_all(directory).unwrap();
+        if pass == 0 {
+            client
+                .delete_documents(pb::DeleteDocumentsRequest {
+                    doc_ids: vec![1],
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            expected.remove(&1);
+        }
+        if pass < 2 {
+            client
+                .compact_shard(pb::CompactShardRequest {
+                    work_dir: directory
+                        .join(format!("compact-{pass}"))
+                        .display()
+                        .to_string(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        inspect_sources(&path, &expected);
     }
+    server.abort();
+    let _ = server.await;
+    drop(client);
+    std::fs::remove_dir_all(directory).unwrap();
     mock.abort();
     let _ = mock.await;
 }

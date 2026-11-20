@@ -99,27 +99,29 @@ fn log_vectors(
 /// Refuse an append whose exact-vector sidecar does not line up with the
 /// provider.
 fn check_exact_shape(guard: &ShardState, dim: usize, index_len: usize) -> Result<(), Status> {
+    // The provider's length counts every catalog row, sealed document-only
+    // rows included: vectors arriving after such a seal have no segment to
+    // join.
+    let sealed_without_vectors: u64 = guard
+        .index
+        .as_ref()
+        .and_then(VectorIndex::as_segmented)
+        .map_or(0, |provider| {
+            let set = provider.snapshot();
+            (0..set.len())
+                .filter(|&i| set.vector(i).is_none())
+                .map(|i| set.metadata(i).rows)
+                .sum()
+        });
+    if sealed_without_vectors > 0 {
+        return Err(Status::failed_precondition(format!(
+            "{sealed_without_vectors} rows are sealed in segments without vectors; \
+             vectors seal with their documents, so send AddVectors for each \
+             AddDocuments batch before the next (or ingest through IngestMapped)"
+        )));
+    }
     let exact = guard.exact_vectors.as_ref().expect("ensured above");
     if exact.len() != index_len || exact.dim() != Some(dim) {
-        // On the segment layout the provider's length counts every
-        // catalog row, sealed document-only rows included: vectors
-        // arriving after such a seal have no segment to join.
-        let tail_len = guard
-            .index
-            .as_ref()
-            .and_then(VectorIndex::as_segmented)
-            .map_or(index_len, |p| p.tail().len());
-        let sealed_without_vectors = index_len
-            .saturating_sub(tail_len)
-            .saturating_sub(exact.len());
-        if sealed_without_vectors > 0 {
-            return Err(Status::failed_precondition(format!(
-                "{sealed_without_vectors} rows are sealed in segments without vectors; \
-                 vectors seal with their documents, so send AddVectors for each \
-                 AddDocuments batch before the next (or ingest through IngestMapped), \
-                 or run this shard with --layout=single-image"
-            )));
-        }
         return Err(Status::failed_precondition(format!(
             "exact-vector sidecar shape {:?}x{} does not match provider shape {dim}x{index_len}",
             exact.dim(),
@@ -286,7 +288,7 @@ impl NodeServiceImpl {
                      rebuild or backfill the generation before appending"
                 )));
             }
-            let store = self.fresh_exact_store(guard.generation.as_ref(), dim)?;
+            let store = self.fresh_exact_store(dim)?;
             guard.exact_vectors = Some(store);
         }
         check_exact_shape(guard, dim, index_len)?;
@@ -301,7 +303,7 @@ impl NodeServiceImpl {
         batch: AddVectorsRequest,
         stable_routing_key: Option<Vec<u8>>,
     ) -> Result<(u64, u64), Status> {
-        guard.check_legacy_mutation()?;
+        guard.check_index_owned_write()?;
         let materialized =
             crate::multi_res_wal::decode_batch(&batch).map_err(Status::invalid_argument)?;
         if batch.vectors.is_empty() {

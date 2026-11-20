@@ -68,7 +68,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             control_compact_segments, control_compact_tombstone_ppm];
         shard_set => [shards, vocab_window_docs, vocab_top_k];
         scan => [chunk_blocks, share_floors, block_max, segment_pruning, shard_pruning,
-            allow_missing_bm25, coalesce, scan_parallel, rerank_parallel];
+            coalesce, scan_parallel, rerank_parallel];
         floors => [floor_delta, floor_warmup_chunks, floor_min_interval_ms, shard_deadline_ms,
             hedge_delay_ms];
         placement => [placement_column, placement_leaf, placement_tree, derived];
@@ -84,7 +84,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         phrases => [phrase_glossary, phrase_field, entity_map_field, phrase_ignore_case,
             phrase_ner, position_fields, bigram_fields, sentence_fields];
         security => [tls, client_tls, allow_plaintext, principals, udp_hmac_key];
-        storage => [layout, seal_tail_docs, vector_mmap];
+        storage => [seal_tail_docs, vector_mmap];
         turbo => [turbo_nlp_columns, turbo_one_pass_query, turbo_rerank_endpoint,
             turbo_rerank_model, turbo_matryoshka_dims, turbo_matryoshka_active_dim,
             turbo_vocab_endpoint, turbo_model_sha256, turbo_bearer_token];

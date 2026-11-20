@@ -1,16 +1,15 @@
-//! Startup attachment of preloaded stores, sidecars, and generation state.
+//! Startup attachment of preloaded stores and sidecars.
 
 use crate::node::*;
 
 impl NodeServiceImpl {
-    /// Attach a preloaded BM25 shard (from `<index path>.bm25`). The
-    /// store's persisted mapped-plan binding becomes the shard's: the
-    /// file IS the durable record of what its columns were written
-    /// under.
+    /// Attach a preloaded BM25 shard. The store's persisted mapped-plan
+    /// binding becomes the shard's: the catalog IS the durable record of
+    /// what its columns were written under.
     pub fn with_bm25(self, store: Option<Bm25Shard>) -> Self {
         {
             let mut guard = write_shard(&self.state);
-            if let Err(error) = guard.check_legacy_mutation() {
+            if let Err(error) = guard.check_index_owned_write() {
                 drop(guard);
                 panic!("{error}");
             }
@@ -18,10 +17,8 @@ impl NodeServiceImpl {
                 if let Some(owner) = &shard.snapshot().manifest().source_owner {
                     let owner = owner.decode().expect("validated source owner");
                     assert!(
-                        owner.collection == self.config.collection
-                            && !self.config.wal
-                            && self.config.layout == Layout::Segments,
-                        "source-managed index requires its original collection, segmented layout and WAL disabled"
+                        owner.collection == self.config.collection && !self.config.wal,
+                        "source-managed index requires its original collection and WAL disabled"
                     );
                     let set = shard.snapshot();
                     let has_vectors = (0..set.len()).any(|i| set.vector(i).is_some());
@@ -146,22 +143,5 @@ impl NodeServiceImpl {
             guard.live_docs = live_docs;
         }
         Ok(self)
-    }
-
-    /// Mark the shard as serving from a snapshot generation directory
-    /// (startup found one via [`recover_generation`]): Flush and the
-    /// AddDocuments reload path then read/write inside it.
-    pub fn with_generation(self, dir: Option<PathBuf>) -> Self {
-        {
-            let mut guard = write_shard(&self.state);
-            if dir.is_some() {
-                if let Err(error) = guard.check_legacy_mutation() {
-                    drop(guard);
-                    panic!("{error}");
-                }
-            }
-            guard.generation = dir;
-        }
-        self
     }
 }

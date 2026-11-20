@@ -144,15 +144,10 @@ impl NodeServiceImpl {
         let Some(store) = guard.bm25.as_ref() else {
             return Ok(echo.unscored(false, req.initial_floor));
         };
-        if store.as_index().is_none() {
-            return Err(Status::failed_precondition(
-                "bm25 bulk build in progress; Flush first",
-            ));
-        }
         let Some(fi) = store.field_index(field) else {
             return Ok(echo.unscored(false, req.initial_floor));
         };
-        let index = store.field_view(fi).expect("searchability checked above");
+        let index = store.field_view(fi);
         if !index.has_splade() {
             return Ok(echo.unscored(true, req.initial_floor));
         }

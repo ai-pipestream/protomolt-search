@@ -16,7 +16,6 @@ use super::{manifest_backup_path, marker_path, MARKER_FORMAT};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct CommitMarker {
     pub(super) format: u32,
-    pub(super) layout: String,
     pub(super) old_wal_generation: u64,
     pub(super) new_wal_generation: u64,
     /// The from-segments path (a catalog without a WAL) writes no
@@ -25,13 +24,8 @@ pub(super) struct CommitMarker {
     #[serde(default)]
     pub(super) walless: bool,
     pub(super) work_dir: PathBuf,
-    /// Single-image: whether the shard served a snapshot generation
-    /// before the cutover (moved to `<index>.snap-old`), as opposed to
-    /// the legacy `<index>` file layout (its files listed below).
-    pub(super) previous_snapshot: bool,
-    pub(super) legacy_files: Vec<PathBuf>,
-    /// Segments: the outputs staged under the catalog and the inputs
-    /// they replace, by id.
+    /// The outputs staged under the catalog and the inputs they
+    /// replace, by id.
     pub(super) staged_segments: Vec<String>,
     pub(super) replaced_segments: Vec<String>,
 }
@@ -73,21 +67,11 @@ impl PendingCommit {
                 }
             }
         };
-        if self.marker.layout == "segments" {
-            let root = crate::node::segments_root(&self.index_path);
-            for id in &self.marker.replaced_segments {
-                retire_dir(&SegmentCatalog::segment_dir(&root, id));
-            }
-            retire_file(&manifest_backup_path(&root));
-        } else {
-            retire_dir(&crate::node::generation_old_dir(&self.index_path));
-            for file in &self.marker.legacy_files {
-                retire_file(file);
-            }
-            retire_dir(&crate::node::bm25_build_dir(
-                &crate::node::bm25_sidecar_path(&self.index_path),
-            ));
+        let root = crate::node::segments_root(&self.index_path);
+        for id in &self.marker.replaced_segments {
+            retire_dir(&SegmentCatalog::segment_dir(&root, id));
         }
+        retire_file(&manifest_backup_path(&root));
         Ok(())
     }
 }
@@ -114,21 +98,16 @@ pub(super) fn write_marker(index_path: &Path, marker: &CommitMarker) -> std::io:
 /// cutover makes is undone in reverse where it happened and skipped
 /// where it did not, so any crash point recovers to the generation the
 /// compaction replaced — which lost nothing that was ever flushed, the
-/// product's durability point. Runs first thing in
-/// [`crate::node::recover_generation`]; a shard without a marker is
-/// untouched. Loud on stderr; a marker it cannot read is a hard stop
+/// product's durability point. Runs when a persisted shard opens; a
+/// shard without a marker is untouched. Loud on stderr; a marker it cannot read is a hard stop
 /// rather than a guess.
-pub(crate) fn recover_interrupted(index_path: &Path) {
+pub fn recover_interrupted(index_path: &Path) {
     let path = marker_path(index_path);
     if !path.exists() {
         return;
     }
     let marker = read_marker(&path);
-    if marker.layout == "segments" {
-        roll_back_segments(index_path, &path, &marker);
-    } else {
-        roll_back_generation(index_path, &marker);
-    }
+    roll_back_segments(index_path, &path, &marker);
     if !marker.walless {
         let new_gen = wal::gen_dir(&wal::wal_dir(index_path), marker.new_wal_generation);
         if new_gen.exists() {
@@ -213,31 +192,5 @@ fn roll_back_segments(index_path: &Path, path: &Path, marker: &CommitMarker) {
         if dir.exists() {
             must("remove a staged segment", std::fs::remove_dir_all(&dir));
         }
-    }
-}
-
-fn roll_back_generation(index_path: &Path, marker: &CommitMarker) {
-    let snap = crate::node::generation_dir(index_path);
-    let old = crate::node::generation_old_dir(index_path);
-    if old.exists() {
-        // The swap began: the old generation is aside. Whether the
-        // new one got renamed in or not, put the old one back.
-        if snap.exists() {
-            must(
-                "remove the compacted generation",
-                std::fs::remove_dir_all(&snap),
-            );
-        }
-        must(
-            "restore the previous generation",
-            std::fs::rename(&old, &snap),
-        );
-    } else if !marker.previous_snapshot && snap.exists() {
-        // Legacy layout: nothing was moved aside, so a generation
-        // directory can only be the compacted one.
-        must(
-            "remove the compacted generation",
-            std::fs::remove_dir_all(&snap),
-        );
     }
 }

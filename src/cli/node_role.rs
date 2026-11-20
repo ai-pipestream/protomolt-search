@@ -8,7 +8,7 @@ use pipestream_search::node::{NodeConfig, NodeServiceImpl};
 use pipestream_search::node_agent::ServedShard;
 use tokio::net::TcpListener;
 
-use super::demo::load_shard_index;
+use super::demo::load_demo_index;
 use super::raft_member::RaftSurfaces;
 use super::transport::{spawn_listener, windowed_server};
 use super::{Startup, TaskHandle};
@@ -32,7 +32,6 @@ fn shard_node_config(
         max_k: cfg.max_k,
         collection: shard.collection.clone(),
         udp_hmac_key: cfg.udp_hmac_key.clone(),
-        layout: cfg.layout,
         vector_mmap: cfg.vector_mmap,
         seal_tail_docs: cfg.seal_tail_docs,
         vector_backend: shard.vector_backend.clone(),
@@ -90,15 +89,12 @@ fn open_shard_node(
 ) -> Result<NodeServiceImpl, Box<dyn std::error::Error>> {
     let cfg = startup.cfg;
     let node_config = shard_node_config(cfg, shard, startup.turbo_handshake.as_ref());
-    let mut node = if shard.demo.is_some() {
-        NodeServiceImpl::new(load_shard_index(shard, None)?, node_config)
+    let mut node = if let Some(demo) = shard.demo {
+        let index = load_demo_index(demo, &shard.vector_backend)?;
+        NodeServiceImpl::new(Some(index), node_config)
             .with_phrase_index(startup.phrase_index.clone())
     } else {
-        NodeServiceImpl::open(
-            node_config,
-            startup.phrase_index.clone(),
-            cfg.allow_missing_bm25,
-        )?
+        NodeServiceImpl::open(node_config, startup.phrase_index.clone())?
     }
     .with_flush_notify(Arc::clone(&startup.flush_notify));
     if let Some(ref nlp_spec) = cfg.turbo_nlp_columns {

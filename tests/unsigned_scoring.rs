@@ -4,7 +4,7 @@ use pipestream_search::{
     bm25::{self, Bm25Params, CorpusStats},
     coordinator::CoordinatorServiceImpl,
     harness::start_relay,
-    node::{Layout, NodeConfig},
+    node::NodeConfig,
     pb::{self, node_service_client::NodeServiceClient, search_service_server::SearchService},
     postings::{AnalyzedDoc, Bm25Reader, Bm25Store},
     scorefn::{ColumnRef, NumericRead, ScoreChain, Stage, StageOp},
@@ -345,74 +345,96 @@ async fn verify(addresses: Vec<String>, mono: String) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unsigned_scores_explanations_and_signals_survive_relays_and_compaction() {
     let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 92171));
-    for layout in [Layout::SingleImage, Layout::Segments] {
-        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("uint_scores_{layout:?}_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut configs = vec![];
-        let mut addresses = vec![];
-        let mut handles = vec![];
-        for shard in 0..5 {
-            let config = NodeConfig {
-                index_path: Some(dir.join(format!("{shard}.tv"))),
-                layout,
-                wal: true,
-                wal_buckets: 2,
-                seal_tail_docs: 2,
-                slot_offset: if shard < 4 { shard * 8 } else { 0 },
-                integer_fields: vec!["row".into()],
-                unsigned_integer_fields: if shard == 3 {
-                    vec![]
-                } else {
-                    vec!["counter".into()]
-                },
-                analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
-                ..Default::default()
-            };
-            let (addr, h) = common::start_empty_node(config.clone()).await;
-            let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("uint_scores_segments_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut configs = vec![];
+    let mut addresses = vec![];
+    let mut handles = vec![];
+    for shard in 0..5 {
+        let config = NodeConfig {
+            index_path: Some(dir.join(format!("{shard}.tv"))),
+            wal: true,
+            wal_buckets: 2,
+            seal_tail_docs: 2,
+            slot_offset: if shard < 4 { shard * 8 } else { 0 },
+            integer_fields: vec!["row".into()],
+            unsigned_integer_fields: if shard == 3 {
+                vec![]
+            } else {
+                vec!["counter".into()]
+            },
+            analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
+            ..Default::default()
+        };
+        let (addr, h) = common::start_empty_node(config.clone()).await;
+        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+        client
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                8, 4, &shift, &scale,
+            ))
+            .await
+            .unwrap();
+        let rows = if shard == 4 {
+            0..32
+        } else {
+            shard as usize * 8..shard as usize * 8 + 8
+        };
+        for row in rows {
             client
-                .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-                    8, 4, &shift, &scale,
-                ))
+                .add_documents(tokio_stream::iter([pb::AddDocumentsRequest {
+                    text: vec!["word"; 1 + row % 3].join(" "),
+                    analysis: Some(body_spec()),
+                    integers: vec![pb::IntegerValue {
+                        field: "row".into(),
+                        value: row as i64,
+                    }],
+                    unsigned_integers: value(row)
+                        .map(|v| pb::UnsignedIntegerValue {
+                            field: "counter".into(),
+                            value: v,
+                        })
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                }]))
                 .await
                 .unwrap();
-            let rows = if shard == 4 {
-                0..32
-            } else {
-                shard as usize * 8..shard as usize * 8 + 8
-            };
-            for row in rows {
-                client
-                    .add_documents(tokio_stream::iter([pb::AddDocumentsRequest {
-                        text: vec!["word"; 1 + row % 3].join(" "),
-                        analysis: Some(body_spec()),
-                        integers: vec![pb::IntegerValue {
-                            field: "row".into(),
-                            value: row as i64,
-                        }],
-                        unsigned_integers: value(row)
-                            .map(|v| pb::UnsignedIntegerValue {
-                                field: "counter".into(),
-                                value: v,
-                            })
-                            .into_iter()
-                            .collect(),
-                        ..Default::default()
-                    }]))
+            client
+                .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
+                    materialized_rows: Vec::new(),
+                    dim: 8,
+                    vectors: common::unit_vectors(1, 8, 412 + row as u64),
+                }]))
+                .await
+                .unwrap();
+        }
+        client.flush(pb::FlushRequest {}).await.unwrap();
+        configs.push(config);
+        addresses.push(addr);
+        handles.push(h);
+    }
+    let mono = addresses.pop().unwrap();
+    verify(addresses, mono).await;
+    for h in handles.drain(..) {
+        h.abort();
+        let _ = h.await;
+    }
+    for round in 0..2 {
+        let mut addresses = vec![];
+        for (shard, config) in configs.iter().enumerate() {
+            let (addr, h) = common::start_opened_node(config.clone()).await;
+            if round == 0 {
+                NodeServiceClient::connect(addr.clone())
                     .await
-                    .unwrap();
-                client
-                    .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
-                        materialized_rows: Vec::new(),
-                        dim: 8,
-                        vectors: common::unit_vectors(1, 8, 412 + row as u64),
-                    }]))
+                    .unwrap()
+                    .compact_shard(pb::CompactShardRequest {
+                        work_dir: dir.join(format!("compact-{shard}")).display().to_string(),
+                        ..Default::default()
+                    })
                     .await
                     .unwrap();
             }
-            client.flush(pb::FlushRequest {}).await.unwrap();
-            configs.push(config);
             addresses.push(addr);
             handles.push(h);
         }
@@ -422,31 +444,6 @@ async fn unsigned_scores_explanations_and_signals_survive_relays_and_compaction(
             h.abort();
             let _ = h.await;
         }
-        for round in 0..2 {
-            let mut addresses = vec![];
-            for (shard, config) in configs.iter().enumerate() {
-                let (addr, h) = common::start_opened_node(config.clone()).await;
-                if round == 0 {
-                    NodeServiceClient::connect(addr.clone())
-                        .await
-                        .unwrap()
-                        .compact_shard(pb::CompactShardRequest {
-                            work_dir: dir.join(format!("compact-{shard}")).display().to_string(),
-                            ..Default::default()
-                        })
-                        .await
-                        .unwrap();
-                }
-                addresses.push(addr);
-                handles.push(h);
-            }
-            let mono = addresses.pop().unwrap();
-            verify(addresses, mono).await;
-            for h in handles.drain(..) {
-                h.abort();
-                let _ = h.await;
-            }
-        }
-        std::fs::remove_dir_all(dir).unwrap();
     }
+    std::fs::remove_dir_all(dir).unwrap();
 }

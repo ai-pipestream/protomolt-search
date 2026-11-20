@@ -251,11 +251,7 @@ fn mapped_bind() -> pb::MappedBind {
     }
 }
 
-fn inspect_disk(
-    path: &std::path::Path,
-    layout: pipestream_search::node::Layout,
-    expected: &std::collections::BTreeMap<u64, Vec<u8>>,
-) {
+fn inspect_disk(path: &std::path::Path, expected: &std::collections::BTreeMap<u64, Vec<u8>>) {
     use pipestream_search::{node, postings::Bm25Reader, segments::OpenedSegmentSet};
     let mut found = std::collections::BTreeMap::new();
     let mut inspect = |reader: &Bm25Reader| {
@@ -278,23 +274,11 @@ fn inspect_disk(
             assert!(found.insert(key, source.payload).is_none());
         }
     };
-    match layout {
-        node::Layout::SingleImage => {
-            let generation = node::generation_dir(path);
-            let image = if generation.exists() {
-                node::generation_bm25(&generation)
-            } else {
-                node::bm25_sidecar_path(path)
-            };
-            inspect(&Bm25Reader::open(&image).unwrap())
-        }
-        node::Layout::Segments => {
-            let segments = OpenedSegmentSet::open(node::segments_root(path)).unwrap();
-            for part in 0..segments.len() {
-                inspect(segments.bm25(part));
-            }
-        }
+    let segments = OpenedSegmentSet::open(node::segments_root(path)).unwrap();
+    for part in 0..segments.len() {
+        inspect(segments.bm25(part));
     }
+
     assert_eq!(&found, expected);
 }
 
@@ -303,7 +287,7 @@ async fn unsigned_mapped_queries_sources_and_keys_survive_reopen_and_compaction(
     use pipestream_search::{
         analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND},
         coordinator::CoordinatorServiceImpl,
-        node::{Layout, NodeConfig},
+        node::NodeConfig,
         pb::{node_service_client::NodeServiceClient, search_service_server::SearchService},
     };
     let records = [
@@ -314,135 +298,130 @@ async fn unsigned_mapped_queries_sources_and_keys_survive_reopen_and_compaction(
         (u64::MAX, Some(u64::MAX)),
     ];
     let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 81568));
-    for (label, layout) in [
-        ("mapped", Layout::SingleImage),
-        ("segmented", Layout::Segments),
-    ] {
-        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("unsigned_mapping_{label}_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("shard.tv");
-        let plan = derive_plan(DESCRIPTOR, TYPE).unwrap();
-        let config = NodeConfig {
-            index_path: Some(path.clone()),
-            layout,
-            wal: true,
-            wal_buckets: 2,
-            seal_tail_docs: 2,
-            analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
-            unsigned_integer_fields: plan
-                .fields
-                .iter()
-                .filter(|f| f.family == pb::ColumnFamily::U64 as i32)
-                .map(|f| f.name.clone())
-                .chain(["derived_uint".into()])
-                .collect(),
-            integer_fields: vec!["signed_hint".into()],
-            ..Default::default()
-        };
-        let (mut addr, mut server) = common::start_empty_node(config.clone()).await;
-        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
-        client
-            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-                8, 4, &shift, &scale,
-            ))
-            .await
-            .unwrap();
-        let mut expected = std::collections::BTreeMap::new();
-        let mut bind = mapped_bind();
-        bind.materialize = Some(pb::MaterializeSpec {
-            columns: vec![pb::MaterializedColumn {
-                name: "derived_uint".into(),
-                expression: "counter + 0u".into(),
-                kind: pb::MaterializeKind::U64 as i32,
-            }],
+    let label = "segmented";
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("unsigned_mapping_{label}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("shard.tv");
+    let plan = derive_plan(DESCRIPTOR, TYPE).unwrap();
+    let config = NodeConfig {
+        index_path: Some(path.clone()),
+        wal: true,
+        wal_buckets: 2,
+        seal_tail_docs: 2,
+        analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
+        unsigned_integer_fields: plan
+            .fields
+            .iter()
+            .filter(|f| f.family == pb::ColumnFamily::U64 as i32)
+            .map(|f| f.name.clone())
+            .chain(["derived_uint".into()])
+            .collect(),
+        integer_fields: vec!["signed_hint".into()],
+        ..Default::default()
+    };
+    let (mut addr, mut server) = common::start_empty_node(config.clone()).await;
+    let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+    client
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            8, 4, &shift, &scale,
+        ))
+        .await
+        .unwrap();
+    let mut expected = std::collections::BTreeMap::new();
+    let mut bind = mapped_bind();
+    bind.materialize = Some(pb::MaterializeSpec {
+        columns: vec![pb::MaterializedColumn {
+            name: "derived_uint".into(),
+            expression: "counter + 0u".into(),
+            kind: pb::MaterializeKind::U64 as i32,
+        }],
+    });
+    let mut requests = vec![pb::IngestMappedRequest {
+        payload: Some(pb::ingest_mapped_request::Payload::Bind(bind)),
+    }];
+    for (id, counter) in records {
+        let mut doc = record(id, counter);
+        doc.many = vec![u64::MAX, 0];
+        doc.counters.insert("max".into(), u64::MAX);
+        let mut bytes = doc.encode_to_vec();
+        bytes.extend([0xa0, 0x06, 0x7b]); // Unknown field 100.
+        expected.insert(id, bytes.clone());
+        requests.push(pb::IngestMappedRequest {
+            payload: Some(pb::ingest_mapped_request::Payload::Document(bytes)),
         });
-        let mut requests = vec![pb::IngestMappedRequest {
-            payload: Some(pb::ingest_mapped_request::Payload::Bind(bind)),
-        }];
-        for (id, counter) in records {
-            let mut doc = record(id, counter);
-            doc.many = vec![u64::MAX, 0];
-            doc.counters.insert("max".into(), u64::MAX);
-            let mut bytes = doc.encode_to_vec();
-            bytes.extend([0xa0, 0x06, 0x7b]); // Unknown field 100.
-            expected.insert(id, bytes.clone());
-            requests.push(pb::IngestMappedRequest {
-                payload: Some(pb::ingest_mapped_request::Payload::Document(bytes)),
-            });
-        }
-        assert_eq!(
-            client
-                .ingest_mapped(tokio_stream::iter(requests))
-                .await
-                .unwrap()
-                .into_inner()
-                .added,
-            5
-        );
-        client.flush(pb::FlushRequest {}).await.unwrap();
-        inspect_disk(&path, layout, &expected);
-        for pass in 0..3 {
-            drop(client);
-            server.abort();
-            let _ = server.await;
-            (addr, server) = common::start_opened_node(config.clone()).await;
-            client = NodeServiceClient::connect(addr.clone()).await.unwrap();
-            let coordinator = CoordinatorServiceImpl::new(vec![addr.clone()])
-                .with_bm25(Some(NATIVE_ANALYSIS_BACKEND.into()), Default::default());
-            for (&id, bytes) in &expected {
-                let counter = Record::decode(bytes.as_slice()).unwrap().counter;
-                let filter = match counter {
-                    Some(v) => format!("id == {id}u && counter == {v}u"),
-                    None => format!("id == {id}u && !has(counter)"),
-                };
-                let response = coordinator
-                    .bm25_search(tonic::Request::new(pb::Bm25SearchRequest {
-                        text: "word".into(),
-                        analysis: Some(body_spec()),
-                        filter,
-                        k: 5,
-                        projections: vec![pb::NamedProjection {
-                            name: "copy".into(),
-                            expression: "derived_uint".into(),
-                        }],
-                        ..Default::default()
-                    }))
-                    .await
-                    .unwrap()
-                    .into_inner();
-                assert_eq!(response.hits.len(), 1);
-                assert_eq!(
-                    response.hits[0].projected[0].value,
-                    counter.map(pb::projected_value::Value::UintValue)
-                );
-            }
-            if pass == 0 {
-                client
-                    .delete_documents(pb::DeleteDocumentsRequest {
-                        doc_ids: vec![1],
-                        ..Default::default()
-                    })
-                    .await
-                    .unwrap();
-                expected.remove(&1);
-            }
-            if pass < 2 {
-                client
-                    .compact_shard(pb::CompactShardRequest {
-                        work_dir: dir.join(format!("compact-{pass}")).display().to_string(),
-                        ..Default::default()
-                    })
-                    .await
-                    .unwrap();
-            }
-            inspect_disk(&path, layout, &expected);
-        }
+    }
+    assert_eq!(
+        client
+            .ingest_mapped(tokio_stream::iter(requests))
+            .await
+            .unwrap()
+            .into_inner()
+            .added,
+        5
+    );
+    client.flush(pb::FlushRequest {}).await.unwrap();
+    inspect_disk(&path, &expected);
+    for pass in 0..3 {
+        drop(client);
         server.abort();
         let _ = server.await;
-        drop(client);
-        std::fs::remove_dir_all(dir).unwrap();
+        (addr, server) = common::start_opened_node(config.clone()).await;
+        client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+        let coordinator = CoordinatorServiceImpl::new(vec![addr.clone()])
+            .with_bm25(Some(NATIVE_ANALYSIS_BACKEND.into()), Default::default());
+        for (&id, bytes) in &expected {
+            let counter = Record::decode(bytes.as_slice()).unwrap().counter;
+            let filter = match counter {
+                Some(v) => format!("id == {id}u && counter == {v}u"),
+                None => format!("id == {id}u && !has(counter)"),
+            };
+            let response = coordinator
+                .bm25_search(tonic::Request::new(pb::Bm25SearchRequest {
+                    text: "word".into(),
+                    analysis: Some(body_spec()),
+                    filter,
+                    k: 5,
+                    projections: vec![pb::NamedProjection {
+                        name: "copy".into(),
+                        expression: "derived_uint".into(),
+                    }],
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(response.hits.len(), 1);
+            assert_eq!(
+                response.hits[0].projected[0].value,
+                counter.map(pb::projected_value::Value::UintValue)
+            );
+        }
+        if pass == 0 {
+            client
+                .delete_documents(pb::DeleteDocumentsRequest {
+                    doc_ids: vec![1],
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            expected.remove(&1);
+        }
+        if pass < 2 {
+            client
+                .compact_shard(pb::CompactShardRequest {
+                    work_dir: dir.join(format!("compact-{pass}")).display().to_string(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        inspect_disk(&path, &expected);
     }
+    server.abort();
+    let _ = server.await;
+    drop(client);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test]

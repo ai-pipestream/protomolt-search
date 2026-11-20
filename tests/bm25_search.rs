@@ -13,6 +13,7 @@ use pipestream_search::pb::{
     Bm25Hit, Bm25QueryRequest, Bm25QueryStreamRequest, GetDocumentsRequest, StopBm25Query,
     TermStatsRequest,
 };
+use pipestream_search::postings::Bm25Index;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -250,8 +251,6 @@ async fn bm25_store_persists_through_flush() {
     let (addr, node) = start_empty_node(NodeConfig {
         analysis_addr: Some(analysis),
         index_path: Some(index_path.clone()),
-        // This test pins the single-image file the flush writes.
-        layout: pipestream_search::node::Layout::SingleImage,
         ..Default::default()
     })
     .await;
@@ -266,14 +265,15 @@ async fn bm25_store_persists_through_flush() {
     assert!(flushed.written);
     assert_eq!(flushed.num_documents, 2);
 
-    let store = pipestream_search::postings::Bm25Store::load(
-        &pipestream_search::node::bm25_sidecar_path(&index_path),
+    let set = pipestream_search::segments::OpenedSegmentSet::open(
+        pipestream_search::node::segments_root(&index_path),
     )
     .unwrap();
-    assert_eq!(store.doc_count(), 2);
-    assert_eq!(store.total_doc_length(), 7);
-    assert_eq!(store.postings("rust").unwrap().len(), 2);
-    assert_eq!(store.text(1), Some("vector search rust"));
+    let store = set.bm25(0);
+    assert_eq!(Bm25Index::doc_count(store), 2);
+    assert_eq!(Bm25Index::total_doc_length(store), 7);
+    assert_eq!(store.field(0).df("rust"), 2);
+    assert_eq!(store.text(1).as_deref(), Some("vector search rust"));
 
     node.abort();
     mock.abort();

@@ -4,4 +4,3 @@
 mod cancelled_call;
 mod dense_probe_jmh;
 mod lexical_parity;
-mod snapshot_seal_race;

@@ -105,13 +105,10 @@ impl NodeServiceImpl {
         let mut out = ShardLayoutDiagnostics {
             shard,
             address,
-            layout: match guard.bm25.as_ref() {
-                Some(Bm25Shard::Segmented(_)) => "segments".to_string(),
-                Some(_) => "single-image".to_string(),
-                None => match self.config.layout {
-                    Layout::Segments => "segments".to_string(),
-                    Layout::SingleImage => "single-image".to_string(),
-                },
+            layout: if self.config.index_path.is_some() {
+                LAYOUT_SEGMENTS.to_string()
+            } else {
+                LAYOUT_MEMORY.to_string()
             },
             rows,
             live_rows: rows.saturating_sub(tombstones),

@@ -245,9 +245,8 @@ impl Store {
     }
 
     /// Append validated rows to the unlinked store (`rows` + `inv_norm`
-    /// only). A heap store that holds built links (for example a
-    /// non-segmented single-image node that flushed and then accepts new
-    /// writes) drops them, so queries enumerate cleanly until the next bulk
+    /// only). A heap store that holds built links (for example a path-less
+    /// node that flushed and then accepts new writes) drops them, so queries enumerate cleanly until the next bulk
     /// build at `prepare` / `write`.
     pub fn append_unlinked(&mut self, vectors: &[f32]) -> Result<(), VectorError> {
         let count = vectors.len() / self.dim;

@@ -1,7 +1,7 @@
 mod common;
 
 use pipestream_search::{
-    node::{Layout, NodeConfig, NodeServiceImpl},
+    node::{NodeConfig, NodeServiceImpl},
     pb::{self, node_service_client::NodeServiceClient, node_service_server::NodeService},
     postings::Bm25Reader,
     replication::{sync_once, ReplicaCursor},
@@ -98,128 +98,114 @@ async fn replication_requires_advertisement_and_acknowledgement_before_advancing
     let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("integer-map-replication-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
-    for layout in [Layout::SingleImage, Layout::Segments] {
-        let config = |name: &str| NodeConfig {
-            index_path: Some(root.join(format!("{name}-{layout:?}.tv"))),
-            layout,
-            wal: true,
-            analysis_addr: Some(pipestream_search::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
-            map_integer_fields: vec!["signed".into()],
-            map_unsigned_integer_fields: vec!["unsigned".into()],
-            ..Default::default()
-        };
-        let (primary, source_server) = common::start_empty_node(config("source")).await;
-        let mut source = NodeServiceClient::connect(primary.clone()).await.unwrap();
-        let document = pb::AddDocumentsRequest {
-            text: "map".into(),
-            analysis: Some(pipestream_search::analyzer::body_spec()),
-            map_integers: vec![pb::MapIntegerEntry {
-                field: "signed".into(),
-                key: String::new(),
-                value: i64::MIN,
-            }],
-            map_unsigned_integers: vec![pb::MapUnsignedIntegerEntry {
-                field: "unsigned".into(),
-                key: String::new(),
-                value: u64::MAX,
-            }],
-            original_source: Some(common::protobuf_source("map", "original")),
-            identity: Some(pb::DocumentIdentity {
-                document_key: vec![0, 255],
-                version: 7,
-                chunk_ordinal: None,
-            }),
-            ..Default::default()
-        };
-        source
-            .add_documents(tokio_stream::iter([document.clone()]))
-            .await
-            .unwrap();
-        source.flush(pb::FlushRequest {}).await.unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let replica = format!("http://{}", listener.local_addr().unwrap());
-        let mode = Arc::new(AtomicU8::new(0));
-        let ingests = Arc::new(AtomicUsize::new(0));
-        let receiver_config = config("receiver");
-        let receiver = VersionedReceiver {
-            node: NodeServiceImpl::new(None, receiver_config.clone()),
-            mode: mode.clone(),
-            ingests: ingests.clone(),
-        };
-        let server = tokio::spawn(
-            tonic::transport::Server::builder()
-                .add_service(receiver)
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
-        );
-        let cursor = ReplicaCursor {
-            primary,
-            replica: replica.clone(),
-            ..Default::default()
-        };
-        let error = sync_once(&cursor).await.unwrap_err();
-        assert!(error.contains("document contract version 0"), "{error}");
+    let config = |name: &str| NodeConfig {
+        index_path: Some(root.join(format!("{name}-segments.tv"))),
+        wal: true,
+        analysis_addr: Some(pipestream_search::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
+        map_integer_fields: vec!["signed".into()],
+        map_unsigned_integer_fields: vec!["unsigned".into()],
+        ..Default::default()
+    };
+    let (primary, source_server) = common::start_empty_node(config("source")).await;
+    let mut source = NodeServiceClient::connect(primary.clone()).await.unwrap();
+    let document = pb::AddDocumentsRequest {
+        text: "map".into(),
+        analysis: Some(pipestream_search::analyzer::body_spec()),
+        map_integers: vec![pb::MapIntegerEntry {
+            field: "signed".into(),
+            key: String::new(),
+            value: i64::MIN,
+        }],
+        map_unsigned_integers: vec![pb::MapUnsignedIntegerEntry {
+            field: "unsigned".into(),
+            key: String::new(),
+            value: u64::MAX,
+        }],
+        original_source: Some(common::protobuf_source("map", "original")),
+        identity: Some(pb::DocumentIdentity {
+            document_key: vec![0, 255],
+            version: 7,
+            chunk_ordinal: None,
+        }),
+        ..Default::default()
+    };
+    source
+        .add_documents(tokio_stream::iter([document.clone()]))
+        .await
+        .unwrap();
+    source.flush(pb::FlushRequest {}).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let replica = format!("http://{}", listener.local_addr().unwrap());
+    let mode = Arc::new(AtomicU8::new(0));
+    let ingests = Arc::new(AtomicUsize::new(0));
+    let receiver_config = config("receiver");
+    let receiver = VersionedReceiver {
+        node: NodeServiceImpl::new(None, receiver_config.clone()),
+        mode: mode.clone(),
+        ingests: ingests.clone(),
+    };
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(receiver)
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+    );
+    let cursor = ReplicaCursor {
+        primary,
+        replica: replica.clone(),
+        ..Default::default()
+    };
+    let error = sync_once(&cursor).await.unwrap_err();
+    assert!(error.contains("document contract version 0"), "{error}");
+    assert_eq!(
+        ingests.load(Ordering::SeqCst),
+        0,
+        "old capability refused before sending documents"
+    );
+    mode.store(1, Ordering::SeqCst);
+    let error = sync_once(&cursor).await.unwrap_err();
+    assert!(error.contains("document contract version 0"), "{error}");
+    assert_eq!(ingests.load(Ordering::SeqCst), 1);
+    mode.store(2, Ordering::SeqCst);
+    let advanced = sync_once(&cursor).await.unwrap();
+    assert!(advanced.clock > 0);
+    assert_eq!(
+        ingests.load(Ordering::SeqCst),
+        1,
+        "retry must not duplicate accepted rows"
+    );
+    assert_eq!(sync_once(&advanced).await.unwrap(), advanced);
+    let check = |reader: &Bm25Reader| {
+        let si = reader.map_integer_index("signed").unwrap();
+        let ui = reader.map_unsigned_integer_index("unsigned").unwrap();
         assert_eq!(
-            ingests.load(Ordering::SeqCst),
-            0,
-            "old capability refused before sending documents"
+            reader.map_integer_value(si, reader.map_integer_key_ord(si, "").unwrap(), 0),
+            Some(i64::MIN)
         );
-        mode.store(1, Ordering::SeqCst);
-        let error = sync_once(&cursor).await.unwrap_err();
-        assert!(error.contains("document contract version 0"), "{error}");
-        assert_eq!(ingests.load(Ordering::SeqCst), 1);
-        mode.store(2, Ordering::SeqCst);
-        let advanced = sync_once(&cursor).await.unwrap();
-        assert!(advanced.clock > 0);
         assert_eq!(
-            ingests.load(Ordering::SeqCst),
-            1,
-            "retry must not duplicate accepted rows"
-        );
-        assert_eq!(sync_once(&advanced).await.unwrap(), advanced);
-        let check = |reader: &Bm25Reader| {
-            let si = reader.map_integer_index("signed").unwrap();
-            let ui = reader.map_unsigned_integer_index("unsigned").unwrap();
-            assert_eq!(
-                reader.map_integer_value(si, reader.map_integer_key_ord(si, "").unwrap(), 0),
-                Some(i64::MIN)
-            );
-            assert_eq!(
-                reader.map_unsigned_integer_value(
-                    ui,
-                    reader.map_unsigned_integer_key_ord(ui, "").unwrap(),
-                    0
-                ),
-                Some(u64::MAX)
-            );
-            assert_eq!(reader.document_identity(0), document.identity);
-            assert_eq!(
-                reader.protobuf_source(0).unwrap(),
-                document.original_source.clone().map(|s| (s, None))
-            );
-        };
-        match layout {
-            Layout::SingleImage => check(
-                &Bm25Reader::open(&pipestream_search::node::bm25_sidecar_path(
-                    receiver_config.index_path.as_ref().unwrap(),
-                ))
-                .unwrap(),
+            reader.map_unsigned_integer_value(
+                ui,
+                reader.map_unsigned_integer_key_ord(ui, "").unwrap(),
+                0
             ),
-            Layout::Segments => {
-                let set = pipestream_search::segments::OpenedSegmentSet::open(
-                    pipestream_search::node::segments_root(
-                        receiver_config.index_path.as_ref().unwrap(),
-                    ),
-                )
-                .unwrap();
-                assert_eq!(set.len(), 1);
-                check(set.bm25(0));
-            }
-        }
-        server.abort();
-        source_server.abort();
-        let _ = server.await;
-        let _ = source_server.await;
-    }
+            Some(u64::MAX)
+        );
+        assert_eq!(reader.document_identity(0), document.identity);
+        assert_eq!(
+            reader.protobuf_source(0).unwrap(),
+            document.original_source.clone().map(|s| (s, None))
+        );
+    };
+    let set = pipestream_search::segments::OpenedSegmentSet::open(
+        pipestream_search::node::segments_root(receiver_config.index_path.as_ref().unwrap()),
+    )
+    .unwrap();
+    assert_eq!(set.len(), 1);
+    check(set.bm25(0));
+
+    server.abort();
+    source_server.abort();
+    let _ = server.await;
+    let _ = source_server.await;
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -239,58 +225,55 @@ async fn derived_wal_replication_refuses_before_transmitting_or_advancing() {
         })
         .unwrap(),
     );
-    for layout in [Layout::SingleImage, Layout::Segments] {
-        let config = |name: &str| NodeConfig {
-            index_path: Some(root.join(format!("{name}-{layout:?}.tv"))),
-            layout,
-            wal: true,
-            analysis_addr: Some(pipestream_search::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
-            map_integer_fields: vec!["signed".into()],
-            derived: Some(declaration.clone()),
+    let config = |name: &str| NodeConfig {
+        index_path: Some(root.join(format!("{name}-segments.tv"))),
+        wal: true,
+        analysis_addr: Some(pipestream_search::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
+        map_integer_fields: vec!["signed".into()],
+        derived: Some(declaration.clone()),
+        ..Default::default()
+    };
+    let (primary, primary_server) = common::start_empty_node(config("source")).await;
+    let mut source = NodeServiceClient::connect(primary.clone()).await.unwrap();
+    source
+        .add_documents(tokio_stream::iter([pb::AddDocumentsRequest {
+            text: "map".into(),
+            analysis: Some(pipestream_search::analyzer::body_spec()),
+            map_integers: vec![pb::MapIntegerEntry {
+                field: "signed".into(),
+                key: "".into(),
+                value: i64::MIN,
+            }],
             ..Default::default()
-        };
-        let (primary, primary_server) = common::start_empty_node(config("source")).await;
-        let mut source = NodeServiceClient::connect(primary.clone()).await.unwrap();
-        source
-            .add_documents(tokio_stream::iter([pb::AddDocumentsRequest {
-                text: "map".into(),
-                analysis: Some(pipestream_search::analyzer::body_spec()),
-                map_integers: vec![pb::MapIntegerEntry {
-                    field: "signed".into(),
-                    key: "".into(),
-                    value: i64::MIN,
-                }],
-                ..Default::default()
-            }]))
-            .await
-            .unwrap();
-        source.flush(pb::FlushRequest {}).await.unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let replica = format!("http://{}", listener.local_addr().unwrap());
-        let ingests = Arc::new(AtomicUsize::new(0));
-        let receiver = VersionedReceiver {
-            node: NodeServiceImpl::new(None, config("receiver")),
-            mode: Arc::new(AtomicU8::new(2)),
-            ingests: ingests.clone(),
-        };
-        let server = tokio::spawn(
-            tonic::transport::Server::builder()
-                .add_service(receiver)
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
-        );
-        let cursor = ReplicaCursor {
-            primary,
-            replica,
-            ..Default::default()
-        };
-        let error = sync_once(&cursor).await.unwrap_err();
-        assert!(error.contains("trusted replay RPC"), "{error}");
-        assert_eq!(ingests.load(Ordering::SeqCst), 0);
-        assert_eq!(cursor.clock, 0);
-        server.abort();
-        primary_server.abort();
-        let _ = server.await;
-        let _ = primary_server.await;
-    }
+        }]))
+        .await
+        .unwrap();
+    source.flush(pb::FlushRequest {}).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let replica = format!("http://{}", listener.local_addr().unwrap());
+    let ingests = Arc::new(AtomicUsize::new(0));
+    let receiver = VersionedReceiver {
+        node: NodeServiceImpl::new(None, config("receiver")),
+        mode: Arc::new(AtomicU8::new(2)),
+        ingests: ingests.clone(),
+    };
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(receiver)
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+    );
+    let cursor = ReplicaCursor {
+        primary,
+        replica,
+        ..Default::default()
+    };
+    let error = sync_once(&cursor).await.unwrap_err();
+    assert!(error.contains("trusted replay RPC"), "{error}");
+    assert_eq!(ingests.load(Ordering::SeqCst), 0);
+    assert_eq!(cursor.clock, 0);
+    server.abort();
+    primary_server.abort();
+    let _ = server.await;
+    let _ = primary_server.await;
     std::fs::remove_dir_all(root).unwrap();
 }

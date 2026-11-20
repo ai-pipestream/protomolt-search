@@ -19,7 +19,7 @@
 //! - A leftover of an interrupted build is refused by name and never
 //!   adopted; the cutover's crash windows roll back at open.
 //! - The refusals: a catalog that does not qualify (no sealed segments,
-//!   no generation binding, the single-image layout) keeps the old
+//!   no generation binding) keeps the old
 //!   by-name refusal, and the build knobs are the from-segments path's
 //!   alone.
 
@@ -34,7 +34,7 @@ use std::time::Duration;
 use pipestream_search::analyzer::body_spec;
 use pipestream_search::live_docs::LiveDocs;
 use pipestream_search::mapping::derive_plan;
-use pipestream_search::node::{segments_root, Layout, NodeConfig};
+use pipestream_search::node::{segments_root, NodeConfig};
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
@@ -101,7 +101,6 @@ fn config(index_path: PathBuf, analysis: &str) -> NodeConfig {
         index_path: Some(index_path),
         analysis_addr: Some(analysis.to_string()),
         wal: false,
-        layout: Layout::Segments,
         seal_tail_docs: SEAL as u32,
         facet_fields: vec!["grp".into()],
         // `other` is declared and never carried: the outputs must still
@@ -1172,7 +1171,7 @@ fn an_interrupted_walless_cutover_rolls_back_at_open() {
     std::fs::create_dir_all(&staged_dir).unwrap();
     std::fs::write(staged_dir.join("junk"), b"torn").unwrap();
     write_marker();
-    pipestream_search::node::recover_generation(&index_path);
+    pipestream_search::compaction::recover_interrupted(&index_path);
     assert_eq!(
         std::fs::read(SegmentCatalog::manifest_path(&root)).unwrap(),
         manifest_bytes,
@@ -1208,7 +1207,7 @@ fn an_interrupted_walless_cutover_rolls_back_at_open() {
     std::fs::write(&backup_path, &manifest_bytes).unwrap();
     std::fs::create_dir_all(&staged_dir).unwrap();
     write_marker();
-    pipestream_search::node::recover_generation(&index_path);
+    pipestream_search::compaction::recover_interrupted(&index_path);
     assert_eq!(
         std::fs::read(SegmentCatalog::manifest_path(&root)).unwrap(),
         manifest_bytes,
@@ -1221,7 +1220,7 @@ fn an_interrupted_walless_cutover_rolls_back_at_open() {
     // adopted: the catalog opens as it was and the leftover simply sits
     // there for the next run to refuse by name.
     std::fs::create_dir_all(&staged_dir).unwrap();
-    pipestream_search::node::recover_generation(&index_path);
+    pipestream_search::compaction::recover_interrupted(&index_path);
     assert_eq!(
         SegmentCatalog::open(&root)
             .unwrap()

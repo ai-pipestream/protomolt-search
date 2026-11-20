@@ -489,7 +489,6 @@ async fn spilled_shard_serves_facets_after_flush() {
     let (addr, node) = start_empty_node(NodeConfig {
         analysis_addr: Some(analysis),
         index_path: Some(index_path.clone()),
-        layout: pipestream_search::node::Layout::SingleImage,
         facet_fields: vec!["court".to_string(), "year".to_string()],
         ..Default::default()
     })
@@ -499,7 +498,7 @@ async fn spilled_shard_serves_facets_after_flush() {
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     let flushed = client.flush(FlushRequest {}).await.unwrap().into_inner();
     assert!(flushed.written);
-    let bm25_path = pipestream_search::node::bm25_sidecar_path(&index_path);
+    let bm25_path = common::catalog::segment_bm25(&index_path, 0);
     let mut magic = [0u8; 8];
     use std::io::Read;
     std::fs::File::open(&bm25_path)

@@ -4,7 +4,6 @@ mod build;
 mod cut;
 mod plan;
 mod segmented;
-mod single;
 mod spill;
 
 use std::path::{Path, PathBuf};
@@ -14,7 +13,7 @@ use super::child_build::child_order;
 use super::reconstruct::{transpose_segment, transposed_fields};
 use super::replay::{read_gen_manifest, replay_buckets_through, Replay};
 use super::segment_sources::open_segment_exact;
-use super::tree_split::{TreeChildLayout, TreeReshardOutput, TreeRowSource, TreeSplitOptions};
+use super::tree_split::{TreeReshardOutput, TreeRowSource, TreeSplitOptions};
 use super::{Analyzer, ReshardOutput};
 
 use self::build::{check_build_memory, PinnedTables, TreeBuild};
@@ -29,11 +28,10 @@ use self::spill::{RoutedRow, SegmentRows, TreeSpill};
 /// serving that leaf (inside a leaf with several shards, by its stable
 /// key's hash, which each such row must then carry). A vector row with
 /// no document cannot be evaluated and refuses the split by id. Memory
-/// is bounded by one WAL bucket during routing and by the largest child
-/// while its image is built: rows are spilled per child under
-/// `out_dir/spill` first, as a partitioned compaction does, and under
-/// [`TreeChildLayout::Segmented`] (the default) each child is a catalog
-/// sealed one spill bucket at a time, so memory is one bucket. Offline
+/// is bounded by one WAL bucket during routing and by one spill bucket
+/// while each child is built: rows are spilled per child under
+/// `out_dir/spill` first, as a partitioned compaction does, and each
+/// child is a catalog sealed one spill bucket at a time. Offline
 /// only: no live cutoff is recorded, so the sources must be quiescent.
 pub fn split_placement_tree_logs(
     gens: &[PathBuf],
@@ -61,12 +59,7 @@ pub fn split_placement_tree_logs(
     let pinned = PinnedTables::of(&plan);
     check_build_memory(&plan, &spill)?;
     let build = TreeBuild::new(&plan, &spill, &pinned, bm25_fields)?;
-    let built = match options.layout {
-        TreeChildLayout::SingleImage { max_child_rows } => {
-            single::build_single_images(&build, max_child_rows, analyze)?
-        }
-        TreeChildLayout::Segmented => segmented::build_segmented(&build, analyze)?,
-    };
+    let built = segmented::build_segmented(&build, analyze)?;
     let generation = build.generation;
     let spill_root = out_dir.join("spill");
     std::fs::remove_dir_all(&spill_root)
@@ -85,7 +78,6 @@ pub fn split_placement_tree_logs(
         children: plan.children.clone(),
         moved: stats.moved,
         placed: stats.placed,
-        layout: options.layout,
         segments: built.segments,
         peak_replay_rows: built.peak_replay_rows,
         spill_bucket_count: spill.spill_bucket_count,
@@ -98,14 +90,7 @@ pub fn split_placement_tree_logs(
 
 /// The refusals that depend only on the options and the child count.
 fn check_options(options: &TreeSplitOptions, children: usize) -> Result<(), String> {
-    let single = matches!(options.layout, TreeChildLayout::SingleImage { .. });
     if let Some(only) = options.only_child {
-        if single {
-            return Err(
-                "--only-child builds one segmented child; a single-image split writes every child"
-                    .to_string(),
-            );
-        }
         if only >= children {
             return Err(format!(
                 "--only-child={only} names no child; the tree has {children} leaf shards \
@@ -123,22 +108,9 @@ fn check_options(options: &TreeSplitOptions, children: usize) -> Result<(), Stri
                  one thread"
             ));
         }
-        if single {
-            return Err(format!(
-                "--build-threads={threads} builds a segmented child's buckets at once; a \
-                 single-image child is one image"
-            ));
-        }
     }
     if options.build_queue == Some(0) {
         return Err("--build-queue=0 holds no finished bucket; give it one or more".to_string());
-    }
-    if options.build_memory.is_some() && single {
-        return Err(
-            "--build-memory sizes the segmented build's bucket replays; a single-image child \
-             is one replay, bounded by --single-image=<rows>"
-                .to_string(),
-        );
     }
     Ok(())
 }

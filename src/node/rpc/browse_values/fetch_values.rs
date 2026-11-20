@@ -133,11 +133,6 @@ impl FetchScope<'_> {
         response: &mut crate::pb::FetchValuesResponse,
     ) -> Result<(), Status> {
         let (offset, visibility) = (self.offset, self.visibility);
-        if store.as_index().is_none() {
-            return Err(Status::failed_precondition(
-                "bm25 bulk build in progress; Flush before fetching values",
-            ));
-        }
         let doc_filter = crate::filter::DocFilter {
             deleted: None,
             geo: Default::default(),

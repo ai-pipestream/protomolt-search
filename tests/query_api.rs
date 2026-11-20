@@ -712,8 +712,9 @@ async fn fp32_mode_reranks_a_persisted_mmap_candidate_pool() {
     assert!(health.exact_vectors_available);
     assert!(health.exact_vectors_mmap);
     assert_eq!(health.exact_vector_rows, ROWS as u64);
-    assert!(pipestream_search::node::exact_vector_sidecar_path(&index_path).exists());
-
+    let root = pipestream_search::node::segments_root(&index_path);
+    let set = pipestream_search::segments::OpenedSegmentSet::open(root).unwrap();
+    assert!(set.exact_vectors(0).is_some(), "sealed FP32 rows kept");
     let profile_path = dir.join("dense-quality.toml");
     std::fs::write(
         &profile_path,
@@ -727,7 +728,6 @@ dimensions = {DIM}
 provider_backend = "{}"
 scoring_fingerprint = "{}"
 measured_queries = 32
-
 [[points]]
 k = 10
 target_recall_ppm = 1000000

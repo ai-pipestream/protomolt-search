@@ -56,25 +56,6 @@ impl<'a> ColumnTables<'a> {
         Ok(tables)
     }
 
-    fn spill_builder(&self, dir: &Path, config: &NodeConfig) -> std::io::Result<Bm25Shard> {
-        SpillBuilder::create_with_fields(dir, &self.names).map(|b| {
-            let mut b = b
-                .with_facet_fields(&self.facets)
-                .with_numeric_fields(&self.numerics)
-                .with_map_facet_fields(&self.map_facets)
-                .with_map_numeric_fields(&self.map_numerics)
-                .with_map_integer_fields(&self.map_integers)
-                .with_map_unsigned_integer_fields(&self.map_unsigned_integers)
-                .with_integer_fields(&self.integers)
-                .with_unsigned_integer_fields(&self.unsigned_integers)
-                .with_geo_fields(&self.geos)
-                .with_position_fields(&self.positions)
-                .with_sentence_fields(&self.sentences);
-            b.set_derived(stored_derived(config));
-            Bm25Shard::Spilling(b)
-        })
-    }
-
     fn heap_builder(&self, config: &NodeConfig) -> Bm25Shard {
         let mut store = Bm25Store::with_fields(&self.names)
             .with_facets(&self.facets)
@@ -94,18 +75,14 @@ impl<'a> ColumnTables<'a> {
 }
 
 impl NodeServiceImpl {
-    /// The builder shape for a fresh ingest: persisted shards bulk-build
-    /// through the disk spiller (bounded heap, not searchable until
-    /// Flush); path-less demo shards build in heap.
-    pub(in crate::node) fn new_builder(
-        &self,
-        generation: Option<&PathBuf>,
-    ) -> Result<Bm25Shard, Status> {
+    /// The builder shape for a fresh ingest: a persisted shard opens its
+    /// segment catalog with a searchable heap tail sealed on flush; a
+    /// path-less shard builds in heap.
+    pub(in crate::node) fn new_builder(&self) -> Result<Bm25Shard, Status> {
         validate_column_tables(&self.config).map_err(Status::failed_precondition)?;
         let tables = ColumnTables::of(&self.config)?;
         match self.config.index_path.as_ref() {
-            // Segmented persisted shard: searchable heap tail sealed into the catalog on flush.
-            Some(p) if self.config.layout == Layout::Segments && generation.is_none() => {
+            Some(p) => {
                 let root = segments_root(p);
                 let tail = heap_store(&self.config).map_err(Status::failed_precondition)?;
                 SegmentedShard::open_with(&root, tail, self.config.vector_load())
@@ -113,12 +90,6 @@ impl NodeServiceImpl {
                     .map_err(|e| {
                         Status::internal(format!("segment catalog {}: {e}", root.display()))
                     })
-            }
-            Some(p) => {
-                let dir = bm25_build_dir(&storage_paths(p, generation).2);
-                tables
-                    .spill_builder(&dir, &self.config)
-                    .map_err(|e| Status::internal(format!("spill dir {}: {e}", dir.display())))
             }
             None => Ok(tables.heap_builder(&self.config)),
         }

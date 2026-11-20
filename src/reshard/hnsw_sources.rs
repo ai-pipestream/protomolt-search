@@ -1,7 +1,5 @@
 //! Source HNSW graphs a compaction may reuse instead of rebuilding.
 
-use std::path::Path;
-
 use crate::vector::{VectorIndex, VectorProvider};
 
 /// Sealed HNSW segment images available for donor transplant and `#99`
@@ -43,25 +41,6 @@ impl HnswCompactionSources {
                 slot_offset,
                 ranges,
             }
-        })
-    }
-
-    pub(crate) fn from_single_image_path(slot_offset: u64, path: &Path) -> Option<Self> {
-        if !path.exists() {
-            return None;
-        }
-        let loaded = VectorIndex::load_mapped(crate::hnsw::HNSW, path).ok()?;
-        let rows = loaded.len() as u64;
-        if rows == 0 || !loaded.is_graph_linked() || loaded.as_hnsw().is_none() {
-            return None;
-        }
-        Some(Self {
-            slot_offset,
-            ranges: vec![HnswSourceRange {
-                base_label: 0,
-                rows,
-                index: std::sync::Arc::new(loaded),
-            }],
         })
     }
 

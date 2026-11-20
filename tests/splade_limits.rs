@@ -1,10 +1,12 @@
 #![cfg(feature = "net")]
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pipestream_search::coordinator::CoordinatorServiceImpl;
-use pipestream_search::node::{bm25_sidecar_path, NodeConfig, NodeServiceImpl};
+use pipestream_search::node::{NodeConfig, NodeServiceImpl};
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::node_service_server::NodeService;
 use pipestream_search::pb::{ScoreSpladeRequest, SpladeTermWeight};
@@ -45,7 +47,9 @@ impl Fixture {
                 },
             );
         }
-        store.save(&bm25_sidecar_path(&path)).unwrap();
+        let bm25 = root.join("index.bm25");
+        store.save(&bm25).unwrap();
+        common::catalog::seal_bm25_file(&path, &bm25);
         let node = NodeServiceImpl::open(
             NodeConfig {
                 max_k,
@@ -53,7 +57,6 @@ impl Fixture {
                 ..Default::default()
             },
             None,
-            true,
         )
         .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

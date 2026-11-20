@@ -62,15 +62,6 @@ fn core_fixed_knobs(config: &NodeConfig) -> Vec<crate::diagnostics::FixedKnob> {
             description: "Exact rerank slots (--rerank-parallel).",
         },
         FixedKnob {
-            name: "layout",
-            kind: KnobKind::String,
-            value: match config.layout {
-                Layout::Segments => "segments".to_string(),
-                Layout::SingleImage => "single-image".to_string(),
-            },
-            description: "On-disk layout of a new persisted shard (--layout).",
-        },
-        FixedKnob {
             name: "vector_mmap",
             kind: KnobKind::Bool,
             value: config.vector_mmap.to_string(),

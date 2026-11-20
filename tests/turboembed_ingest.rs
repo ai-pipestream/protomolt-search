@@ -24,7 +24,7 @@ use pipestream_search::analyzer::{
 };
 use pipestream_search::coordinator::CoordinatorServiceImpl;
 use pipestream_search::link::NodeLink;
-use pipestream_search::node::{Layout, NodeConfig, NodeServiceImpl};
+use pipestream_search::node::{NodeConfig, NodeServiceImpl};
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::wal::wal_record;
 use pipestream_search::pb::{
@@ -213,7 +213,6 @@ async fn dehyphenated_lattice_ingest_and_flush_preserve_both_joined_and_split_ph
         None,
         NodeConfig {
             index_path: Some(index_path),
-            layout: Layout::Segments,
             analysis_addr: Some(TURBO_ANALYSIS_BACKEND.to_string()),
             bm25_fields: vec!["body".to_string(), "body.bigrams".to_string()],
             position_fields: vec!["body".to_string()],
@@ -427,9 +426,8 @@ async fn pre_wal_nlp_columns_materialize_and_replay_deterministically_without_re
         link.flush(FlushRequest::default()).await.unwrap();
     }
 
-    let reopened = Arc::new(
-        NodeServiceImpl::open(nlp_node_config(replayed_path, None, false), None, false).unwrap(),
-    );
+    let reopened =
+        Arc::new(NodeServiceImpl::open(nlp_node_config(replayed_path, None, false), None).unwrap());
     let coord = CoordinatorServiceImpl::with_local_nodes(vec![reopened]).with_bm25(
         Some(NATIVE_ANALYSIS_BACKEND.to_string()),
         Default::default(),

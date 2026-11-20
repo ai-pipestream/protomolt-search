@@ -38,10 +38,8 @@ its dimensions and calibration survive a WAL-free restore.
 ## Snapshots
 
 A zero-row, uncalibrated generation can transfer through `StreamSnapshot` and
-`InstallSnapshotFrom` without manufacturing a provider image. For single-image
-repositories, this requires a bound, zero-row BM25 image, zero vector/document/
-live counts and dimension, no scoring fingerprint, and no FP32 artifact.
-Populated document-only repository installs are not introduced by this change.
+`InstallSnapshotFrom` without manufacturing a provider image: the catalog's
+manifest carries the binding.
 Segment repositories carry the binding in their catalog. Installed BM25-only
 snapshot directories are recognized by startup and generation-swap recovery.
 
@@ -65,9 +63,8 @@ files and retired segments. Artifact hashes alone cannot prove row alignment.
 ## Compatibility and limits
 
 Pin compatible binaries for writers, readers and snapshot receivers. Older
-catalog readers refuse format 2. Older single-image startup code may ignore a
-BM25-only `.snap` directory because it recognizes installed generations only
-by a vector image; downgrading such a shard is unsupported. Keep the prior
+catalog readers refuse format 2; downgrading such a shard is unsupported. Keep
+the prior
 binary and generation together for rollback. Existing BM25 binding-kind and
 WAL version gates remain as documented in [stored vector bindings](vector-binding-storage.md).
 

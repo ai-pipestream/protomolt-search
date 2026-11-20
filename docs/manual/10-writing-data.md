@@ -152,12 +152,12 @@ Two rules follow:
 
 ## Snapshots and bulk load
 
-`NodeService.InstallSnapshot` streams a finished shard image to a node: build
-once anywhere with the cluster's provider configuration, push it to every shard
-owner, and each node stages it in a generation directory, validates it, and
-swaps it in with one atomic rename. A crash mid-swap is recovered at startup.
-An image with a provider identity other than the shard's is rejected, so scores
-stay comparable cluster-wide.
+Bulk load is repository-shaped: build a segment-layout snapshot repository
+once anywhere with the cluster's provider configuration, then install it with
+`InstallSnapshotFrom` below. The legacy raw-image `NodeService.InstallSnapshot`
+stream is retired and refuses with UNIMPLEMENTED; there is no single-image
+install path. An image with a provider identity other than the shard's is
+rejected, so scores stay comparable cluster-wide.
 
 `NodeService.ExportSnapshot` publishes a shard's generation into an empty
 directory (a NAS path is the intended use) with a `snapshot-manifest.json`
@@ -181,8 +181,7 @@ cannot be resharded from its log.
 
 ## Segment layout
 
-A new persisted shard uses the segment layout by default (`--layout=segments`;
-`--layout=single-image` keeps the one-file shape). A segment is four row-aligned
+Every persisted shard uses the segment layout. A segment is four row-aligned
 artifacts: the provider vector image, the exact FP32 rows, the BM25 image, and a
 live-document bitmap, with a `segment.json` recording generation, row range,
 counts, fingerprints, and the SHA-256 of every artifact. Opening a set verifies
@@ -193,9 +192,6 @@ chained block-max cursors. `--seal-tail-docs` (default 500,000) seals a full
 tail into a new immutable segment between documents; 0 seals on flush only.
 Sealed vector images are memory-mapped by default (`--vector-mmap=false` loads
 them into memory instead).
-
-A shard has the layout its files have. No file converts on open, and a path
-holding both a single image and a catalog is rejected by name.
 
 ## Collections
 

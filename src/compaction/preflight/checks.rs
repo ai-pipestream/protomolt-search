@@ -42,31 +42,14 @@ pub(super) fn validate_partition_integer_column(
 }
 
 pub(super) fn resolve_wal_partition_column(
-    segmented: bool,
-    bm25: Option<&Bm25Shard>,
+    bm25: &Bm25Shard,
+    seg: &crate::segmented::SegmentedShard,
     requested: &str,
 ) -> Result<Option<String>, Status> {
     if requested.is_empty() {
         return Ok(None);
     }
-    if !segmented {
-        return Err(Status::failed_precondition(format!(
-            "partition_column {requested:?} needs the segment layout; this shard is a \
-             single image"
-        )));
-    }
-    let Some(shard) = bm25 else {
-        return Err(Status::failed_precondition(format!(
-            "partition_column {requested:?}: this shard holds no documents, so no column \
-             can order it"
-        )));
-    };
-    let ii = validate_partition_integer_column(shard, requested)?;
-    let Bm25Shard::Segmented(seg) = shard else {
-        return Err(Status::internal(
-            "the segment layout serves a segmented shard",
-        ));
-    };
+    let ii = validate_partition_integer_column(bm25, requested)?;
     let sealed: u64 = seg
         .snapshot()
         .manifest()
@@ -127,9 +110,7 @@ pub(super) fn extract_column_tables(
     }
     match bm25 {
         Some(Bm25Shard::Building(s)) => Some(column_tables!(s)),
-        Some(Bm25Shard::Resident(s)) => Some(column_tables!(s)),
         Some(Bm25Shard::Segmented(s)) => Some(column_tables!(s)),
-        Some(Bm25Shard::Spilling(_)) => unreachable!("bulk build refused above"),
         None => None,
     }
 }
@@ -205,39 +186,18 @@ pub(super) fn check_tail_row_alignment(
 pub(super) fn resolve_hnsw_sources(
     slot_offset: u64,
     backend_kind: &str,
-    segmented: bool,
     guard: &ShardState,
-    index_path: &Path,
 ) -> Option<crate::reshard::HnswCompactionSources> {
     if backend_kind != crate::hnsw::HNSW {
         return None;
     }
-    if segmented {
-        guard
-            .index
-            .as_ref()
-            .and_then(VectorIndex::as_segmented)
-            .and_then(|provider| {
-                crate::reshard::HnswCompactionSources::from_segment_set(
-                    slot_offset,
-                    provider.snapshot(),
-                )
-            })
-    } else {
-        let persisted = guard
-            .generation
-            .as_ref()
-            .map(|g| crate::node::generation_vector(g))
-            .unwrap_or_else(|| index_path.to_path_buf());
-        crate::reshard::HnswCompactionSources::from_single_image_path(slot_offset, &persisted)
-    }
+    let provider = guard.index.as_ref().and_then(VectorIndex::as_segmented)?;
+    crate::reshard::HnswCompactionSources::from_segment_set(slot_offset, provider.snapshot())
 }
 
 pub(super) fn validate_wal_preconditions(
     request: &CompactShardRequest,
     manifest: &crate::wal::WalManifest,
-    guard: &ShardState,
-    has_fields: bool,
     analysis_addr: Option<&str>,
 ) -> Result<(), Status> {
     if request.build_threads != 0 || request.build_queue != 0 || request.build_memory != 0 {
@@ -254,12 +214,7 @@ pub(super) fn validate_wal_preconditions(
             manifest.generation, manifest.preexisting_vectors, manifest.preexisting_documents
         )));
     }
-    if matches!(guard.bm25, Some(Bm25Shard::Spilling(_))) {
-        return Err(Status::failed_precondition(
-            "a bulk BM25 build is in progress on this shard; Flush it before compacting",
-        ));
-    }
-    if has_fields && analysis_addr.is_none() {
+    if analysis_addr.is_none() {
         return Err(Status::unavailable(
             "no analysis backend configured for this shard (analysis_addr); compaction \
              re-analyzes every live document",

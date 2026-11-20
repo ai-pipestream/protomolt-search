@@ -447,11 +447,7 @@ async fn catalog_cannot_live_in_a_disposable_shard_directory() {
     let index = dir.0.join("shard.index");
     for owned in [
         pipestream_search::wal::wal_dir(&index),
-        pipestream_search::node::generation_dir(&index),
         pipestream_search::node::segments_root(&index),
-        pipestream_search::node::bm25_build_dir(&pipestream_search::node::bm25_sidecar_path(
-            &index,
-        )),
         pipestream_search::compaction::default_work_dir(&index),
     ] {
         std::fs::create_dir(&owned).unwrap();

@@ -113,7 +113,8 @@ cannot differ.
 ## Shard diagnostics
 
 `GetShardDiagnostics` describes the shards a process serves. A node
-answers for its own shard: the layout (`segments` or `single-image`),
+answers for its own shard: the layout (`segments`, or `memory` for a
+shard without an index path),
 the catalog epoch, rows, live rows, tombstones, rows in the unsealed
 tail, the partition key when a partitioned compaction set one, the
 scoring fingerprint, the live values of `segment_pruning` and
@@ -179,7 +180,8 @@ unchanged; the other live knobs taking their values; immutable, unknown,
 and malformed settings rejected by name; the snapshot equal to the
 rendered page; the stream at its interval and a fresh stream after a
 hang-up; shard diagnostics on a segmented shard with summaries and on a
-single-image shard, through the node and through the coordinator; the
+heap shard without an index path, through the node and through the
+coordinator; the
 ring's contents and order; the admin rule on every coordinator RPC and
 the open service without principals. `tests/diagnostics_authorization.rs`
 checks all six routes against partial workspace grants and an operator flag

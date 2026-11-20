@@ -8,7 +8,7 @@ use pipestream_search::{
     harness::embedded_backend_request,
     index_contract::decode as decode_contract,
     mapping::{derive_plan, derive_plan_with_definition, Extractor},
-    node::{self, Layout, NodeConfig},
+    node::{self, NodeConfig},
     pb,
     postings::Bm25Reader,
     reshard,
@@ -858,7 +858,7 @@ async fn assert_query(address: String, expected_ids: &[u64]) {
 #[tokio::test]
 async fn mapped_maps_cross_rpc_binding_reopen_and_compaction() {
     use pb::node_service_client::NodeServiceClient;
-    use pipestream_search::node::{Layout, NodeConfig};
+    use pipestream_search::node::NodeConfig;
     let schema = two_map_schema();
     let policy = two_map_policy();
     let (planning, planning_task) = common::start_coordinator(Vec::new()).await;
@@ -897,102 +897,91 @@ async fn mapped_maps_cross_rpc_binding_reopen_and_compaction() {
     let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("map-projection-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
-    for layout in [Layout::SingleImage, Layout::Segments] {
-        let path = root.join(format!("{layout:?}.tv"));
-        let config = NodeConfig {
-            index_path: Some(path),
-            layout,
-            wal: true,
-            unsigned_integer_fields: vec!["id".into()],
-            map_facet_fields: vec!["attrs".into()],
-            map_numeric_fields: vec!["weights".into()],
-            analysis_addr: Some(pipestream_search::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
-            ..Default::default()
-        };
-        let (address, server) = common::start_empty_node(config.clone()).await;
-        let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
-        let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 178));
-        client
-            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-                8, 4, &shift, &scale,
-            ))
-            .await
-            .unwrap();
-        let sources = vec![source(&schema, 1), source(&schema, 2)];
-        let result = client
-            .ingest_mapped(tokio_stream::iter(frames(bind.clone(), sources.clone())))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(result.added, 2);
-        client.flush(pb::FlushRequest {}).await.unwrap();
-        assert_query(address, &[1, 2]).await;
-        drop(client);
-        server.abort();
-        let _ = server.await;
-        let (address, server) = common::start_opened_node(config.clone()).await;
-        let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
-        assert_query(address.clone(), &[1, 2]).await;
-        // Correctly fingerprinted changes still refuse against the stored binding.
-        let mut changed = bind.clone();
-        changed.index_definition.as_mut().unwrap().projections.pop();
-        changed.expected_fingerprint = derive_plan_with_definition(
-            &schema,
-            "map_projection.Record",
-            changed.index_definition.as_ref(),
-        )
+    let path = root.join("segments.tv");
+    let config = NodeConfig {
+        index_path: Some(path),
+        wal: true,
+        unsigned_integer_fields: vec!["id".into()],
+        map_facet_fields: vec!["attrs".into()],
+        map_numeric_fields: vec!["weights".into()],
+        analysis_addr: Some(pipestream_search::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
+        ..Default::default()
+    };
+    let (address, server) = common::start_empty_node(config.clone()).await;
+    let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
+    let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 178));
+    client
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            8, 4, &shift, &scale,
+        ))
+        .await
+        .unwrap();
+    let sources = vec![source(&schema, 1), source(&schema, 2)];
+    let result = client
+        .ingest_mapped(tokio_stream::iter(frames(bind.clone(), sources.clone())))
+        .await
         .unwrap()
-        .fingerprint;
-        let error = client
-            .ingest_mapped(tokio_stream::iter(frames(changed, Vec::new())))
-            .await
-            .unwrap_err();
-        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-        assert!(error.message().contains("durably bound"), "{error}");
-        client
-            .delete_documents(pb::DeleteDocumentsRequest {
-                doc_ids: vec![0],
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        client
-            .compact_shard(pb::CompactShardRequest {
-                work_dir: root
-                    .join(format!("compact-{layout:?}"))
-                    .display()
-                    .to_string(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_query(address, &[2]).await;
-        let stored = if layout == Layout::SingleImage {
-            pipestream_search::node::Bm25Shard::open(&pipestream_search::node::generation_bm25(
-                &pipestream_search::node::generation_dir(config.index_path.as_ref().unwrap()),
-            ))
-            .unwrap()
-        } else {
-            pipestream_search::node::Bm25Shard::Segmented(
-                pipestream_search::segmented::SegmentedShard::open(
-                    pipestream_search::node::segments_root(config.index_path.as_ref().unwrap()),
-                    pipestream_search::postings::Bm25Store::new()
-                        .with_unsigned_integers(&["id"])
-                        .with_map_facets(&["attrs"])
-                        .with_map_numerics(&["weights"]),
-                )
-                .unwrap(),
+        .into_inner();
+    assert_eq!(result.added, 2);
+    client.flush(pb::FlushRequest {}).await.unwrap();
+    assert_query(address, &[1, 2]).await;
+    drop(client);
+    server.abort();
+    let _ = server.await;
+    let (address, server) = common::start_opened_node(config.clone()).await;
+    let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
+    assert_query(address.clone(), &[1, 2]).await;
+    // Correctly fingerprinted changes still refuse against the stored binding.
+    let mut changed = bind.clone();
+    changed.index_definition.as_mut().unwrap().projections.pop();
+    changed.expected_fingerprint = derive_plan_with_definition(
+        &schema,
+        "map_projection.Record",
+        changed.index_definition.as_ref(),
+    )
+    .unwrap()
+    .fingerprint;
+    let error = client
+        .ingest_mapped(tokio_stream::iter(frames(changed, Vec::new())))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(error.message().contains("durably bound"), "{error}");
+    client
+        .delete_documents(pb::DeleteDocumentsRequest {
+            doc_ids: vec![0],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    client
+        .compact_shard(pb::CompactShardRequest {
+            work_dir: root.join("compact-segments").display().to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_query(address, &[2]).await;
+    let stored = {
+        pipestream_search::node::Bm25Shard::Segmented(
+            pipestream_search::segmented::SegmentedShard::open(
+                pipestream_search::node::segments_root(config.index_path.as_ref().unwrap()),
+                pipestream_search::postings::Bm25Store::new()
+                    .with_unsigned_integers(&["id"])
+                    .with_map_facets(&["attrs"])
+                    .with_map_numerics(&["weights"]),
             )
-        };
-        assert_eq!(
-            stored.protobuf_source(0).unwrap().unwrap().0.payload,
-            sources[1]
-        );
-        drop(stored);
-        drop(client);
-        server.abort();
-        let _ = server.await;
-    }
+            .unwrap(),
+        )
+    };
+    assert_eq!(
+        stored.protobuf_source(0).unwrap().unwrap().0.payload,
+        sources[1]
+    );
+    drop(stored);
+    drop(client);
+    server.abort();
+    let _ = server.await;
     planning_task.abort();
     let _ = planning_task.await;
     std::fs::remove_dir_all(root).unwrap();
@@ -1299,21 +1288,11 @@ fn inspect_integer_map_reader(reader: &Bm25Reader, fx: &IntMapFixture, ids: &mut
     }
 }
 
-fn verify_integer_map_layout(layout: Layout, path: &Path, fx: &IntMapFixture, exp: &[u64]) {
+fn verify_integer_map_layout(path: &Path, fx: &IntMapFixture, exp: &[u64]) {
     let mut ids = Vec::new();
-    if layout == Layout::Segments {
-        let set = OpenedSegmentSet::open(node::segments_root(path)).unwrap();
-        for segment in 0..set.len() {
-            inspect_integer_map_reader(set.bm25(segment), fx, &mut ids);
-        }
-    } else {
-        let gen_dir = node::generation_dir(path);
-        let file = if gen_dir.exists() {
-            node::generation_bm25(&gen_dir)
-        } else {
-            node::bm25_sidecar_path(path)
-        };
-        inspect_integer_map_reader(&Bm25Reader::open(&file).unwrap(), fx, &mut ids);
+    let set = OpenedSegmentSet::open(node::segments_root(path)).unwrap();
+    for segment in 0..set.len() {
+        inspect_integer_map_reader(set.bm25(segment), fx, &mut ids);
     }
     ids.sort();
     assert_eq!(ids, exp);
@@ -1363,7 +1342,7 @@ async fn seed_and_verify_integer_map_wal(cfg: &NodeConfig, fx: &IntMapFixture) {
         assert_eq!(resp.added, count);
         client.flush(pb::FlushRequest {}).await.unwrap();
     }
-    verify_integer_map_layout(cfg.layout, path, fx, &[1, 2, 3]);
+    verify_integer_map_layout(path, fx, &[1, 2, 3]);
     let manifest = wal::read_manifest(&reshard::resolve_gen(&wal::wal_dir(path)).unwrap()).unwrap();
     assert_eq!(manifest.format_version, wal::FORMAT_VERSION);
     assert!(manifest.columns.is_some());
@@ -1373,10 +1352,10 @@ async fn seed_and_verify_integer_map_wal(cfg: &NodeConfig, fx: &IntMapFixture) {
 }
 
 async fn reopen_refuse_and_compact_integer_maps(cfg: NodeConfig, root: &Path, fx: &IntMapFixture) {
-    let (layout, path) = (cfg.layout, cfg.index_path.clone().unwrap());
+    let path = cfg.index_path.clone().unwrap();
     let (address, server) = common::start_opened_node(cfg).await;
     let mut client = NodeServiceClient::connect(address).await.unwrap();
-    verify_integer_map_layout(layout, &path, fx, &[1, 2, 3]);
+    verify_integer_map_layout(&path, fx, &[1, 2, 3]);
     // A valid alternative projection cannot silently reinterpret the file.
     let mut changed = fx.bind.clone();
     changed.index_definition.as_mut().unwrap().projections[3].kind = pb::MappedKind::Int32 as i32;
@@ -1396,13 +1375,13 @@ async fn reopen_refuse_and_compact_integer_maps(cfg: NodeConfig, root: &Path, fx
         ..Default::default()
     };
     client.delete_documents(del).await.unwrap();
-    let work_dir = format!("{}/compact-{layout:?}", root.display());
+    let work_dir = format!("{}/compact-segments", root.display());
     let compact = pb::CompactShardRequest {
         work_dir,
         ..Default::default()
     };
     client.compact_shard(compact).await.unwrap();
-    verify_integer_map_layout(layout, &path, fx, &[2, 3]);
+    verify_integer_map_layout(&path, fx, &[2, 3]);
     server.abort();
     let _ = server.await;
 }
@@ -1441,21 +1420,18 @@ async fn mapped_integer_maps_bind_persist_and_compact_without_rounding() {
     let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("mapped-integer-maps-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
-    for layout in [Layout::SingleImage, Layout::Segments] {
-        let config = NodeConfig {
-            index_path: Some(root.join(format!("{layout:?}.tv"))),
-            layout,
-            wal: true,
-            wal_buckets: 2,
-            unsigned_integer_fields: vec!["id".into()],
-            map_integer_fields: vec!["attrs".into()],
-            map_unsigned_integer_fields: vec!["weights".into()],
-            analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
-            ..Default::default()
-        };
-        seed_and_verify_integer_map_wal(&config, &fx).await;
-        reopen_refuse_and_compact_integer_maps(config, &root, &fx).await;
-    }
+    let config = NodeConfig {
+        index_path: Some(root.join("segments.tv")),
+        wal: true,
+        wal_buckets: 2,
+        unsigned_integer_fields: vec!["id".into()],
+        map_integer_fields: vec!["attrs".into()],
+        map_unsigned_integer_fields: vec!["weights".into()],
+        analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
+        ..Default::default()
+    };
+    seed_and_verify_integer_map_wal(&config, &fx).await;
+    reopen_refuse_and_compact_integer_maps(config, &root, &fx).await;
     planner_task.abort();
     let _ = planner_task.await;
     std::fs::remove_dir_all(root).unwrap();

@@ -100,7 +100,7 @@ async fn maintenance_cutover_recovers_both_runtime_windows_and_an_uncertain_mani
         // The old held reader remains valid regardless of which files won.
         assert_eq!(before.bm25(1).document_identity(0).unwrap().version, 2);
         fixture.reopen_source();
-        fixture.node = NodeServiceImpl::open(fixture.node.config.clone(), None, false).unwrap();
+        fixture.node = NodeServiceImpl::open(fixture.node.config.clone(), None).unwrap();
         let node = fixture.node.clone();
         let source = fixture.source.clone();
         let recovered = tokio::task::spawn_blocking(move || {
@@ -175,7 +175,6 @@ async fn cancelling_embedded_awaiter_keeps_rewrite_files_and_finishes_the_owned_
     fixture.publish_through_node(KEY, 2, Some(2)).await;
     let mut config = EmbeddedSearchConfig::single(EmbeddedShardConfig {
         node: fixture.node.config.clone(),
-        allow_missing_bm25: false,
     });
     config.document_catalog = Some(EmbeddedDocumentCatalogConfig {
         collection: "books".into(),

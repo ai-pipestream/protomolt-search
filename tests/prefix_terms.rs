@@ -14,7 +14,7 @@ use pipestream_search::analyzer::{analyze_document_native, body_spec, NATIVE_ANA
 use pipestream_search::coordinator::{
     CoordinatorServiceImpl, DEFAULT_PREFIX_EXPANSIONS, MAX_PREFIX_EXPANSIONS,
 };
-use pipestream_search::node::{bm25_sidecar_path, Bm25Shard, NodeConfig, NodeServiceImpl};
+use pipestream_search::node::{NodeConfig, NodeServiceImpl};
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
@@ -450,7 +450,6 @@ async fn the_shard_rpc_reports_counts_and_unknown_fields() {
     let index_path = dir.join("shard.tv");
     let (addr, handle) = start_empty_node(NodeConfig {
         index_path: Some(index_path.clone()),
-        layout: pipestream_search::node::Layout::SingleImage,
         ..config(0)
     })
     .await;
@@ -502,8 +501,8 @@ async fn the_shard_rpc_reports_counts_and_unknown_fields() {
         .unwrap()
         .into_inner();
     assert!(!unknown.known);
-    // Through the reader directly, the same file.
-    let reader = Bm25Reader::open(&bm25_sidecar_path(&index_path)).unwrap();
+    // Through the reader directly, the same segment file.
+    let reader = Bm25Reader::open(&common::catalog::segment_bm25(&index_path, 0)).unwrap();
     assert_eq!(reader.expand_prefix("cou", want.len()), Ok(want));
     handle.abort();
     let _ = std::fs::remove_dir_all(&dir);
@@ -551,17 +550,19 @@ async fn string_ranges_resolve_over_sorted_dictionaries_and_old_files_refuse() {
         .facet_dictionary_sorted(0));
 
     let serve = |path: PathBuf| async move {
-        let shard = Bm25Shard::open(&path).unwrap();
+        let index_path = path.with_extension("tv");
+        common::catalog::seal_bm25_file(&index_path, &path);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = format!("http://{}", listener.local_addr().unwrap());
-        let service = NodeServiceImpl::new(
-            None,
+        let service = NodeServiceImpl::open(
             NodeConfig {
+                index_path: Some(index_path),
                 facet_fields: vec!["court".to_string()],
                 ..config(0)
             },
+            None,
         )
-        .with_bm25(Some(shard));
+        .unwrap();
         let handle = tokio::spawn(
             tonic::transport::Server::builder()
                 .add_service(service.into_server(pipestream_search::MAX_MESSAGE_BYTES))
@@ -628,23 +629,6 @@ async fn string_ranges_resolve_over_sorted_dictionaries_and_old_files_refuse() {
         assert_eq!(ids(resp), expect(pred.as_ref()), "{filter}");
     }
     sorted_h.abort();
-
-    let (legacy_c, legacy_h) = serve(legacy_path).await;
-    let equal = filtered(&legacy_c, r#"court == "scotus""#)
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(ids(equal), vec![0], "equality still serves on an old file");
-    for filter in [r#"court < "ca9""#, r#"court.startsWith("ca")"#] {
-        let error = filtered(&legacy_c, filter).await.unwrap_err();
-        assert_eq!(error.code(), Code::FailedPrecondition, "{filter}");
-        assert!(
-            error.message().contains("first-seen") && error.message().contains("\"court\""),
-            "{filter}: {}",
-            error.message()
-        );
-    }
-    legacy_h.abort();
 
     // The heap builder answers ranges as membership over its first-seen
     // dictionary — never refused, never walked per document.

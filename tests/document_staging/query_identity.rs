@@ -247,7 +247,7 @@ fn check_response(
 #[tokio::test]
 async fn supported_query_shapes_keep_authorized_identity_through_source_compaction() {
     let f = Fixture::new();
-    let node = Arc::new(NodeServiceImpl::open(f.config.clone(), None, false).unwrap());
+    let node = Arc::new(NodeServiceImpl::open(f.config.clone(), None).unwrap());
     rewrite::publish_key(&f, node.clone(), b"a", 1, Some(3)).await;
     rewrite::publish_key(&f, node.clone(), b"b", 1, Some(3)).await;
     rewrite::publish_key(&f, node.clone(), b"a", 2, Some(3)).await;

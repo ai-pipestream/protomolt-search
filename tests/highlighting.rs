@@ -17,7 +17,7 @@ use pipestream_search::analyzer::{
     self, analyze_document_native, analyze_document_native_dual, body_spec, NATIVE_ANALYSIS_BACKEND,
 };
 use pipestream_search::coordinator::CoordinatorServiceImpl;
-use pipestream_search::node::{bm25_sidecar_path, Bm25Shard, NodeConfig, NodeServiceImpl};
+use pipestream_search::node::{NodeConfig, NodeServiceImpl};
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
@@ -919,8 +919,8 @@ fn verify_replayed_sentence_split(
     let output = reshard::split_logs_with(&req, &mut native_replay_analyzer()).unwrap();
     let mut seen = 0usize;
     for child in &output.children {
-        let path = child.bm25_path.as_ref().expect("children hold documents");
-        let child_reader = Bm25Reader::open(path).unwrap();
+        let path = common::catalog::segment_bm25(&child.vector_path, 0);
+        let child_reader = Bm25Reader::open(&path).unwrap();
         assert!(
             child_reader.field_has_sentences(0),
             "child keeps body sentences"
@@ -948,7 +948,6 @@ async fn snippets_survive_flush_reopen_and_wal_replay() {
     let index_path = dir.join("shard.tv");
     let config = NodeConfig {
         index_path: Some(index_path.clone()),
-        layout: pipestream_search::node::Layout::SingleImage,
         wal: true,
         wal_buckets: 8,
         ..config(0, true)
@@ -989,13 +988,12 @@ async fn snippets_survive_flush_reopen_and_wal_replay() {
     }
     handle.abort();
 
-    let bm25_path = bm25_sidecar_path(&index_path);
+    let bm25_path = common::catalog::segment_bm25(&index_path, 0);
     let reader = verify_sentence_sidecar(&bm25_path);
 
-    let shard = Bm25Shard::open(&bm25_path).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr2 = format!("http://{}", listener.local_addr().unwrap());
-    let service = NodeServiceImpl::new(None, config.clone()).with_bm25(Some(shard));
+    let service = NodeServiceImpl::open(config.clone(), None).unwrap();
     let handle2 = tokio::spawn(
         tonic::transport::Server::builder()
             .add_service(service.into_server(pipestream_search::MAX_MESSAGE_BYTES))
@@ -1013,7 +1011,7 @@ async fn snippets_survive_flush_reopen_and_wal_replay() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_old_file_without_the_section_serves_and_refuses_sentence_mode_by_name() {
+async fn a_catalog_without_the_section_serves_and_refuses_sentence_mode_by_name() {
     let dir = tempdir("old");
     // A pre-sentence file: the heap store without the declaration.
     let mut store = Bm25Store::with_fields(&["body"]);
@@ -1022,23 +1020,37 @@ async fn an_old_file_without_the_section_serves_and_refuses_sentence_mode_by_nam
         doc.fields[0].sentences = None;
         store.add_document(i as u32, text.to_string(), doc);
     }
-    // Under the name the node reloads a resident shard from.
-    let path = bm25_sidecar_path(&dir.join("old.tv"));
+    let path = dir.join("old.bm25");
     store.save(&path).unwrap();
     let reader = Bm25Reader::open(&path).unwrap();
     assert!(!reader.field_has_sentences(0), "no silent upgrade on open");
     assert_eq!(reader.field_doc_sentences(0, 0), None);
-    let shard = Bm25Shard::open(&path).unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = format!("http://{}", listener.local_addr().unwrap());
-    let service = NodeServiceImpl::new(
-        None,
+    common::catalog::seal_bm25_file(&dir.join("old.tv"), &path);
+    // A node declaring --sentence-fields=body refuses the catalog at open:
+    // the storage declares none, and half a column would lie.
+    let declared = NodeServiceImpl::open(
         NodeConfig {
             index_path: Some(dir.join("old.tv")),
             ..config(0, true)
         },
+        None,
     )
-    .with_bm25(Some(shard));
+    .err()
+    .expect("a sentence declaration the catalog lacks refuses");
+    assert!(
+        declared.contains("declares a field or column table"),
+        "{declared}"
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("http://{}", listener.local_addr().unwrap());
+    let service = NodeServiceImpl::open(
+        NodeConfig {
+            index_path: Some(dir.join("old.tv")),
+            ..config(0, false)
+        },
+        None,
+    )
+    .unwrap();
     let handle = tokio::spawn(
         tonic::transport::Server::builder()
             .add_service(service.into_server(pipestream_search::MAX_MESSAGE_BYTES))
@@ -1064,19 +1076,9 @@ async fn an_old_file_without_the_section_serves_and_refuses_sentence_mode_by_nam
     )
     .await;
     assert!(win.hits.iter().all(|h| !h.snippets.is_empty()));
-    // Ingest into that file under --sentence-fields=body refuses: the
-    // storage declares none, and half a column would lie.
-    let error = ingest(&addr, &["another court"]).await.unwrap_err();
-    assert_eq!(error.code(), Code::FailedPrecondition);
-    assert!(
-        error.message().contains("predates sentence spans"),
-        "{}",
-        error.message()
-    );
     handle.abort();
     let _ = std::fs::remove_dir_all(&dir);
 }
-
 /// Synthetic corpus: `docs` documents of `lines` sentences each.
 fn synthetic(docs: u32, lines: usize) -> Vec<String> {
     (0..docs)
@@ -1088,7 +1090,6 @@ fn synthetic(docs: u32, lines: usize) -> Vec<String> {
         })
         .collect()
 }
-
 fn section(reader: &Bm25Reader, name: &str) -> u64 {
     reader
         .integrity_sections()
@@ -1102,7 +1103,6 @@ fn section(reader: &Bm25Reader, name: &str) -> u64 {
             )
         })
 }
-
 #[test]
 fn sentence_spans_are_priced_exactly_and_both_writers_agree() {
     let dir = tempdir("price");
