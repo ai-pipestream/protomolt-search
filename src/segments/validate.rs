@@ -40,11 +40,14 @@ pub(super) fn validate_manifest(manifest: &SegmentSetManifest) -> Result<(), Str
     Ok(())
 }
 
-/// Only the current set format opens; older manifests fail closed.
+/// Only the current format reads. Older catalogs refuse here, by
+/// version number, before any per-segment file is parsed: a format-5
+/// segment record has no colocation proof to default.
 fn validate_format(manifest: &SegmentSetManifest) -> Result<(), String> {
     if manifest.format != SET_FORMAT {
         return Err(format!(
-            "segment set format {} is unsupported; expected format {SET_FORMAT}",
+            "segment set format {} is unsupported; this build reads only format \
+             {SET_FORMAT}, so rebuild the catalog through the reshard tool",
             manifest.format
         ));
     }

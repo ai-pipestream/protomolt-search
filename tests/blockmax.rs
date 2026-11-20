@@ -37,7 +37,6 @@ impl Lcg {
         self.next() % n
     }
 }
-
 fn test_dir(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target/tmp")

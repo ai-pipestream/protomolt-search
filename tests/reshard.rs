@@ -25,6 +25,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use common::{fit_calibration, unit_vectors, BIT_WIDTH, DIM};
 use pipestream_search::bm25::{self, CorpusStats};
 use pipestream_search::harness::{build_monolithic, mock_analysis};
 use pipestream_search::node::NodeConfig;

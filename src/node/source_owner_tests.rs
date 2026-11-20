@@ -17,7 +17,7 @@ impl Fixture {
     fn owned_catalog(&self, root: &Path) {
         std::fs::create_dir_all(root).unwrap();
         let manifest = SegmentSetManifest {
-            format: 5,
+            format: 6,
             source_owner: Some(
                 SegmentSourceOwner::encode(&crate::pb::storage::SourceIndexOwner {
                     format_version: 1,

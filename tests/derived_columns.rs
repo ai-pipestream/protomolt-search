@@ -924,7 +924,6 @@ fn an_empty_store_keeps_its_declaration_through_save_and_no_catalog_admits_it() 
         })
         .unwrap_err();
     assert!(err.contains("not aligned"), "{err}");
-
     let _ = std::fs::remove_dir_all(&dir);
 }
 

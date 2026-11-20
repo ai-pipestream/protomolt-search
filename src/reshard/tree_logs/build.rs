@@ -105,6 +105,7 @@ impl<'a> TreeBuild<'a> {
             bucket_count: self.spill.spill_bucket_count as usize,
             dim: self.plan.manifest.dim as usize,
             vectors_only: false,
+            documents_only: false,
             upto_clock: u64::MAX,
             check_routing: self.spill.check_routing,
         };

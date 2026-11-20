@@ -145,6 +145,7 @@ impl Drop for Fixture {
 /// The catalog's published set, reopened as a source-owned generation.
 fn owned_set(catalog: &SegmentCatalog, root: PathBuf) -> OpenedSegmentSet {
     let mut manifest = catalog.snapshot().published_manifest();
+    manifest.format = 6;
     manifest.source_owner = Some(
         SegmentSourceOwner::encode(&crate::pb::storage::SourceIndexOwner {
             format_version: 1,

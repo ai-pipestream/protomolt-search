@@ -6,10 +6,10 @@ use super::child_build::{finish_child, ChildSlot};
 #[cfg(doc)]
 use super::hash_split::split_logs_with;
 use super::hash_split::SplitRequest;
-use super::parent_routing::{parent_routes, route_of};
+use super::parent_routing::{parent_child, parent_routes};
 use super::replay::{replay_buckets, Replay};
 use super::split_inputs::{create_out_dir, distribute, hash_range, SplitInputs};
-use super::{bucket_of, Analyzer, SegmentedChildImage, SegmentedReshardOutput};
+use super::{Analyzer, SegmentedChildImage, SegmentedReshardOutput};
 
 /// Repartition full-history WALs into immutable, bucket-sized segments.
 ///
@@ -108,9 +108,21 @@ impl<'a> SegmentSealer<'a> {
         }
         let n = self.request.n;
         let routes = parent_routes(&replay);
-        let partitions = distribute(replay, n, |id, _| Ok(bucket_of(route_of(&routes, id), n)))?;
-        for (logical_shard, partition) in partitions.into_iter().enumerate() {
-            self.seal_partition(logical_shard, partition, analyze)?;
+        let keys = replay.stable_keys.clone();
+        let divergent = std::cell::RefCell::new(vec![false; n]);
+        let partitions = distribute(replay, n, |id, key| {
+            let (child, keyed) = parent_child(&routes, &keys, id, key, n);
+            if super::parent_routing::route_of(&routes, id).is_lineage() && !keyed {
+                divergent.borrow_mut()[child] = true;
+            }
+            Ok(child)
+        })?;
+        for ((logical_shard, partition), divergent) in partitions
+            .into_iter()
+            .enumerate()
+            .zip(divergent.into_inner())
+        {
+            self.seal_partition(logical_shard, partition, divergent, analyze)?;
         }
         Ok(())
     }
@@ -119,6 +131,7 @@ impl<'a> SegmentSealer<'a> {
         &mut self,
         logical_shard: usize,
         partition: Replay,
+        divergent: bool,
         analyze: &mut Analyzer,
     ) -> Result<(), String> {
         let ids: BTreeSet<u64> = partition
@@ -141,7 +154,10 @@ impl<'a> SegmentSealer<'a> {
             hash_hi,
         };
         let schema = self.inputs.schema(self.request.bm25_fields);
-        let image = finish_child(&self.inputs.manifest, partition, slot, &schema, analyze)?;
+        let mut image = finish_child(&self.inputs.manifest, partition, slot, &schema, analyze)?;
+        if divergent {
+            image.parents_colocated = false;
+        }
         self.segments.push(SegmentedChildImage {
             logical_shard,
             segment_ordinal: self.segment_counts[logical_shard],

@@ -120,7 +120,6 @@ impl Fixture {
             .collect()
     }
 }
-
 #[tokio::test]
 async fn reopen_preserves_document_only_gaps_without_writing_a_sidecar() {
     let fixture = Fixture::new(true);
@@ -149,7 +148,6 @@ async fn reopen_preserves_document_only_gaps_without_writing_a_sidecar() {
     assert_eq!(limited.hits, response.hits);
     assert!(!exact_vector_sidecar_path(&fixture.index).exists());
 }
-
 #[tokio::test]
 async fn a_same_sized_stale_sidecar_cannot_replace_sealed_vector_values() {
     let fixture = Fixture::new(false);
@@ -329,7 +327,6 @@ fn mismatched_exact_dimensions_cannot_enter_a_catalog() {
     assert_eq!(catalog.snapshot().epoch(), before.epoch());
     assert_eq!(catalog.snapshot().len(), before.len());
 }
-
 #[tokio::test]
 async fn sealed_retirements_remain_hidden_on_reopen_and_snapshot_install() {
     use pipestream_search::segments::SegmentRowRetirement;

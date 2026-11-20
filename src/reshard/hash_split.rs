@@ -6,13 +6,13 @@ use super::child_build::{finish_child, ChildSlot};
 use super::child_catalog::sealed;
 use super::merge_inputs::load_merge_manifests;
 use super::parent_routing::{
-    clear_scattered, logs_hold_foreign_parents, parent_routes, route_of, scattered_parents,
+    clear_scattered, logs_hold_foreign_parents, parent_child, parent_routes, scattered_parents,
 };
 use super::replay::{read_gens_binding, replay_buckets, Replay};
 use super::split_inputs::{
     create_out_dir, distribute, hash_range, replay_clocked, require_stable_keys, SplitInputs,
 };
-use super::{bucket_of, Analyzer, ChildImage, ReshardOutput, StableReshardOutput};
+use super::{Analyzer, ChildImage, ReshardOutput, StableReshardOutput};
 
 /// A hash split of one or more full-history WAL generations into `n`
 /// children: child `i` takes `slot_offset = slot_base + i * slot_stride`
@@ -100,7 +100,7 @@ impl<'a> SplitRequest<'a> {
 /// `[i*bucket_count/n, (i+1)*bucket_count/n)`, replays only those files,
 /// and its hash range is exactly those buckets. A finer split
 /// (`n > bucket_count`) re-partitions every record by
-/// [`bucket_of`]`(id, n)` — correct but slower; the WAL bucket count
+/// `bucket_of(id, n)` — correct but slower; the WAL bucket count
 /// caps cheap split granularity.
 ///
 /// All inputs must carry byte-identical provider configurations and one bucket
@@ -180,7 +180,7 @@ fn split_bucket_ranges(
 }
 
 /// A split finer than the bucket count, or over logs that hold lineage
-/// parents: every record is re-partitioned by [`bucket_of`] of its lineage
+/// parents: every record is re-partitioned by the parent routing of its lineage
 /// parent (its own id when it has none), so a parent's chunks share a
 /// child.
 fn split_rehashed(
@@ -206,8 +206,22 @@ fn split_rehashed(
     }
     replay.compact();
     let routes = parent_routes(&replay);
-    let partitions = distribute(replay, n, |id, _| Ok(bucket_of(route_of(&routes, id), n)))?;
-    build_children(request, inputs, partitions, analyze)
+    let keys = replay.stable_keys.clone();
+    let divergent = std::cell::RefCell::new(vec![false; n]);
+    let partitions = distribute(replay, n, |id, key| {
+        let (child, keyed) = parent_child(&routes, &keys, id, key, n);
+        if super::parent_routing::route_of(&routes, id).is_lineage() && !keyed {
+            divergent.borrow_mut()[child] = true;
+        }
+        Ok(child)
+    })?;
+    build_children(
+        request,
+        inputs,
+        partitions,
+        &divergent.into_inner(),
+        analyze,
+    )
 }
 
 /// One image per partition, child `i` at its stride offset and its
@@ -216,6 +230,7 @@ fn build_children(
     request: &SplitRequest<'_>,
     inputs: &SplitInputs,
     partitions: Vec<Replay>,
+    divergent: &[bool],
     analyze: &mut Analyzer,
 ) -> Result<Vec<ChildImage>, String> {
     let schema = inputs.schema(request.bm25_fields);
@@ -240,6 +255,9 @@ fn build_children(
         )?);
     }
     clear_scattered(&mut children, &scattered);
+    // A child holding rows routed outside the online key hash space
+    // cannot promise later keyed appends land on it.
+    clear_scattered(&mut children, divergent);
     Ok(children)
 }
 
@@ -266,7 +284,7 @@ pub fn split_stable_logs_with(
             (crate::coordinator::stable_routing_hash(key) >> shift) as usize
         })
     })?;
-    let children = build_children(request, &inputs, partitions, analyze)?;
+    let children = build_children(request, &inputs, partitions, &vec![false; n], analyze)?;
     Ok(StableReshardOutput {
         images: sealed(&inputs.manifest, inputs.next_generation()?, children)?,
         source_cutoffs,
