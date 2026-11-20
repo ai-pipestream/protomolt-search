@@ -255,7 +255,7 @@ async fn a_staged_accepted_intent_recovers_and_publishes_on_retry() {
     stage_pending_accepted(&fixture, &active, &target).await;
     let admission = fixture.authority.admission("alice").unwrap();
     let staged =
-        crate::node::publication_status_blocking(&active, &admission, 1, &[target.clone()])
+        crate::node::publication_status_blocking(&active, &admission, 1, std::slice::from_ref(&target))
             .unwrap()
             .unwrap();
     assert_eq!(staged.targets[0].state, Target::Staged as i32);
