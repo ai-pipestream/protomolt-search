@@ -46,6 +46,7 @@ pub(in crate::node) enum IngestSource<'a> {
         keys: StreamKeys,
         /// The stream replays a primary's WAL.
         logged: bool,
+        replay_permit: Option<Box<crate::authorization::AccessPermit>>,
     },
     /// Boxed: the extractor's trie dwarfs the plain variant.
     Mapped(Box<MappedSource<'a>>),
@@ -82,18 +83,25 @@ impl IngestSource<'_> {
                 stream,
                 keys,
                 logged,
-            } => match stream.message().await? {
-                Some(req) => Ok(Some(IngestDoc {
-                    req,
-                    vector: None,
-                    stable_routing_key: keys.next_row("document")?,
-                    logged: *logged,
-                })),
-                None => {
-                    keys.finish("document")?;
-                    Ok(None)
+                replay_permit,
+            } => {
+                let message = stream.message().await?;
+                if let Some(permit) = replay_permit {
+                    permit.check()?;
                 }
-            },
+                match message {
+                    Some(req) => Ok(Some(IngestDoc {
+                        req,
+                        vector: None,
+                        stable_routing_key: keys.next_row("document")?,
+                        logged: *logged,
+                    })),
+                    None => {
+                        keys.finish("document")?;
+                        Ok(None)
+                    }
+                }
+            }
             IngestSource::Mapped(source) => source.next().await,
             IngestSource::Prepared(source) => source.next(),
         }?;
