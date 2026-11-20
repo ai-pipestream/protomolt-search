@@ -8,6 +8,7 @@
 //! from the key count, so a row can never be appended under a neighbor's
 //! key or under none.
 
+#[cfg(feature = "net")]
 use std::ops::Range;
 
 /// Binary metadata entry naming one stable routing key per row of an
@@ -17,16 +18,19 @@ pub const STABLE_KEYS_METADATA: &str = "x-protomolt-stable-keys-bin";
 /// Encoded key bytes one stream's metadata value carries at most. Binary
 /// metadata travels base64-encoded inside the HTTP/2 header block, so the
 /// cap leaves a third of headroom under a 16 KiB header list.
+#[cfg(feature = "net")]
 pub const MAX_STREAM_KEY_BYTES: usize = 8 << 10;
 
 const LENGTH_BYTES: usize = std::mem::size_of::<u32>();
 
 /// Bytes `keys` take in a metadata value.
+#[cfg(feature = "net")]
 pub(crate) fn encoded_key_bytes(keys: &[Vec<u8>]) -> usize {
     keys.iter().map(|key| LENGTH_BYTES + key.len()).sum()
 }
 
 /// The metadata value for `keys`, one per row in row order.
+#[cfg(feature = "net")]
 pub fn encode_stable_keys(keys: &[Vec<u8>]) -> Result<Vec<u8>, String> {
     let mut value = Vec::with_capacity(encoded_key_bytes(keys));
     for key in keys {
@@ -61,6 +65,7 @@ pub fn decode_stable_keys(mut value: &[u8]) -> Result<Vec<Vec<u8>>, String> {
 /// `max_rows` rows whose encoded keys fit [`MAX_STREAM_KEY_BYTES`]. Every
 /// row lands in exactly one stream, in order; a row whose key alone
 /// exceeds the cap travels in a stream of its own.
+#[cfg(feature = "net")]
 pub fn plan_keyed_streams(keys: &[Vec<u8>], max_rows: usize) -> Vec<Range<usize>> {
     let max_rows = max_rows.max(1);
     let mut streams = Vec::new();
