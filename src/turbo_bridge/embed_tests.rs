@@ -57,17 +57,3 @@ fn malformed_responses_are_refused_by_name() {
         "turbo-kserve returned 4 values for 1 rows of dimension 2"
     );
 }
-
-#[cfg(feature = "local-core")]
-#[tokio::test]
-async fn queued_local_inference_obeys_the_call_timeout() {
-    let running = super::local_permit(None).await.unwrap();
-    let err = super::local_permit(Some(std::time::Duration::from_millis(5)))
-        .await
-        .unwrap_err();
-    assert_eq!(err.code(), tonic::Code::DeadlineExceeded);
-    drop(running);
-    let _resumed = super::local_permit(Some(std::time::Duration::from_secs(1)))
-        .await
-        .unwrap();
-}

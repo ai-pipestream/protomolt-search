@@ -22,6 +22,7 @@ use super::{AnalysisBackend, RemoteCallOptions};
 #[cfg(feature = "net")]
 use crate::turbo_bridge::embed::{unit_rows, EmbedRole};
 use crate::turbo_bridge::embed::{BatchEmbedder, EmbedOptions, RemoteBatchEmbedder};
+use crate::turbo_bridge::embed_deadline::EmbedDeadline;
 use crate::turbo_bridge::tensor::OwnedMatrix;
 
 /// Embed `text` through `turbo-kserve`'s Open Inference Protocol (`ModelInfer`)
@@ -46,6 +47,7 @@ pub async fn embed_text_with_options(
     text: &str,
     options: &RemoteCallOptions,
 ) -> Result<Vec<f32>, Status> {
+    let deadline = EmbedDeadline::new(options.timeout)?;
     if text.is_empty() {
         require_provider(addr)?;
         return Err(Status::invalid_argument("empty text"));
@@ -54,7 +56,9 @@ pub async fn embed_text_with_options(
         call: options.clone(),
         ..Default::default()
     };
-    let matrix = embed_texts_with_options(addr, &[text], &options).await?;
+    let matrix = deadline
+        .wait(embed_texts_until(addr, &[text], &options, deadline))
+        .await?;
     if !matrix.empty_rows().is_empty() {
         return Err(Status::failed_precondition("embedding pooled to zero"));
     }
@@ -69,6 +73,18 @@ pub async fn embed_texts_with_options(
     texts: &[&str],
     options: &EmbedOptions,
 ) -> Result<OwnedMatrix, Status> {
+    let deadline = EmbedDeadline::new(options.call.timeout)?;
+    deadline
+        .wait(embed_texts_until(addr, texts, options, deadline))
+        .await
+}
+
+async fn embed_texts_until(
+    addr: &str,
+    texts: &[&str],
+    options: &EmbedOptions,
+    deadline: EmbedDeadline,
+) -> Result<OwnedMatrix, Status> {
     let backend = require_provider(addr)?;
     if texts.is_empty() {
         return Err(Status::invalid_argument("embed batch is empty"));
@@ -76,14 +92,14 @@ pub async fn embed_texts_with_options(
     match backend {
         #[cfg(feature = "local-core")]
         AnalysisBackend::Turbo => {
-            local::configured(options)
+            local::configured(deadline)
                 .await?
-                .embed_batch(texts, options)
+                .embed_until(texts, options, deadline)
                 .await
         }
         AnalysisBackend::Sidecar(endpoint) => {
             RemoteBatchEmbedder::new(endpoint)
-                .embed_batch(texts, options)
+                .embed_until(texts, options, deadline)
                 .await
         }
         _ => Err(missing_bundle()),
@@ -100,6 +116,20 @@ impl BatchEmbedder for RemoteBatchEmbedder {
         texts: &'a [&'a str],
         options: &'a EmbedOptions,
     ) -> Result<OwnedMatrix, Status> {
+        let deadline = EmbedDeadline::new(options.call.timeout)?;
+        deadline
+            .wait(self.embed_until(texts, options, deadline))
+            .await
+    }
+}
+
+impl RemoteBatchEmbedder {
+    async fn embed_until(
+        &self,
+        texts: &[&str],
+        options: &EmbedOptions,
+        deadline: EmbedDeadline,
+    ) -> Result<OwnedMatrix, Status> {
         let addr = self.addr.as_str();
         if !matches!(AnalysisBackend::parse(addr)?, AnalysisBackend::Sidecar(_)) {
             return Err(missing_bundle());
@@ -109,12 +139,12 @@ impl BatchEmbedder for RemoteBatchEmbedder {
         }
         #[cfg(not(feature = "net"))]
         {
-            let _ = options;
+            let _ = (options, deadline);
             Err(sidecar_needs_net(addr))
         }
         #[cfg(feature = "net")]
         {
-            embed_remote(addr, texts, options.role, &options.call).await
+            embed_remote(addr, texts, options.role, &options.call, deadline).await
         }
     }
 }
@@ -139,6 +169,7 @@ async fn embed_remote(
     texts: &[&str],
     role: EmbedRole,
     options: &RemoteCallOptions,
+    deadline: EmbedDeadline,
 ) -> Result<OwnedMatrix, Status> {
     let (clean_addr, model_name, uri_handshake) = parse_embed_endpoint(addr);
     let (remote, generation) = remote_for_generation(&clean_addr, options)?;
@@ -148,8 +179,8 @@ async fn embed_remote(
         .or(uri_handshake.as_ref())
     {
         if hs.bundle.is_some() {
-            let result = remote.verify_model_handshake(&model_name, "", hs).await;
             invalidate_cached_model(&clean_addr, &model_name);
+            let result = metadata::verify(&remote, &model_name, hs, deadline).await;
             result
                 .map_err(|e| inspect_remote_client_err(&clean_addr, e))?
                 .0
@@ -158,14 +189,8 @@ async fn embed_remote(
             0
         }
     } else {
-        enforce_tofu_remote_model_handshake(
-            &clean_addr,
-            &model_name,
-            &remote,
-            generation,
-            options.timeout,
-        )
-        .await?
+        enforce_tofu_remote_model_handshake(&clean_addr, &model_name, &remote, generation, deadline)
+            .await?
     };
     let prio = if options.interactive {
         turbo_client::RemotePriority::Interactive
@@ -178,7 +203,7 @@ async fn embed_remote(
             texts,
             role.wire_name(),
             Some(prio),
-            options.timeout,
+            deadline.remaining()?,
         )
         .await
         .map_err(|e| inspect_remote_client_err(&clean_addr, e))?;
@@ -189,6 +214,10 @@ async fn embed_remote(
     }
     unit_rows(flat, texts.len(), dim)
 }
+
+#[cfg(feature = "net")]
+#[path = "embed_metadata.rs"]
+mod metadata;
 
 #[cfg(feature = "net")]
 fn remote_for_generation(
@@ -245,7 +274,7 @@ async fn enforce_tofu_remote_model_handshake(
     model_name: &str,
     remote: &turbo_client::RemoteClient,
     generation: u64,
-    timeout: Option<std::time::Duration>,
+    deadline: EmbedDeadline,
 ) -> Result<u32, Status> {
     let entry = PINNED_REMOTE_MODELS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -254,14 +283,9 @@ async fn enforce_tofu_remote_model_handshake(
         .entry((clean_addr.to_owned(), model_name.to_owned()))
         .or_default()
         .clone();
-    let verify = verify_cached_model(&entry, model_name, remote, generation);
-    let result = match timeout {
-        Some(timeout) => tokio::time::timeout(timeout, verify)
-            .await
-            .unwrap_or_else(|_| Err(Status::deadline_exceeded("model handshake timed out"))),
-        None => verify.await,
-    };
-    result.map_err(|status| inspect_remote_status(clean_addr, status))
+    verify_cached_model(&entry, model_name, remote, generation, deadline)
+        .await
+        .map_err(|status| inspect_remote_status(clean_addr, status))
 }
 
 #[cfg(feature = "net")]
@@ -270,6 +294,7 @@ async fn verify_cached_model(
     model_name: &str,
     remote: &turbo_client::RemoteClient,
     generation: u64,
+    deadline: EmbedDeadline,
 ) -> Result<u32, Status> {
     let runtime = tokio::runtime::Handle::try_current()
         .map_err(|_| Status::failed_precondition("remote embedding requires a Tokio runtime"))?
@@ -288,10 +313,7 @@ async fn verify_cached_model(
         analysis: None,
         bundle: cached.fingerprint,
     };
-    match remote
-        .verify_model_handshake(model_name, "", &expected)
-        .await
-    {
+    match metadata::verify(remote, model_name, &expected, deadline).await {
         Ok((spec, fingerprint)) => {
             if fingerprint.sha256 != [0; 32] {
                 cached.dim = spec.dim;
@@ -406,3 +428,7 @@ fn env_embed_model() -> String {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_EMBED_MODEL.to_string())
 }
+
+#[cfg(all(test, feature = "net"))]
+#[path = "embed_policy_tests.rs"]
+mod policy_tests;

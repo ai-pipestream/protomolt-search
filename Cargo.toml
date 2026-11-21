@@ -162,7 +162,7 @@ protomolt-embedder = { path = "crates/protomolt-embedder" }
 # build: cargo unifies a self dev-dependency's features into the library
 # the tests link, and `cargo build` of the binaries does not see it.
 pipestream-search = { path = ".", features = ["fork-guard"] }
-tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "test-util"] }
 bzip2 = "0.6"
 csv = "1"
 bytes = "1"

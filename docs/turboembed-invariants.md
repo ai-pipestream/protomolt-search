@@ -100,3 +100,30 @@ retention use format 2, so older readers refuse them. Streamed snapshots append
 the retained payload after the live bitmap and carry its bounded declaration
 in the manifest. The `.bm25` column layout and vector-provider image formats
 are unchanged.
+
+## Embedding caller budgets
+
+`EmbedOptions.call.timeout` is a total caller budget. The embedding entry point
+creates one absolute deadline, shared by cold bundle admission and loading,
+warm inference admission, blocking inference, and remote model verification
+and inference. Outgoing metadata and inference RPCs receive the remaining
+budget. Bearer, TLS, model pins, prompt role, and scheduling lane retain their
+existing meaning. `None` imposes no caller deadline.
+
+Expiration returns `DeadlineExceeded`. Cancellation removes an admission
+waiter and aborts a job still queued in Tokio. An encoder or bundle loader
+already running cannot be interrupted: it retains the single process-wide
+local permit until completion, even after its caller has returned. A completed
+cold load can populate the cache for later requests. Timeout does not grant
+capacity to a second concurrent encoder.
+
+The controlled mixed-load test is available with
+`cargo test --locked --features local-core --lib mixed_embedding_load -- --ignored --nocapture`.
+It runs three repetitions of eight closed-loop callers (four interactive,
+four bulk, 32 requests each), a 40 ms budget, and synthetic blocking durations
+of 2 ms and 60 ms. It reports queue and execution means for started work,
+expiration counts, caller p99 including expirations, and expired-caller mean
+latency. It compares the admission-only baseline policy with the shared
+budget at one permit, then probes two permits. This isolates queue/cancellation
+behavior; it is not model throughput evidence and does not justify raising
+the production permit count without representative encoder measurements.

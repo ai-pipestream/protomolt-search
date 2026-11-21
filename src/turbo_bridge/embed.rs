@@ -54,7 +54,7 @@ impl EmbedRole {
 pub struct EmbedOptions {
     /// Prompt role for every text in the batch.
     pub role: EmbedRole,
-    /// Admission timeout and model pin, plus scheduling and credentials for remote calls.
+    /// Total caller timeout and model pin, plus scheduling and credentials for remote calls.
     pub call: RemoteCallOptions,
 }
 
@@ -163,26 +163,26 @@ impl LocalBatchEmbedder {
 }
 
 #[cfg(feature = "local-core")]
-pub(crate) async fn local_permit(
-    timeout: Option<std::time::Duration>,
-) -> Result<tokio::sync::SemaphorePermit<'static>, Status> {
-    static LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
-    let acquire = LIMIT.acquire();
-    match timeout {
-        Some(limit) => tokio::time::timeout(limit, acquire)
-            .await
-            .map_err(|_| Status::deadline_exceeded("local embedding capacity wait timed out"))?,
-        None => acquire.await,
-    }
-    .map_err(|_| Status::unavailable("local embedding executor closed"))
-}
-
-#[cfg(feature = "local-core")]
 impl BatchEmbedder for LocalBatchEmbedder {
     async fn embed_batch<'a>(
         &'a self,
         texts: &'a [&'a str],
         options: &'a EmbedOptions,
+    ) -> Result<OwnedMatrix, Status> {
+        let deadline = super::embed_deadline::EmbedDeadline::new(options.call.timeout)?;
+        deadline
+            .wait(self.embed_until(texts, options, deadline))
+            .await
+    }
+}
+
+#[cfg(feature = "local-core")]
+impl LocalBatchEmbedder {
+    pub(crate) async fn embed_until(
+        &self,
+        texts: &[&str],
+        options: &EmbedOptions,
+        deadline: super::embed_deadline::EmbedDeadline,
     ) -> Result<OwnedMatrix, Status> {
         if texts.is_empty() {
             return Err(Status::invalid_argument("embed batch is empty"));
@@ -191,17 +191,16 @@ impl BatchEmbedder for LocalBatchEmbedder {
             pin.verify_bundle(&self.engine.scoring_spec().fingerprint())
                 .map_err(|e| Status::failed_precondition(format!("embedding bundle: {e}")))?;
         }
-        let permit = local_permit(options.call.timeout).await?;
-        let owned: Vec<String> = texts.iter().map(|&text| text.to_owned()).collect();
-        let role = options.role;
-        let this = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let texts: Vec<&str> = owned.iter().map(String::as_str).collect();
-            this.embed_blocking(&texts, role)
+        super::embed_executor::run(super::embed_executor::local_limit(), deadline, || {
+            let owned: Vec<String> = texts.iter().map(|&text| text.to_owned()).collect();
+            let role = options.role;
+            let this = self.clone();
+            move || {
+                let texts: Vec<&str> = owned.iter().map(String::as_str).collect();
+                this.embed_blocking(&texts, role)
+            }
         })
         .await
-        .map_err(|e| Status::internal(format!("local embedding join error: {e}")))?
     }
 }
 

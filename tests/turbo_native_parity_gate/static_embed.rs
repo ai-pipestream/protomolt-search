@@ -428,3 +428,6 @@ fn configured_local_provider_serves_the_public_embedding_route() {
         String::from_utf8_lossy(&result.stderr)
     );
 }
+
+#[path = "static_embed/deadlines.rs"]
+mod deadlines;

@@ -18,6 +18,9 @@
 
 mod call_policy;
 pub mod embed;
+pub(crate) mod embed_deadline;
+#[cfg(feature = "local-core")]
+pub(crate) mod embed_executor;
 mod materialize;
 mod multi_res;
 mod nlp_columns;

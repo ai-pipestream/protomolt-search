@@ -112,7 +112,8 @@ pub struct RemoteCallOptions {
     pub bearer_token: Option<String>,
     /// Interactive vs bulk scheduling lane (`x-turbo-priority`).
     pub interactive: bool,
-    /// Optional per-RPC deadline translated into `grpc-timeout`.
+    /// Optional timeout translated into `grpc-timeout`. Embedding shares this
+    /// total budget across setup, admission, and inference.
     pub timeout: Option<Duration>,
     /// Optional explicit mTLS / server CA configuration (falls back to
     /// [`crate::security::process_client_tls`]).
