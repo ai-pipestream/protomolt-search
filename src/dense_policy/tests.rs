@@ -31,6 +31,7 @@ fn point(k: u32, candidates: u32, recall: u32) -> DensePolicyPoint {
 }
 
 fn document(points: Vec<DensePolicyPoint>) -> DenseExecutionPolicyDocument {
+    let hosts = vec![local_host_profile()];
     DenseExecutionPolicyDocument {
         format_version: FORMAT_VERSION,
         policy_id: "graph-v2".into(),
@@ -45,9 +46,9 @@ fn document(points: Vec<DensePolicyPoint>) -> DenseExecutionPolicyDocument {
         measured_queries: 32,
         target_recall_ppm: 950_000,
         points,
-        hardware_fingerprint: "hw".into(),
+        hardware_fingerprint: fleet_fingerprint(&hosts),
         node_count: 1,
-        hosts: Vec::new(),
+        hosts,
     }
 }
 
@@ -107,8 +108,14 @@ fn malformed_header_cases() -> Vec<(Mutation, &'static str)> {
             "hardware_fingerprint",
         ),
         (
-            Box::new(|d| d.hosts = vec![local_host_profile()]),
+            Box::new(|d| d.hardware_fingerprint = "other-hw".into()),
             "hardware_fingerprint",
+        ),
+        (Box::new(|d| d.hosts.clear()), "hosts"),
+        (Box::new(|d| d.node_count = 2), "node_count"),
+        (
+            Box::new(|d| d.hosts = vec![crate::pb::DenseHostProfile::default()]),
+            "unprofiled",
         ),
         (Box::new(|d| d.points[0].approximate_qps = 0.0), "qps"),
         (Box::new(|d| d.deleted_docs = 1001), "deleted_docs"),
@@ -350,26 +357,40 @@ fn a_point_that_meets_recall_but_measured_slower_routes_to_exhaustive() {
     );
 }
 
-#[test]
-fn concurrent_slot_installs_keep_serving_and_persisted_fingerprints_identical() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_slot_installs_keep_serving_and_persisted_fingerprints_identical() {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     let dir = std::env::temp_dir().join(format!("dense-slot-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("policy.binpb");
     let slot = Arc::new(PolicySlot::new(None, Some(path.clone())));
-    std::thread::scope(|scope| {
-        for depth in [20u32, 40, 60, 80] {
-            let slot = Arc::clone(&slot);
-            scope.spawn(move || {
-                for i in 0..8u32 {
-                    let mut doc = document(vec![point(10, depth + i, 990_000)]);
-                    doc.policy_id = format!("slot-{depth}-{i}");
-                    let policy = DenseExecutionPolicy::from_document(doc).unwrap();
-                    slot.install(policy).unwrap();
-                }
-            });
+    let running = Arc::new(AtomicBool::new(true));
+    let reader_slot = Arc::clone(&slot);
+    let reader_flag = Arc::clone(&running);
+    let reader = tokio::spawn(async move {
+        while reader_flag.load(Ordering::Relaxed) {
+            if let Some(p) = reader_slot.current() {
+                assert!(!p.fingerprint().is_empty());
+            }
+            tokio::task::yield_now().await;
         }
     });
+    let mut writers = Vec::with_capacity(32);
+    for idx in 0..32u32 {
+        let slot = Arc::clone(&slot);
+        writers.push(tokio::spawn(async move {
+            let mut doc = document(vec![point(10, 20 + idx, 990_000)]);
+            doc.policy_id = format!("slot-{idx}");
+            let policy = DenseExecutionPolicy::from_document(doc).unwrap();
+            slot.install(policy).await.unwrap();
+        }));
+    }
+    for task in writers {
+        task.await.unwrap();
+    }
+    running.store(false, Ordering::Relaxed);
+    reader.await.unwrap();
     let serving = slot.current().unwrap();
     let reloaded = DenseExecutionPolicy::load(&path).unwrap();
     assert_eq!(serving.fingerprint(), reloaded.fingerprint());

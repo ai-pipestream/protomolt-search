@@ -49,24 +49,25 @@ pub(super) fn document(doc: &DenseExecutionPolicyDocument) -> Result<(), String>
     if doc.node_count == 0 {
         return Err("hardware_fingerprint and node_count name the measured fleet".into());
     }
-    if !doc.hosts.is_empty() {
-        if doc.hosts.len() != doc.node_count as usize {
-            return Err(format!(
-                "hosts length {} does not match node_count {}",
-                doc.hosts.len(),
-                doc.node_count
-            ));
-        }
-        if doc.hosts.iter().any(|h| !super::is_profiled_host(h)) {
-            return Err("hosts contains an unprofiled DenseHostProfile".into());
-        }
-        let expected_hw = super::fleet_fingerprint(&doc.hosts);
-        if doc.hardware_fingerprint != expected_hw {
-            return Err(format!(
-                "hardware_fingerprint {:?} does not match hosts fingerprint {expected_hw:?}",
-                doc.hardware_fingerprint
-            ));
-        }
+    if doc.hosts.is_empty() {
+        return Err("hosts must list the measured shard DenseHostProfiles".into());
+    }
+    if doc.hosts.len() != doc.node_count as usize {
+        return Err(format!(
+            "hosts length {} does not match node_count {}",
+            doc.hosts.len(),
+            doc.node_count
+        ));
+    }
+    if doc.hosts.iter().any(|h| !super::is_profiled_host(h)) {
+        return Err("hosts contains an unprofiled DenseHostProfile".into());
+    }
+    let expected_hw = super::fleet_fingerprint(&doc.hosts);
+    if doc.hardware_fingerprint != expected_hw {
+        return Err(format!(
+            "hardware_fingerprint {:?} does not match hosts fingerprint {expected_hw:?}",
+            doc.hardware_fingerprint
+        ));
     }
     for (index, point) in doc.points.iter().enumerate() {
         self::point(point, doc.corpus_rows).map_err(|why| format!("point {index}: {why}"))?;

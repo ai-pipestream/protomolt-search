@@ -147,6 +147,8 @@ fn load_policy(tag: &str, bytes: &[u8]) -> Result<DenseExecutionPolicy, String> 
 /// A version-2 document for the fake ANN fixture: k=3 walked at depth 5.
 fn fake_policy(fingerprint: &str, corpus_fp: &str, generation: u64) -> Vec<u8> {
     use prost::Message;
+    let host = pipestream_search::dense_policy::local_host_profile();
+    let hosts = vec![host.clone(), host];
     DenseExecutionPolicyDocument {
         format_version: pipestream_search::dense_policy::FORMAT_VERSION,
         policy_id: "court-ann-v2".into(),
@@ -160,11 +162,9 @@ fn fake_policy(fingerprint: &str, corpus_fp: &str, generation: u64) -> Vec<u8> {
         dimensions: DIM as u32,
         measured_queries: 16,
         target_recall_ppm: 950_000,
-        hardware_fingerprint: pipestream_search::dense_policy::fleet_fingerprint(&[
-            pipestream_search::dense_policy::local_host_profile(),
-        ]),
+        hardware_fingerprint: pipestream_search::dense_policy::fleet_fingerprint(&hosts),
         node_count: 2,
-        hosts: Vec::new(),
+        hosts,
         points: vec![DensePolicyPoint {
             k: 3,
             filter_selectivity_ppm_min: 1_000_000,

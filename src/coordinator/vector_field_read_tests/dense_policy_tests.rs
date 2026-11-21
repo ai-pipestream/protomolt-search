@@ -29,7 +29,7 @@ fn build_doc_view_policy(
     fingerprint: String,
     live: &crate::dense_policy::LiveIdentity,
 ) -> crate::dense_policy::DenseExecutionPolicy {
-    let host = crate::dense_policy::local_host_profile();
+    let hosts = vec![crate::dense_policy::local_host_profile()];
     crate::dense_policy::DenseExecutionPolicy::from_document(
         crate::pb::DenseExecutionPolicyDocument {
             format_version: crate::dense_policy::FORMAT_VERSION,
@@ -44,9 +44,9 @@ fn build_doc_view_policy(
             dimensions: 16,
             measured_queries: 20,
             target_recall_ppm: 950_000,
-            hardware_fingerprint: crate::dense_policy::fleet_fingerprint(&[host]),
+            hardware_fingerprint: crate::dense_policy::fleet_fingerprint(&hosts),
             node_count: 1,
-            hosts: Vec::new(),
+            hosts,
             points: vec![
                 doc_view_policy_point(1_000_000, 1, 990_000),
                 doc_view_policy_point(500_000, 2, 980_000),

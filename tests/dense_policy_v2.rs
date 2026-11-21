@@ -207,8 +207,8 @@ fn graph_policy(
         measured_queries: 16,
         target_recall_ppm: 950_000,
         hardware_fingerprint: fleet_fingerprint(&[local_host_profile()]),
-        node_count: 1,
-        hosts: Vec::new(),
+        node_count: 2,
+        hosts: vec![local_host_profile(), local_host_profile()],
         points: vec![
             point(DenseExecutionShape::Unary),
             point(DenseExecutionShape::Streaming),

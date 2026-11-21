@@ -57,6 +57,8 @@ fn composite_request(
 }
 
 fn unary_staged_policy(live: &LiveIdentity, k: u32, depth: u32) -> DenseExecutionPolicy {
+    let host = local_host_profile();
+    let hosts = vec![host.clone(), host];
     DenseExecutionPolicy::from_document(DenseExecutionPolicyDocument {
         format_version: pipestream_search::dense_policy::FORMAT_VERSION,
         policy_id: "composite-staged-v2".into(),
@@ -70,6 +72,9 @@ fn unary_staged_policy(live: &LiveIdentity, k: u32, depth: u32) -> DenseExecutio
         dimensions: live.dimensions,
         measured_queries: 16,
         target_recall_ppm: 950_000,
+        hardware_fingerprint: fleet_fingerprint(&hosts),
+        node_count: 2,
+        hosts,
         points: vec![DensePolicyPoint {
             k,
             filter_selectivity_ppm_min: 1_000_000,
@@ -82,6 +87,12 @@ fn unary_staged_policy(live: &LiveIdentity, k: u32, depth: u32) -> DenseExecutio
             output_precision: DenseScorePrecision::Quantized as i32,
             filter_strategy: DenseFilterStrategy::Default as i32,
             shape: DenseExecutionShape::Unary as i32,
+            approximate_p50_us: 10,
+            approximate_p99_us: 20,
+            exhaustive_p50_us: 100,
+            exhaustive_p99_us: 200,
+            approximate_qps: 1000.0,
+            exhaustive_qps: 100.0,
             ..Default::default()
         }],
     })
@@ -89,6 +100,8 @@ fn unary_staged_policy(live: &LiveIdentity, k: u32, depth: u32) -> DenseExecutio
 }
 
 fn streaming_settle_policy(live: &LiveIdentity, k: u32, depth: u32) -> DenseExecutionPolicy {
+    let host = local_host_profile();
+    let hosts = vec![host.clone(), host];
     DenseExecutionPolicy::from_document(DenseExecutionPolicyDocument {
         format_version: pipestream_search::dense_policy::FORMAT_VERSION,
         policy_id: "hnsw-stream-settle-v2".into(),
@@ -102,6 +115,9 @@ fn streaming_settle_policy(live: &LiveIdentity, k: u32, depth: u32) -> DenseExec
         dimensions: live.dimensions,
         measured_queries: 16,
         target_recall_ppm: 950_000,
+        hardware_fingerprint: fleet_fingerprint(&hosts),
+        node_count: 2,
+        hosts,
         points: vec![DensePolicyPoint {
             k,
             filter_selectivity_ppm_min: 1_000_000,
@@ -115,6 +131,12 @@ fn streaming_settle_policy(live: &LiveIdentity, k: u32, depth: u32) -> DenseExec
             output_precision: DenseScorePrecision::Fp32 as i32,
             filter_strategy: DenseFilterStrategy::Speed as i32,
             shape: DenseExecutionShape::Streaming as i32,
+            approximate_p50_us: 10,
+            approximate_p99_us: 20,
+            exhaustive_p50_us: 100,
+            exhaustive_p99_us: 200,
+            approximate_qps: 1000.0,
+            exhaustive_qps: 100.0,
             ..Default::default()
         }],
     })
