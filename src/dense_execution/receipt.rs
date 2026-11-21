@@ -309,22 +309,7 @@ fn approximate_receipt(
         return Ok((techniques, Coverage::CandidateSet, Termination::Exhausted));
     }
     if route == Route::Staged || pool_selection == DenseTechnique::BitplaneStaged {
-        let shards_staged = evidence
-            .shards
-            .iter()
-            .all(|s| s.parts_staged == s.active() && s.parts_walked == 0 && s.parts_scanned == 0);
-        if evidence.parts_staged != active
-            || evidence.parts_walked > 0
-            || evidence.parts_scanned > 0
-            || !shards_staged
-        {
-            return Err(contradiction(
-                route,
-                "staged candidate selection did not run staged top-k on every active part",
-            ));
-        }
-        let techniques = counts(&[(DenseTechnique::BitplaneStaged, evidence.parts_staged)]);
-        return Ok((techniques, Coverage::CandidateSet, Termination::Converged));
+        return staged_receipt(route, active, evidence);
     }
     if evidence.parts_scanned > 0 || evidence.parts_staged > 0 {
         return Err(contradiction(
@@ -360,6 +345,29 @@ fn approximate_receipt(
         Termination::Converged
     };
     Ok((techniques, Coverage::CandidateSet, termination))
+}
+
+fn staged_receipt(
+    route: Route,
+    active: u32,
+    evidence: &Evidence,
+) -> Result<(Vec<DenseTechniqueCount>, Coverage, Termination), DenseExecutionError> {
+    let shards_staged = evidence
+        .shards
+        .iter()
+        .all(|s| s.parts_staged == s.active() && s.parts_walked == 0 && s.parts_scanned == 0);
+    if evidence.parts_staged != active
+        || evidence.parts_walked > 0
+        || evidence.parts_scanned > 0
+        || !shards_staged
+    {
+        return Err(contradiction(
+            route,
+            "staged candidate selection did not run staged top-k on every active part",
+        ));
+    }
+    let techniques = counts(&[(DenseTechnique::BitplaneStaged, evidence.parts_staged)]);
+    Ok((techniques, Coverage::CandidateSet, Termination::Converged))
 }
 
 /// Stamp the plan and the validated receipt onto the outcome. Contradictory

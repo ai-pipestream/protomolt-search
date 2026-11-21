@@ -8,12 +8,17 @@ mod common;
 
 use common::{fit_calibration, start_node, unit_vectors};
 use pipestream_search::coordinator::CoordinatorServiceImpl;
-use pipestream_search::harness::seeded_index;
+use pipestream_search::dense_policy::{DenseExecutionPolicy, LiveIdentity};
+use pipestream_search::harness::{fake_ann, seeded_index};
+use pipestream_search::metrics::dense_policy_drift_total;
 use pipestream_search::node::NodeConfig;
+use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
-    search_query, selection_query, DenseCoverage, DenseExecutionMode as Mode, DenseQuery,
-    DenseTechnique, QueryRequest, SearchQuery, SelectionQuery,
+    search_query, selection_query, AddVectorsRequest, DenseCoverage, DenseExecutionMode as Mode,
+    DenseExecutionPolicyDocument, DenseExecutionShape, DenseFilterStrategy, DensePolicyPoint,
+    DensePrecisionRequest as PrecisionRequest, DenseQuery, DenseScorePrecision, DenseTechnique,
+    QueryRequest, SearchQuery, SelectionQuery,
 };
 use tonic::Request;
 
@@ -141,5 +146,175 @@ async fn small_images_and_streaming_coordinators_keep_the_disclosed_fallback() {
         );
         assert_eq!(outcome.coverage, DenseCoverage::ExhaustiveCertified as i32);
         assert!(!outcome.fallback_reason.is_empty());
+    }
+}
+
+fn auto_query(vector: &[f32], k: u32, precision: PrecisionRequest) -> QueryRequest {
+    QueryRequest {
+        k,
+        selection: Some(SelectionQuery {
+            node: Some(selection_query::Node::Search(SearchQuery {
+                id: "vec".into(),
+                query: Some(search_query::Query::Dense(DenseQuery {
+                    vector: vector.to_vec(),
+                    execution_mode: Mode::Auto as i32,
+                    precision: precision as i32,
+                    ..Default::default()
+                })),
+            })),
+        }),
+        ..Default::default()
+    }
+}
+
+fn staged_policy(
+    live: &LiveIdentity,
+    k: u32,
+    q_depth: u32,
+    fp32_depth: u32,
+) -> DenseExecutionPolicy {
+    let point = |output: DenseScorePrecision, candidates: u32| DensePolicyPoint {
+        k,
+        filter_selectivity_ppm_min: 1_000_000,
+        filter_selectivity_ppm_max: 1_000_000,
+        candidates,
+        measured_recall_ppm: 995_000,
+        mode: Mode::Balanced as i32,
+        technique: DenseTechnique::BitplaneStaged as i32,
+        selection_precision: DenseScorePrecision::Quantized as i32,
+        output_precision: output as i32,
+        filter_strategy: DenseFilterStrategy::Default as i32,
+        shape: DenseExecutionShape::Unary as i32,
+        ..Default::default()
+    };
+    DenseExecutionPolicy::from_document(DenseExecutionPolicyDocument {
+        format_version: pipestream_search::dense_policy::FORMAT_VERSION,
+        policy_id: "staged-v2".into(),
+        embedding_model: "test-embed".into(),
+        provider_backend: live.provider_backend.clone(),
+        scoring_fingerprint: live.scoring_fingerprint.clone(),
+        corpus_generation: live.corpus_generation,
+        corpus_rows: live.corpus_rows,
+        deleted_docs: live.deleted_docs,
+        corpus_fingerprint: live.corpus_fingerprint.clone(),
+        dimensions: live.dimensions,
+        measured_queries: 32,
+        target_recall_ppm: 950_000,
+        points: vec![
+            point(DenseScorePrecision::Quantized, q_depth),
+            point(DenseScorePrecision::Fp32, fp32_depth),
+        ],
+    })
+    .unwrap()
+}
+
+async fn ingest_vectors(addr: &str, corpus: &[f32]) {
+    let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
+    let batches: Vec<AddVectorsRequest> = corpus
+        .chunks(10_000 * DIM)
+        .map(|chunk| AddVectorsRequest {
+            materialized_rows: Vec::new(),
+            vectors: chunk.to_vec(),
+            dim: DIM as u32,
+        })
+        .collect();
+    client
+        .add_vectors(tokio_stream::iter(batches))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_qualifies_staged_quantized_and_fp32_points_deterministically() {
+    let corpus = unit_vectors(128, DIM, 0x57A6_1001);
+    let (shift, scale) = fit_calibration(DIM, 4, &corpus);
+    let index = fake_ann::fake_staged_index(seeded_index(DIM, 4, &shift, &scale));
+    let (addr, _handle) = start_node(index, NodeConfig::default()).await;
+    ingest_vectors(&addr, &corpus).await;
+
+    let base = CoordinatorServiceImpl::new(vec![addr]).with_topology_generation(5);
+    let live = base.live_dense_identity().await.unwrap();
+    let coordinator = base.with_dense_execution_policy(staged_policy(&live, 10, 24, 32));
+    let qvec = unit_vectors(1, DIM, 0x57A6_1002);
+
+    let quantized = coordinator
+        .query(Request::new(auto_query(&qvec, 10, PrecisionRequest::Auto)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(quantized.executed, "search");
+    let q_out = quantized.dense_execution.unwrap();
+    assert_eq!(q_out.resolved_mode, Mode::Balanced as i32);
+    assert!(q_out.policy_qualified);
+    assert_eq!(q_out.candidate_depth, 24);
+    assert_eq!(q_out.filter_strategy, DenseFilterStrategy::Default as i32);
+    assert_eq!(q_out.coverage, DenseCoverage::CandidateSet as i32);
+    assert_eq!(
+        q_out.techniques[0].technique,
+        DenseTechnique::BitplaneStaged as i32
+    );
+
+    let fp32 = coordinator
+        .query(Request::new(auto_query(&qvec, 10, PrecisionRequest::Fp32)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(fp32.executed, "search:fp32_pool");
+    let fp_out = fp32.dense_execution.unwrap();
+    assert_eq!(fp_out.resolved_mode, Mode::Balanced as i32);
+    assert!(fp_out.policy_qualified);
+    assert_eq!(fp_out.candidate_depth, 32);
+    assert_eq!(
+        fp_out.selection_precision,
+        DenseScorePrecision::Quantized as i32
+    );
+    assert_eq!(fp_out.output_precision, DenseScorePrecision::Fp32 as i32);
+    assert_eq!(
+        fp_out.techniques[0].technique,
+        DenseTechnique::BitplaneStaged as i32
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_serves_staged_policy_over_real_embedded_turbovec_40k() {
+    let corpus = unit_vectors(40_000, DIM, 0x57A6_2001);
+    let (shift, scale) = fit_calibration(DIM, 4, &corpus[..1024 * DIM]);
+    let index = seeded_index(DIM, 4, &shift, &scale);
+    let (addr, _handle) = start_node(index, NodeConfig::default()).await;
+    ingest_vectors(&addr, &corpus).await;
+
+    let base = CoordinatorServiceImpl::new(vec![addr]).with_topology_generation(9);
+    let live = base.live_dense_identity().await.unwrap();
+    let coordinator = base.with_dense_execution_policy(staged_policy(&live, 10, 40, 64));
+    let qvec = unit_vectors(1, DIM, 0x57A6_2002);
+
+    for (prec, expected_depth) in [
+        (PrecisionRequest::Quantized, 40),
+        (PrecisionRequest::Fp32, 64),
+    ] {
+        let before = dense_policy_drift_total();
+        let outcome = coordinator
+            .query(Request::new(auto_query(&qvec, 10, prec)))
+            .await
+            .unwrap()
+            .into_inner()
+            .dense_execution
+            .unwrap();
+        if host_reads_4bit_planes() {
+            assert_eq!(outcome.resolved_mode, Mode::Balanced as i32);
+            assert!(outcome.policy_qualified);
+            assert_eq!(outcome.candidate_depth, expected_depth);
+            assert_eq!(
+                outcome.techniques[0].technique,
+                DenseTechnique::BitplaneStaged as i32
+            );
+        } else {
+            assert_eq!(outcome.resolved_mode, Mode::Exhaustive as i32);
+            assert!(!outcome.policy_qualified);
+            assert!(outcome
+                .fallback_reason
+                .contains("staged bit-plane selection"));
+            assert!(dense_policy_drift_total() > before);
+        }
     }
 }

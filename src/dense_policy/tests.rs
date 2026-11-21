@@ -86,6 +86,52 @@ fn malformed_header_cases() -> Vec<(Mutation, &'static str)> {
     ]
 }
 
+fn malformed_staged_and_shape_cases() -> Vec<(Mutation, &'static str)> {
+    vec![
+        (
+            Box::new(|d| {
+                d.points[0].technique = Technique::BitplaneStaged as i32;
+                d.points[0].filter_strategy = Strategy::Default as i32;
+                d.points[0].shape = Shape::Streaming as i32;
+                d.points[0].enumerate_max_rows = None;
+            }),
+            "UNARY-only",
+        ),
+        (
+            Box::new(|d| {
+                d.points[0].technique = Technique::BitplaneStaged as i32;
+                d.points[0].filter_strategy = Strategy::Speed as i32;
+                d.points[0].enumerate_max_rows = None;
+            }),
+            "BITPLANE_STAGED filter_strategy",
+        ),
+        (
+            Box::new(|d| {
+                d.points[0].technique = Technique::BitplaneStaged as i32;
+                d.points[0].filter_strategy = Strategy::Default as i32;
+                d.points[0].enumerate_max_rows = None;
+                d.points[0].patience_saturation_ppm = Some(990_000);
+                d.points[0].patience_hops = Some(10);
+            }),
+            "BITPLANE_STAGED point must not set",
+        ),
+        (
+            Box::new(|d| {
+                d.points[0].technique = Technique::BitplaneStaged as i32;
+                d.points[0].filter_strategy = Strategy::Default as i32;
+                d.points[0].enumerate_max_rows = None;
+                d.points[0].floor_greediness_ppm = Some(950_000);
+                d.points[0].floor_clamp_min = Some(8);
+            }),
+            "BITPLANE_STAGED point must not set",
+        ),
+        (
+            Box::new(|d| d.points[0].finish_settle_us = Some(250)),
+            "UNARY point must not set finish_settle_us",
+        ),
+    ]
+}
+
 fn malformed_point_cases() -> Vec<(Mutation, &'static str)> {
     vec![
         (
@@ -94,14 +140,6 @@ fn malformed_point_cases() -> Vec<(Mutation, &'static str)> {
         ),
         (Box::new(|d| d.points[0].technique = 0), "technique"),
         (Box::new(|d| d.points[0].shape = 0), "shape"),
-        (
-            Box::new(|d| {
-                d.points[0].technique = Technique::BitplaneStaged as i32;
-                d.points[0].shape = Shape::Streaming as i32;
-                d.points[0].enumerate_max_rows = None;
-            }),
-            "UNARY-only",
-        ),
         (
             Box::new(|d| d.points[0].filter_strategy = 0),
             "filter_strategy",
@@ -157,6 +195,7 @@ fn malformed_documents_refuse_by_name() {
     assert!(DenseExecutionPolicy::decode(v1).is_err());
     for (mutate, needle) in malformed_header_cases()
         .into_iter()
+        .chain(malformed_staged_and_shape_cases())
         .chain(malformed_point_cases())
     {
         let mut doc = document(vec![point(10, 40, 990_000)]);

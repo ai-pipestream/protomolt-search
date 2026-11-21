@@ -52,7 +52,6 @@ pub struct MembershipSet {
     pub terms: Vec<String>,
     /// Sealed segments the shards consulted and ruled out while resolving this set.
     pub prune: crate::segment_prune::PruneStats,
-    pub(crate) ranges: Vec<(u64, u64)>,
 }
 
 /// Match-set scope for percentile rounds: an explicit ID allowlist or a

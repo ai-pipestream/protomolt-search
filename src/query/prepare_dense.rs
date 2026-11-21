@@ -48,7 +48,8 @@ impl PolicyKnobs {
             filter_strategy: plan.filter_strategy as i32,
             enumerate_all: plan.route == Route::EnumerateAll,
             staged_selection: plan.route == Route::Staged
-                || plan.pool_selection == crate::pb::DenseTechnique::BitplaneStaged,
+                || (plan.route == Route::Fp32Pool
+                    && plan.pool_selection == crate::pb::DenseTechnique::BitplaneStaged),
         }
     }
 }
@@ -132,7 +133,7 @@ pub(super) fn fp32_pool(shape: &Shape<'_>, dense: &DensePlan) -> Result<bool, St
     match shape {
         Shape::Dense { query, .. } => {
             let pooled = route == Some(Route::Fp32Pool);
-            if query.quality.is_some() && !pooled {
+            if query.quality.is_some() && (!pooled || dense.policy_depth.is_some()) {
                 return Err(refuse(
                     "DenseQualityPolicy sizes the FP32 candidate pool of a BALANCED \
                      selection on a quantized provider; this plan has no such pool",
@@ -183,7 +184,7 @@ pub(super) async fn resolve_quality(base: &Base<'_>, dense: &mut DensePlan) -> R
                 .resolve_dense_quality(req.k, query.vector.len(), policy)
                 .await?,
         ),
-        None if dense.fp32_pool && req.selection_k == 0 => {
+        None if dense.fp32_pool && req.selection_k == 0 && dense.policy_depth.is_none() => {
             let resolved = coordinator
                 .resolve_dense_quality_default(req.k, query.vector.len())
                 .await?;

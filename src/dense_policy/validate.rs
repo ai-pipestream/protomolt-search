@@ -74,14 +74,22 @@ fn enums(point: &DensePolicyPoint) -> Result<(), String> {
             _ => return Err(format!("{name} {value} is not FP32 or QUANTIZED")),
         }
     }
-    match Strategy::try_from(point.filter_strategy) {
-        Ok(Strategy::Speed | Strategy::EnumerateSmall) => {}
-        _ => {
+    match (technique, Strategy::try_from(point.filter_strategy)) {
+        (Technique::HnswWalk, Ok(Strategy::Speed | Strategy::EnumerateSmall)) => {}
+        (Technique::HnswWalk, _) => {
             return Err(format!(
-                "filter_strategy {} must name the routing that was measured",
+                "HNSW_WALK filter_strategy {} must be SPEED or ENUMERATE_SMALL",
                 point.filter_strategy
             ))
         }
+        (Technique::BitplaneStaged, Ok(Strategy::Default)) => {}
+        (Technique::BitplaneStaged, _) => {
+            return Err(format!(
+                "BITPLANE_STAGED filter_strategy {} must be DEFAULT",
+                point.filter_strategy
+            ))
+        }
+        _ => unreachable!("technique was validated above"),
     }
     let shape = match Shape::try_from(point.shape) {
         Ok(s @ (Shape::Unary | Shape::Streaming)) => s,
@@ -119,14 +127,28 @@ fn point(point: &DensePolicyPoint, corpus_rows: u64) -> Result<(), String> {
 }
 
 fn controls(point: &DensePolicyPoint, corpus_rows: u64) -> Result<(), String> {
+    if point.technique == Technique::BitplaneStaged as i32
+        && (point.enumerate_max_rows.is_some()
+            || point.patience_saturation_ppm.is_some()
+            || point.patience_hops.is_some()
+            || point.finish_settle_us.is_some()
+            || point.floor_greediness_ppm.is_some()
+            || point.floor_clamp_min.is_some())
+    {
+        return Err(
+            "BITPLANE_STAGED point must not set enumerate_max_rows, patience, finish_settle_us, \
+             or floor controls"
+                .into(),
+        );
+    }
+    if point.shape == Shape::Unary as i32 && point.finish_settle_us.is_some() {
+        return Err("UNARY point must not set finish_settle_us".into());
+    }
     let unfiltered = point.filter_selectivity_ppm_min == UNFILTERED_PPM
         && point.filter_selectivity_ppm_max == UNFILTERED_PPM;
     match point.enumerate_max_rows {
         Some(_) if unfiltered => {
             return Err("unfiltered point must not set enumerate_max_rows".into())
-        }
-        Some(_) if point.technique == Technique::BitplaneStaged as i32 => {
-            return Err("BITPLANE_STAGED point must not set enumerate_max_rows".into())
         }
         Some(rows) if u64::from(rows) > corpus_rows => {
             return Err(format!(

@@ -46,6 +46,13 @@ fn check_capabilities(
     if point.selection_precision != caps.native as i32 {
         return refuse("another selection precision");
     }
+    if point.output_precision == Precision::Fp32 as i32
+        && caps.native == Precision::Quantized
+        && !caps.walks
+        && !caps.fp32_sidecar
+    {
+        return refuse("shard-local FP32 sidecar rescoring");
+    }
     Ok(())
 }
 
@@ -55,11 +62,32 @@ pub(crate) fn qualified(
     caps: &ProviderCaps,
     point: &DensePolicyPoint,
 ) -> Result<ResolvedDensePlan, DenseExecutionError> {
+    let staged = point.technique == DenseTechnique::BitplaneStaged as i32;
+    let strategy = Strategy::try_from(point.filter_strategy).unwrap_or(Strategy::Default);
+    if staged
+        && (strategy != Strategy::Default
+            || point.enumerate_max_rows.is_some()
+            || point.patience_hops.is_some()
+            || point.finish_settle_us.is_some()
+            || point.floor_greediness_ppm.is_some()
+            || point.floor_clamp_min.is_some())
+    {
+        return Err(DenseExecutionError::InvalidRequest(
+            "BITPLANE_STAGED policy point must use DEFAULT filter_strategy without graph controls"
+                .to_string(),
+        ));
+    }
+    if point.shape == crate::pb::DenseExecutionShape::Unary as i32
+        && point.finish_settle_us.is_some()
+    {
+        return Err(DenseExecutionError::InvalidRequest(
+            "UNARY policy point must not set finish_settle_us".to_string(),
+        ));
+    }
     check_capabilities(point, caps)?;
     let mode = Mode::try_from(point.mode).unwrap_or(Mode::Balanced);
     let output = Precision::try_from(point.output_precision).unwrap_or(caps.native);
     let selection = caps.native;
-    let staged = point.technique == DenseTechnique::BitplaneStaged as i32;
     let route = match (output == selection, staged) {
         (false, _) => Route::Fp32Pool,
         (true, true) => Route::Staged,
@@ -83,6 +111,5 @@ pub(crate) fn qualified(
     } else {
         DenseTechnique::HnswWalk
     };
-    let strategy = Strategy::try_from(point.filter_strategy).unwrap_or(Strategy::Default);
     Ok(bind(request, output, strategy, choice, true))
 }

@@ -180,21 +180,7 @@ impl CoordinatorServiceImpl {
         key: DenseRequestKey<'_>,
     ) -> Result<PolicyDecision, Status> {
         if let Err(drift) = policy.verify_identity(&facts.live_identity()) {
-            crate::metrics::record_dense_policy_drift();
-            eprintln!("warning: {drift}; AUTO falling back to exhaustive execution");
-            let mut plan = crate::dense_execution::resolve(request, caps).map_err(|err| {
-                dense_status(
-                    crate::dense_execution::DenseExecutionError::FailedPrecondition(format!(
-                        "{drift}; {err}"
-                    )),
-                )
-            })?;
-            plan.fallback_reason = drift;
-            return Ok(PolicyDecision {
-                plan,
-                qualified: None,
-                selectivity_ppm: 0,
-            });
+            return auto_drift_fallback(request, caps, drift, 0);
         }
         let selectivity_ppm = self
             .dense_filter_selectivity(key.filters, facts.rows)
@@ -214,12 +200,19 @@ impl CoordinatorServiceImpl {
             shape,
         });
         match qualification {
-            Qualification::Qualified(hit) => Ok(PolicyDecision {
-                plan: crate::dense_execution::qualified(request, caps, &hit.point)
-                    .map_err(dense_status)?,
-                qualified: Some(hit),
-                selectivity_ppm,
-            }),
+            Qualification::Qualified(hit) => {
+                match crate::dense_execution::qualified(request, caps, &hit.point) {
+                    Ok(plan) => Ok(PolicyDecision {
+                        plan,
+                        qualified: Some(hit),
+                        selectivity_ppm,
+                    }),
+                    Err(crate::dense_execution::DenseExecutionError::FailedPrecondition(drift)) => {
+                        auto_drift_fallback(request, caps, drift, selectivity_ppm)
+                    }
+                    Err(err) => Err(dense_status(err)),
+                }
+            }
             Qualification::Unqualified(reason) => {
                 let mut plan =
                     crate::dense_execution::resolve(request, caps).map_err(dense_status)?;
@@ -232,6 +225,29 @@ impl CoordinatorServiceImpl {
             }
         }
     }
+}
+
+fn auto_drift_fallback(
+    request: DenseRequest,
+    caps: &ProviderCaps,
+    drift: String,
+    selectivity_ppm: u32,
+) -> Result<PolicyDecision, Status> {
+    crate::metrics::record_dense_policy_drift();
+    eprintln!("warning: {drift}; AUTO falling back to exhaustive execution");
+    let mut plan = crate::dense_execution::resolve(request, caps).map_err(|err| {
+        dense_status(
+            crate::dense_execution::DenseExecutionError::FailedPrecondition(format!(
+                "{drift}; {err}"
+            )),
+        )
+    })?;
+    plan.fallback_reason = drift;
+    Ok(PolicyDecision {
+        plan,
+        qualified: None,
+        selectivity_ppm,
+    })
 }
 
 /// The measured evidence behind a qualified AUTO plan.
