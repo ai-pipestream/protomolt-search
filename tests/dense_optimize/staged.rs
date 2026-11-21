@@ -1,5 +1,5 @@
-//! End-to-end staged bit-plane (`BitplaneStaged`) and capability-downgraded
-//! (`!caps.enumerates`) `OptimizeDensePolicy` + `Query(AUTO)` verification.
+//! End-to-end staged bit-plane (`BitplaneStaged`) `OptimizeDensePolicy` +
+//! `Query(AUTO)` verification and non-exhaustive ANN baseline refusal.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -190,7 +190,7 @@ async fn fake_staged_optimize_installs_and_serves_auto_at_quantized_and_fp32_pre
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fake_ann_without_enumeration_records_downgraded_speed_filter_strategy() {
+async fn ann_without_exhaustive_baseline_refuses_optimize_cleanly() {
     const ANN_DIM: usize = 32;
     let corpus = unit_vectors(256, ANN_DIM, 0x57A6_3001);
     let (shift, scale) = fit_calibration(ANN_DIM, 4, &corpus);

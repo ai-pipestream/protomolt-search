@@ -91,7 +91,12 @@ impl Run {
                 if want.is_empty() {
                     return 1_000_000;
                 }
-                let hits = got.iter().take(k).filter(|id| want.contains(id)).count();
+                let mut seen = HashSet::with_capacity(k.min(got.len()));
+                let hits = got
+                    .iter()
+                    .take(k)
+                    .filter(|id| seen.insert(**id) && want.contains(id))
+                    .count();
                 (hits as u64 * 1_000_000 / want.len() as u64) as u32
             })
             .min()
@@ -99,6 +104,12 @@ impl Run {
     }
 }
 
+/// Build the in-process `QueryRequest` for one sample vector. Served `AUTO`
+/// executes native approximate points by fetching `policy_depth = candidates`
+/// hits per shard (`fetch_k = depth` in `query::prepare_depth`) and truncating
+/// in memory to `k`; explicit `BALANCED`/`FAST` single-leaf queries forbid
+/// `selection_k != k`, so `k = depth` reproduces the exact shard work and wire
+/// payload while `run` retains the top `spec.k` IDs.
 fn build_query_request(vector: &[f32], spec: &CellSpec) -> QueryRequest {
     let (k, selection_k) = if spec.mode == Mode::Exhaustive {
         (spec.k, 0)
@@ -179,6 +190,41 @@ fn verify_cell_receipt(
         )));
     }
     Ok(strategy)
+}
+
+/// Execute one untimed exhaustive query before timing a precision pass so
+/// shard channel initialization and cold page caches do not penalize the first
+/// timed `Exhaustive` truth baseline. Returns `Ok(false)` if `deadline` expires.
+pub(super) async fn warmup(
+    coordinator: &CoordinatorServiceImpl,
+    vector: &[f32],
+    k: u32,
+    precision_req: DensePrecisionRequest,
+    output_precision: DenseScorePrecision,
+    deadline: Instant,
+) -> Result<bool, Status> {
+    if Instant::now() >= deadline {
+        return Ok(false);
+    }
+    let spec = CellSpec {
+        k,
+        depth: k,
+        mode: Mode::Exhaustive,
+        technique: DenseTechnique::Fp32Scan,
+        patience: None,
+        precision_req,
+        output_precision,
+        pooled_fp32: false,
+    };
+    let request = build_query_request(vector, &spec);
+    let rpc = SearchService::query(coordinator, Request::new(request));
+    let Ok(result) = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), rpc).await
+    else {
+        return Ok(false);
+    };
+    let response = result?.into_inner();
+    verify_cell_receipt(&spec, response.dense_execution.as_ref())?;
+    Ok(true)
 }
 
 /// Run every sample query under `spec`, keeping each query's top `k`.
@@ -276,6 +322,13 @@ mod tests {
                 "k={k}"
             );
         }
+        let dup_base = TruthBaseline::from_run(&truth_small, 4);
+        let dup_cand = Run {
+            ids: vec![vec![], vec![10, 10, 10, 10], vec![1, 1, 1, 1]],
+            latencies: vec![Duration::from_micros(10); 3],
+            filter_strategy: DenseFilterStrategy::Speed,
+        };
+        assert_eq!(dup_cand.min_recall_ppm(&dup_base, 4), 250_000);
 
         const K: usize = 10_000;
         const QUERIES: usize = 64;

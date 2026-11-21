@@ -6292,7 +6292,9 @@ message DensePolicyPoint {
   DenseExecutionShape shape = 17;
   // Measured latency of the approximate technique at this point and of the
   // exhaustive technique for the same queries, through the same route and
-  // fleet. AUTO selects the point only where it is faster.
+  // fleet. AUTO selects the point only where approximate_p50_us is lower.
+  // QPS fields record sequential single-query rate (queries / sum(latency_s)),
+  // i.e. 1 / mean latency, not concurrent multi-client throughput.
   uint32 approximate_p50_us = 18;
   uint32 approximate_p99_us = 19;
   uint32 exhaustive_p50_us = 20;
@@ -6336,8 +6338,9 @@ message DenseExecutionPolicyDocument {
   // The recall a point must have measured for AUTO to select it.
   uint32 target_recall_ppm = 10;
   repeated DensePolicyPoint points = 11;
-  // SHA-256 over the fleet's canonical per-shard host capability profiles
-  // (excluding node_count so homogeneous replica scale-out preserves it).
+  // SHA-256 over the sorted, deduplicated set of normalized per-shard
+  // DenseHostProfiles (shard-count-invariant across homogeneous hosts; shard
+  // additions, removals, or restarts still change corpus_fingerprint).
   // A live fleet with another fingerprint fails AUTO closed to EXHAUSTIVE.
   string hardware_fingerprint = 12;
   uint32 node_count = 13;

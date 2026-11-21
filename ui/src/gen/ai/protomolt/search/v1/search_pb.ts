@@ -14302,7 +14302,9 @@ export type DensePolicyPoint = Message<"ai.protomolt.search.v1.DensePolicyPoint"
   /**
    * Measured latency of the approximate technique at this point and of the
    * exhaustive technique for the same queries, through the same route and
-   * fleet. AUTO selects the point only where it is faster.
+   * fleet. AUTO selects the point only where approximate_p50_us is lower.
+   * QPS fields record sequential single-query rate (queries / sum(latency_s)),
+   * i.e. 1 / mean latency, not concurrent multi-client throughput.
    *
    * @generated from field: uint32 approximate_p50_us = 18;
    */
@@ -14443,8 +14445,9 @@ export type DenseExecutionPolicyDocument = Message<"ai.protomolt.search.v1.Dense
   points: DensePolicyPoint[];
 
   /**
-   * SHA-256 over the fleet's canonical per-shard host capability profiles
-   * (excluding node_count so homogeneous replica scale-out preserves it).
+   * SHA-256 over the sorted, deduplicated set of normalized per-shard
+   * DenseHostProfiles (shard-count-invariant across homogeneous hosts; shard
+   * additions, removals, or restarts still change corpus_fingerprint).
    * A live fleet with another fingerprint fails AUTO closed to EXHAUSTIVE.
    *
    * @generated from field: string hardware_fingerprint = 12;

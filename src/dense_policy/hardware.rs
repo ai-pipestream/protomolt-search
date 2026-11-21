@@ -138,9 +138,11 @@ pub fn local_host_profile() -> DenseHostProfile {
         .clone()
 }
 
-/// SHA-256 over the fleet's canonical per-shard host capability profiles,
-/// excluding `node_count` so homogeneous replica scale-out preserves the
-/// policy while any CPU/SIMD/core change or unprofiled shard invalidates it.
+/// SHA-256 over the sorted, deduplicated set of canonical per-shard
+/// [`DenseHostProfile`]s. The digest is shard-count-invariant across
+/// homogeneous hosts while changing on any CPU/SIMD/core difference or
+/// unprofiled shard; live shard additions, removals, or restarts still drift on
+/// `corpus_fingerprint` and fail `AUTO` closed to `EXHAUSTIVE`.
 pub fn fleet_fingerprint(hosts: &[DenseHostProfile]) -> String {
     let mut hasher = turbo_sha256::Sha256::new();
     if hosts.is_empty() || hosts.iter().any(|h| !is_profiled_host(h)) {
@@ -173,7 +175,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fleet_fingerprint_preserves_replica_scale_out_and_separates_distinct_or_unprofiled_hosts() {
+    fn fleet_fingerprint_deduplicates_homogeneous_hosts_and_separates_distinct_or_unprofiled_hosts()
+    {
         let a = local_host_profile();
         assert!(is_profiled_host(&a));
         let mut b = a.clone();
@@ -181,7 +184,7 @@ mod tests {
         assert_eq!(
             fleet_fingerprint(std::slice::from_ref(&a)),
             fleet_fingerprint(&[a.clone(), a.clone(), a.clone()]),
-            "scaling homogeneous replica count must preserve hardware_fingerprint"
+            "homogeneous host sets of size 1 and 3 share hardware_fingerprint"
         );
         assert_ne!(
             fleet_fingerprint(std::slice::from_ref(&a)),

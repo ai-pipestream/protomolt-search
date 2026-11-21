@@ -1442,16 +1442,21 @@ cache as searches touch them; writable tails remain heap-owned. See [Mapped vect
 
 ## TODO
 
-- **2026-11-20 — Dense execution policy v2 and staged bit-plane selection.**
-  `DenseExecutionPolicy` loads version-2 binary `DenseExecutionPolicyDocument`
-  protobuf files (`--dense-execution-policy` / `dense_execution_policy`,
-  refusing retired version-1 TOML files), binding recall-qualified `AUTO`
-  points (`HNSW_WALK` and `BITPLANE_STAGED`) to per-shard `num_vectors`,
-  `deleted_docs`, WAL watermarks, `stats_epoch`, and `stats_incarnation`
-  (`corpus_fingerprint`), counting filter/visibility selectivity directly over
-  compact wire bitmaps, and failing closed to `EXHAUSTIVE`
-  (`turbovec_dense_policy_drift_total`) on corpus mutation, node/relay
-  restart, or live capability loss. Owned `embedded-turbovec` images with
+- **2026-11-20 — Dense execution policy v2, staged bit-plane selection, and
+  `OptimizeDensePolicy`.** `DenseExecutionPolicy` loads version-2 binary
+  `DenseExecutionPolicyDocument` protobuf files (`--dense-execution-policy` /
+  `dense_execution_policy`, refusing retired version-1 TOML files; upgrade the
+  full v2 stack together), binding recall- and latency-qualified `AUTO` points
+  (`HNSW_WALK` and `BITPLANE_STAGED`, `approximate_p50_us < exhaustive_p50_us`,
+  plus sequential single-query QPS) to both deduplicated homogeneous shard
+  `DenseHostProfile`s (`hardware_fingerprint` / `hosts`) and ordered per-shard
+  `num_vectors`, `deleted_docs`, WAL watermarks, `stats_epoch`, and
+  `stats_incarnation` (`corpus_fingerprint`). `SearchService.OptimizeDensePolicy`
+  (`examples/dense_optimize.rs`) runs single-flight bounded sweeps over the
+  coordinator's `Query` route and installs atomically without blocking serving
+  reads; shard additions, removals, restarts, corpus mutations, hardware
+  changes, or live capability loss fail `AUTO` closed to `EXHAUSTIVE`
+  (`turbovec_dense_policy_drift_total`). Owned `embedded-turbovec` images with
   `>= 32,768` rows and supported `2`-/`4`-bit geometry advertise
   `staged_top_k` (`bitplane-balanced-v1`), intersected across relay children
   and partitioned cleanly inside coalesced shard batches. See

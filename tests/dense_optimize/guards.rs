@@ -260,7 +260,7 @@ async fn delayed_provider_respects_max_runtime_ms_single_flight_and_mid_sweep_mu
         t0.elapsed()
     );
 
-    // Query 1 issues 2 TermStats probes (pin + validate); hold right before Query 2's pin (#3).
+    // First Query issues 2 TermStats probes (pin + validate); hold before the third probe.
     shard.term_gate.calls.store(0, Ordering::SeqCst);
     shard.term_gate.hold_on_call.store(3, Ordering::SeqCst);
     let c1 = coordinator.clone();

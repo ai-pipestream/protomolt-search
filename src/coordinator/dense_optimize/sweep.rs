@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use tonic::Status;
 
-use super::measure::{run, CellSpec, Run, TruthBaseline};
+use super::measure::{run, warmup, CellSpec, Run, TruthBaseline};
 use super::{CandidateTechnique, Fleet, PrecisionPass, Sweep};
 use crate::coordinator::CoordinatorServiceImpl;
 use crate::dense_execution::{ProviderCaps, HNSW_BALANCED, HNSW_FAST};
@@ -113,6 +113,38 @@ impl CoordinatorServiceImpl {
         Ok(sweep)
     }
 
+    async fn warmup_pass(
+        &self,
+        queries: &[Vec<f32>],
+        ks: &[u32],
+        pass: PrecisionPass,
+        sweep: &mut Sweep,
+    ) -> Result<bool, Status> {
+        let (Some(first_q), Some(&first_k)) = (queries.first(), ks.first()) else {
+            return Ok(false);
+        };
+        match warmup(
+            self,
+            first_q,
+            first_k,
+            pass.precision_req,
+            pass.output_precision,
+            pass.deadline,
+        )
+        .await
+        {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                sweep.truncated = true;
+                Ok(false)
+            }
+            Err(status) if pass.pooled_fp32 && status.code() == tonic::Code::FailedPrecondition => {
+                Ok(false)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     async fn sweep_precision_pass(
         &self,
         fleet: &Fleet,
@@ -121,6 +153,9 @@ impl CoordinatorServiceImpl {
         pass: PrecisionPass,
         sweep: &mut Sweep,
     ) -> Result<(), Status> {
+        if !self.warmup_pass(queries, ks, pass, sweep).await? {
+            return Ok(());
+        }
         let limit = self
             .knobs
             .max_k()

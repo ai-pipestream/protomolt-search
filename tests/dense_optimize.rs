@@ -198,54 +198,116 @@ async fn optimize_measures_installs_and_auto_routes_on_unary_and_streaming() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn replica_scale_out_preserves_policy_while_foreign_hardware_and_relays_are_checked() {
-    let (addrs, handles) = graph_fleet().await;
+async fn topology_scale_out_fails_auto_closed_on_corpus_fingerprint_while_host_sets_deduplicate() {
+    let local = local_host_profile();
+    let local_fp = fleet_fingerprint(std::slice::from_ref(&local));
+    assert_eq!(
+        local_fp,
+        fleet_fingerprint(&[local.clone(), local.clone(), local]),
+        "homogeneous host sets produce identical hardware_fingerprint regardless of shard count"
+    );
+
+    let (addrs, mut handles) = graph_fleet().await;
     let (relay_addr, _relay, relay_handle) = start_relay(addrs.clone()).await;
     let relay_coord = CoordinatorServiceImpl::new(vec![relay_addr]);
-    let mut doc =
+    let relay_doc =
         SearchService::optimize_dense_policy(&relay_coord, Request::new(optimize_request(false)))
             .await
             .unwrap()
             .into_inner()
             .policy
             .unwrap();
-    assert_eq!(
-        doc.hardware_fingerprint,
-        fleet_fingerprint(&[local_host_profile()])
-    );
-    assert_eq!(doc.node_count, 1);
-    assert_eq!(doc.hosts.len(), 1);
-    for p in &mut doc.points {
-        p.approximate_p50_us = 1;
-        p.measured_recall_ppm = 1_000_000;
-    }
-    let two_shard_probe = CoordinatorServiceImpl::new(addrs.clone());
-    let two_live = two_shard_probe.live_dense_identity().await.unwrap();
-    doc.corpus_fingerprint = two_live.corpus_fingerprint;
-    let scaled_policy = DenseExecutionPolicy::from_document(doc.clone()).unwrap();
-    let two_shard = two_shard_probe.with_dense_execution_policy(scaled_policy);
-    let scaled_out = run_auto(&two_shard, 10).await;
-    assert!(
-        scaled_out.policy_qualified,
-        "1-node hardware_fingerprint stays valid on 2-node homogeneous fleet"
-    );
+    assert_eq!(relay_doc.hardware_fingerprint, local_fp);
+    assert_eq!(relay_doc.node_count, 1);
 
+    let direct_two_shard = CoordinatorServiceImpl::new(addrs.clone())
+        .with_dense_execution_policy(DenseExecutionPolicy::from_document(relay_doc).unwrap());
+    let before_relay_drift = dense_policy_drift_total();
+    let relay_to_direct = run_auto(&direct_two_shard, 10).await;
+    assert_eq!(relay_to_direct.resolved_mode, Mode::Exhaustive as i32);
+    assert!(!relay_to_direct.policy_qualified);
+    assert!(relay_to_direct
+        .fallback_reason
+        .contains("corpus_fingerprint"));
+    assert!(dense_policy_drift_total() > before_relay_drift);
+
+    let two_shard_base = CoordinatorServiceImpl::new(addrs.clone());
+    let two_shard_doc = SearchService::optimize_dense_policy(
+        &two_shard_base,
+        Request::new(optimize_request(false)),
+    )
+    .await
+    .unwrap()
+    .into_inner()
+    .policy
+    .unwrap();
+    let (addr2, h2) = start_node(
+        VectorIndex::create(HNSW, DIM, 8).unwrap(),
+        NodeConfig {
+            slot_offset: (2 * PER_SHARD) as u64,
+            ..Default::default()
+        },
+    )
+    .await;
+    send_vectors(&addr2, unit_vectors(PER_SHARD, DIM, 0x0971_0009), DIM, true).await;
+    handles.push(h2);
+    let mut three_addrs = addrs;
+    three_addrs.push(addr2);
+    let scaled_out = CoordinatorServiceImpl::new(three_addrs)
+        .with_dense_execution_policy(DenseExecutionPolicy::from_document(two_shard_doc).unwrap());
+    let before_scale_drift = dense_policy_drift_total();
+    let scale_out_res = run_auto(&scaled_out, 10).await;
+    assert_eq!(scale_out_res.resolved_mode, Mode::Exhaustive as i32);
+    assert_eq!(
+        scale_out_res.coverage,
+        DenseCoverage::ExhaustiveCertified as i32
+    );
+    assert!(!scale_out_res.policy_qualified);
+    assert!(scale_out_res.fallback_reason.contains("corpus_fingerprint"));
+    assert!(dense_policy_drift_total() > before_scale_drift);
+
+    relay_handle.abort();
+    for h in handles {
+        h.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn foreign_hardware_drifts_auto_closed_and_mixed_relay_children_clear_host() {
+    let local = local_host_profile();
     let foreign_host = DenseHostProfile {
         cpu_model: "foreign-cpu-model".into(),
         simd_features: vec!["sse2".into()],
         logical_cores: 64,
     };
-    doc.node_count = 2;
-    doc.hosts = vec![foreign_host.clone(), foreign_host];
-    doc.hardware_fingerprint = fleet_fingerprint(&doc.hosts);
+    let local_fp = fleet_fingerprint(std::slice::from_ref(&local));
+    assert_ne!(
+        local_fp,
+        fleet_fingerprint(std::slice::from_ref(&foreign_host))
+    );
+    assert_ne!(local_fp, fleet_fingerprint(&[local, foreign_host.clone()]));
+    assert_ne!(local_fp, fleet_fingerprint(&[DenseHostProfile::default()]));
+
+    let (addrs, handles) = graph_fleet().await;
+    let base = CoordinatorServiceImpl::new(addrs.clone());
+    let mut foreign_doc =
+        SearchService::optimize_dense_policy(&base, Request::new(optimize_request(false)))
+            .await
+            .unwrap()
+            .into_inner()
+            .policy
+            .unwrap();
+    foreign_doc.hosts = vec![foreign_host.clone(), foreign_host];
+    foreign_doc.hardware_fingerprint = fleet_fingerprint(&foreign_doc.hosts);
     let foreign = CoordinatorServiceImpl::new(addrs.clone())
-        .with_dense_execution_policy(DenseExecutionPolicy::from_document(doc).unwrap());
-    let before = dense_policy_drift_total();
-    let out = run_auto(&foreign, 10).await;
-    assert_eq!(out.resolved_mode, Mode::Exhaustive as i32);
-    assert_eq!(out.coverage, DenseCoverage::ExhaustiveCertified as i32);
-    assert!(out.fallback_reason.contains("hardware_fingerprint"));
-    assert!(dense_policy_drift_total() > before);
+        .with_dense_execution_policy(DenseExecutionPolicy::from_document(foreign_doc).unwrap());
+    let before_hw_drift = dense_policy_drift_total();
+    let hw_out = run_auto(&foreign, 10).await;
+    assert_eq!(hw_out.resolved_mode, Mode::Exhaustive as i32);
+    assert_eq!(hw_out.coverage, DenseCoverage::ExhaustiveCertified as i32);
+    assert!(!hw_out.policy_qualified);
+    assert!(hw_out.fallback_reason.contains("hardware_fingerprint"));
+    assert!(dense_policy_drift_total() > before_hw_drift);
 
     let mut c0 = NodeServiceClient::connect(addrs[0].clone()).await.unwrap();
     let r0 = c0
@@ -258,7 +320,6 @@ async fn replica_scale_out_preserves_policy_while_foreign_hardware_and_relays_ar
     let mixed = merge_vector_backend(&["a".into(), "b".into()], &[r0, r1]).unwrap();
     assert!(mixed.host.is_none());
 
-    relay_handle.abort();
     for h in handles {
         h.abort();
     }
