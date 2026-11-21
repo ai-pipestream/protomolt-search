@@ -44,9 +44,6 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Error as TransportError;
-
-use common::{fit_calibration, unit_vectors, BIT_WIDTH, DIM};
-
 #[path = "common/dir.rs"]
 mod dir;
 use dir::tempdir;

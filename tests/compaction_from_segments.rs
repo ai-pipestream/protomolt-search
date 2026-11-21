@@ -52,14 +52,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tonic::Request;
-
-use common::mock::start_mock_analysis;
-use common::{fit_calibration, start_empty_node, start_opened_node, unit_vectors, BIT_WIDTH, DIM};
-
 #[path = "common/dir.rs"]
 mod dir;
 use dir::tempdir;
-
 #[path = "common/scratch.rs"]
 mod scratch;
 use scratch::scratch_path;
