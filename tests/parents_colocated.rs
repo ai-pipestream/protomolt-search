@@ -68,9 +68,11 @@ async fn append(
     };
     let mut request = Request::new(tokio_stream::iter([doc]));
     if let Some(key) = key {
+        let encoded =
+            pipestream_search::replication::encode_stable_keys(&[key.into_bytes()]).unwrap();
         request.metadata_mut().insert_bin(
-            "x-protomolt-stable-key-bin",
-            tonic::metadata::MetadataValue::from_bytes(key.as_bytes()),
+            "x-protomolt-stable-keys-bin",
+            tonic::metadata::MetadataValue::from_bytes(&encoded),
         );
     }
     client.add_documents(request).await.unwrap();
