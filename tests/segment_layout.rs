@@ -588,11 +588,68 @@ fn live_heap_bytes() -> usize {
 /// top-k. Measured per thread on the allocator, not on process RSS.
 #[test]
 fn a_mapped_sealed_image_opens_without_the_heap_load() {
+    use pipestream_search::segments::VectorLoad;
+    use pipestream_search::vector::VectorSearchOptions;
+
+    const DIM: usize = 256;
+    let (dir, root, corpus, image_bytes) = stage_large_sealed_image();
+    // Both opens verify every artifact and open the BM25 and exact
+    // stores; the image is the difference between them.
+    let before = live_heap_bytes();
+    let mapped = OpenedSegmentSet::open_with(&root, VectorLoad::Mapped).unwrap();
+    let mapped_growth = live_heap_bytes().saturating_sub(before);
+    assert!(mapped.vector(0).unwrap().is_mapped());
+    let before = live_heap_bytes();
+    let heap = OpenedSegmentSet::open_with(&root, VectorLoad::Heap).unwrap();
+    let heap_growth = live_heap_bytes().saturating_sub(before);
+    assert!(!heap.vector(0).unwrap().is_mapped());
+    assert!(
+        mapped_growth < image_bytes / 2,
+        "mapped open retained {mapped_growth} heap bytes for a {image_bytes}-byte image"
+    );
+    assert!(
+        heap_growth >= image_bytes,
+        "a heap load retained {heap_growth} heap bytes for a {image_bytes}-byte image"
+    );
+    assert!(
+        heap_growth > mapped_growth + image_bytes / 2,
+        "a heap load retained {heap_growth} heap bytes against {mapped_growth} mapped for a \
+         {image_bytes}-byte image"
+    );
+    let query = &corpus[7 * DIM..8 * DIM];
+    let a = mapped
+        .vector(0)
+        .unwrap()
+        .try_search(query, 10, VectorSearchOptions::new())
+        .unwrap();
+    let b = heap
+        .vector(0)
+        .unwrap()
+        .try_search(query, 10, VectorSearchOptions::new())
+        .unwrap();
+    assert_eq!(a.slots_for_query(0), b.slots_for_query(0));
+    assert_eq!(
+        a.scores_for_query(0)
+            .iter()
+            .map(|s| s.to_bits())
+            .collect::<Vec<_>>(),
+        b.scores_for_query(0)
+            .iter()
+            .map(|s| s.to_bits())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(a.slots_for_query(0)[0], 7);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Stage one large sealed segment (80k rows, >8 MiB image) and return
+/// its directory, catalog root, corpus, and image size in bytes.
+fn stage_large_sealed_image() -> (dir::TestDir, PathBuf, Vec<f32>, usize) {
     use pipestream_search::exact_vectors::ExactVectorStore;
     use pipestream_search::live_docs::LiveDocs;
     use pipestream_search::postings::AnalyzedDoc;
-    use pipestream_search::segments::{SegmentCatalog, SegmentSource, VectorLoad};
-    use pipestream_search::vector::{VectorSearchOptions, EMBEDDED_TURBOVEC};
+    use pipestream_search::segments::{SegmentCatalog, SegmentSource};
+    use pipestream_search::vector::EMBEDDED_TURBOVEC;
 
     const DIM: usize = 256;
     const ROWS: usize = 80_000;
@@ -650,51 +707,5 @@ fn a_mapped_sealed_image_opens_without_the_heap_load() {
         })
         .unwrap();
     drop(catalog);
-    // Both opens verify every artifact and open the BM25 and exact
-    // stores; the image is the difference between them.
-    let before = live_heap_bytes();
-    let mapped = OpenedSegmentSet::open_with(&root, VectorLoad::Mapped).unwrap();
-    let mapped_growth = live_heap_bytes().saturating_sub(before);
-    assert!(mapped.vector(0).unwrap().is_mapped());
-    let before = live_heap_bytes();
-    let heap = OpenedSegmentSet::open_with(&root, VectorLoad::Heap).unwrap();
-    let heap_growth = live_heap_bytes().saturating_sub(before);
-    assert!(!heap.vector(0).unwrap().is_mapped());
-    assert!(
-        mapped_growth < image_bytes / 2,
-        "mapped open retained {mapped_growth} heap bytes for a {image_bytes}-byte image"
-    );
-    assert!(
-        heap_growth >= image_bytes,
-        "a heap load retained {heap_growth} heap bytes for a {image_bytes}-byte image"
-    );
-    assert!(
-        heap_growth > mapped_growth + image_bytes / 2,
-        "a heap load retained {heap_growth} heap bytes against {mapped_growth} mapped for a \
-         {image_bytes}-byte image"
-    );
-    let query = &corpus[7 * DIM..8 * DIM];
-    let a = mapped
-        .vector(0)
-        .unwrap()
-        .try_search(query, 10, VectorSearchOptions::new())
-        .unwrap();
-    let b = heap
-        .vector(0)
-        .unwrap()
-        .try_search(query, 10, VectorSearchOptions::new())
-        .unwrap();
-    assert_eq!(a.slots_for_query(0), b.slots_for_query(0));
-    assert_eq!(
-        a.scores_for_query(0)
-            .iter()
-            .map(|s| s.to_bits())
-            .collect::<Vec<_>>(),
-        b.scores_for_query(0)
-            .iter()
-            .map(|s| s.to_bits())
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(a.slots_for_query(0)[0], 7);
-    let _ = std::fs::remove_dir_all(&dir);
+    (dir, root, corpus, image_bytes)
 }

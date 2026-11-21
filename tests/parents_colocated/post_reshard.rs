@@ -2,6 +2,8 @@
 
 use super::*;
 
+/// The child a parent's key hash names under the online routing rule:
+/// the child whose hash range holds the key's stable routing hash.
 fn online_child(output: &reshard::ReshardOutput, key: &str) -> usize {
     let hash = pipestream_search::coordinator::stable_routing_hash(key.as_bytes());
     output

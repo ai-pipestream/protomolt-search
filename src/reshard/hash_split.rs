@@ -458,6 +458,9 @@ pub fn merge(
         ..Default::default()
     };
     let slot = ChildSlot::full_range(0, out_dir, slot_base.unwrap_or(min_slot_offset));
-    let child = finish_child(&manifests[0], merged, slot, &schema, analyze)?;
+    let mut child = finish_child(&manifests[0], merged, slot, &schema, analyze)?;
+    if vectors_only {
+        child.parents_colocated = false;
+    }
     sealed(&manifests[0], max_generation + 1, vec![child])
 }

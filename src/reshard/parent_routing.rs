@@ -158,6 +158,11 @@ pub(super) fn logs_hold_foreign_parents(
     manifest: &WalManifest,
     vectors_only: bool,
 ) -> Result<bool, String> {
+    if vectors_only {
+        // No documents will replay, so no lineage can scatter; do not
+        // read every bucket's FP32 rows only to discard them.
+        return Ok(false);
+    }
     let (count, dim) = (manifest.bucket_count as usize, manifest.dim as usize);
     for bucket in 0..manifest.bucket_count {
         let mut replay = Replay::default();

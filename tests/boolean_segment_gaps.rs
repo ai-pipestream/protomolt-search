@@ -44,75 +44,10 @@ async fn document_only_segment_is_a_gap_in_bitmap_and_boolean_membership() {
         .into_inner();
     assert_eq!((bitmap.base_label, bitmap.label_count), (100, 8));
     assert_eq!(bitmap.bits, vec![0b1111_0011]);
+    let leaves = assert_boolean_groups(&node, &vectors).await;
     let leaf = |i| BooleanPlanNode {
         node: Some(boolean_plan_node::Node::Leaf(i)),
     };
-    let leaves = vec![
-        BooleanPlanLeaf {
-            leaf: Some(boolean_plan_leaf::Leaf::Dense(BooleanPlanDense {
-                vector: vectors[..16].to_vec(),
-                ..Default::default()
-            })),
-        },
-        BooleanPlanLeaf {
-            leaf: Some(boolean_plan_leaf::Leaf::Filter(BooleanPlanFilter::default())),
-        },
-    ];
-    let groups = [
-        (
-            BooleanPlanGroup {
-                must: vec![leaf(0)],
-                ..Default::default()
-            },
-            vec![100, 101, 104, 105, 106, 107],
-        ),
-        (
-            BooleanPlanGroup {
-                must: vec![leaf(1)],
-                should: vec![leaf(0)],
-                ..Default::default()
-            },
-            (100..108).collect(),
-        ),
-        (
-            BooleanPlanGroup {
-                must: vec![leaf(1)],
-                must_not: vec![leaf(0)],
-                ..Default::default()
-            },
-            vec![102, 103],
-        ),
-        (
-            BooleanPlanGroup {
-                must_not: vec![leaf(0)],
-                ..Default::default()
-            },
-            vec![102, 103],
-        ),
-    ];
-    for (group, expected) in groups {
-        let response = node
-            .evaluate_boolean(Request::new(BooleanShardRequest {
-                root: Some(group),
-                leaves: leaves.clone(),
-                depth: 8,
-                ..Default::default()
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        let mut ids: Vec<_> = response.candidates.iter().map(|c| c.doc_id).collect();
-        ids.sort_unstable();
-        assert_eq!(ids, expected);
-        for candidate in response
-            .candidates
-            .iter()
-            .filter(|c| [102, 103].contains(&c.doc_id))
-        {
-            assert!(candidate.signals.is_empty());
-            assert!(!candidate.matched.contains(&0));
-        }
-    }
     // Missing rerank storage cannot silently redefine dense membership.
     let mut exact_leaves = leaves;
     let Some(boolean_plan_leaf::Leaf::Dense(dense)) = exact_leaves[0].leaf.as_mut() else {
@@ -215,4 +150,85 @@ fn build_gapped_node(
         },
     )
     .with_bm25(Some(Bm25Shard::Segmented(bm25)))
+}
+
+/// The two plan leaves: dense over the first vector, and the empty filter.
+fn boolean_leaves(vectors: &[f32]) -> Vec<BooleanPlanLeaf> {
+    vec![
+        BooleanPlanLeaf {
+            leaf: Some(boolean_plan_leaf::Leaf::Dense(BooleanPlanDense {
+                vector: vectors[..16].to_vec(),
+                ..Default::default()
+            })),
+        },
+        BooleanPlanLeaf {
+            leaf: Some(boolean_plan_leaf::Leaf::Filter(BooleanPlanFilter::default())),
+        },
+    ]
+}
+
+/// Every boolean group shape over the gap rows must return its exact
+/// candidate set, with gap rows carrying no dense signal. Returns the
+/// leaves for reuse by the exact-sidecar refusal check.
+async fn assert_boolean_groups(node: &NodeServiceImpl, vectors: &[f32]) -> Vec<BooleanPlanLeaf> {
+    let leaf = |i| BooleanPlanNode {
+        node: Some(boolean_plan_node::Node::Leaf(i)),
+    };
+    let leaves = boolean_leaves(vectors);
+    let groups = [
+        (
+            BooleanPlanGroup {
+                must: vec![leaf(0)],
+                ..Default::default()
+            },
+            vec![100, 101, 104, 105, 106, 107],
+        ),
+        (
+            BooleanPlanGroup {
+                must: vec![leaf(1)],
+                should: vec![leaf(0)],
+                ..Default::default()
+            },
+            (100..108).collect(),
+        ),
+        (
+            BooleanPlanGroup {
+                must: vec![leaf(1)],
+                must_not: vec![leaf(0)],
+                ..Default::default()
+            },
+            vec![102, 103],
+        ),
+        (
+            BooleanPlanGroup {
+                must_not: vec![leaf(0)],
+                ..Default::default()
+            },
+            vec![102, 103],
+        ),
+    ];
+    for (group, expected) in groups {
+        let response = node
+            .evaluate_boolean(Request::new(BooleanShardRequest {
+                root: Some(group),
+                leaves: leaves.clone(),
+                depth: 8,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut ids: Vec<_> = response.candidates.iter().map(|c| c.doc_id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, expected);
+        for candidate in response
+            .candidates
+            .iter()
+            .filter(|c| [102, 103].contains(&c.doc_id))
+        {
+            assert!(candidate.signals.is_empty());
+            assert!(!candidate.matched.contains(&0));
+        }
+    }
+    leaves
 }

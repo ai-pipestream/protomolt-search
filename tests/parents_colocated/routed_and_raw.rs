@@ -26,8 +26,6 @@ async fn routed_parents_reshard_whole_and_keep_their_proof() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The child a parent's key hash names under the online routing rule:
-/// the child whose hash range holds the key's stable routing hash.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raw_lineage_cannot_claim_colocation_and_a_reshard_does_not_launder_it() {
     let dir = tempdir("raw");
