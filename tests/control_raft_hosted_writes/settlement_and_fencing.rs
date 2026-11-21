@@ -8,38 +8,6 @@ use super::*;
 // settle is named unconfirmed and settled by the exact retry; one whose
 // actor lost the right meanwhile is fenced by name, and stays fenced.
 
-/// Make `node` lead again after a partition: its peers are cut from each
-/// other so that, with a log as long as any, it is the only member either
-/// of them can elect; then every link is healed.
-async fn lead_again(cluster: &Voters, host: &Arc<RaftHost>, others: &[u64]) {
-    for other in others {
-        let rest: Vec<u64> = others.iter().copied().filter(|n| n != other).collect();
-        cluster.host(*other).isolate(rest);
-    }
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while host.metrics().borrow().state != openraft::ServerState::Leader {
-        assert!(
-            Instant::now() < deadline,
-            "the member never led again after the partition"
-        );
-        host.trigger_election().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    for other in others {
-        cluster.host(*other).heal();
-    }
-}
-
-fn history_request(history_id: Vec<u8>) -> ReadAcceptedDocumentsRequest {
-    ReadAcceptedDocumentsRequest {
-        after_sequence: 0,
-        limit: 100,
-        through_sequence: None,
-        max_bytes: 1 << 20,
-        history_id,
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_write_durable_after_its_lease_lapsed_is_settled_under_a_fresh_lease() {
     let _serial = serial();
