@@ -31,6 +31,7 @@ pub fn seal_bm25_file(index_path: &Path, bm25_path: &Path) {
             bm25_path,
             live_docs_path: &live,
             partition_column: None,
+            parents_colocated: false,
         })
         .unwrap();
     if let Some(binding) = reader.binding() {

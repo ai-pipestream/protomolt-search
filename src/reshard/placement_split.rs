@@ -215,6 +215,9 @@ pub fn split_placement_logs_with(
         request.child_of(id, codes.get(&id).copied().flatten())
     })?;
     let schema = inputs.schema(request.bm25_fields);
+    // Placement routes by code, so a parent's chunks share a child only
+    // when they carry one code: verified per child, never assumed.
+    let scattered = super::parent_routing::scattered_parents(&partitions);
     let mut out = Vec::with_capacity(request.children.len());
     for (shard, replay) in partitions.into_iter().enumerate() {
         let slot = ChildSlot::full_range(shard, request.out_dir, request.slot_offsets[shard]);
@@ -225,6 +228,12 @@ pub fn split_placement_logs_with(
             &schema,
             analyze,
         )?);
+    }
+    super::parent_routing::clear_scattered(&mut out, &scattered);
+    if request.vectors_only {
+        for child in &mut out {
+            child.parents_colocated = false;
+        }
     }
     Ok(PlacementReshardOutput {
         images: super::child_catalog::sealed(&inputs.manifest, inputs.next_generation()?, out)?,

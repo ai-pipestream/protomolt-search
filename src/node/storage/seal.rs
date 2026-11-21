@@ -36,6 +36,7 @@ pub(in crate::node) struct SealPlan {
     pub(in crate::node) stage: PathBuf,
     pub(in crate::node) segment_id: String,
     pub(in crate::node) generation: u64,
+    pub(in crate::node) parents_colocated: bool,
 }
 
 /// Freeze the vector tail over the same `rows` as the documents (or pick
@@ -67,6 +68,13 @@ fn freeze_vector_image(
         },
         None => Ok(None),
     }
+}
+
+/// In Aligned and Deferred modes a provider-backed tail with
+/// documents but no vectors yet is mid-row: its vectors are still
+/// coming, so it must not seal documents-only.
+fn tail_awaits_vectors(mode: TailSeal, has_provider: bool, vectors: usize) -> bool {
+    matches!(mode, TailSeal::Aligned | TailSeal::Deferred) && has_provider && vectors == 0
 }
 
 impl NodeServiceImpl {
@@ -183,9 +191,7 @@ impl NodeServiceImpl {
                 if docs == 0 && vectors == 0 {
                     return Ok(None);
                 }
-                let awaits_vectors = matches!(mode, TailSeal::Aligned | TailSeal::Deferred)
-                    && provider.is_some()
-                    && vectors == 0;
+                let awaits_vectors = tail_awaits_vectors(mode, provider.is_some(), vectors);
                 if docs != 0 && (vectors != 0 || awaits_vectors) && docs != vectors {
                     if mode == TailSeal::Deferred {
                         return Ok(None);
@@ -228,6 +234,9 @@ impl NodeServiceImpl {
             stage: shard.stage_dir(&format!("{generation:08}")),
             segment_id: format!("seg-{generation:08}"),
             generation,
+            parents_colocated: shard
+                .frozen_parents_colocated()
+                .expect("the seal froze the tail above"),
         }))
     }
 

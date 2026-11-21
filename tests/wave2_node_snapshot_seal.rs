@@ -380,6 +380,7 @@ fn stale_append(catalog: &SegmentCatalog, root: &Path, base: u64) -> Result<(), 
             bm25_path: &bm25,
             live_docs_path: &live,
             partition_column: None,
+            parents_colocated: false,
         })
         .map(|_| ())
 }

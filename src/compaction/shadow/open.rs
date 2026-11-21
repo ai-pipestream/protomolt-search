@@ -24,6 +24,10 @@ pub(in crate::compaction) struct StageImagesSpec<'a> {
     pub source_generation: u64,
     pub backend_kind: &'a str,
     pub partition_column: Option<&'a str>,
+    /// The colocation proof every output carries when the inputs decide it
+    /// (a rebuild from sealed segments keeps the set's); `None` takes each
+    /// image's own, proven from the replayed rows.
+    pub parents_colocated: Option<bool>,
 }
 
 pub(in crate::compaction) fn stage_compacted_images(
@@ -71,6 +75,11 @@ pub(in crate::compaction) fn stage_compacted_images(
             bm25_path: image.bm25_path.as_deref().expect("checked above"),
             live_docs_path: live,
             partition_column: spec.partition_column,
+            parents_colocated: spec
+                .parents_colocated
+                .map_or(image.parents_colocated, |held| {
+                    held && image.parents_colocated
+                }),
         })
         .collect();
     crate::segments::stage_segments(spec.root, sources)
@@ -133,6 +142,16 @@ impl NodeServiceImpl {
                 _ => live_manifest.epoch,
             }
         };
+        // Single-shard compaction cannot prove cross-shard colocation the
+        // source set did not already hold: intersect instead of taking
+        // the rebuild's own verdict over this shard alone.
+        let source_colocated = {
+            let guard = crate::node::read_shard(&self.state);
+            match guard.bm25.as_ref() {
+                Some(Bm25Shard::Segmented(shard)) => shard.snapshot().parents_colocated(),
+                _ => true,
+            }
+        };
         let staged = stage_compacted_images(StageImagesSpec {
             root: &root,
             images: &build.images,
@@ -140,6 +159,7 @@ impl NodeServiceImpl {
             source_generation: epoch_at_open + 1,
             backend_kind: &pre.backend_kind,
             partition_column: pre.partition.as_deref(),
+            parents_colocated: Some(source_colocated),
         })?;
         match self.open_staged_segmented_shadow(pre, &root, &staged, epoch_at_open, new_wal) {
             Ok(shadow) => Ok(shadow),

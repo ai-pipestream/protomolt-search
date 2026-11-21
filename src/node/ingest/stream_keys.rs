@@ -35,16 +35,21 @@ impl StreamKeys {
         })
     }
 
-    /// The key of the stream's next row; `None` for an unkeyed stream.
+    /// The key of the stream's next row; `None` for an unkeyed stream or
+    /// a row whose entry is empty (an unkeyed row inside a keyed stream:
+    /// an empty key routes nothing and proves no colocation).
     pub(in crate::node) fn next_row(&mut self, what: &str) -> Result<Option<Vec<u8>>, Status> {
         if !self.keyed {
             return Ok(None);
         }
-        self.keys.next().map(Some).ok_or_else(|| {
-            Status::invalid_argument(format!(
-                "the replication stream carries more {what} rows than stable keys"
-            ))
-        })
+        self.keys
+            .next()
+            .map(|key| (!key.is_empty()).then_some(key))
+            .ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "the replication stream carries more {what} rows than stable keys"
+                ))
+            })
     }
 
     /// Refuse a keyed stream that closed before every key had its row.
@@ -104,7 +109,7 @@ mod tests {
             left.message().contains("ended with 2 stable keys"),
             "{left}"
         );
-        assert_eq!(keys.next_row("document").unwrap(), Some(Vec::new()));
+        assert_eq!(keys.next_row("document").unwrap(), None);
         assert_eq!(keys.next_row("document").unwrap(), Some(b"c".to_vec()));
         keys.finish("document").unwrap();
         let extra = keys.next_row("document").unwrap_err();

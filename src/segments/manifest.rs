@@ -90,6 +90,9 @@ pub struct SegmentMetadata {
     /// Optional per-segment column summary used as a pruning accelerator;
     /// segments with `None` remain unpruned and are always scanned.
     pub summary: Option<SegmentSummary>,
+    /// Whether every lineage parent with a row in this segment holds all
+    /// of its live rows on this shard (see [`super::SegmentSource`]).
+    pub parents_colocated: bool,
 }
 
 impl SegmentMetadata {

@@ -92,6 +92,7 @@ fn source_generation<'a>(
         bm25_path: &fixture.bm25,
         live_docs_path: &fixture.live_docs,
         partition_column: None,
+        parents_colocated: false,
     }
 }
 
@@ -158,7 +159,7 @@ fn source_owner_metadata_rejects_downgrade_corruption_and_noncanonical_protobuf(
     assert!(unknown.decode().is_err());
     let root = std::env::temp_dir().join(format!("source-owner-format-{}", std::process::id()));
     let valid_manifest = SegmentSetManifest {
-        format: 5,
+        format: 6,
         source_owner: Some(valid),
         ..Default::default()
     };
@@ -168,12 +169,41 @@ fn source_owner_metadata_rejects_downgrade_corruption_and_noncanonical_protobuf(
         let mut invalid = valid_manifest.clone();
         match case {
             0 => invalid.format = 1,
-            1 => invalid.format = 4,
-            2 => invalid.format = 6,
+            1 => invalid.format = 2,
+            2 => invalid.format = 5,
             _ => invalid.source_owner = Some(corrupted.clone()),
         }
         assert!(
             OpenedSegmentSet::open_manifest(root.clone(), invalid, Default::default()).is_err()
         );
     }
+}
+
+#[test]
+fn raw_format5_manifest_refuses_by_version_not_missing_field() {
+    let root =
+        std::env::temp_dir().join(format!("protomolt-segments-format5-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    // A format-5 segments.json as the previous build wrote it: its one
+    // segment record has no "parents_colocated" key at all.
+    std::fs::write(
+        root.join(SET_FILE),
+        r#"{"format":5,"epoch":1,"segments":[{"segment_id":"s0","generation":1,"base_label":0,"rows":1,"live_rows":1}]}"#,
+    )
+    .unwrap();
+    for error in [
+        OpenedSegmentSet::open(root.clone()).unwrap_err(),
+        SegmentCatalog::read_manifest(&root).unwrap_err(),
+    ] {
+        assert!(
+            error.contains("reads only format 6"),
+            "version refusal, got: {error}"
+        );
+        assert!(
+            !error.contains("parents_colocated"),
+            "must not surface as a serde field error: {error}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
 }

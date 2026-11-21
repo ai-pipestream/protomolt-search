@@ -60,7 +60,11 @@ impl NodeServiceImpl {
             return Err(Status::internal("WAL vector record has invalid dimensions"));
         }
         let rows = (batch.vectors.len() / dim) as u64;
-        let key = add.stable_routing_keys.into_iter().next();
+        let key = add
+            .stable_routing_keys
+            .into_iter()
+            .next()
+            .filter(|k| !k.is_empty());
         let (added, first) = self.apply_batch_locked(&mut shadow.state, batch, key)?;
         if added != rows {
             return Err(Status::internal(format!(
@@ -89,7 +93,7 @@ impl NodeServiceImpl {
             let analyzed_doc = analyzed.next().ok_or_else(|| {
                 Status::internal("the tail applied more documents than it analyzed")
             })?;
-            let key = keys.next();
+            let key = keys.next().filter(|k| !k.is_empty());
             let (doc, analyzed_doc) =
                 self.materialize_document(doc, analyzed_doc, key.as_deref(), true)?;
             let mut added = 0u64;

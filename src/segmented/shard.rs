@@ -45,6 +45,26 @@ impl SegmentedShard {
         self.frozen.as_ref().map(|f| (f.base, f.rows, &f.store))
     }
 
+    /// Whether the frozen part's rows prove their parents colocated.
+    pub fn frozen_parents_colocated(&self) -> Option<bool> {
+        self.frozen.as_ref().map(|f| f.parents_colocated)
+    }
+
+    /// A row whose lineage parent may hold rows on another shard joined
+    /// the tail: the segment it seals into cannot claim colocation.
+    pub fn note_scattered_parent(&mut self) {
+        self.tail_parents_colocated = false;
+    }
+
+    /// Whether every row this shard serves proves its lineage parent
+    /// colocated here: every sealed segment, the frozen part and the
+    /// tail.
+    pub fn parents_colocated(&self) -> bool {
+        self.set.parents_colocated()
+            && self.tail_parents_colocated
+            && self.frozen.as_ref().is_none_or(|f| f.parents_colocated)
+    }
+
     pub(super) fn frozen_store(&self) -> &Bm25Store {
         &self
             .frozen

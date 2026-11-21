@@ -133,6 +133,7 @@ impl Inputs<'_> {
                 bm25_path: &path.join("documents.bm25"),
                 live_docs_path: &path.join("live-docs.bin"),
                 partition_column: None,
+                parents_colocated: false,
             })
             .unwrap();
     }
@@ -141,6 +142,7 @@ impl Inputs<'_> {
 /// Mark the catalog as the owned, declared generation a rewrite requires.
 fn declare_owned_generation(catalog: &SegmentCatalog, root: &Path, backend: VectorBackendConfig) {
     let mut manifest = catalog.snapshot().published_manifest();
+    manifest.format = 6;
     manifest.source_owner = Some(
         SegmentSourceOwner::encode(&crate::pb::storage::SourceIndexOwner {
             format_version: 1,
@@ -184,6 +186,7 @@ fn output_sources<'a>(
             bm25_path: &p[2],
             live_docs_path: &p[3],
             partition_column: None,
+            parents_colocated: false,
         })
         .collect()
 }

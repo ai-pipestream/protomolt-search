@@ -106,6 +106,9 @@ struct Frozen {
     base: u32,
     rows: u32,
     store: Arc<Bm25Store>,
+    /// Whether every lineage parent of the frozen rows is colocated on
+    /// this shard (see [`SegmentedShard::note_scattered_parent`]).
+    parents_colocated: bool,
 }
 
 pub struct SegmentedShard {
@@ -115,6 +118,10 @@ pub struct SegmentedShard {
     frozen: Option<Frozen>,
     tail: Bm25Store,
     tail_base: u32,
+    /// Whether every lineage parent of the tail's rows is colocated on
+    /// this shard; a row that cannot prove it clears it until the tail
+    /// freezes.
+    tail_parents_colocated: bool,
     facets: Vec<UnionDict>,
     map_keys: Vec<UnionDict>,
     map_values: Vec<UnionDict>,

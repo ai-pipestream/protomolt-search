@@ -6,9 +6,10 @@ use super::child_build::{finish_child, ChildSlot};
 #[cfg(doc)]
 use super::hash_split::split_logs_with;
 use super::hash_split::SplitRequest;
-use super::replay::{replay_buckets, Replay};
+use super::parent_routing::{extend_lineage_keys, parent_child, parent_routes, LineageKeys};
+use super::replay::{replay_buckets, replay_buckets_documents, Replay};
 use super::split_inputs::{create_out_dir, distribute, hash_range, SplitInputs};
-use super::{bucket_of, Analyzer, SegmentedChildImage, SegmentedReshardOutput};
+use super::{Analyzer, SegmentedChildImage, SegmentedReshardOutput};
 
 /// Repartition full-history WALs into immutable, bucket-sized segments.
 ///
@@ -30,7 +31,26 @@ pub fn split_logs_segmented_with(
     }
     let inputs = SplitInputs::check(request.gens, "segmented split", true)?;
     create_out_dir(request.out_dir)?;
+    // Chunks of one parent can sit in several WAL buckets, so the
+    // shared-key verdict needs every bucket before any segment seals.
+    // The pre-scan reads documents only, never the FP32 rows.
+    let mut lineage = LineageKeys::new();
+    if !request.vectors_only {
+        let (count, dim) = (
+            inputs.manifest.bucket_count as usize,
+            inputs.manifest.dim as usize,
+        );
+        for bucket in 0..inputs.manifest.bucket_count {
+            let mut scan = Replay::default();
+            for gen in request.gens {
+                replay_buckets_documents(gen, bucket..bucket + 1, count, dim, &mut scan)?;
+            }
+            scan.compact();
+            extend_lineage_keys(&mut lineage, &scan);
+        }
+    }
     let mut sealer = SegmentSealer::new(request, &inputs)?;
+    sealer.lineage = lineage;
     for bucket in 0..inputs.manifest.bucket_count {
         let mut replay = Replay::default();
         for gen in request.gens {
@@ -68,6 +88,7 @@ struct SegmentSealer<'a> {
     segment_counts: Vec<usize>,
     segments: Vec<SegmentedChildImage>,
     peak_replay_rows: u64,
+    lineage: LineageKeys,
 }
 
 impl<'a> SegmentSealer<'a> {
@@ -89,6 +110,7 @@ impl<'a> SegmentSealer<'a> {
             segment_counts: vec![0; request.n],
             segments: Vec::new(),
             peak_replay_rows: 0,
+            lineage: LineageKeys::new(),
         })
     }
 
@@ -106,9 +128,21 @@ impl<'a> SegmentSealer<'a> {
             return Ok(());
         }
         let n = self.request.n;
-        let partitions = distribute(replay, n, |id, _| Ok(bucket_of(id, n)))?;
-        for (logical_shard, partition) in partitions.into_iter().enumerate() {
-            self.seal_partition(logical_shard, partition, analyze)?;
+        let routes = parent_routes(&replay);
+        let divergent = std::cell::RefCell::new(vec![false; n]);
+        let partitions = distribute(replay, n, |id, key| {
+            let (child, keyed) = parent_child(&routes, &self.lineage, id, key, n);
+            if super::parent_routing::route_of(&routes, id).is_lineage() && !keyed {
+                divergent.borrow_mut()[child] = true;
+            }
+            Ok(child)
+        })?;
+        for ((logical_shard, partition), divergent) in partitions
+            .into_iter()
+            .enumerate()
+            .zip(divergent.into_inner())
+        {
+            self.seal_partition(logical_shard, partition, divergent, analyze)?;
         }
         Ok(())
     }
@@ -117,6 +151,7 @@ impl<'a> SegmentSealer<'a> {
         &mut self,
         logical_shard: usize,
         partition: Replay,
+        divergent: bool,
         analyze: &mut Analyzer,
     ) -> Result<(), String> {
         let ids: BTreeSet<u64> = partition
@@ -139,7 +174,10 @@ impl<'a> SegmentSealer<'a> {
             hash_hi,
         };
         let schema = self.inputs.schema(self.request.bm25_fields);
-        let image = finish_child(&self.inputs.manifest, partition, slot, &schema, analyze)?;
+        let mut image = finish_child(&self.inputs.manifest, partition, slot, &schema, analyze)?;
+        if divergent || self.request.vectors_only {
+            image.parents_colocated = false;
+        }
         self.segments.push(SegmentedChildImage {
             logical_shard,
             segment_ordinal: self.segment_counts[logical_shard],

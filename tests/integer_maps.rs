@@ -232,118 +232,151 @@ fn integer_map_only_and_empty_files_have_valid_section_boundaries() {
 
 #[test]
 fn integer_maps_translate_keys_across_sealed_frozen_and_mutable_parts() {
-    use pipestream_search::{segmented::SegmentedShard, segments::SegmentSource};
+    use pipestream_search::segmented::SegmentedShard;
     let dir = directory("segments");
     let root = dir.join("catalog");
-    let tail = || {
-        Bm25Store::new()
-            .with_columns(MapInteger, &["signed"])
-            .with_columns(MapUnsignedInteger, &["unsigned"])
+    let rows = integer_map_rows();
+    let check = |shard: &pipestream_search::segmented::SegmentedShard, count: usize| {
+        check_integer_maps(shard, &rows, count)
     };
-    let mut shard = SegmentedShard::open(&root, tail()).unwrap();
-    let rows = [
+    let mut shard = SegmentedShard::open(&root, integer_tail()).unwrap();
+    for batch in 0..3 {
+        for row in batch * 2..batch * 2 + 2 {
+            if shard.next_doc_id() <= row as u32 {
+                add_integer_map_row(&mut shard, &rows, row);
+            }
+            check(&shard, row + 1);
+        }
+        assert!(shard.freeze_tail(Bm25Store::new(), 2).is_err());
+        let frozen = shard.freeze_tail(integer_tail(), 2).unwrap();
+        check(&shard, (batch + 1) * 2);
+        if batch == 0 {
+            // The fresh tail introduces a key absent from the frozen dictionary.
+            add_integer_map_row(&mut shard, &rows, 2);
+            check(&shard, 3);
+        }
+        freeze_and_publish(&mut shard, &dir, batch, &frozen);
+    }
+    drop(shard);
+    assert!(SegmentedShard::open(&root, Bm25Store::new()).is_err());
+    let reopened = SegmentedShard::open(&root, integer_tail()).unwrap();
+    check(&reopened, rows.len());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// The integer-map tail store: one signed and one unsigned map column.
+fn integer_tail() -> Bm25Store {
+    Bm25Store::new()
+        .with_columns(MapInteger, &["signed"])
+        .with_columns(MapUnsignedInteger, &["unsigned"])
+}
+
+/// The six probe rows: (key, signed value, unsigned value).
+fn integer_map_rows() -> [(&'static str, i64, u64); 6] {
+    [
         ("z", i64::MIN, u64::MAX),
         ("", 0, 0),
         ("a", (1i64 << 53) + 1, (1u64 << 53) + 1),
         ("z", i64::MAX, 1 << 63),
         ("", -1, 42),
         ("b", 3, 7),
-    ];
-    let check = |shard: &SegmentedShard, count: usize| {
-        for (row, &(key, signed, unsigned)) in rows[..count].iter().enumerate() {
-            let sk = shard.map_integer_key_ord(0, key).unwrap();
-            let uk = shard.map_unsigned_integer_key_ord(0, key).unwrap();
-            assert_eq!(shard.map_integer_value(0, sk, row as u32), Some(signed));
-            assert_eq!(
-                shard.map_unsigned_integer_value(0, uk, row as u32),
-                Some(unsigned)
-            );
-            let values: Vec<_> = rows[..count]
-                .iter()
-                .filter(|entry| entry.0 == key)
-                .collect();
-            assert_eq!(
-                shard.map_integer_key_min_max(0, sk),
-                Some((
-                    values.iter().map(|e| e.1).min().unwrap(),
-                    values.iter().map(|e| e.1).max().unwrap()
-                ))
-            );
-            assert_eq!(
-                shard.map_unsigned_integer_key_min_max(0, uk),
-                Some((
-                    values.iter().map(|e| e.2).min().unwrap(),
-                    values.iter().map(|e| e.2).max().unwrap()
-                ))
-            );
-            for (other, entry) in rows.iter().enumerate().take(count) {
-                if entry.0 != key {
-                    assert_eq!(shard.map_integer_value(0, sk, other as u32), None);
-                    assert_eq!(shard.map_unsigned_integer_value(0, uk, other as u32), None);
-                }
+    ]
+}
+
+/// Every keyed value and range over the first `count` rows must read back.
+fn check_integer_maps(
+    shard: &pipestream_search::segmented::SegmentedShard,
+    rows: &[(&str, i64, u64)],
+    count: usize,
+) {
+    for (row, &(key, signed, unsigned)) in rows[..count].iter().enumerate() {
+        let sk = shard.map_integer_key_ord(0, key).unwrap();
+        let uk = shard.map_unsigned_integer_key_ord(0, key).unwrap();
+        assert_eq!(shard.map_integer_value(0, sk, row as u32), Some(signed));
+        assert_eq!(
+            shard.map_unsigned_integer_value(0, uk, row as u32),
+            Some(unsigned)
+        );
+        let values: Vec<_> = rows[..count]
+            .iter()
+            .filter(|entry| entry.0 == key)
+            .collect();
+        assert_eq!(
+            shard.map_integer_key_min_max(0, sk),
+            Some((
+                values.iter().map(|e| e.1).min().unwrap(),
+                values.iter().map(|e| e.1).max().unwrap()
+            ))
+        );
+        assert_eq!(
+            shard.map_unsigned_integer_key_min_max(0, uk),
+            Some((
+                values.iter().map(|e| e.2).min().unwrap(),
+                values.iter().map(|e| e.2).max().unwrap()
+            ))
+        );
+        for (other, entry) in rows.iter().enumerate().take(count) {
+            if entry.0 != key {
+                assert_eq!(shard.map_integer_value(0, sk, other as u32), None);
+                assert_eq!(shard.map_unsigned_integer_value(0, uk, other as u32), None);
             }
-            assert_eq!(shard.map_integer_value(0, sk, u32::MAX), None);
         }
-        assert_eq!(shard.map_unsigned_integer_key_min_max(0, u32::MAX), None);
-    };
-    let add_row = |shard: &mut SegmentedShard, row: usize| {
-        let local = row as u32 - shard.tail_base();
-        shard
-            .add_document(row as u32, "map".into(), document(), None)
-            .unwrap();
-        shard
-            .tail_mut()
-            .set_map_integer(0, local, rows[row].0, rows[row].1)
-            .unwrap();
-        shard
-            .tail_mut()
-            .set_map_unsigned_integer(0, local, rows[row].0, rows[row].2)
-            .unwrap();
-        shard.sync_tail();
-    };
-    for batch in 0..3 {
-        for row in batch * 2..batch * 2 + 2 {
-            if shard.next_doc_id() <= row as u32 {
-                add_row(&mut shard, row);
-            }
-            check(&shard, row + 1);
-        }
-        assert!(shard.freeze_tail(Bm25Store::new(), 2).is_err());
-        let frozen = shard.freeze_tail(tail(), 2).unwrap();
-        check(&shard, (batch + 1) * 2);
-        if batch == 0 {
-            // The fresh tail introduces a key absent from the frozen dictionary.
-            add_row(&mut shard, 2);
-            check(&shard, 3);
-        }
-        let (base, count, _) = shard.frozen().unwrap();
-        let image = dir.join(format!("{batch}.bm25"));
-        let live = dir.join(format!("{batch}.live"));
-        frozen.save(&image).unwrap();
-        pipestream_search::live_docs::LiveDocs::default()
-            .write(&live, count as u64)
-            .unwrap();
-        let published = shard
-            .catalog()
-            .append(SegmentSource {
-                multi_res_path: None,
-                segment_id: &format!("seg-{batch}"),
-                generation: batch as u64 + 1,
-                base_label: base as u64,
-                backend_kind: "",
-                vector_path: None,
-                exact_vector_path: None,
-                bm25_path: &image,
-                live_docs_path: &live,
-                partition_column: None,
-            })
-            .unwrap();
-        shard.republish(published).unwrap();
-        check(&shard, shard.next_doc_id() as usize);
+        assert_eq!(shard.map_integer_value(0, sk, u32::MAX), None);
     }
-    drop(shard);
-    assert!(SegmentedShard::open(&root, Bm25Store::new()).is_err());
-    let reopened = SegmentedShard::open(&root, tail()).unwrap();
-    check(&reopened, rows.len());
-    std::fs::remove_dir_all(dir).unwrap();
+    assert_eq!(shard.map_unsigned_integer_key_min_max(0, u32::MAX), None);
+}
+
+/// Append probe row `row` with its signed and unsigned map entries.
+fn add_integer_map_row(
+    shard: &mut pipestream_search::segmented::SegmentedShard,
+    rows: &[(&str, i64, u64)],
+    row: usize,
+) {
+    let local = row as u32 - shard.tail_base();
+    shard
+        .add_document(row as u32, "map".into(), document(), None)
+        .unwrap();
+    shard
+        .tail_mut()
+        .set_map_integer(0, local, rows[row].0, rows[row].1)
+        .unwrap();
+    shard
+        .tail_mut()
+        .set_map_unsigned_integer(0, local, rows[row].0, rows[row].2)
+        .unwrap();
+    shard.sync_tail();
+}
+
+/// Save the frozen part, append it to the catalog, and republish.
+fn freeze_and_publish(
+    shard: &mut pipestream_search::segmented::SegmentedShard,
+    dir: &std::path::Path,
+    batch: usize,
+    frozen: &std::sync::Arc<Bm25Store>,
+) {
+    let (base, count, _) = shard.frozen().unwrap();
+    let image = dir.join(format!("{batch}.bm25"));
+    let live = dir.join(format!("{batch}.live"));
+    frozen.save(&image).unwrap();
+    pipestream_search::live_docs::LiveDocs::default()
+        .write(&live, count as u64)
+        .unwrap();
+    let published = shard
+        .catalog()
+        .append(pipestream_search::segments::SegmentSource {
+            multi_res_path: None,
+            segment_id: &format!("seg-{batch}"),
+            generation: batch as u64 + 1,
+            base_label: base as u64,
+            backend_kind: "",
+            vector_path: None,
+            exact_vector_path: None,
+            bm25_path: &image,
+            live_docs_path: &live,
+            partition_column: None,
+            parents_colocated: false,
+        })
+        .unwrap();
+    shard.republish(published).unwrap();
+    check_integer_maps(shard, &integer_map_rows(), shard.next_doc_id() as usize);
 }
