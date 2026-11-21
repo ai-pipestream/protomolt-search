@@ -17,8 +17,9 @@ use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
-    AddDocumentsRequest, Bm25SearchRequest, Bm25SearchResponse, FacetValue, GeoBbox, GeoFilter,
-    GeoPointValue, IntegerValue, MapFacetEntry, MapNumericEntry, NumericValue, TimestampValue,
+    AddDocumentsRequest, Bm25SearchRequest, Bm25SearchResponse, FacetValue, FilterBound, GeoBbox,
+    GeoFilter, GeoPointValue, IntegerValue, MapFacetEntry, MapFacetField, MapNumericEntry,
+    NumericValue, RangeFacetField, TimestampValue,
 };
 use pipestream_search::postings::{AnalyzedDoc, Bm25Reader, Bm25Store};
 use pipestream_search::scorefn::NumericRead;
@@ -622,16 +623,14 @@ async fn filters_narrow_facet_counts() {
         Bm25SearchRequest {
             text: "rust".into(),
             k: 1,
-            map_facet_fields: vec![pipestream_search::pb::MapFacetField {
+            map_facet_fields: vec![MapFacetField {
                 column: "tags".into(),
                 key: "color".into(),
             }],
-            range_facet_fields: vec![pipestream_search::pb::RangeFacetField {
+            range_facet_fields: vec![RangeFacetField {
                 column: "year".into(),
-                edges: [1990.0, 2000.0, 2030.0]
-                    .map(pipestream_search::pb::FilterBound::num)
-                    .to_vec(),
-                ..Default::default()
+                map_key: None,
+                edges: [1990.0, 2000.0, 2030.0].map(FilterBound::num).to_vec(),
             }],
             filter: r#"court == "scotus""#.into(),
             ..Default::default()

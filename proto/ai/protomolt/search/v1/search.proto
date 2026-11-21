@@ -1257,6 +1257,8 @@ message CompactShardRequest {
 }
 
 message CompactShardResponse {
+  reserved 5;
+  reserved "locked_tail_records";
   // Physical rows (live plus tombstoned) at the cutoff clock.
   uint64 rows_before = 1;
   // Physical rows served after the cutover: the dense image plus the
@@ -3020,7 +3022,7 @@ message Bm25QueryRequest {
   // counted exactly like a plain facet field — count-then-rank, one
   // ords lookup per matched document, independent of k and the floor.
   // Answered in Bm25QueryResponse.facets AFTER the plain facet
-  // entries, with FacetFieldCounts.key set.
+  // entries, with FacetFieldCounts.map_key set.
   repeated MapFacetField map_facet_fields = 13;
   // Range buckets to count over the match set (as `facet_fields`
   // defines it, filters included; docs/range-facets.md): "how many
@@ -4044,7 +4046,7 @@ message Bm25SearchRequest {
   // Map-facet keys to count over the full match set
   // (docs/map-columns.md), forwarded to every shard and summed like
   // plain facet fields; answered in `facets` after the plain entries,
-  // with FacetFieldCounts.key set. A (column, key) pair no shard knows
+  // with FacetFieldCounts.map_key set. A (column, key) pair no shard knows
   // is refused (INVALID_ARGUMENT).
   repeated MapFacetField map_facet_fields = 8;
   // Range buckets to count over the full match set

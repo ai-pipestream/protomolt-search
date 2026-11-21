@@ -24,15 +24,13 @@ fn compare(a: NumBound, b: NumBound) -> Ordering {
 }
 
 impl crate::pb::FilterBound {
-    /// An inclusive double bound.
+    /// Inclusive double bound for test construction.
+    #[doc(hidden)]
     pub fn num(value: f64) -> Self {
         Self::inclusive(Value::Num(value))
     }
-    /// An inclusive signed bound.
-    pub fn int(value: i64) -> Self {
-        Self::inclusive(Value::Int(value))
-    }
-    /// An inclusive unsigned bound.
+    /// Inclusive unsigned integer bound for test construction.
+    #[doc(hidden)]
     pub fn uint(value: u64) -> Self {
         Self::inclusive(Value::Uint(value))
     }
@@ -54,7 +52,7 @@ impl<'a> Intervals<'a> {
             Status::invalid_argument(format!(
                 "range facet {:?}[{:?}]: {why}",
                 request.column,
-                request.map_key()
+                request.map_key.as_deref()
             ))
         };
         if request.column.is_empty() {
@@ -130,7 +128,7 @@ impl<'a> Intervals<'a> {
             Status::failed_precondition(format!(
                 "range facet {:?}[{:?}]: child response does not match requested intervals",
                 self.request.column,
-                self.request.map_key()
+                self.request.map_key.as_deref()
             ))
         };
         if response.column != self.request.column || response.map_key != self.request.map_key {
@@ -181,8 +179,9 @@ pub(crate) fn merge(
             for (sum, bucket) in sums[i].iter_mut().zip(&response.buckets) {
                 *sum = sum.checked_add(bucket.count).ok_or_else(|| {
                     Status::out_of_range(format!(
-                        "range facet {:?}: bucket count overflows u64",
-                        requested[i].column
+                        "range facet {:?}[{:?}]: bucket count overflows u64",
+                        requested[i].column,
+                        requested[i].map_key.as_deref()
                     ))
                 })?;
             }
@@ -195,9 +194,10 @@ pub(crate) fn merge(
         .map(|((plan, counts), known)| {
             if require_known && !known {
                 return Err(Status::invalid_argument(format!(
-                "no shard has range-facet column {:?}[{:?}]; check --numeric-fields / --integer-fields / --unsigned-integer-fields / --map-numeric-fields / --map-integer-fields / --map-unsigned-integer-fields",
-                plan.request.column, plan.request.map_key()
-            )));
+                    "no shard has range-facet column {:?}[{:?}]; check --numeric-fields / --integer-fields / --unsigned-integer-fields / --map-numeric-fields / --map-integer-fields / --map-unsigned-integer-fields",
+                    plan.request.column,
+                    plan.request.map_key.as_deref()
+                )));
             }
             Ok(plan.response(counts, known))
         })
@@ -376,5 +376,26 @@ mod tests {
                 .code(),
             tonic::Code::OutOfRange
         );
+    }
+
+    #[test]
+    fn refusal_messages_distinguish_plain_column_from_empty_map_key() {
+        let plain = RangeFacetField {
+            column: "col".into(),
+            map_key: None,
+            edges: vec![FilterBound::num(1.0)],
+        };
+        let empty_key = RangeFacetField {
+            map_key: Some(String::new()),
+            ..plain.clone()
+        };
+        let plain_msg = Intervals::new(&plain).err().unwrap().message().to_string();
+        let empty_msg = Intervals::new(&empty_key)
+            .err()
+            .unwrap()
+            .message()
+            .to_string();
+        assert!(plain_msg.contains(r#""col"[None]"#), "{plain_msg}");
+        assert!(empty_msg.contains(r#""col"[Some("")]"#), "{empty_msg}");
     }
 }

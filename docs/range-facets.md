@@ -6,17 +6,16 @@ kind that can hold an integer without rounding it.
 
 ## Integer map entries (2026-09-07)
 
-`RangeFacetField.typed_map` at tag 6 selects an f64/i64/u64 map entry, using
-`MapRangeFacet { key, edges, typed_edges }`. Supply only `column` and
-`typed_map`; the legacy key/edge fields and `map` must be absent. Literal
-empty and quoted keys are supported. `map` at tag 5 and the legacy nonempty
-key continue to select only f64 maps.
+`RangeFacetField.map_key` (optional string, tag 7) selects an f64, i64 or u64
+map entry, paired with `column` and `repeated FilterBound edges` (tag 8).
+Literal empty and quoted keys are supported; omitting `map_key` selects a plain
+f64, i64 or u64 column.
 
 Values retain their signed or unsigned integer domain through bucket comparison.
-Typed edges may mix signed, unsigned and finite double bounds, in strictly
+`edges` may mix signed, unsigned and finite double bounds, in strictly
 increasing numeric order. Buckets remain half-open. Adjacent large integers
-stay distinct even when their rounded display bounds coincide; `typed_from`
-and `typed_to` are authoritative. The final exclusive edge `num(2^64)` includes
+stay distinct, and each `RangeBucket` echoes exact `FilterBound` `from` (tag 6)
+and `to` (tag 7) bounds. The final exclusive edge `num(2^64)` includes
 `u64::MAX` without inventing an unsigned value outside the protobuf domain.
 
 A missing entry contributes nothing, while zero is a present value. Counts
@@ -25,15 +24,13 @@ filters still apply. A shard request with k=0 still computes counts. The public
 request retains its documented k=0 default of the configured maximum. Queries
 that analyze to no terms return the named intervals with zero counts on flat,
 fused and phrase routes, while validating their column and key identities. An unresolved child returns unknown and no buckets,
-with the literal map key echoed. Every relay and the root validate that key,
+with the literal map key echoed in `RangeFacetCounts.map_key`. Every relay and the root validate that key,
 the requested interval identities and checked count addition. The root refuses
 a key unknown to every child.
 
-Older decoders discard the new selector and refuse the resulting empty edge
-list. Both explicit selectors together, conflicting legacy fields, invalid
-bounds and missing interval lists refuse before an empty-node shortcut. No
-storage format or RPC route changes. Field USE and DISCLOSE are both required
-for bucket counts, with denial before fetching statistics.
+Invalid bounds and missing interval lists refuse before an empty-node shortcut.
+Field USE and DISCLOSE are both required for bucket counts, with denial before
+fetching statistics.
 
 The integer-map range tests compare with an independent i128 oracle, including
 half-integer boundaries and adjacent extremes. They exercise heap and mapped
@@ -50,9 +47,8 @@ Validation on `28983cd` plus the range increment passed 508 library tests,
 subsequent empty-analysis coordinator fix and expanded flat/fused/phrase cases
 passed all 41 tests across the six affected query and permission targets.
 Embedded tests, all five mobile Rust targets, test/example compilation,
-formatting and vendored-proto checks passed again on the final code. Descriptor
-comparison permits only RangeFacetField.typed_map at tag 6. All validation ran
-under an 8 GiB cgroup limit with swap disabled.
+formatting and vendored-proto checks passed again on the final code. All
+validation ran under an 8 GiB cgroup limit with swap disabled.
 
 This checkpoint is separate from main cea2c63. That commit's derived-column
 contracts collide with earlier integer-map allocations; see the
@@ -153,7 +149,7 @@ client builds for this feature: older protobuf readers can ignore the new
 request field, and older storage readers refuse kind 11.
 
 Score stages read i64 columns transparently: `ScoreStage.column` with
-no `key` resolves against the f64 table first and the i64 table second
+no `map_key` resolves against the f64 table first and the i64 table second
 (one name space across all kinds, so at most one answers). Values and
 the column's min/max both reach the stage arithmetic through `as f64`.
 That cast rounds above 2^53 but it is monotone non-decreasing, and a
@@ -190,7 +186,7 @@ and a field valued by both is a producer that has not decided.
 
 ## Counting: explicit edges, half-open, no tails
 
-`RangeFacetField { column, key, edges }` rides the same count-then-rank
+`RangeFacetField { column, map_key, edges }` rides the same count-then-rank
 pass as `docs/facets.md` describes, over the same FULL match set,
 independent of `k` and the floor. Plain facets, map facets, and range
 facets share ONE match bitmap per query: the traversal is the
@@ -223,68 +219,65 @@ The bucket rules are stated once and enforced everywhere:
   BEFORE its zero-term/k=0 early return and the nodes run it again: a
   malformed list refuses even when there is no match set to count.
 
-In the legacy form (no `map`), an empty `key` selects f64, i64 or u64; a nonempty
-`key` selects a map-numeric entry. A column has one declared family per shard.
-Different shards may use different numeric families: an interval has the same
-numeric meaning for each, and all values compare exactly across domains.
-Integer values are never cast to f64 before bucket membership is decided.
-This also fixes legacy double-edge requests: for example, `i64::MAX` belongs
-below the exact double edge 2^63, and `u64::MAX` belongs below 2^64.
+An absent `map_key` selects an f64, i64 or u64 plain column; a present
+`map_key` (including empty) selects an f64, i64 or u64 map entry. A column has
+one declared family per shard. Different shards may use different numeric
+families: an interval has the same numeric meaning for each, and all values
+compare exactly across domains. Integer values are never cast to f64 before
+bucket membership is decided; for example, `i64::MAX` belongs below the exact
+double edge 2^63, and `u64::MAX` belongs below 2^64.
 
-### Typed edges (2026-09-05, feature branch)
+### Typed edges
 
-Supply either `edges` or `typed_edges`, never both. Each typed edge is a
-`FilterBound` with one int, uint or finite num value and `exclusive=false`.
-Range facets always use half-open intervals; the bound's exclusivity flag is
-not a way to change that rule. Mixed types are permitted, but numerically equal
-edges such as int(0), uint(0), and num(-0.0) cannot form separate boundaries.
-An unset value, nonfinite double, exclusive edge, duplicate or descending
-numeric edge refuses even when no documents match.
+Each entry in `RangeFacetField.edges` (tag 8) is a `FilterBound` with one `int`,
+`uint` or finite `num` value and `exclusive=false`. Range facets always use
+half-open intervals; the bound's exclusivity flag is not a way to change that
+rule. Mixed types are permitted, but numerically equal edges such as `int(0)`,
+`uint(0)`, and `num(-0.0)` cannot form separate boundaries. An unset value,
+nonfinite double, exclusive edge, duplicate or descending numeric edge refuses
+even when no documents match.
 
 For example, these protobuf text-format boundaries isolate the two largest
 unsigned integers without rounding:
 
 ```protobuf
-typed_edges { uint: 18446744073709551614 }
-typed_edges { uint: 18446744073709551615 }
-typed_edges { num: 18446744073709551616 }
+edges { uint: 18446744073709551614 }
+edges { uint: 18446744073709551615 }
+edges { num: 18446744073709551616 }
 ```
 
 The last boundary, 2^64, is exactly representable as a double. To cover the
-whole unsigned domain, use uint(0) and num(2^64). To cover the whole signed
-domain, use int(-9223372036854775808) and num(9223372036854775808).
+whole unsigned domain, use `uint(0)` and `num(2^64)`. To cover the whole signed
+domain, use `int(-9223372036854775808)` and `num(9223372036854775808)`.
 
-For typed requests each `RangeBucket` echoes `typed_from` and `typed_to`.
-Those are authoritative. The old `from` and `to` doubles are display values
-and may coincide for a nonempty integer interval. Legacy requests retain their
-double boundaries and omit typed response fields. Use matching client and
-server builds: old nodes cannot execute typed requests, and relays or roots
-refuse responses that lack the requested exact bounds. No index format or
-materialization fingerprint changes are needed for this query feature.
+Each `RangeBucket` echoes exact `FilterBound` `from` (tag 6) and `to` (tag 7).
+Relays and roots verify exact interval bounds before merging counts.
 
 ### Explicit map input (2026-09-06)
 
-`RangeFacetField.map` (tag 5) selects a numeric map entry with a literal key,
-including empty. Its `MapRangeFacet` holds the key and either `edges` or
-`typed_edges`. The containing request supplies the column; leave its legacy
-`key`, `edges` and `typed_edges` empty. Mixed selectors refuse. Edge validation,
-exact comparison and half-open membership are shared with the legacy form.
+`RangeFacetField.map_key` (optional string, tag 7) selects a numeric map entry
+with a literal key, including empty, paired with `column` and `edges`. Edge
+validation, exact comparison and half-open membership are shared with plain
+columns.
 
 ```protobuf
 column: "metrics"
-map { key: "" edges: [-1, 0, 3, 6] }
+map_key: ""
+edges { num: -1 }
+edges { num: 0 }
+edges { num: 3 }
+edges { num: 6 }
 ```
 
 `RangeFacetCounts.map_key` (optional string, tag 5) is present on every map
 response, even for an empty key or `known=false`. Plain-column responses omit
-it. Explicit map requests require this response context; a root or relay
-refuses a missing or different key before merging counts. Legacy nonempty-key
-requests still accept an older response's matching `key` without `map_key`.
-An older decoder drops the new map input, leaving no edges; existing range
-validation refuses that request rather than counting a plain column. Regenerate
-clients and use updated servers for the new request shape. Ordinary ingestion
-now accepts empty keys; [map semantics](map-columns.md) documents recovery and
-rewrite coverage, and the remaining descriptor-projection limitations.
+it. Map requests require this response context; a root or relay refuses a
+missing or different key before merging counts. Deploy matching coordinator,
+relay, node and regenerated gRPC/JSON client builds when switching to the
+canonical `FilterBound` and `optional string map_key` schema. Ordinary
+ingestion accepts empty keys; [map semantics](map-columns.md) documents
+recovery, rollout and rewrite coverage, and the remaining descriptor-projection
+limitations.
 
 ## Distribution
 

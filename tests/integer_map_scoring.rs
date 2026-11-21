@@ -190,28 +190,14 @@ async fn verify(address: String) {
             .is_err());
     }
 }
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn integer_map_score_values_explain_and_fetch_survive_relay_reopen_and_compaction() {
-    let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 92371));
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("map-score-segments-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let config = NodeConfig {
-        index_path: Some(dir.join("index.tv")),
-        wal: true,
-        wal_buckets: 2,
-        seal_tail_docs: 3,
-        map_integer_fields: vec!["signed".into()],
-        map_unsigned_integer_fields: vec!["unsigned".into()],
-        integer_fields: vec!["row".into()],
-        analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
-        ..Default::default()
-    };
-    let (addr, handle) = common::start_empty_node(config.clone()).await;
-    let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+async fn ingest_map_score_fixture(
+    client: &mut NodeServiceClient<tonic::transport::Channel>,
+    shift: &[f32],
+    scale: &[f32],
+) {
     client
         .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-            8, 4, &shift, &scale,
+            8, 4, shift, scale,
         ))
         .await
         .unwrap();
@@ -265,6 +251,28 @@ async fn integer_map_score_values_explain_and_fetch_survive_relay_reopen_and_com
             client.flush(pb::FlushRequest {}).await.unwrap();
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn integer_map_score_values_explain_and_fetch_survive_relay_reopen_and_compaction() {
+    let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 92371));
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("map-score-segments-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = NodeConfig {
+        index_path: Some(dir.join("index.tv")),
+        wal: true,
+        wal_buckets: 2,
+        seal_tail_docs: 3,
+        map_integer_fields: vec!["signed".into()],
+        map_unsigned_integer_fields: vec!["unsigned".into()],
+        integer_fields: vec!["row".into()],
+        analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
+        ..Default::default()
+    };
+    let (addr, handle) = common::start_empty_node(config.clone()).await;
+    let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+    ingest_map_score_fixture(&mut client, &shift, &scale).await;
     verify(addr.clone()).await;
     let (empty, empty_h) = common::start_empty_node(NodeConfig {
         slot_offset: 16,

@@ -103,11 +103,9 @@ fn map_range() -> pb::RangeFacetField {
     }
 }
 
-#[tokio::test]
-async fn map_ranges_preserve_edges_and_refuse_lost_context() {
+fn build_map_numeric_node() -> pipestream_search::node::NodeServiceImpl {
     use pipestream_search::{
         node::{Bm25Shard, NodeConfig, NodeServiceImpl},
-        pb::node_service_server::NodeService,
         postings::{AnalyzedDoc, Bm25Store, ColumnKind::MapNumeric},
     };
     let mut data = Bm25Store::new().with_columns(MapNumeric, &["metrics"]);
@@ -124,14 +122,20 @@ async fn map_ranges_preserve_edges_and_refuse_lost_context() {
             data.set_map_numeric(0, row as u32, "", value);
         }
     }
-    let node = NodeServiceImpl::new(
+    NodeServiceImpl::new(
         None,
         NodeConfig {
             map_numeric_fields: vec!["metrics".into()],
             ..Default::default()
         },
     )
-    .with_bm25(Some(Bm25Shard::Building(data)));
+    .with_bm25(Some(Bm25Shard::Building(data)))
+}
+
+#[tokio::test]
+async fn map_ranges_preserve_edges_and_refuse_lost_context() {
+    use pipestream_search::pb::node_service_server::NodeService;
+    let node = build_map_numeric_node();
     let range = map_range();
     let req = pb::Bm25QueryRequest {
         terms: vec!["word".into()],

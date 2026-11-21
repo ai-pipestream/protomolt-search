@@ -21,7 +21,7 @@ admission bar, because block-max pruning lifts its bounds through the chain.
 
 `SCORE_OP_UNSPECIFIED` is rejected: a stage must say what it does.
 
-`column` names an f64 or i64 column; with `key` set it names a map-numeric
+`column` names an f64 or i64 column; with `map_key` set it names a map-numeric
 column and reads that key; for the geo operations it names a geo-point column.
 A document with no value for the column passes through unchanged. That is exact,
 not degraded, and it is why a shard lacking the column entirely is still
