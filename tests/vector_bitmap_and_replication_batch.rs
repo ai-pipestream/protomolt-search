@@ -1,22 +1,23 @@
 //! Two equivalences. A chunked scan under a word-packed bitmap allowlist
 //! is the scan under the same allowlist as one flag per row. A replica
-//! caught up through coalesced append streams holds the log a record-at-a-time
-//! catch-up writes, while keyed rows keep one stream and their key each.
+//! caught up through coalesced append streams holds, byte for byte, the log
+//! a record-at-a-time catch-up writes: keyed rows keep their key each, and
+//! logged derived values replay without being derived again.
 
 mod common;
+#[path = "vector_bitmap_and_replication_batch/derived.rs"]
+mod derived;
+#[path = "vector_bitmap_and_replication_batch/pair.rs"]
+mod pair;
+#[path = "vector_bitmap_and_replication_batch/streams.rs"]
+mod streams;
 
 use pipestream_search::boolean_bits::Bits;
 use pipestream_search::chunked::{
     chunked_topk, chunked_topk_batch_observed, chunked_topk_collapsed, BatchQuery, ChunkedScan,
     ScanStats,
 };
-use pipestream_search::node::{NodeConfig, NodeServiceImpl};
-use pipestream_search::pb::wal::{wal_record::Op, WalRecord};
-use pipestream_search::pb::{self, node_service_client::NodeServiceClient};
-use pipestream_search::replication::{sync_once, ReplicaCursor};
 use pipestream_search::vector::{Mask, VectorIndex, EMBEDDED_TURBOVEC};
-use prost::Message;
-use std::sync::{Arc, Mutex};
 
 const DIM: usize = 64;
 const ROWS: usize = 5_003;
@@ -211,225 +212,4 @@ fn competitive_chunks_merge_through_two_buffers_without_changing_the_heap() {
         let chunked = chunked_topk(scan(1), keep_ties, &mut || None, &mut |_| false).0;
         assert_eq!(chunked, whole, "k {k} keep_ties {keep_ties}");
     }
-}
-
-/// A node that records which append RPCs reach it, in order.
-#[derive(Clone)]
-struct CountingReceiver {
-    node: NodeServiceImpl,
-    appends: Arc<Mutex<Vec<&'static str>>>,
-}
-impl tonic::server::NamedService for CountingReceiver {
-    const NAME: &'static str = "ai.protomolt.search.v1.NodeService";
-}
-impl<B> tonic::codegen::Service<tonic::codegen::http::Request<B>> for CountingReceiver
-where
-    B: http_body::Body + Send + 'static,
-    B::Error: Into<tonic::codegen::StdError> + Send + 'static,
-{
-    type Response = tonic::codegen::http::Response<tonic::body::Body>;
-    type Error = std::convert::Infallible;
-    type Future = std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
-    >;
-    fn poll_ready(
-        &mut self,
-        _: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-    fn call(&mut self, request: tonic::codegen::http::Request<B>) -> Self::Future {
-        for name in ["AddDocuments", "AddVectors"] {
-            if request.uri().path().ends_with(&format!("/{name}")) {
-                self.appends.lock().unwrap().push(name);
-            }
-        }
-        let node = self.node.clone();
-        Box::pin(pb::node_service_server::NodeServiceServer::new(node).call(request))
-    }
-}
-
-/// A primary and a counting replica over fresh WAL-backed shards.
-struct Pair {
-    cursor: ReplicaCursor,
-    source: NodeServiceClient<tonic::transport::Channel>,
-    appends: Arc<Mutex<Vec<&'static str>>>,
-}
-
-impl Pair {
-    async fn start(tag: &str, vectors: bool) -> Self {
-        let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("replication-batch-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let config = |name: &str| NodeConfig {
-            index_path: Some(root.join(format!("{name}.tv"))),
-            wal: true,
-            analysis_addr: Some(pipestream_search::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
-            ..Default::default()
-        };
-        let (primary, _) = common::start_empty_node(config("source")).await;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let replica = format!("http://{}", listener.local_addr().unwrap());
-        let appends = Arc::new(Mutex::new(Vec::new()));
-        let receiver = CountingReceiver {
-            node: NodeServiceImpl::new(None, config("receiver")),
-            appends: appends.clone(),
-        };
-        tokio::spawn(
-            tonic::transport::Server::builder()
-                .add_service(receiver)
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
-        );
-        let sample = common::unit_vectors(64, DIM, 0xB17_0006);
-        let (shift, scale) = common::fit_calibration(DIM, 4, &sample);
-        for addr in [&primary, &replica].into_iter().filter(|_| vectors) {
-            NodeServiceClient::connect(addr.clone())
-                .await
-                .unwrap()
-                .configure_vector_backend(common::embedded_backend_request(DIM, 4, &shift, &scale))
-                .await
-                .unwrap();
-        }
-        Self {
-            source: NodeServiceClient::connect(primary.clone()).await.unwrap(),
-            cursor: ReplicaCursor {
-                primary,
-                replica,
-                ..Default::default()
-            },
-            appends,
-        }
-    }
-
-    /// Append `texts` to the primary, one logged record per document; a
-    /// `key` sends each document in its own stream under that stable key.
-    async fn documents(&mut self, texts: std::ops::Range<usize>, key: Option<&[u8]>) {
-        let documents = texts.map(|i| pb::AddDocumentsRequest {
-            text: format!("document {i} of the replicated log"),
-            analysis: Some(pipestream_search::analyzer::body_spec()),
-            ..Default::default()
-        });
-        let Some(key) = key else {
-            let stream = tokio_stream::iter(documents.collect::<Vec<_>>());
-            self.source.add_documents(stream).await.unwrap();
-            return;
-        };
-        for document in documents {
-            let mut request = tonic::Request::new(tokio_stream::iter([document]));
-            request.metadata_mut().insert_bin(
-                "x-protomolt-stable-key-bin",
-                tonic::metadata::MetadataValue::from_bytes(key),
-            );
-            self.source.add_documents(request).await.unwrap();
-        }
-    }
-
-    /// Append one logged record of `rows` vectors to the primary.
-    async fn vectors(&mut self, rows: usize, seed: u64) {
-        let batch = pb::AddVectorsRequest {
-            materialized_rows: Vec::new(),
-            vectors: common::unit_vectors(rows, DIM, seed),
-            dim: DIM as u32,
-        };
-        let stream = tokio_stream::iter([batch]);
-        self.source.add_vectors(stream).await.unwrap();
-    }
-
-    /// Flush the primary, catch the replica up from `from`, and hold the
-    /// replica's append log to the primary's, record for record.
-    async fn sync(&mut self, from: &ReplicaCursor) -> ReplicaCursor {
-        self.source.flush(pb::FlushRequest {}).await.unwrap();
-        let advanced = sync_once(from).await.unwrap();
-        let logged = appended(&self.cursor.primary).await;
-        assert!(!logged.is_empty());
-        assert_eq!(appended(&self.cursor.replica).await, logged);
-        advanced
-    }
-
-    fn appends(&self) -> Vec<&'static str> {
-        self.appends.lock().unwrap().clone()
-    }
-}
-
-/// The append records of a node's flushed WAL, in log order.
-async fn appended(addr: &str) -> Vec<Op> {
-    let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
-    let health = client.health(pb::HealthRequest {}).await.unwrap();
-    let request = pb::ReadWalRequest {
-        generation: health.into_inner().wal_generation,
-        after_clock: 0,
-    };
-    let mut stream = client.read_wal(request).await.unwrap().into_inner();
-    let mut ops = Vec::new();
-    while let Some(frame) = stream.message().await.unwrap() {
-        if frame.completed {
-            continue;
-        }
-        let record = WalRecord::decode(frame.record.as_slice()).unwrap();
-        if let Some(op @ (Op::AddDocuments(_) | Op::AddVectors(_))) = record.op {
-            ops.push(op);
-        }
-    }
-    ops
-}
-
-#[tokio::test]
-async fn unkeyed_document_records_share_streams_and_a_retry_sends_nothing() {
-    let mut pair = Pair::start("unkeyed", false).await;
-    pair.documents(0..530, None).await;
-    let start = pair.cursor.clone();
-    let advanced = pair.sync(&start).await;
-    assert_eq!(pair.appends(), ["AddDocuments", "AddDocuments"]);
-    // A cursor lost after the replica flushed: every row is already there.
-    assert!(pair.sync(&start).await.clock >= advanced.clock);
-    assert_eq!(pair.appends().len(), 2);
-    pair.documents(530..540, None).await;
-    assert!(pair.sync(&start).await.clock > advanced.clock);
-    assert_eq!(pair.appends().len(), 3);
-}
-
-#[tokio::test]
-async fn keyed_rows_keep_one_stream_and_their_key_between_unkeyed_runs() {
-    let mut pair = Pair::start("keyed", false).await;
-    pair.documents(0..3, None).await;
-    pair.documents(3..5, Some(b"stable-key")).await;
-    pair.documents(5..8, None).await;
-    let start = pair.cursor.clone();
-    pair.sync(&start).await;
-    assert_eq!(pair.appends().len(), 4, "one run, two keyed rows, one run");
-    let keys: Vec<Vec<Vec<u8>>> = appended(&pair.cursor.replica)
-        .await
-        .into_iter()
-        .map(|op| match op {
-            Op::AddDocuments(add) => add.stable_routing_keys,
-            other => panic!("unexpected record {other:?}"),
-        })
-        .collect();
-    let keyed = vec![b"stable-key".to_vec()];
-    let expected = [
-        vec![],
-        vec![],
-        vec![],
-        keyed.clone(),
-        keyed,
-        vec![],
-        vec![],
-        vec![],
-    ];
-    assert_eq!(keys, expected);
-}
-
-#[tokio::test]
-async fn unkeyed_vector_records_share_one_stream_and_keep_their_records() {
-    let mut pair = Pair::start("vectors", true).await;
-    for seed in 0..3 {
-        pair.vectors(4, 0xB17_0100 + seed).await;
-    }
-    let start = pair.cursor.clone();
-    let advanced = pair.sync(&start).await;
-    assert_eq!(pair.appends(), ["AddVectors"]);
-    pair.vectors(2, 0xB17_0200).await;
-    assert!(pair.sync(&start).await.clock > advanced.clock);
-    assert_eq!(pair.appends(), ["AddVectors", "AddVectors"]);
 }

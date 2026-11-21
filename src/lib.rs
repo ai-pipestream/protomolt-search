@@ -77,6 +77,7 @@ pub mod reconcile;
 pub mod relay;
 #[cfg(feature = "net")]
 pub mod replication;
+pub(crate) mod replication_wire;
 pub mod reshard;
 pub mod scorefn;
 pub mod security;

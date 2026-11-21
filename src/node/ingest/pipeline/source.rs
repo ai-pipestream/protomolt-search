@@ -12,6 +12,9 @@ pub(in crate::node) struct PendingDoc {
     /// the ordinary AddDocuments path.
     pub(in crate::node) vector: Option<Vec<f32>>,
     pub(in crate::node) stable_routing_key: Option<Vec<u8>>,
+    /// True for a document a WAL replay stream carries: it keeps the
+    /// derived values its primary logged instead of being refused for them.
+    pub(in crate::node) logged: bool,
     /// `(field table index, analysis)`, in submission order. `None` until
     /// that field's result lands.
     pub(in crate::node) extras: Vec<(usize, Option<crate::postings::AnalyzedField>)>,
@@ -25,8 +28,11 @@ pub(in crate::node) struct PendingDoc {
 pub(in crate::node) struct IngestDoc {
     pub(in crate::node) req: AddDocumentsRequest,
     pub(in crate::node) vector: Option<Vec<f32>>,
-    /// Opaque product identity supplied only by routed mapped ingest.
+    /// Opaque product identity supplied by routed mapped ingest and by
+    /// replication streams.
     pub(in crate::node) stable_routing_key: Option<Vec<u8>>,
+    /// True only for a document of a WAL replay stream.
+    pub(in crate::node) logged: bool,
 }
 
 /// Where the ingest pipeline's documents come from: the ordinary
@@ -38,8 +44,10 @@ pub(in crate::node) struct IngestDoc {
 pub(in crate::node) enum IngestSource<'a> {
     Plain {
         stream: &'a mut Streaming<AddDocumentsRequest>,
-        stable_routing_key: Option<Vec<u8>>,
-        consumed: bool,
+        keys: StreamKeys,
+        /// The stream replays a primary's WAL.
+        logged: bool,
+        replay_permit: Option<Box<crate::authorization::AccessPermit>>,
     },
     /// Boxed: the extractor's trie dwarfs the plain variant.
     Mapped(Box<MappedSource<'a>>),
@@ -74,21 +82,26 @@ impl IngestSource<'_> {
         let mut document = match self {
             IngestSource::Plain {
                 stream,
-                stable_routing_key,
-                consumed,
+                keys,
+                logged,
+                replay_permit,
             } => {
-                let request = stream.message().await?;
-                if request.is_some() && *consumed && stable_routing_key.is_some() {
-                    return Err(Status::invalid_argument(
-                        "a replication stable-key metadata value may carry exactly one document",
-                    ));
+                let message = stream.message().await?;
+                if let Some(permit) = replay_permit {
+                    permit.check()?;
                 }
-                *consumed |= request.is_some();
-                Ok(request.map(|req| IngestDoc {
-                    req,
-                    vector: None,
-                    stable_routing_key: stable_routing_key.clone(),
-                }))
+                match message {
+                    Some(req) => Ok(Some(IngestDoc {
+                        req,
+                        vector: None,
+                        stable_routing_key: keys.next_row("document")?,
+                        logged: *logged,
+                    })),
+                    None => {
+                        keys.finish("document")?;
+                        Ok(None)
+                    }
+                }
             }
             IngestSource::Mapped(source) => source.next().await,
             IngestSource::Prepared(source) => source.next(),
@@ -177,6 +190,7 @@ impl MappedSource<'_> {
                 req,
                 vector: Some(extracted.vector),
                 stable_routing_key: stable_routing_key.clone(),
+                logged: false,
             });
         }
         Ok(())

@@ -42,6 +42,15 @@ coordinator — replica catch-up, snapshot install, the calibration
 tools — so every cluster-internal channel in the process is the same
 identity. A TLS coordinator without `--tls-ca` refuses to start.
 
+**Replication under principals needs mTLS.** A primary sends its WAL
+replay streams (replica catch-up) with no bearer token: it relies on the
+node channel. A receiving node that has bearer principals configured
+admits a replay stream only from a peer whose verified client
+certificate chains to the cluster CA, or from a bearer caller holding
+ADMIN on the collection. A node with principals but no mTLS therefore
+refuses catch-up from its primary as `UNAUTHENTICATED`. That fails
+closed; run such nodes with `--tls-client-ca`, or without principals.
+
 **Rollout.** The default listen addresses are `0.0.0.0`, so an existing
 plaintext deployment (the NAS compose included) must add
 `--allow-plaintext` (or TLS material) when it moves to this version; a

@@ -7,18 +7,16 @@
 //! while gaps and partial rows fail loudly. Deletes and replacements already
 //! have idempotent node contracts.
 //!
-//! Consecutive unkeyed append records share one stream (`batch`); a record
-//! is admitted against the tips, and every document checked for fresh
-//! ingest, before it is held, so nothing a record refuses was sent for it.
-//! A keyed row travels alone under the single-key entry every receiver
-//! accepts; `keyed` defines the per-row key value and stream plan a
-//! receiver must advertise before a sender may put several keyed rows in
-//! one stream.
+//! Consecutive append records share one stream (`batch`); a record is
+//! admitted against the tips and checked for one stable key per row before
+//! it is held. Keyed rows travel several to a stream under the per-row key
+//! value `replication_wire` defines, and document streams are marked as WAL
+//! replay so logged derived values are verified rather than derived
+//! again. The live reshard tail routes each keyed row to its child alone.
 
 mod append;
 mod batch;
 mod cutover;
-mod keyed;
 mod live;
 mod sync;
 
@@ -30,12 +28,12 @@ use tonic::transport::Channel;
 use crate::pb::node_service_client::NodeServiceClient;
 
 pub use self::cutover::atomic_live_cutover;
-pub use self::keyed::{
-    decode_stable_keys, encode_stable_keys, plan_keyed_streams, MAX_STREAM_KEY_BYTES,
-    STABLE_KEYS_METADATA,
-};
 pub use self::live::{catch_up_children_once, initialize_live_reshard};
 pub use self::sync::sync_once;
+pub use crate::replication_wire::{
+    decode_replay_first_id, decode_stable_keys, encode_replay_first_id, encode_stable_keys,
+    plan_keyed_streams, MAX_STREAM_KEY_BYTES, STABLE_KEYS_METADATA, WAL_REPLAY_METADATA,
+};
 
 /// One child of a live reshard: where it serves, the hash range and
 /// slots it takes, its tips when the baseline was installed, and the
@@ -179,25 +177,27 @@ fn client(addr: &str) -> Result<NodeServiceClient<Channel>, String> {
 fn keyed_request<T>(
     row: T,
     key: &[u8],
-) -> tonic::Request<tokio_stream::Iter<std::array::IntoIter<T, 1>>> {
+) -> Result<tonic::Request<tokio_stream::Iter<std::array::IntoIter<T, 1>>>, String> {
     let mut request = tonic::Request::new(tokio_stream::iter([row]));
+    let encoded = encode_stable_keys(std::slice::from_ref(&key.to_vec()))?;
     request.metadata_mut().insert_bin(
-        "x-protomolt-stable-key-bin",
-        tonic::metadata::MetadataValue::from_bytes(key),
+        STABLE_KEYS_METADATA,
+        tonic::metadata::MetadataValue::from_bytes(&encoded),
     );
-    request
+    Ok(request)
 }
 
-/// AddDocuments is a fresh-ingest contract. A fingerprint is not
-/// authority to bypass derivation; forwarding a logged derived row needs
-/// a distinct, authenticated replay contract that retains its
-/// already-computed values. Derived-column WAL replay therefore refuses
-/// here: the check runs on every document of a record before any of the
-/// record is held or sent, on the batched and the keyed path alike, and a
-/// refusal ends the catch-up without advancing the cursor.
+/// The live reshard tail sends each row to a child as fresh ingest, so a
+/// logged derived row has no contract there: carrying its values would need
+/// the child's tip in a WAL replay stream, which the tail does not track
+/// per row. The check runs before the row is sent, and a refusal ends the
+/// tail without advancing its cursor.
 fn require_fresh_ingest_replay(document: &crate::pb::AddDocumentsRequest) -> Result<(), String> {
     if !document.derived_fingerprint.is_empty() {
-        return Err("derived-column WAL replication requires a trusted replay RPC; AddDocuments accepts fresh ingest, not carried derived values".to_string());
+        return Err(
+            "the live reshard tail sends fresh ingest and cannot carry logged derived values"
+                .to_string(),
+        );
     }
     Ok(())
 }

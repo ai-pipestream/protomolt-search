@@ -210,7 +210,7 @@ async fn replication_requires_advertisement_and_acknowledgement_before_advancing
 }
 
 #[tokio::test]
-async fn derived_wal_replication_refuses_before_transmitting_or_advancing() {
+async fn derived_wal_replication_replays_and_retries_without_resending() {
     let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("derived-map-replication-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
@@ -252,9 +252,10 @@ async fn derived_wal_replication_refuses_before_transmitting_or_advancing() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let replica = format!("http://{}", listener.local_addr().unwrap());
     let ingests = Arc::new(AtomicUsize::new(0));
+    let mode = Arc::new(AtomicU8::new(2));
     let receiver = VersionedReceiver {
         node: NodeServiceImpl::new(None, config("receiver")),
-        mode: Arc::new(AtomicU8::new(2)),
+        mode: mode.clone(),
         ingests: ingests.clone(),
     };
     let server = tokio::spawn(
@@ -267,10 +268,11 @@ async fn derived_wal_replication_refuses_before_transmitting_or_advancing() {
         replica,
         ..Default::default()
     };
-    let error = sync_once(&cursor).await.unwrap_err();
-    assert!(error.contains("trusted replay RPC"), "{error}");
-    assert_eq!(ingests.load(Ordering::SeqCst), 0);
-    assert_eq!(cursor.clock, 0);
+    let advanced = sync_once(&cursor).await.unwrap();
+    assert!(advanced.clock > 0);
+    assert_eq!(ingests.load(Ordering::SeqCst), 1);
+    assert_eq!(sync_once(&advanced).await.unwrap(), advanced);
+    assert_eq!(ingests.load(Ordering::SeqCst), 1, "a retry sends nothing");
     server.abort();
     primary_server.abort();
     let _ = server.await;
