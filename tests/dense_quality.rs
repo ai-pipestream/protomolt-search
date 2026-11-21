@@ -2,12 +2,12 @@
 //! `quality::measure` produces a version 2 profile from the public
 //! `Query` route over two shards, the profile loads and its points hold
 //! when re-checked query by query, the two-shard ladder equals the
-//! single-shard ladder, and `DENSE_EXECUTION_MODE_AUTO` with FP32 rerank
-//! resolves its candidate depth through the profile's default target
+//! single-shard ladder, and `DENSE_EXECUTION_MODE_BALANCED` with `FP32`
+//! precision resolves its candidate depth through the profile's default target
 //! bitwise as an explicit `DenseQualityPolicy` would — with provenance,
 //! at the measured depth (the cost gate), across a shard reopen. Without
-//! a profile, without a default, or on identity drift it refuses by
-//! name; EXACT and UNSPECIFIED keep the caller's pool at `k`.
+//! a profile, without a default, or on identity drift it refuses or keeps `k`;
+//! `UNSPECIFIED` refuses, while `EXHAUSTIVE` and `AUTO` at `FP32` scan every row.
 
 mod common;
 
@@ -605,6 +605,46 @@ async fn auto_with_fp32_rerank_resolves_the_depth_through_the_profile_default() 
     }
 }
 
+async fn assert_exhaustive_fp32_matches_oracle(
+    coordinator: &CoordinatorServiceImpl,
+    vector: &[f32],
+) {
+    // EXHAUSTIVE and AUTO at FP32 score every row from the FP32 sidecar.
+    let oracle = query(
+        coordinator,
+        request(K, ROWS as u32, balanced_fp32(vector, None)),
+    )
+    .await
+    .unwrap();
+    for mode in [DenseExecutionMode::Exhaustive, DenseExecutionMode::Auto] {
+        let response = query(
+            coordinator,
+            request(
+                K,
+                0,
+                dense_leaf(vector, mode, DensePrecisionRequest::Fp32, None),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(hit_bits(&response), hit_bits(&oracle), "{mode:?}");
+        assert!(response.dense_quality.is_none(), "{mode:?}");
+        assert_eq!(response.executed, "search:fp32_scan");
+        assert_eq!(response.profile.as_ref().unwrap().rerank_rows, ROWS as u64);
+        let execution = response.dense_execution.unwrap();
+        assert_eq!(
+            execution.resolved_mode,
+            DenseExecutionMode::Exhaustive as i32
+        );
+        assert_eq!(
+            execution.coverage,
+            DenseCoverage::ExhaustiveCertified as i32
+        );
+        assert_eq!(execution.output_precision, DenseScorePrecision::Fp32 as i32);
+        assert!(!execution.planner_reason.contains("quality profile"));
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exhaustive_fp32_scans_every_row_and_named_depths_keep_their_pool() {
     let fixture = start_fixture("exact", &[2048, 2048]).await;
@@ -642,40 +682,7 @@ async fn exhaustive_fp32_scans_every_row_and_named_depths_keep_their_pool() {
     .unwrap_err();
     assert_eq!(missing.code(), tonic::Code::InvalidArgument);
 
-    // EXHAUSTIVE and AUTO at FP32 score every row from the FP32 sidecar.
-    let oracle = query(
-        &coordinator,
-        request(K, ROWS as u32, balanced_fp32(vector, None)),
-    )
-    .await
-    .unwrap();
-    for mode in [DenseExecutionMode::Exhaustive, DenseExecutionMode::Auto] {
-        let response = query(
-            &coordinator,
-            request(
-                K,
-                0,
-                dense_leaf(vector, mode, DensePrecisionRequest::Fp32, None),
-            ),
-        )
-        .await
-        .unwrap();
-        assert_eq!(hit_bits(&response), hit_bits(&oracle), "{mode:?}");
-        assert!(response.dense_quality.is_none(), "{mode:?}");
-        assert_eq!(response.executed, "search:fp32_scan");
-        assert_eq!(response.profile.as_ref().unwrap().rerank_rows, ROWS as u64);
-        let execution = response.dense_execution.unwrap();
-        assert_eq!(
-            execution.resolved_mode,
-            DenseExecutionMode::Exhaustive as i32
-        );
-        assert_eq!(
-            execution.coverage,
-            DenseCoverage::ExhaustiveCertified as i32
-        );
-        assert_eq!(execution.output_precision, DenseScorePrecision::Fp32 as i32);
-        assert!(!execution.planner_reason.contains("quality profile"));
-    }
+    assert_exhaustive_fp32_matches_oracle(&coordinator, vector).await;
 
     let named = query(&coordinator, request(K, 40, balanced_fp32(vector, None)))
         .await

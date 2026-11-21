@@ -2414,8 +2414,7 @@ export type ClusterHealthResponse = Message<"ai.protomolt.search.v1.ClusterHealt
 
   /**
    * The coordinator's live topology generation: the value a dense quality
-   * profile (docs/dense-quality-profile.md) or dense execution policy
-   * (docs/dense-execution-policy.md) binds to as `corpus_generation`.
+   * profile (docs/dense-quality-profile.md) binds to as `corpus_generation`.
    * 0 on the per-collection listing of a coordinator with named
    * collections (each CollectionHealth carries its own).
    *
@@ -14111,9 +14110,9 @@ export const DenseExecutionOutcomeSchema: GenMessage<DenseExecutionOutcome> = /*
   messageDesc(file_ai_protomolt_search_v1_search, 254);
 
 /**
- * One measured point of a dense execution policy
- * (docs/dense-execution-policy.md): the exact key a request must match and
- * the recall measured there against the exhaustive traversal.
+ * One measured point of a dense execution policy (docs/query-api.md): the
+ * exact key a request must match and the recall measured there against the
+ * exhaustive traversal.
  *
  * @generated from message ai.protomolt.search.v1.DensePolicyPoint
  */

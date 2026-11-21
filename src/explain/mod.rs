@@ -44,7 +44,7 @@ pub fn dense(id: &str, score: f32, estimate: Option<f32>) -> Explanation {
             f64::from(score),
             format!(
                 "dense leaf {id:?}: exact FP32 dot product of the query with the stored \
-                 vector (docs/query-api.md \"Dense FP32 rerank\")"
+                 vector (docs/query-api.md \"Dense execution contract\")"
             ),
             vec![leaf(
                 f64::from(estimate),
@@ -56,7 +56,7 @@ pub fn dense(id: &str, score: f32, estimate: Option<f32>) -> Explanation {
             f64::from(score),
             format!(
                 "dense leaf {id:?}: the provider's native similarity score for the stored \
-                 vector (docs/dense-execution-policy.md)"
+                 vector (docs/query-api.md \"Dense execution contract\")"
             ),
         ),
     }

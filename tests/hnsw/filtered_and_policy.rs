@@ -2,6 +2,20 @@
 
 use super::*;
 
+fn filtered_truth(corpus: &[f32], query: &[f32], court: &str, k: usize) -> Vec<u64> {
+    let mut all: Vec<(u64, f32)> = corpus
+        .as_chunks::<DIM>()
+        .0
+        .iter()
+        .enumerate()
+        .filter(|(id, _)| court_of(*id) == court)
+        .map(|(id, row)| (id as u64, pipestream_search::exact_vectors::dot(row, query)))
+        .collect();
+    all.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    all.truncate(k);
+    all.into_iter().map(|hit| hit.0).collect()
+}
+
 /// A filtered ANN query on shards larger than one
 /// scan chunk answers from one search of each shard's whole graph, on the
 /// unary route and the streaming one alike. A mask of half the rows is
@@ -14,20 +28,6 @@ async fn a_filtered_ann_query_reports_its_regime_and_keeps_recall() {
     const K: usize = 20;
     let (fixture, addrs) = start_filtered_fixture().await;
     let queries = unit_vectors(8, DIM, 0x4A5E_0056);
-    let truth = |query: &[f32], court: &str| -> Vec<u64> {
-        let mut all: Vec<(u64, f32)> = fixture
-            .corpus
-            .as_chunks::<DIM>()
-            .0
-            .iter()
-            .enumerate()
-            .filter(|(id, _)| court_of(*id) == court)
-            .map(|(id, row)| (id as u64, pipestream_search::exact_vectors::dot(row, query)))
-            .collect();
-        all.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-        all.truncate(K);
-        all.into_iter().map(|hit| hit.0).collect()
-    };
     for streaming in [false, true] {
         let coordinator = CoordinatorServiceImpl::new(addrs.clone())
             .with_bm25(
@@ -67,7 +67,7 @@ async fn a_filtered_ann_query_reports_its_regime_and_keeps_recall() {
                 );
                 let response = query(&coordinator, req).await.unwrap();
                 assert_eq!(response.hits.len(), K, "streaming={streaming} {court}");
-                let expected = truth(query_vector, court);
+                let expected = filtered_truth(&fixture.corpus, query_vector, court, K);
                 for hit in &response.hits {
                     assert_eq!(court_of(hit.doc_id as usize), court);
                     let row = &fixture.corpus[hit.doc_id as usize * DIM..][..DIM];

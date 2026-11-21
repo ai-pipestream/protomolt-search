@@ -239,6 +239,70 @@ fn and_filtered(filter: SelectionQuery, leaf: SelectionQuery) -> SelectionQuery 
     }
 }
 
+fn filtered_and_boolean_shapes(vector: &[f32]) -> Vec<(&'static str, SelectionQuery)> {
+    vec![
+        (
+            "filtered lexical",
+            and_filtered(
+                cel_clause("f", r#"court == "scotus""#),
+                lexical_clause("lex", "court"),
+            ),
+        ),
+        (
+            "filtered dense",
+            and_filtered(
+                cel_clause("f", r#"court == "ca9""#),
+                dense_clause("vec", vector),
+            ),
+        ),
+        (
+            "boolean lexical must filter",
+            boolean(
+                vec![
+                    lexical_clause("lex", "court"),
+                    cel_clause("f", r#"court == "scotus""#),
+                ],
+                Vec::new(),
+                Vec::new(),
+            ),
+        ),
+        (
+            "boolean dense must filter",
+            boolean(
+                vec![
+                    dense_clause("vec", vector),
+                    cel_clause("f", r#"court == "ca9""#),
+                ],
+                Vec::new(),
+                Vec::new(),
+            ),
+        ),
+        (
+            "fp32 rerank",
+            fp32_clause("vec", vector, DenseExecutionMode::Balanced),
+        ),
+        (
+            "boolean fp32 must filter",
+            boolean(
+                vec![
+                    fp32_clause("vec", vector, DenseExecutionMode::Exhaustive),
+                    cel_clause("f", r#"court == "scotus""#),
+                ],
+                Vec::new(),
+                Vec::new(),
+            ),
+        ),
+        (
+            "boolean should and must_not",
+            boolean(
+                vec![lexical_clause("lex", "court")],
+                vec![lexical_clause("z", "zebra"), dense_clause("vec", vector)],
+                vec![cel_clause("f", r#"court == "ca9""#)],
+            ),
+        ),
+    ]
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn filtered_and_boolean_queries_through_relays_equal_the_flat_fanout() {
     let leaves = lexical_leaves(&[true; LEX_LEAVES]).await;
@@ -261,68 +325,7 @@ async fn filtered_and_boolean_queries_through_relays_equal_the_flat_fanout() {
         ("two levels", vec![top]),
     ];
     let flat = with_bm25(l.clone());
-    let vector = leaves.corpus[..DIM].to_vec();
-    let shapes: Vec<(&str, SelectionQuery)> = vec![
-        (
-            "filtered lexical",
-            and_filtered(
-                cel_clause("f", r#"court == "scotus""#),
-                lexical_clause("lex", "court"),
-            ),
-        ),
-        (
-            "filtered dense",
-            and_filtered(
-                cel_clause("f", r#"court == "ca9""#),
-                dense_clause("vec", &vector),
-            ),
-        ),
-        (
-            "boolean lexical must filter",
-            boolean(
-                vec![
-                    lexical_clause("lex", "court"),
-                    cel_clause("f", r#"court == "scotus""#),
-                ],
-                Vec::new(),
-                Vec::new(),
-            ),
-        ),
-        (
-            "boolean dense must filter",
-            boolean(
-                vec![
-                    dense_clause("vec", &vector),
-                    cel_clause("f", r#"court == "ca9""#),
-                ],
-                Vec::new(),
-                Vec::new(),
-            ),
-        ),
-        (
-            "fp32 rerank",
-            fp32_clause("vec", &vector, DenseExecutionMode::Balanced),
-        ),
-        (
-            "boolean fp32 must filter",
-            boolean(
-                vec![
-                    fp32_clause("vec", &vector, DenseExecutionMode::Exhaustive),
-                    cel_clause("f", r#"court == "scotus""#),
-                ],
-                Vec::new(),
-                Vec::new(),
-            ),
-        ),
-        (
-            "boolean should and must_not",
-            boolean(
-                vec![lexical_clause("lex", "court")],
-                vec![lexical_clause("z", "zebra"), dense_clause("vec", &vector)],
-                vec![cel_clause("f", r#"court == "ca9""#)],
-            ),
-        ),
-    ];
+    let shapes = filtered_and_boolean_shapes(&leaves.corpus[..DIM]);
     for (shape, selection) in &shapes {
         let want = run_query(&flat, selection.clone())
             .await

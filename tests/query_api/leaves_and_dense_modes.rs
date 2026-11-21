@@ -2,6 +2,27 @@
 
 use super::*;
 
+fn assert_exhaustive_native_receipt(execution: &DenseExecutionOutcome) {
+    assert_eq!(
+        DenseExecutionMode::try_from(execution.requested_mode).unwrap(),
+        DenseExecutionMode::Exhaustive
+    );
+    assert_eq!(
+        DenseExecutionMode::try_from(execution.resolved_mode).unwrap(),
+        DenseExecutionMode::Exhaustive
+    );
+    assert_eq!(execution.provider_backend, "embedded-turbovec");
+    assert_eq!(
+        VectorQualityContract::try_from(execution.quality_contract).unwrap(),
+        VectorQualityContract::ExhaustiveNativeScore
+    );
+    assert_eq!(
+        execution.coverage,
+        DenseCoverage::ExhaustiveCertified as i32
+    );
+    assert!(!execution.scoring_fingerprint.is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn single_leaves_execute_their_ordinary_routes() {
     let (coordinator, qvec, _handles) = start_fleet().await;
@@ -72,24 +93,7 @@ async fn single_leaves_execute_their_ordinary_routes() {
     let execution = public
         .dense_execution
         .expect("every dense result reports its execution contract");
-    assert_eq!(
-        DenseExecutionMode::try_from(execution.requested_mode).unwrap(),
-        DenseExecutionMode::Exhaustive
-    );
-    assert_eq!(
-        DenseExecutionMode::try_from(execution.resolved_mode).unwrap(),
-        DenseExecutionMode::Exhaustive
-    );
-    assert_eq!(execution.provider_backend, "embedded-turbovec");
-    assert_eq!(
-        VectorQualityContract::try_from(execution.quality_contract).unwrap(),
-        VectorQualityContract::ExhaustiveNativeScore
-    );
-    assert_eq!(
-        execution.coverage,
-        DenseCoverage::ExhaustiveCertified as i32
-    );
-    assert!(!execution.scoring_fingerprint.is_empty());
+    assert_exhaustive_native_receipt(&execution);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -236,18 +240,7 @@ candidates = {ROWS}
     assert!(physical.rerank_pages > 0);
     assert!(physical.rerank_tasks > 0);
 
-    let mut expected: Vec<(u64, f32)> = corpus
-        .as_chunks::<DIM>()
-        .0
-        .iter()
-        .enumerate()
-        .map(|(id, row)| {
-            let score: f32 = row.iter().zip(&query_vector).map(|(a, b)| a * b).sum();
-            (id as u64, score)
-        })
-        .collect();
-    expected.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    expected.truncate(10);
+    let expected_bits = expected_fp32_bits(&corpus, &query_vector, 10);
     let actual: Vec<(u64, u32)> = response
         .hits
         .iter()
@@ -255,10 +248,6 @@ candidates = {ROWS}
             assert_eq!(hit.signals[0].score.to_bits(), hit.score.to_bits());
             (hit.doc_id, hit.score.to_bits())
         })
-        .collect();
-    let expected_bits: Vec<(u64, u32)> = expected
-        .iter()
-        .map(|(id, score)| (*id, score.to_bits()))
         .collect();
     assert_eq!(actual, expected_bits);
 
@@ -275,8 +264,8 @@ candidates = {ROWS}
                         max_candidates: ROWS as u32,
                         required_profile_fingerprint: String::new(),
                     }),
-                    execution_mode: pipestream_search::pb::DenseExecutionMode::Balanced as i32,
-                    precision: pipestream_search::pb::DensePrecisionRequest::Fp32 as i32,
+                    execution_mode: DenseExecutionMode::Balanced as i32,
+                    precision: DensePrecisionRequest::Fp32 as i32,
                     ..Default::default()
                 })),
             })),
@@ -360,4 +349,23 @@ candidates = {ROWS}
 
     handle.abort();
     let _ = std::fs::remove_dir_all(dir);
+}
+
+fn expected_fp32_bits(corpus: &[f32], query_vector: &[f32], k: usize) -> Vec<(u64, u32)> {
+    let mut expected: Vec<(u64, f32)> = corpus
+        .as_chunks::<DIM>()
+        .0
+        .iter()
+        .enumerate()
+        .map(|(id, row)| {
+            let score: f32 = row.iter().zip(query_vector).map(|(a, b)| a * b).sum();
+            (id as u64, score)
+        })
+        .collect();
+    expected.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    expected.truncate(k);
+    expected
+        .into_iter()
+        .map(|(id, score)| (id, score.to_bits()))
+        .collect()
 }

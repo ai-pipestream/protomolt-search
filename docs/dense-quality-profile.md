@@ -264,8 +264,10 @@ resolves through the default bitwise as the explicit policy, with the
 outcome and planner reason, at the measured depth (`rerank_rows`), and again
 after the shards are reopened from their images; no profile, no default,
 row/fingerprint/generation drift, competing `selection_k`, `k = 0`, and an
-unmeasured target refuse by name; EXACT and UNSPECIFIED keep the pool at `k`
-and AUTO with native scoring never consults the profile; the tool refuses a
+unmeasured target refuse by name; `BALANCED` with explicit `selection_k = k`
+keeps the pool at `k`, `UNSPECIFIED` refuses, `EXHAUSTIVE` and `AUTO` with
+`FP32` scan every row from the sidecar, and `AUTO` with native scoring never
+consults the profile; the tool refuses a
 depth above the corpus, a `k` without a depth, a depth below `k`, a
 dimension mismatch, a short brute file, a default naming no point, full
 depth above `max_k`, and a tombstoned generation, which the coordinator
