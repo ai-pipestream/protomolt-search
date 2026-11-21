@@ -31,11 +31,11 @@ fn binding() -> StoredBinding {
 fn empty_catalog_binding_is_atomic_idempotent_and_validated_on_open() {
     let root = root("empty");
     let catalog = SegmentCatalog::open(&root).unwrap();
-    assert_eq!(catalog.snapshot().manifest().format, 5);
+    assert_eq!(catalog.snapshot().manifest().format, 6);
     let binding = binding();
     let pinned = catalog.publish_binding(&binding).unwrap();
     assert!(pinned.is_empty());
-    assert_eq!(pinned.manifest().format, 5);
+    assert_eq!(pinned.manifest().format, 6);
     assert_eq!(pinned.binding(), Some(&binding));
     assert_eq!(
         catalog.publish_binding(&binding).unwrap().epoch(),
@@ -53,8 +53,8 @@ fn empty_catalog_binding_is_atomic_idempotent_and_validated_on_open() {
         let mut bad = canonical.clone();
         match case {
             0 => bad.format = 1,
-            1 => bad.format = 4,
-            2 => bad.format = 6,
+            1 => bad.format = 3,
+            2 => bad.format = 5,
             3 => bad.binding.as_mut().unwrap().sha256 = "0".repeat(64),
             _ => {
                 let record = bad.binding.as_mut().unwrap();
@@ -66,12 +66,20 @@ fn empty_catalog_binding_is_atomic_idempotent_and_validated_on_open() {
                 record.sha256 = turbo_sha256::sha256(&record.protobuf).to_hex();
             }
         }
-        pipestream_search::segments::write_manifest_file(&root.join("segments.json"), &bad)
-            .unwrap();
+        // Raw write: the manifest helper refuses to even read back a
+        // non-current format, which is the refusal under test here.
+        std::fs::write(
+            root.join("segments.json"),
+            serde_json::to_vec(&bad).unwrap(),
+        )
+        .unwrap();
         assert!(OpenedSegmentSet::open(&root).is_err(), "case {case}");
     }
-    pipestream_search::segments::write_manifest_file(&root.join("segments.json"), &canonical)
-        .unwrap();
+    std::fs::write(
+        root.join("segments.json"),
+        serde_json::to_vec(&canonical).unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         OpenedSegmentSet::open(&root).unwrap().binding(),
         Some(&binding)
@@ -114,6 +122,7 @@ fn append(
             bm25_path: &bm25,
             live_docs_path: &live,
             partition_column: None,
+            parents_colocated: false,
         })
         .map(|_| ())
 }
@@ -141,7 +150,7 @@ fn mixed_bindings_cannot_be_published_and_last_segment_removal_keeps_identity() 
             .unwrap();
         assert!(empty.is_empty());
         assert_eq!(empty.binding(), Some(&expected));
-        assert_eq!(empty.manifest().format, 5);
+        assert_eq!(empty.manifest().format, 6);
         assert_eq!(
             OpenedSegmentSet::open(&directory).unwrap().binding(),
             Some(&expected)

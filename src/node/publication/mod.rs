@@ -333,6 +333,7 @@ fn candidate_sources<'a>(
             bm25_path: &paths[2],
             live_docs_path: &paths[3],
             partition_column: None,
+            parents_colocated: meta.parents_colocated,
         });
         base = base
             .checked_add(meta.rows)

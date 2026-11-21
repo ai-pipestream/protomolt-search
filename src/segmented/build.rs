@@ -60,6 +60,7 @@ impl SegmentedShard {
             frozen: None,
             tail,
             tail_base: 0,
+            tail_parents_colocated: true,
             facets: Vec::new(),
             map_keys: Vec::new(),
             map_values: Vec::new(),
@@ -319,6 +320,7 @@ impl SegmentedShard {
         }
         let store = Arc::new(std::mem::replace(&mut self.tail, fresh));
         self.frozen = Some(Frozen {
+            parents_colocated: std::mem::replace(&mut self.tail_parents_colocated, true),
             base: self.tail_base,
             rows,
             store: Arc::clone(&store),

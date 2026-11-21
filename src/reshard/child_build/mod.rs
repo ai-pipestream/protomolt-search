@@ -121,6 +121,7 @@ fn build_child(
         num_documents,
         parent_ids: vector_side.parent_ids,
         row_parent_ids,
+        parents_colocated: false,
     })
 }
 
@@ -163,6 +164,7 @@ pub(super) fn finish_child_ordered(
         replay.documents.len(),
         vector_path.display()
     );
+    let parents_colocated = rows_prove_parents_colocated(&replay);
     let rows = take_in_order(&mut replay, order, ordinal)?;
     let mut child = build_child(
         manifest,
@@ -175,7 +177,19 @@ pub(super) fn finish_child_ordered(
     child.slot_offset = slot.slot_offset;
     child.hash_lo = slot.hash_lo;
     child.hash_hi = slot.hash_hi;
+    child.parents_colocated = parents_colocated;
     Ok(child)
+}
+
+/// Whether every document of `replay` proves its lineage parent's rows
+/// shared one source shard; a caller that routes parents apart clears it.
+fn rows_prove_parents_colocated(replay: &Replay) -> bool {
+    replay.documents.iter().all(|(id, doc)| {
+        crate::colocation::row_proves_parent_colocated(
+            doc,
+            replay.stable_keys.get(id).is_some_and(|k| !k.is_empty()),
+        )
+    })
 }
 
 /// Move the rows `order` names out of `replay`, in that order; a row the

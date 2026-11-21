@@ -25,6 +25,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use common::{fit_calibration, unit_vectors, BIT_WIDTH, DIM};
 use pipestream_search::bm25::{self, CorpusStats};
 use pipestream_search::harness::{build_monolithic, mock_analysis};
 use pipestream_search::node::NodeConfig;
@@ -43,9 +44,6 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Error as TransportError;
-
-use common::{fit_calibration, unit_vectors, BIT_WIDTH, DIM};
-
 #[path = "common/dir.rs"]
 mod dir;
 use dir::tempdir;
@@ -801,6 +799,7 @@ fn verify_segmented_wal_compaction_tombstones(
             bm25_path: &sealed_dir.join(&sealed.bm25.file),
             live_docs_path: &pipestream_search::node::live_docs_sidecar_path(index_path),
             partition_column: None,
+            parents_colocated: false,
         })
         .unwrap();
     let input_ids = ["parent".to_string()];

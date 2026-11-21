@@ -237,6 +237,7 @@ fn the_mask_from_the_columns_is_the_row_by_row_mask_across_every_part() {
                 bm25_path: &image,
                 live_docs_path: &live,
                 partition_column: None,
+                parents_colocated: false,
             })
             .unwrap();
         shard.republish(published).unwrap();
@@ -256,6 +257,47 @@ fn the_mask_from_the_columns_is_the_row_by_row_mask_across_every_part() {
 #[ignore = "a measurement, run by hand"]
 fn measure_the_mask_from_the_columns() {
     let dir = directory("measure");
+    let shard = build_mask_shard(&dir);
+    let n = shard.next_doc_id() as usize;
+    let forward = Forward(&shard);
+    let all = Bits::full(n);
+    let years = ResolvedFilter::Leaf(ResolvedLeaf::IntRange {
+        column: 0,
+        lo: 2000,
+        hi: 2010,
+    });
+    let cases = mask_cases(&shard);
+    let started = std::time::Instant::now();
+    let mut first = Bits::empty(n);
+    shard.facet_present(0, &mut first);
+    println!(
+        "{n} rows; inverting the column in 8 segments, once: {:.1} ms",
+        started.elapsed().as_secs_f64() * 1e3
+    );
+    let started = std::time::Instant::now();
+    members(&years, true, &all, &forward, &shard);
+    println!(
+        "sorting the year column in 8 segments, once: {:.1} ms",
+        started.elapsed().as_secs_f64() * 1e3
+    );
+    for (name, filter) in &cases {
+        let (rows_ms, rows_count) = time_best(&|| {
+            (0..n as u32)
+                .filter(|&row| filter.eval(row, &forward) == Tri::True)
+                .count() as u64
+        });
+        let (bits_ms, bits_count) =
+            time_best(&|| members(filter, true, &all, &forward, &shard).count());
+        assert_eq!(rows_count, bits_count);
+        println!(
+            "{name}: {bits_count} rows; row by row {rows_ms:.2} ms, from the columns {bits_ms:.3} ms ({:.0}x)",
+            rows_ms / bits_ms
+        );
+    }
+}
+
+/// The million-row, 8-segment column fixture the mask is measured on.
+fn build_mask_shard(dir: &std::path::Path) -> SegmentedShard {
     let root = dir.join("catalog");
     let tail = || {
         Bm25Store::new()
@@ -314,13 +356,16 @@ fn measure_the_mask_from_the_columns() {
                 bm25_path: &image,
                 live_docs_path: &live,
                 partition_column: None,
+                parents_colocated: false,
             })
             .unwrap();
         shard.republish(published).unwrap();
     }
-    let n = shard.next_doc_id() as usize;
-    let forward = Forward(&shard);
-    let all = Bits::full(n);
+    shard
+}
+
+/// The measured filter cases over `shard`'s court and year columns.
+fn mask_cases(shard: &SegmentedShard) -> Vec<(&'static str, ResolvedFilter)> {
     let facet = |value: &str| {
         ResolvedFilter::Leaf(ResolvedLeaf::Facet {
             column: Some(0),
@@ -332,7 +377,7 @@ fn measure_the_mask_from_the_columns() {
         lo: 2000,
         hi: 2010,
     });
-    let cases = [
+    vec![
         ("court = half (50%)", facet("half")),
         ("court = tenth (10%)", facet("tenth")),
         ("court = hundredth (1%)", facet("hundredth")),
@@ -350,41 +395,17 @@ fn measure_the_mask_from_the_columns() {
             "NOT year in 2000..=2010",
             ResolvedFilter::Not(Box::new(years.clone())),
         ),
-    ];
-    let started = std::time::Instant::now();
-    let mut first = Bits::empty(n);
-    shard.facet_present(0, &mut first);
-    println!(
-        "{n} rows; inverting the column in 8 segments, once: {:.1} ms",
-        started.elapsed().as_secs_f64() * 1e3
-    );
-    let started = std::time::Instant::now();
-    members(&years, true, &all, &forward, &shard);
-    println!(
-        "sorting the year column in 8 segments, once: {:.1} ms",
-        started.elapsed().as_secs_f64() * 1e3
-    );
-    for (name, filter) in &cases {
-        let time = |run: &dyn Fn() -> u64| {
-            let mut best = f64::INFINITY;
-            let mut count = 0;
-            for _ in 0..5 {
-                let started = std::time::Instant::now();
-                count = run();
-                best = best.min(started.elapsed().as_secs_f64() * 1e3);
-            }
-            (best, count)
-        };
-        let (rows_ms, rows_count) = time(&|| {
-            (0..n as u32)
-                .filter(|&row| filter.eval(row, &forward) == Tri::True)
-                .count() as u64
-        });
-        let (bits_ms, bits_count) = time(&|| members(filter, true, &all, &forward, &shard).count());
-        assert_eq!(rows_count, bits_count);
-        println!(
-            "{name}: {bits_count} rows; row by row {rows_ms:.2} ms, from the columns {bits_ms:.3} ms ({:.0}x)",
-            rows_ms / bits_ms
-        );
+    ]
+}
+
+/// Best of five runs in milliseconds, with the last run's count.
+fn time_best(run: &dyn Fn() -> u64) -> (f64, u64) {
+    let mut best = f64::INFINITY;
+    let mut count = 0;
+    for _ in 0..5 {
+        let started = std::time::Instant::now();
+        count = run();
+        best = best.min(started.elapsed().as_secs_f64() * 1e3);
     }
+    (best, count)
 }

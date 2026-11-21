@@ -93,6 +93,7 @@ fn seal_child_catalog(
                 bm25_path: &staged.bm25,
                 live_docs_path: &staged.live,
                 partition_column: None,
+                parents_colocated: image.parents_colocated,
             })
             .map_err(|error| format!("seal child {}: {error}", root.display()))?;
         if let Some(binding) = Bm25Reader::open(&staged.bm25)
@@ -171,6 +172,7 @@ fn seal_mixed_child(
             bm25_path: &part_bm25,
             live_docs_path: &live,
             partition_column: None,
+            parents_colocated: image.parents_colocated,
         });
         let _ = remove_if_present(&part_bm25);
         let _ = remove_if_present(&live);

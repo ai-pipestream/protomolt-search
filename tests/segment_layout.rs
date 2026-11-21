@@ -5,6 +5,8 @@
 //! bitmap, facets, filters, highlights, prefixes, block-max.
 
 mod common;
+#[path = "segment_layout/union_fixture.rs"]
+mod union_fixture;
 
 use std::path::PathBuf;
 
@@ -55,7 +57,6 @@ const BATCHES: [&[(&str, &str)]; 3] = [
         ("a last appeal to the court", "nysd"),
     ],
 ];
-
 fn config(index_path: Option<PathBuf>) -> NodeConfig {
     NodeConfig {
         index_path,
@@ -372,145 +373,27 @@ async fn one_stream_seals_bounded_segments_before_it_ends() {
 fn the_union_index_equals_one_image_over_the_same_rows() {
     let dir = tempdir("union");
     let root = dir.join("catalog");
-    let tail = || {
-        Bm25Store::with_text_fields(&["body"])
-            .with_columns(pipestream_search::postings::ColumnKind::Facet, &["court"])
-            .with_positions(&["body"])
-            .with_sentences(&["body"])
-    };
-    let mut union = SegmentedShard::open(&root, tail()).unwrap();
-    let mut whole = tail();
+    let mut union = SegmentedShard::open(&root, union_fixture::union_tail()).unwrap();
+    let mut whole = union_fixture::union_tail();
     let mut next = 0u32;
     let mut snapshots = Vec::new();
     let mut mapped_sets = Vec::new();
     let mut frozen_stores = Vec::new();
-    let identity = |row: u32| {
-        (row % 3 != 1).then(|| pipestream_search::pb::DocumentIdentity {
-            document_key: [vec![0, 255], row.to_le_bytes().to_vec()].concat(),
-            version: u64::MAX - u64::from(row),
-            chunk_ordinal: row.is_multiple_of(2).then_some(0),
-        })
-    };
-    let attach = |store: &mut Bm25Store, local: u32, row: u32, text: &str| {
-        if let Some(identity) = identity(row) {
-            store
-                .source_archive_mut()
-                .attach_source_with_identity(
-                    local,
-                    &pipestream_search::pb::ProtobufSource {
-                        descriptor_set: b"opaque producer descriptor".to_vec(),
-                        message_type: "test.Doc".into(),
-                        payload: text.as_bytes().to_vec(),
-                    },
-                    identity.chunk_ordinal,
-                    Some(&identity),
-                )
-                .unwrap();
-        }
-    };
-    // Seal the first two batches by hand through the catalog: the same
-    // path the node takes, minus the node.
     for batch in &BATCHES[..2] {
-        for (text, court) in batch.iter() {
-            let doc =
-                pipestream_search::analyzer::analyze_document_native(text, Some(&body_spec()))
-                    .unwrap();
-            let local = next - union.tail_base();
-            union
-                .add_document(next, text.to_string(), doc.clone(), None)
-                .unwrap();
-            union.tail_mut().set_facet(0, local, court);
-            attach(union.tail_mut(), local, next, text);
-            union.sync_tail();
-            whole.add_document(next, text.to_string(), doc);
-            whole.set_facet(0, next, court);
-            attach(&mut whole, next, next, text);
-            next += 1;
-        }
+        union_fixture::append_batch(&mut union, &mut whole, batch, &mut next);
         snapshots.push((next, union.identity_snapshot().unwrap()));
-        // Freeze the tail as the node's seal does, and read through the
-        // frozen part before its segment exists: the same rows answer.
-        let frozen = union
-            .freeze_tail(tail(), union.tail().next_doc_id())
-            .unwrap();
-        snapshots.push((next, union.identity_snapshot().unwrap()));
-        frozen_stores.push(std::sync::Arc::downgrade(&frozen));
-        let (base, rows, _) = union.frozen().unwrap();
-        assert_eq!(u64::from(base) + u64::from(rows), u64::from(next));
-        assert_eq!(union.df("court"), whole.df("court"), "frozen part served");
-        assert_eq!(
-            union
-                .facet_ord(0, next - 1)
-                .map(|o| union.facet_value(0, o).to_string()),
-            whole
-                .facet_ord(0, next - 1)
-                .map(|o| whole.facet_value(0, o).to_string())
+        union_fixture::seal_batch(
+            &mut union,
+            &dir,
+            &mut mapped_sets,
+            &mut frozen_stores,
+            &whole,
+            next,
         );
-        let stage = dir.join(format!("stage-{}", union.sealed_parts()));
-        std::fs::create_dir_all(&stage).unwrap();
-        frozen.save(&stage.join("documents.bm25")).unwrap();
-        pipestream_search::live_docs::LiveDocs::default()
-            .write(&stage.join("live-docs.bin"), u64::from(rows))
-            .unwrap();
-        let published = union
-            .catalog()
-            .append(pipestream_search::segments::SegmentSource {
-                multi_res_path: None,
-                segment_id: &format!("seg-{}", union.sealed_parts()),
-                generation: union.sealed_parts() as u64 + 1,
-                base_label: u64::from(base),
-                backend_kind: "",
-                vector_path: None,
-                exact_vector_path: None,
-                bm25_path: &stage.join("documents.bm25"),
-                live_docs_path: &stage.join("live-docs.bin"),
-                partition_column: None,
-            })
-            .unwrap();
-        union.republish(published).unwrap();
-        assert!(union.frozen().is_none());
         snapshots.push((next, union.identity_snapshot().unwrap()));
-        mapped_sets.push(std::sync::Arc::downgrade(union.snapshot()));
     }
-    for (text, court) in BATCHES[2] {
-        let doc =
-            pipestream_search::analyzer::analyze_document_native(text, Some(&body_spec())).unwrap();
-        let local = next - union.tail_base();
-        union
-            .add_document(next, text.to_string(), doc.clone(), None)
-            .unwrap();
-        union.tail_mut().set_facet(0, local, court);
-        attach(union.tail_mut(), local, next, text);
-        union.sync_tail();
-        whole.add_document(next, text.to_string(), doc);
-        whole.set_facet(0, next, court);
-        attach(&mut whole, next, next, text);
-        next += 1;
-    }
-    assert_eq!(union.next_doc_id(), whole.next_doc_id());
-    assert_eq!(Bm25Index::doc_count(&union), Bm25Index::doc_count(&whole));
-    assert_eq!(union.total_doc_length(), whole.total_doc_length());
-    for term in ["court", "appeal", "courier", "nothing", "absent"] {
-        assert_eq!(union.df(term), whole.df(term), "{term}");
-        let mut a = Vec::new();
-        union.for_each_posting(term, &mut |doc, tf, offsets| {
-            a.push((doc, tf, offsets.to_vec()))
-        });
-        let mut b = Vec::new();
-        whole.for_each_posting(term, &mut |doc, tf, offsets| {
-            b.push((doc, tf, offsets.to_vec()))
-        });
-        assert_eq!(a, b, "{term}");
-        for doc in 0..next {
-            assert_eq!(union.doc_length(doc), whole.doc_length(doc));
-            assert_eq!(
-                union.posting_positions(term, doc),
-                whole.posting_positions(term, doc)
-            );
-            assert_eq!(union.text(doc), Bm25Index::text(&whole, doc));
-            assert_eq!(union.doc_sentences(doc), whole.doc_sentences(doc));
-        }
-    }
+    union_fixture::append_batch(&mut union, &mut whole, BATCHES[2], &mut next);
+    union_fixture::assert_equal_terms(&union, &whole, next);
     // Sealed terms have a chained cursor that walks every posting in
     // order; a term the tail holds has none until the next seal.
     let mut cursor = union.impacts("courier").expect("sealed term has impacts");
@@ -523,39 +406,13 @@ fn the_union_index_equals_one_image_over_the_same_rows() {
     whole.for_each_posting("courier", &mut |doc, tf, _| want.push((doc, tf)));
     assert_eq!(walked, want);
     assert!(union.impacts("court").is_none(), "the tail holds court");
-    // Dictionaries: one global ordinal space, value lookups agree.
-    let dict: Vec<String> = union.facet_dictionary(0).to_vec();
-    assert_eq!(dict[..union.facet_value_count(0).min(5)].len(), 5);
-    for doc in 0..next {
-        let a = union
-            .facet_ord(0, doc)
-            .map(|o| union.facet_value(0, o).to_string());
-        let b = whole
-            .facet_ord(0, doc)
-            .map(|o| whole.facet_value(0, o).to_string());
-        assert_eq!(a, b, "doc {doc}");
-    }
-    for court in ["scotus", "ca9", "dcc", "ca5", "nysd", "zzz"] {
-        assert_eq!(
-            union
-                .facet_value_ord_of(0, court)
-                .map(|o| union.facet_value(0, o)),
-            whole
-                .facet_value_ord_of(0, court)
-                .map(|o| whole.facet_value(0, o)),
-        );
-    }
-    assert_eq!(
-        union.expand_prefix("cour", 64).unwrap(),
-        whole.expand_prefix("cour", 64).unwrap()
-    );
-    assert_eq!(
-        union.expand_prefix("cour", 1),
-        whole.expand_prefix("cour", 1)
-    );
+    union_fixture::assert_equal_dictionary(&union, &whole, next);
     snapshots.push((next, union.identity_snapshot().unwrap()));
     for row in 0..next {
-        assert_eq!(union.document_identity(row), identity(row));
+        assert_eq!(
+            union.document_identity(row),
+            union_fixture::row_identity(row)
+        );
     }
     drop(cursor);
     drop(union);
@@ -565,7 +422,7 @@ fn the_union_index_equals_one_image_over_the_same_rows() {
     std::fs::remove_dir_all(&dir).unwrap();
     for (rows, snapshot) in snapshots {
         for row in 0..rows {
-            assert_eq!(snapshot.identity(row), identity(row));
+            assert_eq!(snapshot.identity(row), union_fixture::row_identity(row));
         }
         for row in rows..=next {
             assert!(
@@ -731,11 +588,68 @@ fn live_heap_bytes() -> usize {
 /// top-k. Measured per thread on the allocator, not on process RSS.
 #[test]
 fn a_mapped_sealed_image_opens_without_the_heap_load() {
+    use pipestream_search::segments::VectorLoad;
+    use pipestream_search::vector::VectorSearchOptions;
+
+    const DIM: usize = 256;
+    let (dir, root, corpus, image_bytes) = stage_large_sealed_image();
+    // Both opens verify every artifact and open the BM25 and exact
+    // stores; the image is the difference between them.
+    let before = live_heap_bytes();
+    let mapped = OpenedSegmentSet::open_with(&root, VectorLoad::Mapped).unwrap();
+    let mapped_growth = live_heap_bytes().saturating_sub(before);
+    assert!(mapped.vector(0).unwrap().is_mapped());
+    let before = live_heap_bytes();
+    let heap = OpenedSegmentSet::open_with(&root, VectorLoad::Heap).unwrap();
+    let heap_growth = live_heap_bytes().saturating_sub(before);
+    assert!(!heap.vector(0).unwrap().is_mapped());
+    assert!(
+        mapped_growth < image_bytes / 2,
+        "mapped open retained {mapped_growth} heap bytes for a {image_bytes}-byte image"
+    );
+    assert!(
+        heap_growth >= image_bytes,
+        "a heap load retained {heap_growth} heap bytes for a {image_bytes}-byte image"
+    );
+    assert!(
+        heap_growth > mapped_growth + image_bytes / 2,
+        "a heap load retained {heap_growth} heap bytes against {mapped_growth} mapped for a \
+         {image_bytes}-byte image"
+    );
+    let query = &corpus[7 * DIM..8 * DIM];
+    let a = mapped
+        .vector(0)
+        .unwrap()
+        .try_search(query, 10, VectorSearchOptions::new())
+        .unwrap();
+    let b = heap
+        .vector(0)
+        .unwrap()
+        .try_search(query, 10, VectorSearchOptions::new())
+        .unwrap();
+    assert_eq!(a.slots_for_query(0), b.slots_for_query(0));
+    assert_eq!(
+        a.scores_for_query(0)
+            .iter()
+            .map(|s| s.to_bits())
+            .collect::<Vec<_>>(),
+        b.scores_for_query(0)
+            .iter()
+            .map(|s| s.to_bits())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(a.slots_for_query(0)[0], 7);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Stage one large sealed segment (80k rows, >8 MiB image) and return
+/// its directory, catalog root, corpus, and image size in bytes.
+fn stage_large_sealed_image() -> (dir::TestDir, PathBuf, Vec<f32>, usize) {
     use pipestream_search::exact_vectors::ExactVectorStore;
     use pipestream_search::live_docs::LiveDocs;
     use pipestream_search::postings::AnalyzedDoc;
-    use pipestream_search::segments::{SegmentCatalog, SegmentSource, VectorLoad};
-    use pipestream_search::vector::{VectorSearchOptions, EMBEDDED_TURBOVEC};
+    use pipestream_search::segments::{SegmentCatalog, SegmentSource};
+    use pipestream_search::vector::EMBEDDED_TURBOVEC;
 
     const DIM: usize = 256;
     const ROWS: usize = 80_000;
@@ -789,55 +703,9 @@ fn a_mapped_sealed_image_opens_without_the_heap_load() {
             bm25_path: &bm25_path,
             live_docs_path: &live_path,
             partition_column: None,
+            parents_colocated: false,
         })
         .unwrap();
     drop(catalog);
-
-    // Both opens verify every artifact and open the BM25 and exact
-    // stores; the image is the difference between them.
-    let before = live_heap_bytes();
-    let mapped = OpenedSegmentSet::open_with(&root, VectorLoad::Mapped).unwrap();
-    let mapped_growth = live_heap_bytes().saturating_sub(before);
-    assert!(mapped.vector(0).unwrap().is_mapped());
-    let before = live_heap_bytes();
-    let heap = OpenedSegmentSet::open_with(&root, VectorLoad::Heap).unwrap();
-    let heap_growth = live_heap_bytes().saturating_sub(before);
-    assert!(!heap.vector(0).unwrap().is_mapped());
-    assert!(
-        mapped_growth < image_bytes / 2,
-        "mapped open retained {mapped_growth} heap bytes for a {image_bytes}-byte image"
-    );
-    assert!(
-        heap_growth >= image_bytes,
-        "a heap load retained {heap_growth} heap bytes for a {image_bytes}-byte image"
-    );
-    assert!(
-        heap_growth > mapped_growth + image_bytes / 2,
-        "a heap load retained {heap_growth} heap bytes against {mapped_growth} mapped for a \
-         {image_bytes}-byte image"
-    );
-    let query = &corpus[7 * DIM..8 * DIM];
-    let a = mapped
-        .vector(0)
-        .unwrap()
-        .try_search(query, 10, VectorSearchOptions::new())
-        .unwrap();
-    let b = heap
-        .vector(0)
-        .unwrap()
-        .try_search(query, 10, VectorSearchOptions::new())
-        .unwrap();
-    assert_eq!(a.slots_for_query(0), b.slots_for_query(0));
-    assert_eq!(
-        a.scores_for_query(0)
-            .iter()
-            .map(|s| s.to_bits())
-            .collect::<Vec<_>>(),
-        b.scores_for_query(0)
-            .iter()
-            .map(|s| s.to_bits())
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(a.slots_for_query(0)[0], 7);
-    let _ = std::fs::remove_dir_all(&dir);
+    (dir, root, corpus, image_bytes)
 }

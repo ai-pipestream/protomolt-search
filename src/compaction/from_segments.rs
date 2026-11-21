@@ -307,6 +307,7 @@ impl NodeServiceImpl {
             source_generation: generation,
             backend_kind: &pre.backend_kind,
             partition_column: Some(&pre.partition),
+            parents_colocated: Some(pre.set.parents_colocated()),
         })?;
         let opened = (|| -> Result<(), Status> {
             let manifest = SegmentSetManifest {

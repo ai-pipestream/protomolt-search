@@ -58,9 +58,12 @@ pub(crate) use row_update::SourceGeneration;
 use stage::{cleanup_staged, stage_segment, verify_retry_source};
 pub use stage::{remove_segment_dirs, stage_segments, write_manifest_file};
 pub(crate) use summary::summarize_columns;
-use validate::{validate_manifest, validate_relative_file, validate_segment_id};
+use validate::{probe_set_format, validate_manifest, validate_relative_file, validate_segment_id};
 
-const SET_FORMAT: u32 = 5;
+/// The one segment-set format this build writes or reads. Format 6 is
+/// the first whose segment records carry the colocation proof; there is
+/// no ladder to older formats, which are refused by version number.
+const SET_FORMAT: u32 = 6;
 const SET_FILE: &str = "segments.json";
 const SEGMENT_META_FILE: &str = "segment.json";
 
@@ -81,6 +84,10 @@ pub struct SegmentSource<'a> {
     /// its partition.
     /// `None` for a tail seal and for the bucket layout.
     pub partition_column: Option<&'a str>,
+    /// Whether every lineage parent with a row in this segment holds all
+    /// of its live rows on this shard. Reshard and routed ingest prove it;
+    /// anything that cannot passes `false`.
+    pub parents_colocated: bool,
 }
 
 /// The scoring contracts a sealed segment's provider may carry: the

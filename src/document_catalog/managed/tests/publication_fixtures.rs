@@ -203,6 +203,7 @@ fn append_candidate(
             bm25_path: &artifact(&metadata.bm25.file),
             live_docs_path: &artifact(&metadata.live_docs.file),
             partition_column: None,
+            parents_colocated: metadata.parents_colocated,
         })
         .unwrap()
 }

@@ -35,6 +35,46 @@ async fn document_only_segment_is_a_gap_in_bitmap_and_boolean_membership() {
     std::fs::create_dir_all(&root).unwrap();
     let vectors = unit_vectors(8, 16, 731);
     let (shift, scale) = fit_calibration(16, 4, &vectors);
+    stage_three_part_catalog(&root, &vectors, &shift, &scale);
+    let node = build_gapped_node(&root, &vectors, &shift, &scale);
+    let bitmap = node
+        .resolve_vector_bitmap(Request::new(VectorBitmapRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((bitmap.base_label, bitmap.label_count), (100, 8));
+    assert_eq!(bitmap.bits, vec![0b1111_0011]);
+    let leaves = assert_boolean_groups(&node, &vectors).await;
+    let leaf = |i| BooleanPlanNode {
+        node: Some(boolean_plan_node::Node::Leaf(i)),
+    };
+    // Missing rerank storage cannot silently redefine dense membership.
+    let mut exact_leaves = leaves;
+    let Some(boolean_plan_leaf::Leaf::Dense(dense)) = exact_leaves[0].leaf.as_mut() else {
+        unreachable!()
+    };
+    dense.exact_fp32 = true;
+    let error = node
+        .evaluate_boolean(Request::new(BooleanShardRequest {
+            root: Some(BooleanPlanGroup {
+                must: vec![leaf(0)],
+                ..Default::default()
+            }),
+            leaves: exact_leaves,
+            depth: 8,
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(error.message().contains("exact-vector sidecar"));
+    drop(node);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Stage three 2-row parts into the catalog; the middle part carries no
+/// vector or exact artifact.
+fn stage_three_part_catalog(root: &std::path::Path, vectors: &[f32], shift: &[f32], scale: &[f32]) {
     let catalog = SegmentCatalog::open(root.join("catalog")).unwrap();
     for part in 0..3 {
         let stage = root.join(format!("stage-{part}"));
@@ -46,7 +86,7 @@ async fn document_only_segment_is_a_gap_in_bitmap_and_boolean_membership() {
         documents().save(&bm25).unwrap();
         LiveDocs::default().write(&live, 2).unwrap();
         if part != 1 {
-            let mut index = seeded_index(16, 4, &shift, &scale);
+            let mut index = seeded_index(16, 4, shift, scale);
             index.add(&vectors[part * 32..(part + 1) * 32], 16).unwrap();
             index.prepare().unwrap();
             index.write(&image).unwrap();
@@ -70,11 +110,22 @@ async fn document_only_segment_is_a_gap_in_bitmap_and_boolean_membership() {
                 bm25_path: &bm25,
                 live_docs_path: &live,
                 partition_column: None,
+                parents_colocated: false,
             })
             .unwrap();
     }
+}
+
+/// Open the catalog as a served node: provider index with a 2-row tail
+/// over a segmented BM25 holding the same tail documents.
+fn build_gapped_node(
+    root: &std::path::Path,
+    vectors: &[f32],
+    shift: &[f32],
+    scale: &[f32],
+) -> NodeServiceImpl {
     let set = std::sync::Arc::new(OpenedSegmentSet::open(root.join("catalog")).unwrap());
-    let provider = SegmentedProvider::open(set, seeded_index(16, 4, &shift, &scale)).unwrap();
+    let provider = SegmentedProvider::open(set, seeded_index(16, 4, shift, scale)).unwrap();
     let mut index = VectorIndex::from_provider(provider);
     index.add(&vectors[96..], 16).unwrap();
     index.prepare().unwrap();
@@ -91,25 +142,19 @@ async fn document_only_segment_is_a_gap_in_bitmap_and_boolean_membership() {
         )
         .unwrap();
     }
-    let node = NodeServiceImpl::new(
+    NodeServiceImpl::new(
         Some(index),
         NodeConfig {
             slot_offset: 100,
             ..Default::default()
         },
     )
-    .with_bm25(Some(Bm25Shard::Segmented(bm25)));
-    let bitmap = node
-        .resolve_vector_bitmap(Request::new(VectorBitmapRequest::default()))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!((bitmap.base_label, bitmap.label_count), (100, 8));
-    assert_eq!(bitmap.bits, vec![0b1111_0011]);
-    let leaf = |i| BooleanPlanNode {
-        node: Some(boolean_plan_node::Node::Leaf(i)),
-    };
-    let leaves = vec![
+    .with_bm25(Some(Bm25Shard::Segmented(bm25)))
+}
+
+/// The two plan leaves: dense over the first vector, and the empty filter.
+fn boolean_leaves(vectors: &[f32]) -> Vec<BooleanPlanLeaf> {
+    vec![
         BooleanPlanLeaf {
             leaf: Some(boolean_plan_leaf::Leaf::Dense(BooleanPlanDense {
                 vector: vectors[..16].to_vec(),
@@ -119,7 +164,17 @@ async fn document_only_segment_is_a_gap_in_bitmap_and_boolean_membership() {
         BooleanPlanLeaf {
             leaf: Some(boolean_plan_leaf::Leaf::Filter(BooleanPlanFilter::default())),
         },
-    ];
+    ]
+}
+
+/// Every boolean group shape over the gap rows must return its exact
+/// candidate set, with gap rows carrying no dense signal. Returns the
+/// leaves for reuse by the exact-sidecar refusal check.
+async fn assert_boolean_groups(node: &NodeServiceImpl, vectors: &[f32]) -> Vec<BooleanPlanLeaf> {
+    let leaf = |i| BooleanPlanNode {
+        node: Some(boolean_plan_node::Node::Leaf(i)),
+    };
+    let leaves = boolean_leaves(vectors);
     let groups = [
         (
             BooleanPlanGroup {
@@ -175,27 +230,5 @@ async fn document_only_segment_is_a_gap_in_bitmap_and_boolean_membership() {
             assert!(!candidate.matched.contains(&0));
         }
     }
-    // Missing rerank storage cannot silently redefine dense membership.
-    let mut exact_leaves = leaves;
-    let Some(boolean_plan_leaf::Leaf::Dense(dense)) = exact_leaves[0].leaf.as_mut() else {
-        unreachable!()
-    };
-    dense.exact_fp32 = true;
-    let error = node
-        .evaluate_boolean(Request::new(BooleanShardRequest {
-            root: Some(BooleanPlanGroup {
-                must: vec![leaf(0)],
-                ..Default::default()
-            }),
-            leaves: exact_leaves,
-            depth: 8,
-            ..Default::default()
-        }))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert!(error.message().contains("exact-vector sidecar"));
-    drop(node);
-    drop(catalog);
-    std::fs::remove_dir_all(root).unwrap();
+    leaves
 }

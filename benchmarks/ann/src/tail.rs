@@ -28,9 +28,7 @@ use crate::fixture::{self, Fixture};
 use crate::util::{
     arg, dot, harness, host, host_threads, list_usize, par_map, write_json, Error, TopK,
 };
-
 static NEXT_DIR: AtomicU32 = AtomicU32::new(0);
-
 fn scratch_dir(tag: &str) -> Result<PathBuf, Error> {
     let dir = std::env::temp_dir().join(format!(
         "ann-tail-{tag}-{}-{}",
@@ -269,6 +267,7 @@ fn measure_ingest_and_seal(
         bm25_path: &bm25_path,
         live_docs_path: &live_path,
         partition_column: None,
+        parents_colocated: false,
     })?;
     provider.republish(published)?;
     let seal_s = seal_start.elapsed().as_secs_f64();
@@ -333,6 +332,7 @@ fn seal_base_segments(
             bm25_path: &bm25_path,
             live_docs_path: &live_path,
             partition_column: None,
+            parents_colocated: false,
         })?;
         let _ = std::fs::remove_dir_all(&stage);
         base_offset += len;

@@ -25,12 +25,8 @@
 
 mod common;
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
+use common::mock::start_mock_analysis;
+use common::{fit_calibration, start_empty_node, start_opened_node, unit_vectors, BIT_WIDTH, DIM};
 use pipestream_search::analyzer::body_spec;
 use pipestream_search::live_docs::LiveDocs;
 use pipestream_search::mapping::derive_plan;
@@ -47,18 +43,21 @@ use pipestream_search::postings::{Bm25Index, Bm25Reader, StoredBinding};
 use pipestream_search::reshard::{self, PartitionSpec, SegmentCompactionOptions};
 use pipestream_search::segments::{SegmentCatalog, SegmentSetManifest};
 use prost::Message;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tonic::Request;
-
-use common::mock::start_mock_analysis;
-use common::{fit_calibration, start_empty_node, start_opened_node, unit_vectors, BIT_WIDTH, DIM};
-
+#[path = "compaction_from_segments/fixture_helpers.rs"]
+mod fixture_helpers;
+use fixture_helpers::write_rollback_marker;
 #[path = "common/dir.rs"]
 mod dir;
 use dir::tempdir;
-
 #[path = "common/scratch.rs"]
 mod scratch;
 use scratch::scratch_path;
@@ -1098,90 +1097,25 @@ async fn walless_compaction_preserves_the_derived_declaration() {
 
 #[test]
 fn an_interrupted_walless_cutover_rolls_back_at_open() {
-    // The on-disk state a crash leaves around the manifest publish of a
-    // from-segments cutover: the backup the cutover kept, the marker
-    // naming the staged outputs and the replaced inputs, and — in the
-    // "after publish" case — the new manifest already in place.
-    let dir = scratch_path(&format!("walless-rollback-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let index_path = dir.join("shard.tv");
-    let root = segments_root(&index_path);
-    let catalog = SegmentCatalog::open(&root).unwrap();
-    // One real segment to stand for the serving set.
-    let work = dir.join("work-segment");
-    std::fs::create_dir_all(&work).unwrap();
-    let bm25_path = work.join("documents.bm25");
-    let live_path = work.join("live.bin");
-    let mut store = pipestream_search::postings::Bm25Store::with_text_fields(&["body"]);
-    store.add_document(
-        0,
-        "document".into(),
-        pipestream_search::analyzer::analyze_document_native("document", Some(&body_spec()))
-            .unwrap(),
-    );
-    store.save(&bm25_path).unwrap();
-    LiveDocs::default().write(&live_path, 1).unwrap();
-    catalog
-        .append(pipestream_search::segments::SegmentSource {
-            multi_res_path: None,
-            segment_id: "seg-00000001",
-            generation: 1,
-            base_label: 0,
-            backend_kind: "",
-            vector_path: None,
-            exact_vector_path: None,
-            bm25_path: &bm25_path,
-            live_docs_path: &live_path,
-            partition_column: None,
-        })
-        .unwrap();
-    let manifest = catalog.snapshot().manifest().clone();
-    let manifest_bytes = std::fs::read(SegmentCatalog::manifest_path(&root)).unwrap();
-    let backup_path = {
-        let mut name = SegmentCatalog::manifest_path(&root).as_os_str().to_owned();
-        name.push(".pre-compact");
-        PathBuf::from(name)
-    };
-    let marker_path = pipestream_search::compaction::marker_path(&index_path);
-    let staged_dir = SegmentCatalog::segment_dir(&root, "cmp-000007-0000");
-    let write_marker = || {
-        std::fs::write(
-            &marker_path,
-            serde_json::json!({
-                "format": 1,
-                "layout": "segments",
-                "old_wal_generation": 0,
-                "new_wal_generation": 0,
-                "walless": true,
-                "work_dir": dir.join("work"),
-                "previous_snapshot": false,
-                "legacy_files": [],
-                "staged_segments": ["cmp-000007-0000"],
-                "replaced_segments": ["seg-00000001"],
-            })
-            .to_string(),
-        )
-        .unwrap();
-    };
-
+    let fx = fixture_helpers::rollback_fixture();
+    let root = &fx.root;
     // Crash after the marker, before the publish: the manifest on disk
     // is the serving one.
-    std::fs::write(&backup_path, &manifest_bytes).unwrap();
-    std::fs::create_dir_all(&staged_dir).unwrap();
-    std::fs::write(staged_dir.join("junk"), b"torn").unwrap();
-    write_marker();
-    pipestream_search::compaction::recover_interrupted(&index_path);
+    std::fs::write(&fx.backup_path, &fx.manifest_bytes).unwrap();
+    std::fs::create_dir_all(&fx.staged_dir).unwrap();
+    std::fs::write(fx.staged_dir.join("junk"), b"torn").unwrap();
+    write_rollback_marker(&fx);
+    pipestream_search::compaction::recover_interrupted(&fx.index_path);
     assert_eq!(
-        std::fs::read(SegmentCatalog::manifest_path(&root)).unwrap(),
-        manifest_bytes,
+        std::fs::read(SegmentCatalog::manifest_path(root)).unwrap(),
+        fx.manifest_bytes,
         "the serving manifest is restored"
     );
-    assert!(!staged_dir.exists(), "the staged outputs are removed");
-    assert!(!marker_path.exists());
-    assert!(!backup_path.exists());
+    assert!(!fx.staged_dir.exists(), "the staged outputs are removed");
+    assert!(!fx.marker_path.exists());
+    assert!(!fx.backup_path.exists());
     assert_eq!(
-        SegmentCatalog::open(&root)
+        SegmentCatalog::open(root)
             .unwrap()
             .snapshot()
             .manifest()
@@ -1194,35 +1128,35 @@ fn an_interrupted_walless_cutover_rolls_back_at_open() {
     // Crash after the publish: the new manifest (the serving set
     // replaced by the staged outputs) is already in place; the rollback
     // restores the backup over it.
-    let mut published = manifest.clone();
+    let mut published = fx.manifest.clone();
     published.epoch += 1;
     let mut replacement = published.segments[0].clone();
     replacement.segment_id = "cmp-000007-0000".to_string();
     published.segments.push(replacement);
     pipestream_search::segments::write_manifest_file(
-        &SegmentCatalog::manifest_path(&root),
+        &SegmentCatalog::manifest_path(root),
         &published,
     )
     .unwrap();
-    std::fs::write(&backup_path, &manifest_bytes).unwrap();
-    std::fs::create_dir_all(&staged_dir).unwrap();
-    write_marker();
-    pipestream_search::compaction::recover_interrupted(&index_path);
+    std::fs::write(&fx.backup_path, &fx.manifest_bytes).unwrap();
+    std::fs::create_dir_all(&fx.staged_dir).unwrap();
+    write_rollback_marker(&fx);
+    pipestream_search::compaction::recover_interrupted(&fx.index_path);
     assert_eq!(
-        std::fs::read(SegmentCatalog::manifest_path(&root)).unwrap(),
-        manifest_bytes,
+        std::fs::read(SegmentCatalog::manifest_path(root)).unwrap(),
+        fx.manifest_bytes,
         "the backup replaces the published manifest"
     );
-    assert!(!staged_dir.exists());
-    assert!(!marker_path.exists());
+    assert!(!fx.staged_dir.exists());
+    assert!(!fx.marker_path.exists());
 
     // Torn staging without a marker (a crash during the build) is never
     // adopted: the catalog opens as it was and the leftover simply sits
     // there for the next run to refuse by name.
-    std::fs::create_dir_all(&staged_dir).unwrap();
-    pipestream_search::compaction::recover_interrupted(&index_path);
+    std::fs::create_dir_all(&fx.staged_dir).unwrap();
+    pipestream_search::compaction::recover_interrupted(&fx.index_path);
     assert_eq!(
-        SegmentCatalog::open(&root)
+        SegmentCatalog::open(root)
             .unwrap()
             .snapshot()
             .manifest()
@@ -1231,17 +1165,14 @@ fn an_interrupted_walless_cutover_rolls_back_at_open() {
         1
     );
     assert!(
-        staged_dir.exists(),
+        fx.staged_dir.exists(),
         "recovery adopts nothing without a marker"
     );
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&fx.dir);
 }
 
 #[test]
 fn partitioned_compaction_preserves_lattice_and_per_document_sparse_scales() {
-    use pipestream_search::exact_vectors::ExactVectorStore;
-    use pipestream_search::postings::{AnalyzedDoc, AnalyzedField, Bm25Store};
-    use pipestream_search::segments::SegmentSource;
     use pipestream_search::vector::{VectorIndex, EMBEDDED_TURBOVEC};
     let dir = tempdir("lattice-sparse");
     let catalog = SegmentCatalog::open(dir.join("catalog")).unwrap();
@@ -1250,69 +1181,7 @@ fn partitioned_compaction_preserves_lattice_and_per_document_sparse_scales() {
     let sample: Vec<_> = (0..64).map(|i| (i as f32 * 0.3).sin()).collect();
     let backend = VectorIndex::fit_backend_config(EMBEDDED_TURBOVEC, 8, 4, &sample).unwrap();
     for segment in 0..2 {
-        let source = dir.join(format!("source-{segment}"));
-        std::fs::create_dir(&source).unwrap();
-        let mut store = Bm25Store::with_text_fields(&["body"])
-            .with_positions(&["body"])
-            .with_columns(pipestream_search::postings::ColumnKind::Integer, &["num"]);
-        store.set_binding(Some(binding.clone()));
-        let mut vectors = Vec::new();
-        let mut live = LiveDocs::default();
-        for row in 0..3 {
-            let id = segment * 3 + row;
-            store.add_document(
-                row,
-                format!("row{id}"),
-                AnalyzedDoc {
-                    fields: vec![AnalyzedField {
-                        terms: vec![
-                            ("joined".into(), 1, vec![(0, 3)]),
-                            ("word".into(), 1, vec![(4, 8)]),
-                        ],
-                        length: 3,
-                        positions: Some(vec![vec![0], vec![2]]),
-                        pos_lengths: Some(vec![vec![2], vec![1]]),
-                        splade: vec![("neural".into(), 65535)],
-                        splade_scale_bits: (0.00001_f32 * (id + 1) as f32).to_bits(),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                },
-            );
-            store.set_integer(0, row, (5 - id) as i64);
-            vectors.extend((0..8).map(|d| (id as f32 + d as f32) / 8.0));
-            if id == 1 {
-                live.delete(row as usize);
-            }
-        }
-        let bp = source.join("bm25");
-        store.save(&bp).unwrap();
-        let vp = source.join("vector");
-        let mut vector = VectorIndex::from_backend_config(8, &backend).unwrap();
-        vector.add(&vectors, 8).unwrap();
-        vector.prepare().unwrap();
-        vector.write(&vp).unwrap();
-        let ep = source.join("exact");
-        ExactVectorStore::from_values(8, vectors)
-            .unwrap()
-            .write(&ep)
-            .unwrap();
-        let lp = source.join("live");
-        live.write(&lp, 3).unwrap();
-        catalog
-            .append(SegmentSource {
-                multi_res_path: None,
-                segment_id: &format!("source-{segment}"),
-                generation: 1,
-                base_label: (segment * 3) as u64,
-                backend_kind: EMBEDDED_TURBOVEC,
-                vector_path: Some(&vp),
-                exact_vector_path: Some(&ep),
-                bm25_path: &bp,
-                live_docs_path: &lp,
-                partition_column: None,
-            })
-            .unwrap();
+        fixture_helpers::append_lattice_source(&catalog, &dir, &binding, &backend, segment);
     }
     let mut overlay = LiveDocs::default();
     overlay.delete(4);

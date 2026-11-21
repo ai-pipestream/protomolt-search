@@ -5,11 +5,14 @@ use std::path::{Path, PathBuf};
 use super::child_build::{finish_child, ChildSlot};
 use super::child_catalog::sealed;
 use super::merge_inputs::load_merge_manifests;
+use super::parent_routing::{
+    clear_scattered, logs_hold_foreign_parents, parent_child, parent_routes, scattered_parents,
+};
 use super::replay::{read_gens_binding, replay_buckets, Replay};
 use super::split_inputs::{
     create_out_dir, distribute, hash_range, replay_clocked, require_stable_keys, SplitInputs,
 };
-use super::{bucket_of, Analyzer, ChildImage, ReshardOutput, StableReshardOutput};
+use super::{Analyzer, ChildImage, ReshardOutput, StableReshardOutput};
 
 /// A hash split of one or more full-history WAL generations into `n`
 /// children: child `i` takes `slot_offset = slot_base + i * slot_stride`
@@ -97,7 +100,7 @@ impl<'a> SplitRequest<'a> {
 /// `[i*bucket_count/n, (i+1)*bucket_count/n)`, replays only those files,
 /// and its hash range is exactly those buckets. A finer split
 /// (`n > bucket_count`) re-partitions every record by
-/// [`bucket_of`]`(id, n)` — correct but slower; the WAL bucket count
+/// `bucket_of(id, n)`: correct but slower; the WAL bucket count
 /// caps cheap split granularity.
 ///
 /// All inputs must carry byte-identical provider configurations and one bucket
@@ -112,15 +115,25 @@ pub fn split_logs_with(
     create_out_dir(request.out_dir)?;
     let n = request.n;
     let bucket_count = inputs.manifest.bucket_count as usize;
-    let children = if n <= bucket_count && bucket_count.is_multiple_of(n) {
+    let cheap = n <= bucket_count && bucket_count.is_multiple_of(n);
+    let mut children = if cheap
+        && !logs_hold_foreign_parents(request.gens, &inputs.manifest, request.vectors_only)?
+    {
         split_bucket_ranges(request, &inputs, analyze)?
     } else {
         eprintln!(
-            "reshard: WAL bucket count {bucket_count} caps cheap splits at {bucket_count} \
-             children; re-partitioning every record for split={n}"
+            "reshard: whole WAL buckets route by row id, which would scatter a lineage \
+             parent's rows or cap the split at {bucket_count} children; re-partitioning \
+             every record by parent for split={n}"
         );
         split_rehashed(request, &inputs, analyze)?
     };
+    if request.vectors_only {
+        // No document replayed, so lineage is unknown, never proven.
+        for child in &mut children {
+            child.parents_colocated = false;
+        }
+    }
     sealed(&inputs.manifest, inputs.next_generation()?, children)
 }
 
@@ -172,8 +185,10 @@ fn split_bucket_ranges(
     Ok(children)
 }
 
-/// A finer split than the bucket count: every record is re-partitioned
-/// by [`bucket_of`]`(id, n)`.
+/// A split finer than the bucket count, or over logs that hold lineage
+/// parents: every record is re-partitioned by the parent routing of its lineage
+/// parent (its own id when it has none), so a parent's chunks share a
+/// child.
 fn split_rehashed(
     request: &SplitRequest<'_>,
     inputs: &SplitInputs,
@@ -196,8 +211,23 @@ fn split_rehashed(
         )?;
     }
     replay.compact();
-    let partitions = distribute(replay, n, |id, _| Ok(bucket_of(id, n)))?;
-    build_children(request, inputs, partitions, analyze)
+    let routes = parent_routes(&replay);
+    let lineage = super::parent_routing::lineage_keys(&replay);
+    let divergent = std::cell::RefCell::new(vec![false; n]);
+    let partitions = distribute(replay, n, |id, key| {
+        let (child, keyed) = parent_child(&routes, &lineage, id, key, n);
+        if super::parent_routing::route_of(&routes, id).is_lineage() && !keyed {
+            divergent.borrow_mut()[child] = true;
+        }
+        Ok(child)
+    })?;
+    build_children(
+        request,
+        inputs,
+        partitions,
+        &divergent.into_inner(),
+        analyze,
+    )
 }
 
 /// One image per partition, child `i` at its stride offset and its
@@ -206,10 +236,12 @@ fn build_children(
     request: &SplitRequest<'_>,
     inputs: &SplitInputs,
     partitions: Vec<Replay>,
+    divergent: &[bool],
     analyze: &mut Analyzer,
 ) -> Result<Vec<ChildImage>, String> {
     let schema = inputs.schema(request.bm25_fields);
     let n = partitions.len();
+    let scattered = scattered_parents(&partitions);
     let mut children = Vec::with_capacity(n);
     for (i, replay) in partitions.into_iter().enumerate() {
         let (hash_lo, hash_hi) = hash_range(i, n);
@@ -228,6 +260,10 @@ fn build_children(
             analyze,
         )?);
     }
+    clear_scattered(&mut children, &scattered);
+    // A child holding rows routed outside the online key hash space
+    // cannot promise later keyed appends land on it.
+    clear_scattered(&mut children, divergent);
     Ok(children)
 }
 
@@ -254,7 +290,13 @@ pub fn split_stable_logs_with(
             (crate::coordinator::stable_routing_hash(key) >> shift) as usize
         })
     })?;
-    let children = build_children(request, &inputs, partitions, analyze)?;
+    let children = build_children(
+        request,
+        &inputs,
+        partitions,
+        &vec![request.vectors_only; n],
+        analyze,
+    )?;
     Ok(StableReshardOutput {
         images: sealed(&inputs.manifest, inputs.next_generation()?, children)?,
         source_cutoffs,
@@ -295,6 +337,7 @@ pub fn split_stable_logs_ranged(
             })
     })?;
     let schema = inputs.schema(bm25_fields);
+    let scattered = scattered_parents(&partitions);
     let mut children = Vec::with_capacity(ranges.len());
     for (shard, replay) in partitions.into_iter().enumerate() {
         let (hash_lo, hash_hi) = ranges[shard];
@@ -312,6 +355,12 @@ pub fn split_stable_logs_ranged(
             &schema,
             analyze,
         )?);
+    }
+    clear_scattered(&mut children, &scattered);
+    if vectors_only {
+        for child in &mut children {
+            child.parents_colocated = false;
+        }
     }
     Ok(StableReshardOutput {
         images: sealed(&inputs.manifest, inputs.next_generation()?, children)?,
@@ -409,6 +458,9 @@ pub fn merge(
         ..Default::default()
     };
     let slot = ChildSlot::full_range(0, out_dir, slot_base.unwrap_or(min_slot_offset));
-    let child = finish_child(&manifests[0], merged, slot, &schema, analyze)?;
+    let mut child = finish_child(&manifests[0], merged, slot, &schema, analyze)?;
+    if vectors_only {
+        child.parents_colocated = false;
+    }
     sealed(&manifests[0], max_generation + 1, vec![child])
 }

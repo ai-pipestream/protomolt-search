@@ -136,8 +136,15 @@ pub fn compact_segments_partitioned(
         cuts.build_threaded(options)?
     };
     let _ = std::fs::remove_dir_all(&spill_root);
+    // The spill strips stable keys, so a per-image recompute from its
+    // records can neither prove keyed colocation nor disprove the set's:
+    // carry the source set's verdict onto every output directly.
+    let mut images = placed.images;
+    for image in &mut images {
+        image.parents_colocated = set.parents_colocated();
+    }
     Ok(SegmentCompactionBuild {
-        images: placed.images,
+        images,
         id_map: placed.id_map,
         rows_before: count.rows_before,
         tombstones: count.tombstones,
