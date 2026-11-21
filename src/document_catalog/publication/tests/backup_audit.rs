@@ -139,7 +139,7 @@ fn damage_first_maintenance(f: &Fixture, damage: &str) {
                 _ => unreachable!(),
             }
             intent.intent_id.clear();
-            intent.intent_id = sha256::digest(&intent.encode_to_vec()).to_vec();
+            intent.intent_id = turbo_sha256::sha256(&intent.encode_to_vec()).0.to_vec();
             let key = maintenance_key(
                 &intent.owner.as_ref().unwrap().index_key,
                 intent.after_epoch,

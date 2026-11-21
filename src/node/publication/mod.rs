@@ -164,7 +164,7 @@ impl NodeServiceImpl {
             .map(|i| {
                 format!(
                     "source-{}-{}-{i}",
-                    crate::sha256::hex_digest(index_key),
+                    turbo_sha256::sha256(index_key).to_hex(),
                     info.accepted_sequence
                 )
             })

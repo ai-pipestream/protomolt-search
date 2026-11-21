@@ -74,7 +74,7 @@ impl LiveDocs {
         let payload = &bytes[HEADER_BYTES..];
         let mut expected_hash = [0u8; 32];
         expected_hash.copy_from_slice(&bytes[HASH_START..HASH_END]);
-        if crate::sha256::digest(payload) != expected_hash {
+        if turbo_sha256::sha256(payload).0 != expected_hash {
             return Err(invalid(format!(
                 "{} live-doc payload SHA-256 mismatch",
                 path.display()
@@ -195,7 +195,7 @@ impl LiveDocs {
         for word in &words {
             payload.extend_from_slice(&word.to_le_bytes());
         }
-        let hash = crate::sha256::digest(&payload);
+        let hash = turbo_sha256::sha256(&payload).0;
         let mut header = [0u8; HEADER_BYTES];
         header[..8].copy_from_slice(MAGIC);
         let version = if self.retained_vectors {

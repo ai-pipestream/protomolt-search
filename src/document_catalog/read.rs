@@ -84,7 +84,7 @@ impl DocumentCatalog {
             .get(document.source_sha256.as_slice())
             .map_err(storage)?
             .ok_or_else(|| Status::data_loss("document source missing"))?;
-        if sha256::digest(bytes.value()).as_slice() != document.source_sha256 {
+        if turbo_sha256::sha256(bytes.value()).0.as_slice() != document.source_sha256 {
             return Err(Status::data_loss("document source checksum mismatch"));
         }
         let source: SourceRecord = decode(bytes.value())?;
@@ -93,7 +93,7 @@ impl DocumentCatalog {
             .get(source.descriptor_sha256.as_slice())
             .map_err(storage)?
             .ok_or_else(|| Status::data_loss("document descriptor missing"))?;
-        if sha256::digest(bytes.value()).as_slice() != source.descriptor_sha256 {
+        if turbo_sha256::sha256(bytes.value()).0.as_slice() != source.descriptor_sha256 {
             return Err(Status::data_loss("document descriptor checksum mismatch"));
         }
         Ok(Some((

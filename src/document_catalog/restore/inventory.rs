@@ -15,7 +15,9 @@ fn metadata(
 ) -> Result<Vec<u8>, Status> {
     charge(total, artifact.bytes, maximum)?;
     let bytes = read_bounded(root, &artifact.file, artifact.bytes.min(maximum))?;
-    if bytes.len() as u64 != artifact.bytes || sha256::hex_digest(&bytes) != artifact.sha256 {
+    if bytes.len() as u64 != artifact.bytes
+        || turbo_sha256::sha256(&bytes).to_hex() != artifact.sha256
+    {
         return Err(damaged("index metadata differs from its inventory"));
     }
     Ok(bytes)
@@ -76,7 +78,9 @@ fn check_source_entry(
         .as_slice()
         .try_into()
         .map_err(|_| damaged("source checkpoint checksum has an invalid length"))?;
-    if source_file.bytes != source.bytes || source_file.sha256 != sha256::to_hex(source_digest) {
+    if source_file.bytes != source.bytes
+        || source_file.sha256 != turbo_sha256::to_hex(source_digest)
+    {
         return Err(damaged(
             "source checkpoint checksum or length differs from its inventory",
         ));
@@ -152,7 +156,7 @@ impl Inventory<'_> {
         let set: SegmentSetManifest =
             serde_json::from_slice(&bytes).map_err(|e| damaged(format!("index manifest: {e}")))?;
         if serde_json::to_vec(&set).map_err(storage)? != bytes
-            || sha256::digest(&bytes).as_slice() != state.committed_manifest_sha256
+            || turbo_sha256::sha256(&bytes).0.as_slice() != state.committed_manifest_sha256
             || set.epoch != index.catalog_epoch
         {
             return Err(damaged("index manifest differs from its journal or epoch"));

@@ -38,11 +38,14 @@ pub(super) fn check_files(path: &std::path::Path, manifest: &SourceBackupManifes
     );
     let mut encoded = manifest.clone();
     let id = std::mem::take(&mut encoded.manifest_sha256);
-    assert_eq!(sha256::digest(&encoded.encode_to_vec()).as_slice(), id);
+    assert_eq!(
+        turbo_sha256::sha256(&encoded.encode_to_vec()).0.as_slice(),
+        id
+    );
     for artifact in &manifest.artifacts {
         let bytes = std::fs::read(path.join(&artifact.file)).unwrap();
         assert_eq!(bytes.len() as u64, artifact.bytes);
-        assert_eq!(sha256::hex_digest(&bytes), artifact.sha256);
+        assert_eq!(turbo_sha256::sha256(&bytes).to_hex(), artifact.sha256);
     }
 }
 

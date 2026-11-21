@@ -8,7 +8,7 @@
 //! count, and the SHA-256 of the rows' little-endian bytes in row order, the
 //! digest `ExactVectorStore` keeps over its payload.
 
-use crate::sha256::Sha256;
+use turbo_sha256::Sha256;
 
 /// What a later row store must match before it can replace the rows the
 /// graph was built over.
@@ -48,7 +48,7 @@ pub trait RowSource: Sync {
             }
             sha.update(&bytes);
         }
-        sha.finalize()
+        sha.finish().0
     }
 
     fn identity(&self) -> RowSourceIdentity {

@@ -242,7 +242,7 @@ impl CatalogCheckpoint<'_> {
 fn file_sha256(file: &File) -> Result<Vec<u8>, Status> {
     let mut input = file;
     input.seek(SeekFrom::Start(0)).map_err(storage)?;
-    let mut hash = sha256::Sha256::new();
+    let mut hash = turbo_sha256::Sha256::new();
     let mut buffer = [0u8; 64 << 10];
     loop {
         let n = input.read(&mut buffer).map_err(storage)?;
@@ -251,7 +251,7 @@ fn file_sha256(file: &File) -> Result<Vec<u8>, Status> {
         }
         hash.update(&buffer[..n]);
     }
-    Ok(hash.finalize().to_vec())
+    Ok(hash.finish().0.to_vec())
 }
 
 struct OwnedFile<'a> {

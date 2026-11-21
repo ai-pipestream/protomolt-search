@@ -195,7 +195,7 @@ pub async fn stage_from_url(
     }
     let manifest = RepositoryManifest::parse(&bytes)
         .map_err(|e| Status::invalid_argument(format!("GET {manifest_url}: {e}")))?;
-    let sha = crate::sha256::hex_digest(&bytes);
+    let sha = turbo_sha256::sha256(&bytes).to_hex();
     stage_manifest(tmp_dir, &bytes).await?;
     for artifact in &manifest.artifacts {
         fetch_artifact(

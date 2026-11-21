@@ -61,7 +61,7 @@ impl ExactVectorStore {
                 .checked_mul(dim)
                 .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
                 .ok_or_else(|| invalid("exact-vector payload size overflow"))?;
-            let header = make_header(dim, *rows, payload_bytes, digest.clone().finalize())?;
+            let header = make_header(dim, *rows, payload_bytes, digest.clone().finish().0)?;
             file.write_all_at(&header, 0)?;
             file.sync_all()?;
             std::fs::rename(spill, path)?;
@@ -94,13 +94,13 @@ impl ExactVectorStore {
             let file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
             let mut out = BufWriter::new(file);
             out.write_all(&[0u8; HEADER_BYTES])?;
-            let mut digest = crate::sha256::Sha256::new();
+            let mut digest = turbo_sha256::Sha256::new();
             self.write_payload(&mut out, &mut digest)?;
             out.flush()?;
             let mut file = out
                 .into_inner()
                 .map_err(|e| io::Error::new(e.error().kind(), e.to_string()))?;
-            let header = make_header(dim, rows, payload_bytes, digest.finalize())?;
+            let header = make_header(dim, rows, payload_bytes, digest.finish().0)?;
             file.seek(SeekFrom::Start(0))?;
             file.write_all(&header)?;
             file.sync_all()?;
@@ -133,7 +133,7 @@ impl ExactVectorStore {
     pub(super) fn write_payload(
         &self,
         out: &mut impl Write,
-        digest: &mut crate::sha256::Sha256,
+        digest: &mut turbo_sha256::Sha256,
     ) -> io::Result<()> {
         match &self.storage {
             Storage::Building { values, .. } => {
@@ -184,9 +184,9 @@ impl ExactVectorStore {
                 return delta.verify_payload();
             }
             Storage::Spilled { digest, .. } => {
-                let mut actual = crate::sha256::Sha256::new();
+                let mut actual = turbo_sha256::Sha256::new();
                 self.write_payload(&mut io::sink(), &mut actual)?;
-                return if actual.finalize() == digest.clone().finalize() {
+                return if actual.finish().0 == digest.clone().finish().0 {
                     Ok(())
                 } else {
                     Err(invalid("spilled exact-vector payload SHA-256 mismatch"))
@@ -203,7 +203,7 @@ impl ExactVectorStore {
         else {
             return Ok(());
         };
-        let actual = crate::sha256::digest(&map[HEADER_BYTES..]);
+        let actual = turbo_sha256::sha256(&map[HEADER_BYTES..]).0;
         if &actual != payload_sha256 {
             return Err(invalid(format!(
                 "{} exact-vector payload SHA-256 mismatch",

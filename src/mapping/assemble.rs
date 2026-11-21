@@ -5,7 +5,6 @@ use super::MappingError;
 use super::extractor::{ExtractedDoc, Extractor, Land, Leaf, Slot};
 use super::refuse_at;
 use crate::pb;
-use crate::sha256;
 
 impl Extractor {
     /// Build one engine row from the parent slots plus, for chunked
@@ -225,7 +224,7 @@ fn reduce_id(land: &Land, slot: &Slot, path: &str) -> Result<u64, MappingError> 
             })
         }
         (_, Slot::Str(value)) => Ok(u64::from_be_bytes(
-            sha256::digest(value.as_bytes())[..8]
+            turbo_sha256::sha256(value.as_bytes()).0[..8]
                 .try_into()
                 .expect("32 bytes hold 8"),
         )),

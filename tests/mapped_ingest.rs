@@ -1759,7 +1759,7 @@ fn opinion_node_config(analysis: String) -> NodeConfig {
 
 fn reduced(id: &str) -> u64 {
     u64::from_be_bytes(
-        pipestream_search::sha256::digest(id.as_bytes())[..8]
+        turbo_sha256::sha256(id.as_bytes()).0[..8]
             .try_into()
             .unwrap(),
     )

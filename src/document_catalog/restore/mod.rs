@@ -149,7 +149,7 @@ fn copy_artifacts(
         }
         let mut output = new_file(&path)?;
         let mut count = 0u64;
-        let mut hash = sha256::Sha256::new();
+        let mut hash = turbo_sha256::Sha256::new();
         loop {
             let n = input.read(&mut buffer).map_err(storage)?;
             if n == 0 {
@@ -162,7 +162,7 @@ fn copy_artifacts(
             hash.update(&buffer[..n]);
             output.write_all(&buffer[..n]).map_err(storage)?;
         }
-        if count != artifact.bytes || sha256::to_hex(&hash.finalize()) != artifact.sha256 {
+        if count != artifact.bytes || hash.finish().to_hex() != artifact.sha256 {
             return Err(damaged("artifact failed its length or checksum"));
         }
         output.sync_all().map_err(storage)?;

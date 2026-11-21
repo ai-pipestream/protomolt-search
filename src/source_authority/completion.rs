@@ -34,7 +34,7 @@ impl VerifiedOwnerCompletion {
             binding: binding.clone(),
             completion: SourceOwnerCompletion {
                 format_version: 1,
-                binding_sha256: crate::sha256::digest(&binding.encode_to_vec()).to_vec(),
+                binding_sha256: turbo_sha256::sha256(&binding.encode_to_vec()).0.to_vec(),
                 bound_at_sequence: binding.bound_at_sequence,
                 history_id: target.history_id.clone(),
                 node_id: target.node_id.clone(),

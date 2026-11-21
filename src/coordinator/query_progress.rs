@@ -63,7 +63,7 @@ pub(super) fn query_stream_content_fingerprint(
             }
         }
     }
-    crate::sha256::hex_digest(&bytes)
+    turbo_sha256::sha256(&bytes).to_hex()
 }
 
 pub(super) fn query_stream_revision(
@@ -111,7 +111,7 @@ pub(super) fn combined_scoring_fingerprint(
     let mut canonical = fingerprints.to_vec();
     canonical.sort();
     canonical.dedup();
-    crate::sha256::hex_digest(canonical.join("\0").as_bytes())
+    turbo_sha256::sha256(canonical.join("\0").as_bytes()).to_hex()
 }
 
 impl CoordinatorServiceImpl {

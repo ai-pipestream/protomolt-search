@@ -12,7 +12,7 @@ pub(crate) mod wire;
 mod batch;
 mod embed;
 mod lattice;
-mod native;
+pub(crate) mod native;
 #[cfg(feature = "net")]
 mod pool;
 #[cfg(feature = "net")]
@@ -41,7 +41,7 @@ use std::time::Duration;
 use tonic::Status;
 
 pub use batch::{analyze_batch, analyze_batch_streams};
-pub use embed::{embed_text, embed_text_with_options};
+pub use embed::{embed_text, embed_text_with_options, embed_texts_with_options};
 pub use native::{analyze_document_native, analyze_document_native_dual};
 #[cfg(feature = "net")]
 pub use pool::{

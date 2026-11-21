@@ -12,8 +12,8 @@ use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     AddDocumentsRequest, Bm25SearchRequest, MapFacetField, PhraseSearchOptions, PhraseSearchRequest,
 };
+use pipestream_search::phrases::GlossaryEntry;
 use pipestream_search::phrases::{entity_key, PhraseIndex};
-use protomolt_analyzer::GlossaryEntry;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;

@@ -81,7 +81,7 @@ impl CursorSigner {
         Ok(format!(
             "{PREFIX}{}:{}",
             encode_hex(&bytes),
-            crate::sha256::to_hex(&self.tag(&bytes)?)
+            turbo_sha256::to_hex(self.tag(&bytes)?)
         ))
     }
 }
@@ -139,8 +139,8 @@ impl CursorBinding {
         // The actual served generation is in context, so an explicit equivalent
         // precondition does not change the query. Admission checks it separately.
         normalized.required_topology_generation = 0;
-        context.query_sha256 = crate::sha256::digest(&normalized.encode_to_vec()).to_vec();
-        let digest = crate::sha256::digest(&context.encode_to_vec()).to_vec();
+        context.query_sha256 = turbo_sha256::sha256(&normalized.encode_to_vec()).0.to_vec();
+        let digest = turbo_sha256::sha256(&context.encode_to_vec()).0.to_vec();
         let mut expected_read_digest = None;
         if !request.cursor.is_empty() {
             let envelope = signer.open(&request.cursor)?;
@@ -169,7 +169,7 @@ impl CursorBinding {
                 incarnation: version.incarnation(),
             });
         }
-        let digest = crate::sha256::digest(&read_set.encode_to_vec()).to_vec();
+        let digest = turbo_sha256::sha256(&read_set.encode_to_vec()).0.to_vec();
         if self
             .expected_read_digest
             .as_ref()

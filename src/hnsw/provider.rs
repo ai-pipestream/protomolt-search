@@ -26,7 +26,7 @@ impl VectorProvider for HnswIndex {
             bits_per_dimension: Some(32),
             metric: "inner_product".to_string(),
             score_direction: ScoreDirection::HigherIsBetter,
-            scoring_fingerprint: crate::sha256::hex_digest(
+            scoring_fingerprint: turbo_sha256::sha256(
                 [
                     HNSW.as_bytes(),
                     BACKEND_VERSION.as_bytes(),
@@ -36,7 +36,8 @@ impl VectorProvider for HnswIndex {
                 ]
                 .concat()
                 .as_slice(),
-            ),
+            )
+            .to_hex(),
             quality_contract: QualityContract::ConfiguredAnn,
             capabilities: vec![
                 VectorCapability::BatchQuery,

@@ -336,7 +336,7 @@ fn the_fingerprint_is_deterministic_and_pinned() {
     );
     assert_eq!(
         a.descriptor_sha256,
-        pipestream_search::sha256::hex_digest(&set),
+        turbo_sha256::sha256(&set).to_hex(),
         "the descriptor content address is the SHA-256 the exchange \
          contract registers"
     );

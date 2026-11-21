@@ -4,7 +4,7 @@ use prost::Message;
 
 use super::codec::*;
 use super::*;
-use crate::sha256::Sha256;
+use turbo_sha256::Sha256;
 
 struct Directory(PathBuf);
 impl Directory {
@@ -40,7 +40,7 @@ fn row() -> RetainedVector {
             inv_norm: -0.0,
             quantized_codes: Some(vec![0, 255, 17]),
             sentence_vectors: vec![vec![f32::from_bits(0x80000001), 0.0]],
-            sha256: hash.finalize(),
+            sha256: hash.finish().0,
         },
     }
 }
@@ -91,7 +91,7 @@ fn framed(rows: &[Row], span: u64) -> Vec<u8> {
         bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&payload);
     }
-    let footer = crate::sha256::digest(&bytes);
+    let footer = turbo_sha256::sha256(&bytes).0;
     bytes.extend_from_slice(&footer);
     bytes
 }
@@ -103,7 +103,7 @@ fn stored(slot: u32) -> Row {
 }
 fn open_bytes(path: &Path, bytes: &[u8], span: u64) -> io::Result<MultiResVectors> {
     std::fs::write(path, bytes).unwrap();
-    MultiResVectors::open(path, span, &crate::sha256::hex_digest(bytes))
+    MultiResVectors::open(path, span, &turbo_sha256::sha256(bytes).to_hex())
 }
 
 #[test]
@@ -120,7 +120,7 @@ fn payload_and_sidecar_preserve_every_float_bit_and_optional_codes() {
         let (size, hash) = rows.write(&path, 10).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(size, bytes.len() as u64);
-        assert_eq!(hash, crate::sha256::hex_digest(&bytes));
+        assert_eq!(hash, turbo_sha256::sha256(&bytes).to_hex());
         let opened = MultiResVectors::open(&path, 10, &hash).unwrap();
         assert_eq!(opened.row_count(), 2);
         assert!(opened.get(0).is_none());
@@ -284,10 +284,10 @@ fn artifact_binding_rejects_other_generation_and_bad_expected_digest() {
     other.embedding.as_mut().unwrap().inv_norm = Some(42.0);
     let second = framed(&[other], 1);
     std::fs::write(&target, &second).unwrap();
-    assert!(MultiResVectors::open(&target, 1, &crate::sha256::hex_digest(&first)).is_err());
+    assert!(MultiResVectors::open(&target, 1, &turbo_sha256::sha256(&first).to_hex()).is_err());
     assert!(MultiResVectors::open(&target, 1, "").is_err());
     assert!(MultiResVectors::open(&target, 1, &"G".repeat(64)).is_err());
-    assert!(MultiResVectors::open(&target, 2, &crate::sha256::hex_digest(&second)).is_err());
+    assert!(MultiResVectors::open(&target, 2, &turbo_sha256::sha256(&second).to_hex()).is_err());
 }
 
 #[test]
@@ -377,7 +377,7 @@ fn pre_rename_failure_cleans_owned_temp_and_post_rename_error_reports_uncertaint
     let bytes = std::fs::read(&target).unwrap();
     equal_bits(
         &row(),
-        MultiResVectors::open(&target, 1, &crate::sha256::hex_digest(&bytes))
+        MultiResVectors::open(&target, 1, &turbo_sha256::sha256(&bytes).to_hex())
             .unwrap()
             .retained(0)
             .unwrap(),

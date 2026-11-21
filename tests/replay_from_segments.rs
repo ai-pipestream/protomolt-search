@@ -1162,13 +1162,10 @@ fn catalog_digests(root: &Path) -> Vec<(String, String)> {
                 walk(&path, root, out);
                 continue;
             }
-            let mut hasher = pipestream_search::sha256::Sha256::new();
+            let mut hasher = turbo_sha256::Sha256::new();
             hasher.update(&std::fs::read(&path).unwrap());
             let relative = path.strip_prefix(root).unwrap().display().to_string();
-            out.push((
-                relative,
-                pipestream_search::sha256::to_hex(&hasher.finalize()),
-            ));
+            out.push((relative, hasher.finish().to_hex()));
         }
     }
     let mut out = Vec::new();

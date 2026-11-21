@@ -153,7 +153,7 @@ pub(super) fn actor_assignment(
         history_id: receipt.history_id.clone(),
         operation_id: request.operation_id.clone(),
         principal: principal.into(),
-        request_sha256: crate::sha256::digest(&request.encode_to_vec()).to_vec(),
+        request_sha256: turbo_sha256::sha256(&request.encode_to_vec()).0.to_vec(),
     }
 }
 

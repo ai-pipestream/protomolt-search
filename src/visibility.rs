@@ -2,11 +2,11 @@
 //! These checks do not authenticate a caller or authorize a document grant.
 
 use crate::pb::{DocumentVisibility, TermStatsResponse};
-use crate::sha256::Sha256;
 use prost::Message;
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
 use std::sync::OnceLock;
 use tonic::Status;
+use turbo_sha256::Sha256;
 
 /// Version probes are distinct from empty-term corpus statistics. Keeping this
 /// mode explicit prevents a version response from becoming a zero-valued share.
@@ -112,7 +112,7 @@ impl VisibilityScope {
         hash.update(b"protomolt.search.document-visibility.v1\0");
         hash.update(&canonical_bytes(visibility)?);
         Ok(Self {
-            fingerprint: hash.finalize().to_vec(),
+            fingerprint: hash.finish().0.to_vec(),
             columns: crate::filter::leaf_count(filter),
         })
     }
@@ -167,7 +167,7 @@ mod tests {
         assert_eq!(canonical_bytes(&same_view).unwrap(), encoded);
         let scope = VisibilityScope::new(Some(&view)).unwrap();
         assert_eq!(
-            crate::sha256::to_hex(scope.fingerprint().try_into().unwrap()),
+            turbo_sha256::to_hex(<[u8; 32]>::try_from(scope.fingerprint()).unwrap()),
             "833cffd46fe72f11b9b86ff1733f2d3d1ea376b3ccc4f9395b59e905de7c0462"
         );
     }
@@ -181,7 +181,7 @@ mod tests {
         assert_eq!(canonical_bytes(&view).unwrap(), encoded);
         let scope = VisibilityScope::new(Some(&view)).unwrap();
         assert_eq!(
-            crate::sha256::to_hex(scope.fingerprint().try_into().unwrap()),
+            turbo_sha256::to_hex(<[u8; 32]>::try_from(scope.fingerprint()).unwrap()),
             "e3e13a3fcf1c73bb6ae20f670de952525f283fa0a869215f0ee77278d9e00f6e"
         );
         assert_eq!(scope.column_count(), 1);

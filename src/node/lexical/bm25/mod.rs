@@ -30,7 +30,7 @@ pub(in crate::node) fn bm25_scoring_fingerprint(req: &Bm25QueryRequest) -> Strin
     canonical.stats_fields.clear();
     canonical.cardinality_fields.clear();
     canonical.projections.clear();
-    crate::sha256::hex_digest(&prost::Message::encode_to_vec(&canonical))
+    turbo_sha256::sha256(&prost::Message::encode_to_vec(&canonical)).to_hex()
 }
 
 /// Validate BM25 parameters required for sound bounds; zero selects the default.

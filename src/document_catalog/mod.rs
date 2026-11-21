@@ -20,7 +20,6 @@ use crate::pb::{
     DocumentWriteReceipt, ProtobufSource, ReadAcceptedDocumentsRequest,
     ReadAcceptedDocumentsResponse,
 };
-use crate::sha256;
 
 mod accept;
 mod access;

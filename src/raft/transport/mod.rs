@@ -148,7 +148,7 @@ impl FinalChunk {
             meta: rpc.meta.clone(),
             offset: rpc.offset,
             length: rpc.data.len(),
-            sha256: crate::sha256::digest(&rpc.data),
+            sha256: turbo_sha256::sha256(&rpc.data).0,
         }
     }
 }

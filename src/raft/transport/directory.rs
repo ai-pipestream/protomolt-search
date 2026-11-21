@@ -73,7 +73,7 @@ pub fn certificate_sha256(pem: &[u8]) -> Result<[u8; 32], Status> {
             "PEM holds more than one certificate; a member identity is one leaf",
         ));
     }
-    Ok(crate::sha256::digest(first.as_ref()))
+    Ok(turbo_sha256::sha256(first.as_ref()).0)
 }
 
 impl Default for TransportLimits {

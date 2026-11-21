@@ -37,10 +37,10 @@ const COMMAND_DOMAIN: &[u8] = b"protomolt.control-install.command.v1\0";
 const SNAPSHOT_DOMAIN: &[u8] = b"protomolt.control-snapshot.v1\0";
 
 pub(super) fn hash(domain: &[u8], bytes: &[u8]) -> Vec<u8> {
-    let mut hasher = crate::sha256::Sha256::new();
+    let mut hasher = turbo_sha256::Sha256::new();
     hasher.update(domain);
     hasher.update(bytes);
-    hasher.finalize().to_vec()
+    hasher.finish().0.to_vec()
 }
 
 pub(super) fn command_digest(command: &ControlInstallCommand) -> Vec<u8> {

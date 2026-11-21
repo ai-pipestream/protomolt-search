@@ -103,7 +103,7 @@ fn doc_op(id: u64) -> wal_record::Op {
             quality: None,
             geography: None,
             phrases: vec![crate::pb::PhrasePosting {
-                term: protomolt_analyzer::phrase_posting_term("example"),
+                term: crate::analyzer::native::phrase_posting_term("example"),
                 concept_id: "example".to_string(),
                 token_count: 2,
                 offsets: vec![crate::pb::OffsetSpan { start: 0, end: 3 }],

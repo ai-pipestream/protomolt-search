@@ -64,10 +64,10 @@ fn explicit_policy_survives_heap_spill_and_mapped_images_with_and_without_rows()
                     }],
                 }
                 .encode_to_vec();
-                let mut hasher = pipestream_search::sha256::Sha256::new();
+                let mut hasher = turbo_sha256::Sha256::new();
                 hasher.update(b"protomolt.search.mapped-analysis.v1\0");
                 hasher.update(&binding.analysis_contract);
-                binding.analysis_sha = pipestream_search::sha256::to_hex(&hasher.finalize());
+                binding.analysis_sha = hasher.finish().to_hex();
             }
             let mut heap = Bm25Store::new();
             let mut spill =
@@ -216,7 +216,7 @@ fn empty_segment_catalog_retains_and_validates_explicit_policy() {
     let mut logged = pb::wal::LoggedBinding::decode(envelope.protobuf.as_slice()).unwrap();
     logged.index_contract.extend([8, 1]);
     envelope.protobuf = logged.encode_to_vec();
-    envelope.sha256 = pipestream_search::sha256::hex_digest(&envelope.protobuf);
+    envelope.sha256 = turbo_sha256::sha256(&envelope.protobuf).to_hex();
     pipestream_search::segments::write_manifest_file(&root.join("segments.json"), &manifest)
         .unwrap();
     assert!(OpenedSegmentSet::open(&root).is_err());

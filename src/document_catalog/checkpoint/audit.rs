@@ -199,14 +199,16 @@ impl<'a> History<'a> {
                     "source descriptor exceeds source_batch_bytes",
                 ));
             }
-            if bytes.value().is_empty() || sha256::digest(bytes.value()).as_slice() != key.value() {
+            if bytes.value().is_empty()
+                || turbo_sha256::sha256(bytes.value()).0.as_slice() != key.value()
+            {
                 return Err(damaged("descriptor content-address mismatch"));
             }
         }
         for entry in self.sources.iter().map_err(storage)? {
             let (key, bytes) = entry.map_err(storage)?;
             let source: SourceRecord = bounded(bytes.value(), self.record_bytes)?;
-            if sha256::digest(bytes.value()).as_slice() != key.value()
+            if turbo_sha256::sha256(bytes.value()).0.as_slice() != key.value()
                 || source.message_type.is_empty()
                 || source.descriptor_sha256.len() != 32
             {

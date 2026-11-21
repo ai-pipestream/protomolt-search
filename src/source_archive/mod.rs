@@ -12,7 +12,6 @@ use prost::Message;
 
 use crate::pb::storage::{SourceArchiveIndex, SourceBlob, SourceIdentity, SourceRecord, SourceRow};
 use crate::pb::{DocumentIdentity, ProtobufSource};
-use crate::sha256;
 
 const MAGIC: &[u8; 8] = b"PMSOURCE";
 const HEADER_BYTES: usize = 48;

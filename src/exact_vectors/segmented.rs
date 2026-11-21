@@ -125,7 +125,7 @@ impl SegmentedExact {
     pub fn write_payload(
         &self,
         out: &mut impl Write,
-        digest: &mut crate::sha256::Sha256,
+        digest: &mut turbo_sha256::Sha256,
     ) -> io::Result<()> {
         if self.parts.iter().any(|part| part.store.is_none()) {
             return Err(invalid("a sparse exact-vector view must persist through its segment catalog, not a dense sidecar"));

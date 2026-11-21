@@ -198,7 +198,7 @@ fn pinned_checkpoint_copies_exact_history_while_acceptance_continues() {
     assert_eq!(info.bytes, std::fs::metadata(&output).unwrap().len());
     assert_eq!(
         info.sha256,
-        sha256::digest(&std::fs::read(&output).unwrap())
+        turbo_sha256::sha256(&std::fs::read(&output).unwrap()).0
     );
     let restored = DocumentCatalog::open(&output, "books").unwrap();
     assert_copy_holds_the_pinned_records(&restored, &checkpoint, &info);

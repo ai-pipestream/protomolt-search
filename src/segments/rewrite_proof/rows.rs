@@ -110,9 +110,11 @@ impl Batch<'_> {
                 hash.update(&[1]);
                 part(&mut hash, transcript);
             }
-            None => hash.update(&[0]),
+            None => {
+                hash.update(&[0]);
+            }
         }
-        Ok(hash.finalize())
+        Ok(hash.finish().0)
     }
 
     /// Start every live row's digest from its stored content.
@@ -175,7 +177,7 @@ impl Batch<'_> {
                     hash.update(&end.to_le_bytes());
                 }
             }
-            digests[row - start] = hash.finalize();
+            digests[row - start] = hash.finish().0;
         }
         field.visit_splade(start as u32, end as u32, |term, row, impact, scale| {
             let row = row as usize;
@@ -184,7 +186,7 @@ impl Batch<'_> {
                 part(&mut hash, term.as_bytes());
                 hash.update(&impact.to_le_bytes());
                 hash.update(&scale.to_le_bytes());
-                digests[row - start] = hash.finalize();
+                digests[row - start] = hash.finish().0;
             }
             Ok::<(), String>(())
         })?;
@@ -236,7 +238,7 @@ impl Batch<'_> {
                         hash.update(&len.to_le_bytes());
                     }
                 }
-                digests[row - start] = hash.finalize();
+                digests[row - start] = hash.finish().0;
             }
             cursor.next_posting();
         }

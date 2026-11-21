@@ -227,7 +227,7 @@ fn decoder_refuses_old_malformed_oversized_and_noncanonical_tokens() {
         let token = format!(
             "{PREFIX}{}:{}",
             encode_hex(&bytes),
-            crate::sha256::to_hex(&signer.tag(&bytes).unwrap())
+            turbo_sha256::to_hex(signer.tag(&bytes).unwrap())
         );
         assert_eq!(
             signer.open(&token).unwrap_err().code(),

@@ -114,3 +114,40 @@ fn l2_normalization_records_zero_rows_and_is_idempotent() {
         assert!(row.iter().map(|v| v * v).sum::<f32>() <= 1.0);
     }
 }
+
+#[test]
+fn empty_rows_must_be_ascending_in_range_and_zero() {
+    let flat = || vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0];
+    let matrix = OwnedMatrix::from_flat(flat(), 2).unwrap();
+    let marked = matrix.with_empty_rows(vec![0, 2]).unwrap();
+    assert_eq!(marked.empty_rows(), &[0, 2]);
+    let refuse = |rows: Vec<u32>, row: u32| {
+        let error = OwnedMatrix::from_flat(flat(), 2)
+            .unwrap()
+            .with_empty_rows(rows)
+            .unwrap_err();
+        assert_eq!(error, TensorError::EmptyRow { row, rows: 3 });
+    };
+    refuse(vec![3], 3);
+    refuse(vec![2, 0], 0);
+    refuse(vec![0, 0], 0);
+    refuse(vec![1], 1);
+    assert_eq!(
+        TensorError::EmptyRow { row: 1, rows: 3 }.to_string(),
+        "empty row 1 is out of order, outside 3 rows, or not zero"
+    );
+}
+
+#[test]
+fn repeated_normalization_rebuilds_empty_rows_in_order() {
+    let mut matrix =
+        OwnedMatrix::from_flat(vec![f32::NEG_INFINITY, 1., 3., 4., 0., 0., 1., f32::NAN], 2)
+            .unwrap()
+            .with_empty_rows(vec![2])
+            .unwrap();
+    for _ in 0..2 {
+        matrix.l2_normalize_rows();
+        assert_eq!(matrix.empty_rows(), &[0, 2, 3]);
+        assert_eq!(matrix.data(), &[0., 0., 0.6, 0.8, 0., 0., 0., 0.]);
+    }
+}
