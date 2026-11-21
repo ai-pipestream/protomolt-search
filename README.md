@@ -1453,8 +1453,10 @@ cache as searches touch them; writable tails remain heap-owned. See [Mapped vect
   reserved in favor of `DensePrecisionRequest` (`AUTO`, `FP32`, `QUANTIZED`),
   `DenseFilterStrategy` (`DEFAULT`, `SPEED`, `ENUMERATE_SMALL`), and typed
   `DenseCoverage` / `DenseTermination` / per-technique part receipts (remote
-  `clustered-turbovec` scans report `CANDIDATE_SET` without invented part
-  counts). Retired version-1 TOML `dense_execution_policy` keys and
+  `clustered-turbovec` quantized scans refuse `EXHAUSTIVE` and serve `BALANCED`
+  with `CANDIDATE_SET` coverage and zero invented part counts, while single-leaf
+  `EXHAUSTIVE` + `FP32` certifies via shard-local sidecars). Retired version-1
+  TOML `dense_execution_policy` keys and
   `--dense-execution-policy` flags refuse at startup; upgrade coordinators,
   relays, nodes, and regenerated gRPC/JSON clients together. See
   [Query API](docs/query-api.md#dense-execution-contract).

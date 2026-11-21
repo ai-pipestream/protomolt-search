@@ -10,6 +10,8 @@ fn turbovec() -> ProviderCaps {
         provider: "embedded-turbovec".into(),
         native: Precision::Quantized,
         exhaustive_scan: true,
+        uncertified_scan: false,
+        fp32_sidecar: true,
         walks: false,
         enumerates: false,
         patience: false,
@@ -24,10 +26,28 @@ fn hnsw() -> ProviderCaps {
         provider: "hnsw".into(),
         native: Precision::Fp32,
         exhaustive_scan: false,
+        uncertified_scan: false,
+        fp32_sidecar: false,
         walks: true,
         enumerates: true,
         patience: true,
         floor_pruning: true,
+        candidate_stream: true,
+        rows: 100,
+    }
+}
+
+fn clustered(fp32_sidecar: bool) -> ProviderCaps {
+    ProviderCaps {
+        provider: "clustered-turbovec".into(),
+        native: Precision::Quantized,
+        exhaustive_scan: false,
+        uncertified_scan: true,
+        fp32_sidecar,
+        walks: false,
+        enumerates: false,
+        patience: false,
+        floor_pruning: false,
         candidate_stream: true,
         rows: 100,
     }
@@ -164,6 +184,8 @@ fn quantized_walker_matrix() {
         provider: "fake-ann".into(),
         native: Precision::Quantized,
         exhaustive_scan: false,
+        uncertified_scan: false,
+        fp32_sidecar: false,
         walks: true,
         enumerates: false,
         patience: false,
@@ -372,18 +394,47 @@ fn per_shard_fp32_over_reporting_and_uncertified_backends_fail_closed() {
         ..Default::default()
     };
     assert!(stamp(&walk, &over_reported, &mut planned_outcome(&walk)).is_err());
+    assert!(verify_exhaustive_scan(
+        Route::NativeScan,
+        &Evidence {
+            rows: 200,
+            consulted_shards: 1,
+            ..Default::default()
+        }
+    )
+    .is_err());
+}
 
-    let native = plan(Mode::Exhaustive, Request::Auto, &turbovec()).unwrap();
-    let clustered = Evidence {
-        uncertified_backend: true,
-        rows: 200,
-        ..Default::default()
-    };
-    assert!(verify_exhaustive_scan(Route::NativeScan, &clustered).is_err());
-    let mut out = planned_outcome(&native);
-    stamp(&native, &clustered, &mut out).unwrap();
-    assert_eq!(out.coverage, DenseCoverage::CandidateSet as i32);
-    assert_eq!(out.termination, DenseTermination::Unspecified as i32);
-    assert!(out.techniques.is_empty());
-    assert!(out.planner_reason.contains("coverage is not certified"));
+#[test]
+fn clustered_turbovec_refuses_uncertified_exhaustive_and_stamps_balanced() {
+    let c = clustered(true);
+    for mode in [Mode::Exhaustive, Mode::Auto] {
+        assert!(plan(mode, Request::Auto, &c).is_err());
+        assert!(plan(mode, Request::Quantized, &c).is_err());
+        assert_eq!(
+            plan(mode, Request::Fp32, &c).unwrap().route,
+            Route::Fp32AllRows
+        );
+        assert!(plan(mode, Request::Fp32, &clustered(false)).is_err());
+    }
+    assert!(plan(Mode::Balanced, Request::Fp32, &clustered(false)).is_err());
+    for req in [Request::Auto, Request::Fp32] {
+        let bal = plan(Mode::Balanced, req, &c).unwrap();
+        assert_eq!(bal.resolved_mode, Mode::Balanced);
+        assert!(bal.fallback_reason.is_empty(), "{}", bal.fallback_reason);
+        let mut out = planned_outcome(&bal);
+        stamp(
+            &bal,
+            &Evidence {
+                rows: 100,
+                ..Default::default()
+            },
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out.resolved_mode, Mode::Balanced as i32);
+        assert_eq!(out.coverage, DenseCoverage::CandidateSet as i32);
+        assert_eq!(out.termination, DenseTermination::Unspecified as i32);
+        assert!(out.techniques.is_empty());
+    }
 }

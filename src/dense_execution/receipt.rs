@@ -38,8 +38,6 @@ impl ShardPartEvidence {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Evidence {
     pub(crate) regimes: Option<DenseFilterRegimes>,
-    /// Set when a remote backend answered without per-part execution receipts.
-    pub(crate) uncertified_backend: bool,
     /// Consulted non-empty shards and how many reported explicit per-part counts.
     pub(crate) consulted_shards: u32,
     pub(crate) reported_shards: u32,
@@ -201,7 +199,7 @@ fn exhaustive_route_techniques(
                 evidence.parts_enumerated,
             )]))
         }
-        Route::Walk | Route::Fp32Pool => Err(contradiction(
+        Route::Walk | Route::Fp32Pool | Route::UncertifiedScan => Err(contradiction(
             route,
             "approximate route reached exhaustive receipt validation",
         )),
@@ -215,12 +213,6 @@ fn exhaustive_receipt(
     route: Route,
     evidence: &Evidence,
 ) -> Result<(Vec<DenseTechniqueCount>, Coverage, Termination), DenseExecutionError> {
-    if evidence.uncertified_backend {
-        return Err(contradiction(
-            route,
-            "clustered backend returned no per-part execution counts",
-        ));
-    }
     if evidence.reported_shards < evidence.consulted_shards {
         return Err(contradiction(
             route,
@@ -261,6 +253,23 @@ pub(crate) fn verify_exhaustive_scan(
     exhaustive_receipt(route, evidence).map(|_| ())
 }
 
+fn uncertified_remote_receipt(
+    route: Route,
+    evidence: &Evidence,
+) -> Result<(Vec<DenseTechniqueCount>, Coverage, Termination), DenseExecutionError> {
+    if evidence.consulted_shards > 0
+        || evidence.parts_total > 0
+        || evidence.executed_parts() > 0
+        || evidence.early_stops() > 0
+    {
+        return Err(contradiction(
+            route,
+            "uncertified remote scan unexpectedly reported shard part counts",
+        ));
+    }
+    Ok((Vec::new(), Coverage::CandidateSet, Termination::Unspecified))
+}
+
 /// Approximate routes report actual per-part walk vs enumeration counts and
 /// honest termination (`EXHAUSTED` when every active part enumerated without
 /// walking, `BUDGET_STOPPED` when patience or early finish stopped a walk,
@@ -270,6 +279,11 @@ fn approximate_receipt(
     pool_selection: DenseTechnique,
     evidence: &Evidence,
 ) -> Result<(Vec<DenseTechniqueCount>, Coverage, Termination), DenseExecutionError> {
+    if route == Route::UncertifiedScan
+        || (route == Route::Fp32Pool && pool_selection == DenseTechnique::Unspecified)
+    {
+        return uncertified_remote_receipt(route, evidence);
+    }
     if evidence.reported_shards < evidence.consulted_shards {
         return Err(contradiction(
             route,
@@ -328,9 +342,6 @@ fn approximate_receipt(
     Ok((techniques, Coverage::CandidateSet, termination))
 }
 
-const UNCERTIFIED_CLUSTERED_NOTE: &str =
-    "; clustered backend returned no per-part scan counts, so coverage is not certified";
-
 /// Stamp the plan and the validated receipt onto the outcome. Contradictory
 /// evidence is an error, never a weaker certificate.
 pub(crate) fn stamp(
@@ -338,20 +349,6 @@ pub(crate) fn stamp(
     evidence: &Evidence,
     outcome: &mut DenseExecutionOutcome,
 ) -> Result<(), DenseExecutionError> {
-    if evidence.uncertified_backend {
-        outcome.techniques.clear();
-        outcome.coverage = Coverage::CandidateSet as i32;
-        outcome.termination = Termination::Unspecified as i32;
-        outcome.filter_regimes = None;
-        outcome.tail_enumerated_rows = 0;
-        outcome.patience_stopped = 0;
-        outcome.shards_finished_early = 0;
-        outcome.shards_floor_pruned = 0;
-        if !outcome.planner_reason.ends_with(UNCERTIFIED_CLUSTERED_NOTE) {
-            outcome.planner_reason.push_str(UNCERTIFIED_CLUSTERED_NOTE);
-        }
-        return Ok(());
-    }
     let (techniques, coverage, termination) = if plan.approximate() {
         approximate_receipt(plan.route, plan.pool_selection, evidence)?
     } else {

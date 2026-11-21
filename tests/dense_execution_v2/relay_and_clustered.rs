@@ -14,6 +14,7 @@ use pipestream_search::vector::{
 };
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
+use tonic::Code;
 use turbovec_grpc::{
     CoordinatorService, Index, IndexStore, NodeTable, ShardConfig, TurboVecService,
 };
@@ -211,18 +212,51 @@ async fn serve_turbovec_shard(
 }
 
 async fn assert_clustered_uncertified_routes(coord: &CoordinatorServiceImpl, qvec: &[f32]) {
-    for (mode, precision, selection_k) in [
-        (Mode::Exhaustive, Precision::Auto, 0),
-        (Mode::Auto, Precision::Auto, 0),
-        (Mode::Balanced, Precision::Auto, 0),
-        (Mode::Balanced, Precision::Fp32, 10),
+    for (mode, precision) in [
+        (Mode::Exhaustive, Precision::Auto),
+        (Mode::Exhaustive, Precision::Quantized),
+        (Mode::Auto, Precision::Auto),
+        (Mode::Auto, Precision::Quantized),
+    ] {
+        let err = coord
+            .query(Request::new(QueryRequest {
+                k: 5,
+                selection: Some(dense_leaf(qvec, mode, precision)),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::FailedPrecondition,
+            "{mode:?}/{precision:?}"
+        );
+        assert!(err.message().contains("clustered-turbovec"), "{err}");
+    }
+    for mode in [Mode::Exhaustive, Mode::Auto] {
+        let err = coord
+            .query(Request::new(composite_query(
+                qvec,
+                mode,
+                strat::Strategy::Rrf(RrfScore::default()),
+            )))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition, "{mode:?}");
+        assert!(err.message().contains("clustered-turbovec"), "{err}");
+    }
+
+    for (precision, selection_k) in [
+        (Precision::Auto, 0),
+        (Precision::Quantized, 0),
+        (Precision::Fp32, 10),
     ] {
         let out = run_query(
             coord,
             QueryRequest {
                 k: 5,
                 selection_k,
-                selection: Some(dense_leaf(qvec, mode, precision)),
+                selection: Some(dense_leaf(qvec, Mode::Balanced, precision)),
                 ..Default::default()
             },
         )
@@ -230,6 +264,8 @@ async fn assert_clustered_uncertified_routes(coord: &CoordinatorServiceImpl, qve
         .dense_execution
         .unwrap();
         assert_eq!(out.provider_backend, "clustered-turbovec");
+        assert_eq!(out.resolved_mode, Mode::Balanced as i32);
+        assert!(out.fallback_reason.is_empty(), "{}", out.fallback_reason);
         assert_eq!(out.coverage, DenseCoverage::CandidateSet as i32);
         assert_eq!(out.termination, DenseTermination::Unspecified as i32);
         assert!(out.techniques.is_empty(), "{:?}", out.techniques);
@@ -237,22 +273,25 @@ async fn assert_clustered_uncertified_routes(coord: &CoordinatorServiceImpl, qve
 
     for strategy in [
         strat::Strategy::Rrf(RrfScore::default()),
+        strat::Strategy::ScoreBlend(BlendScore::default()),
         strat::Strategy::Decomposed(DecomposedScore::default()),
         strat::Strategy::Cascade(CascadeScore {
             gate_id: "dense".into(),
         }),
     ] {
-        let out = run_query(coord, composite_query(qvec, Mode::Exhaustive, strategy))
+        let out = run_query(coord, composite_query(qvec, Mode::Balanced, strategy))
             .await
             .dense_execution
             .unwrap();
+        assert_eq!(out.resolved_mode, Mode::Balanced as i32);
+        assert!(out.fallback_reason.is_empty(), "{}", out.fallback_reason);
         assert_eq!(out.coverage, DenseCoverage::CandidateSet as i32);
         assert!(out.techniques.is_empty());
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn clustered_turbovec_publishes_candidate_set_without_invented_part_counts() {
+async fn clustered_turbovec_refuses_uncertified_exhaustive_and_serves_balanced_candidate_set() {
     let rows = 64usize;
     let corpus = unit_vectors(rows, DIM, 0xC105_9901);
     let qvec = corpus[..DIM].to_vec();
@@ -276,29 +315,43 @@ async fn clustered_turbovec_publishes_candidate_set_without_invented_part_counts
             Some(NATIVE_ANALYSIS_BACKEND.to_string()),
             Default::default(),
         )
-        .with_clustered_turbovec(backend);
+        .with_clustered_turbovec(backend.clone());
 
     assert_clustered_uncertified_routes(&coord, &qvec).await;
 
-    let local_fp32 = run_query(
-        &coord,
-        QueryRequest {
+    for mode in [Mode::Exhaustive, Mode::Auto] {
+        let local_fp32 = run_query(
+            &coord,
+            QueryRequest {
+                k: 5,
+                selection: Some(dense_leaf(&qvec, mode, Precision::Fp32)),
+                ..Default::default()
+            },
+        )
+        .await
+        .dense_execution
+        .unwrap();
+        assert_eq!(local_fp32.resolved_mode, Mode::Exhaustive as i32);
+        assert_eq!(
+            local_fp32.coverage,
+            DenseCoverage::ExhaustiveCertified as i32
+        );
+        assert_eq!(
+            local_fp32.techniques,
+            vec![tech_count(DenseTechnique::Fp32Scan, 1)]
+        );
+    }
+
+    let sidecarless = CoordinatorServiceImpl::new(Vec::new()).with_clustered_turbovec(backend);
+    let no_sidecar = sidecarless
+        .query(Request::new(QueryRequest {
             k: 5,
             selection: Some(dense_leaf(&qvec, Mode::Exhaustive, Precision::Fp32)),
             ..Default::default()
-        },
-    )
-    .await
-    .dense_execution
-    .unwrap();
-    assert_eq!(
-        local_fp32.coverage,
-        DenseCoverage::ExhaustiveCertified as i32
-    );
-    assert_eq!(
-        local_fp32.techniques,
-        vec![tech_count(DenseTechnique::Fp32Scan, 1)]
-    );
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(no_sidecar.code(), Code::FailedPrecondition);
 
     prod_h.abort();
     tv_h.abort();

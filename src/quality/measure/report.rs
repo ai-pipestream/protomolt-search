@@ -56,6 +56,7 @@ pub(super) fn check_exact(response: &QueryResponse, k: u32, index: usize) -> Res
     match &response.dense_execution {
         Some(outcome)
             if outcome.selection_precision == DenseScorePrecision::Quantized as i32
+                && !outcome.techniques.is_empty()
                 && outcome
                     .techniques
                     .iter()
@@ -108,4 +109,46 @@ pub fn ladder_table(measured: &MeasuredProfile) -> String {
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_exact;
+    use crate::pb::{
+        DenseExecutionOutcome, DenseScorePrecision, DenseTechnique, DenseTechniqueCount, QueryHit,
+        QueryResponse,
+    };
+
+    #[test]
+    fn check_exact_rejects_empty_or_non_quantized_techniques() {
+        let make = |techniques: Vec<DenseTechniqueCount>| QueryResponse {
+            hits: vec![QueryHit::default(); 2],
+            dense_execution: Some(DenseExecutionOutcome {
+                selection_precision: DenseScorePrecision::Quantized as i32,
+                planner_reason: "remote quantized scan".into(),
+                techniques,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(check_exact(&make(Vec::new()), 2, 0).is_err());
+        assert!(check_exact(
+            &make(vec![DenseTechniqueCount {
+                technique: DenseTechnique::HnswWalk as i32,
+                parts: 1,
+            }]),
+            2,
+            0
+        )
+        .is_err());
+        assert!(check_exact(
+            &make(vec![DenseTechniqueCount {
+                technique: DenseTechnique::QuantizedScan as i32,
+                parts: 2,
+            }]),
+            2,
+            0
+        )
+        .is_ok());
+    }
 }

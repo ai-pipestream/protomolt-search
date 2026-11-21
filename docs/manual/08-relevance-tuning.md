@@ -195,10 +195,12 @@ precision (`score_mode` is retired and reserved). Every dense leaf must name
 its execution mode (`UNSPECIFIED` and retired values `1..=3` refuse):
 
 - `EXHAUSTIVE` scores every live, authorized, filter-admitted row at the
-  requested precision, or refuses by name. On quantized scan providers it runs
-  the scan (or a shard-local FP32 sidecar scan when `precision = FP32`); on
-  graph providers (`hnsw`) shards pin enumeration of every admitted row rather
-  than walking the graph.
+  requested precision, or refuses by name. On embedded quantized scan providers
+  it runs the scan (or a shard-local FP32 sidecar scan when `precision = FP32`);
+  on `clustered-turbovec` it certifies only via shard-local `FP32` sidecar
+  scanning on a single dense leaf (remote quantized scans refuse `EXHAUSTIVE`
+  and serve `BALANCED`); on graph providers (`hnsw`) shards pin enumeration of
+  every admitted row rather than walking the graph.
 - `BALANCED` runs the provider's balanced preset (`hnsw-balanced-v1`: beam
   `max(k, selection_k, 16)` with `ENUMERATE_SMALL` filter routing). A provider
   without a balanced preset runs its same-precision exhaustive technique and

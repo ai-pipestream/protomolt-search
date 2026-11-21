@@ -8,6 +8,8 @@ pub(super) struct DenseProviderFacts {
     pub(super) scoring_fingerprint: String,
     pub(super) quality: crate::pb::VectorQualityContract,
     pub(super) exhaustive: bool,
+    pub(super) uncertified_scan: bool,
+    pub(super) fp32_sidecar: bool,
     pub(super) enumerates: bool,
     pub(super) supports_patience: bool,
     pub(super) supports_floor_pruning: bool,
@@ -20,14 +22,20 @@ pub(super) struct DenseProviderFacts {
 
 impl DenseProviderFacts {
     /// The clustered backend runs quantized collection searches remotely
-    /// without returning per-part scan counts and exposes none of the
-    /// per-shard graph regimes.
-    pub(super) fn clustered(identity: crate::clustered_turbovec::ClusteredQualityIdentity) -> Self {
+    /// without returning per-part scan counts; shard-local FP32 sidecar
+    /// scanning and rescoring remain available when product shards own
+    /// original FP32 rows.
+    pub(super) fn clustered(
+        identity: crate::clustered_turbovec::ClusteredQualityIdentity,
+        fp32_sidecar: bool,
+    ) -> Self {
         Self {
             provider: "clustered-turbovec".to_string(),
             scoring_fingerprint: identity.scoring_fingerprint,
             quality: crate::pb::VectorQualityContract::ExhaustiveNativeScore,
-            exhaustive: true,
+            exhaustive: false,
+            uncertified_scan: true,
+            fp32_sidecar,
             enumerates: false,
             supports_patience: false,
             supports_floor_pruning: false,
@@ -134,13 +142,18 @@ impl ShardFactsFold {
 
     fn finish(self) -> DenseProviderFacts {
         let configured = self.provider.is_some();
+        let exhaustive = self.exhaustive.unwrap_or(false);
+        let quality = self
+            .quality
+            .unwrap_or(crate::pb::VectorQualityContract::Unspecified);
         DenseProviderFacts {
             provider: self.provider.unwrap_or_default(),
             scoring_fingerprint: self.fingerprint.unwrap_or_default(),
-            quality: self
-                .quality
-                .unwrap_or(crate::pb::VectorQualityContract::Unspecified),
-            exhaustive: self.exhaustive.unwrap_or(false),
+            quality,
+            exhaustive,
+            uncertified_scan: false,
+            fp32_sidecar: quality == crate::pb::VectorQualityContract::ExhaustiveNativeScore
+                && exhaustive,
             enumerates: self.enumerates && configured,
             supports_patience: self.supports_patience && configured,
             supports_floor_pruning: self.supports_floor_pruning && configured,

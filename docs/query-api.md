@@ -281,28 +281,37 @@ precision they are ranked; the two are independent.
 1-3 refuse):
 
 - `EXHAUSTIVE` scores every live, authorized, filter-admitted row at the
-  requested precision, or refuses. On a quantized scan provider (embedded or
-  clustered TurboVec) it is the provider's own scan; on a graph provider
-  (`hnsw`) the shards pin enumeration of every admitted row, filtered or not,
-  and never merely walk the graph.
+  requested precision, or refuses. On embedded TurboVec it is the provider's
+  own quantized scan (or a shard-local FP32 sidecar scan when `precision = FP32`);
+  on clustered TurboVec `EXHAUSTIVE` certifies via shard-local `FP32` sidecar
+  scanning on a single dense leaf, while remote quantized/pool scans serve
+  `BALANCED` with `CANDIDATE_SET` coverage because remote search responses carry
+  no per-part scan counts; on a graph provider (`hnsw`) the shards pin
+  enumeration of every admitted row, filtered or not, and never merely walk the
+  graph.
 - `BALANCED` runs the provider's balanced technique under a versioned
   built-in preset (`hnsw-balanced-v1`: the request's depth as the beam,
   `ENUMERATE_SMALL` routing). A provider without one runs its exhaustive
-  technique at the same precision and says so in `fallback_reason`.
+  technique at the same precision and says so in `fallback_reason` (or, on
+  clustered TurboVec, runs its remote quantized/pool scan with `CANDIDATE_SET`
+  coverage).
 - `FAST` runs a distinct speed preset (`hnsw-fast-v1`: patience 0.99 over 15
   hops, `SPEED` routing) and refuses where the provider has none. It is never
   replaced by another mode.
 - `AUTO` lets the coordinator choose. Approximation needs qualifying measured
   evidence, so AUTO runs the exhaustive technique at the requested precision;
-  an installed version-1 policy cannot qualify a plan and refuses by name.
+  `dense_execution_policy` (`--dense-execution-policy`, including version-1 TOML
+  policies) is refused at startup config load on this build.
 
 `DenseQuery.precision` is `AUTO` (the provider's native precision: FP32 for
 `hnsw`, quantized for TurboVec), `FP32` or `QUANTIZED`. Explicit precisions
 are strict: `QUANTIZED` on a provider that scores original FP32 rows refuses.
-`EXHAUSTIVE` FP32 on a quantized provider fetches every row from the scan
-and scores all of them from the FP32 sidecar (bounded by `--max-k`), so it
-matches a full-row FP32 oracle; `BALANCED` FP32 there rescores a quantized
-candidate pool and reports candidate-set coverage.
+`EXHAUSTIVE` FP32 on a quantized provider runs a shard-local tie-complete
+chunked scan (`exact_fp32_scan`) over every admitted live vector row in
+`ExactVectorStore`, unbounded by `--max-k` and failing closed if any admitted
+live vector row is missing or unscored, so it matches a full-row FP32 oracle;
+`BALANCED` FP32 there rescores a quantized candidate pool and reports
+candidate-set coverage.
 
 `DenseQuery.filter_strategy` (`DEFAULT`, `SPEED`, `ENUMERATE_SMALL`) is the
 mask routing of a `BALANCED` or `FAST` walk; `EXHAUSTIVE` and `AUTO` own their
@@ -315,20 +324,23 @@ requested, selection and output precisions (never `UNSPECIFIED` on success),
 (`EXHAUSTED`, `CONVERGED`, `BUDGET_STOPPED`), every technique that ran with
 the parts it ran on, the actual filter strategy, the built-in `preset`,
 `policy_qualified` (false for a preset), `fallback_reason`, the provider kind,
-quality contract and scoring fingerprint. The coordinator validates what the
-shards report against the plan: a part that walked or stopped early under an
-exhaustive plan, or an FP32 row scan that fetched fewer rows than the fleet
-holds, is an error, never a weaker certificate. FP32 rescoring of a pool never
-certifies exhaustive coverage. Two plans never share a kernel call merely
+quality contract and scoring fingerprint. The coordinator validates what each
+shard reports against the plan: a part that walked or stopped early under an
+exhaustive plan, a non-empty shard or relay child that omitted part counts, or
+a shard-local FP32 scan where an active shard failed to score its admitted live
+vector rows, is an error, never a weaker certificate. FP32 rescoring of a pool
+never certifies exhaustive coverage. Two plans never share a kernel call merely
 because their masks match. Mixed provider kinds, scoring spaces, precisions,
 dimensions, quality contracts, or completion capabilities across shards fail
 preflight. Redaction withholds the per-technique part counts and the
 physical counters, never the mode, precision or coverage.
 
-Composite fusion consumes provider-native dense scores and does not yet
-return per-part receipts, so a composite dense leaf serves a provider's own
-exhaustive scan or a `BALANCED` walk; FP32 precision on a quantized provider,
-pinned enumeration and `FAST` are served on a single dense leaf. Recursive
+Composite fusion consumes provider-native dense scores and threads per-part
+shard execution evidence across `HybridShard`, `ShardLegs`, cascade, and
+decomposed routes into `composite_receipt`: a composite dense leaf serves
+`EXHAUSTIVE` (quantized scan or pinned graph enumeration), `BALANCED`, and
+`FAST`, while `DenseQualityPolicy` and FP32 precision on a quantized provider
+(`Fp32Pool` and `Fp32AllRows`) are served on a single dense leaf. Recursive
 boolean dense clauses take `EXHAUSTIVE` or `AUTO`, with `FP32` precision
 scoring the original rows. Dense boosts score a fixed pool with
 provider-native candidate scoring and leave mode, precision and routing unset.

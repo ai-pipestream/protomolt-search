@@ -190,7 +190,6 @@ impl CoordinatorServiceImpl {
 pub(crate) fn clustered_scan_execution(rows: u64) -> DenseScanExecution {
     DenseScanExecution {
         evidence: crate::dense_execution::Evidence {
-            uncertified_backend: true,
             rows,
             ..Default::default()
         },

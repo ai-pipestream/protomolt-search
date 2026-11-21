@@ -16,6 +16,8 @@ impl DenseProviderFacts {
                 crate::pb::DenseScorePrecision::Quantized
             },
             exhaustive_scan: self.exact_available(),
+            uncertified_scan: self.uncertified_scan,
+            fp32_sidecar: self.fp32_sidecar,
             walks: self.configured_ann(),
             enumerates: self.enumerates,
             patience: self.supports_patience,
@@ -45,7 +47,14 @@ impl CoordinatorServiceImpl {
         query_dim: usize,
     ) -> Result<DensePlanned, Status> {
         let facts = match self.clustered_quality_identity().await? {
-            Some(identity) => DenseProviderFacts::clustered(identity),
+            Some(identity) => {
+                let fp32_sidecar = if request.precision == crate::pb::DensePrecisionRequest::Fp32 {
+                    self.clustered_fp32_sidecar_available(identity.rows).await?
+                } else {
+                    false
+                };
+                DenseProviderFacts::clustered(identity, fp32_sidecar)
+            }
             None => self.shard_dense_facts().await?,
         };
         if facts.dimensions as usize != query_dim {
@@ -66,6 +75,22 @@ impl CoordinatorServiceImpl {
         })
     }
 
+    async fn clustered_fp32_sidecar_available(&self, clustered_rows: u64) -> Result<bool, Status> {
+        if self.node_addrs.is_empty() {
+            return Ok(false);
+        }
+        if clustered_rows == 0 {
+            return Ok(true);
+        }
+        let mut exact_rows = 0u64;
+        for addr in &self.node_addrs {
+            let mut client = self.node_client(addr)?;
+            let health = client.health(HealthRequest {}).await?.into_inner();
+            exact_rows = exact_rows.saturating_add(health.exact_vector_rows);
+        }
+        Ok(exact_rows > 0)
+    }
+
     /// Validate raw dense controls on direct `Search` / `HybridSearch` calls
     /// and check peer capabilities before dispatching to shards.
     pub(in crate::coordinator) async fn validate_raw_dense_controls(
@@ -77,7 +102,7 @@ impl CoordinatorServiceImpl {
             return Ok(0);
         }
         let facts = match self.clustered_quality_identity().await? {
-            Some(identity) => DenseProviderFacts::clustered(identity),
+            Some(identity) => DenseProviderFacts::clustered(identity, false),
             None => self.shard_dense_facts().await?,
         };
         crate::dense_execution::validate_raw_controls(raw, Some(&facts.caps()))

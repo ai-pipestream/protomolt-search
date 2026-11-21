@@ -76,8 +76,12 @@ pub(crate) struct ProviderCaps {
     pub(crate) provider: String,
     /// The precision the provider's own scores are in.
     pub(crate) native: Precision,
-    /// The provider scans every admitted row and certifies completion.
+    /// The provider scans every admitted row and certifies completion via per-part counts.
     pub(crate) exhaustive_scan: bool,
+    /// The provider runs an uncertified remote quantized scan without per-part receipts.
+    pub(crate) uncertified_scan: bool,
+    /// Product shards hold original FP32 sidecars for shard-local exact scanning and rescoring.
+    pub(crate) fp32_sidecar: bool,
     /// The provider runs a configured approximate traversal.
     pub(crate) walks: bool,
     /// The provider can pin enumeration of a mask.
@@ -98,6 +102,8 @@ pub(crate) enum Route {
     EnumerateAll,
     /// Every admitted row scored in FP32 from the shard-local exact sidecar.
     Fp32AllRows,
+    /// An uncertified remote quantized scan without per-part receipts.
+    UncertifiedScan,
     /// A graph walk under a built-in preset.
     Walk,
     /// A quantized candidate pool rescored in FP32.
@@ -145,7 +151,10 @@ pub(crate) struct ResolvedDensePlan {
 
 impl ResolvedDensePlan {
     pub(crate) fn approximate(&self) -> bool {
-        matches!(self.route, Route::Walk | Route::Fp32Pool)
+        matches!(
+            self.route,
+            Route::Walk | Route::Fp32Pool | Route::UncertifiedScan
+        )
     }
 }
 
@@ -258,16 +267,19 @@ pub(crate) fn resolve(
         preset: choice.preset,
         pool_selection: if caps.exhaustive_scan {
             DenseTechnique::QuantizedScan
-        } else {
+        } else if caps.walks {
             DenseTechnique::HnswWalk
+        } else {
+            DenseTechnique::Unspecified
         },
         fallback_reason: choice.fallback,
         planner_reason: choice.reason.to_string(),
     })
 }
 
-/// BALANCED: the graph preset, a quantized pool rescored in FP32, or the
-/// disclosed same-precision exhaustive technique.
+/// BALANCED: the graph preset, a quantized pool rescored in FP32, an
+/// uncertified remote quantized scan, or the disclosed same-precision
+/// exhaustive technique.
 fn balanced(caps: &ProviderCaps, output: Precision) -> Result<Choice, DenseExecutionError> {
     if caps.walks && output != caps.native {
         return Ok(Choice::new(
@@ -287,7 +299,7 @@ fn balanced(caps: &ProviderCaps, output: Precision) -> Result<Choice, DenseExecu
         choice.preset = Some(HNSW_BALANCED);
         return Ok(choice);
     }
-    if caps.exhaustive_scan && output == Precision::Fp32 {
+    if caps.exhaustive_scan && output == Precision::Fp32 && caps.fp32_sidecar {
         let mut choice = Choice::new(
             Mode::Balanced,
             Route::Fp32Pool,
@@ -298,6 +310,9 @@ fn balanced(caps: &ProviderCaps, output: Precision) -> Result<Choice, DenseExecu
             exhaustive quantized scan selected the pool"
             .to_string();
         return Ok(choice);
+    }
+    if caps.uncertified_scan {
+        return balanced_uncertified(caps, output);
     }
     let (route, selection) = exhaustive(caps, output)?;
     let mut choice = Choice::new(
@@ -312,6 +327,33 @@ fn balanced(caps: &ProviderCaps, output: Precision) -> Result<Choice, DenseExecu
         caps.provider
     );
     Ok(choice)
+}
+
+fn balanced_uncertified(
+    caps: &ProviderCaps,
+    output: Precision,
+) -> Result<Choice, DenseExecutionError> {
+    match output {
+        Precision::Quantized => Ok(Choice::new(
+            Mode::Balanced,
+            Route::UncertifiedScan,
+            Precision::Quantized,
+            "BALANCED ran a remote quantized scan without per-part coverage receipts",
+        )),
+        Precision::Fp32 if caps.fp32_sidecar => Ok(Choice::new(
+            Mode::Balanced,
+            Route::Fp32Pool,
+            Precision::Quantized,
+            "BALANCED rescored a remote quantized candidate pool in FP32",
+        )),
+        Precision::Fp32 => Err(DenseExecutionError::FailedPrecondition(format!(
+            "BALANCED FP32 rescoring on provider {} requires product-owned FP32 sidecars",
+            caps.provider
+        ))),
+        Precision::Unspecified => Err(DenseExecutionError::InvalidRequest(
+            "dense query: output precision must be resolved".to_string(),
+        )),
+    }
 }
 
 /// FAST: the graph's speed preset, never a substitute.
@@ -351,8 +393,16 @@ fn exhaustive(
         (Precision::Quantized, Precision::Quantized) if caps.exhaustive_scan => {
             Ok((Route::NativeScan, Precision::Quantized))
         }
-        (Precision::Quantized, Precision::Fp32) if caps.exhaustive_scan => {
+        (Precision::Quantized, Precision::Fp32) if caps.fp32_sidecar => {
             Ok((Route::Fp32AllRows, Precision::Fp32))
+        }
+        (Precision::Quantized, Precision::Quantized) if caps.uncertified_scan => {
+            Err(DenseExecutionError::FailedPrecondition(format!(
+                "provider {} runs remote quantized searches without per-part scan receipts \
+                 and cannot certify EXHAUSTIVE QUANTIZED coverage; use BALANCED, or \
+                 EXHAUSTIVE with FP32 precision on a single dense selection",
+                caps.provider
+            )))
         }
         _ => Err(DenseExecutionError::FailedPrecondition(format!(
             "provider {} cannot score every admitted row at {} precision",
