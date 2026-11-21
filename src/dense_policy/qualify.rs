@@ -17,7 +17,7 @@ pub struct RequestKey {
 }
 
 /// The policy and the point that admitted approximation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Qualified {
     pub policy_id: String,
     pub policy_fingerprint: String,
@@ -29,15 +29,16 @@ pub struct Qualified {
 
 /// A qualifying point, or why no point qualifies (the request then runs the
 /// exhaustive technique and the reason is disclosed).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Qualification {
     Qualified(Box<Qualified>),
     Unqualified(String),
 }
 
 impl DenseExecutionPolicy {
-    /// The cheapest point the key matches exactly whose measured recall meets
-    /// the target: fewest candidates, then FAST before BALANCED.
+    /// The fastest point the key matches exactly whose measured recall meets
+    /// the target and whose approximate technique measured faster than the
+    /// exhaustive one: lowest p50, then fewest candidates, then FAST.
     pub fn qualify(&self, key: RequestKey) -> Qualification {
         let id = self.policy_id();
         if key.k == 0 {
@@ -56,8 +57,15 @@ impl DenseExecutionPolicy {
             .points()
             .iter()
             .filter(|p| matches(p, &key) && p.measured_recall_ppm >= target)
+            .filter(|p| p.approximate_p50_us < p.exhaustive_p50_us)
             .collect();
-        matching.sort_by_key(|p| (p.candidates, std::cmp::Reverse(p.mode)));
+        matching.sort_by_key(|p| {
+            (
+                p.approximate_p50_us,
+                p.candidates,
+                std::cmp::Reverse(p.mode),
+            )
+        });
         match matching.first() {
             Some(point) => Qualification::Qualified(Box::new(Qualified {
                 policy_id: id.to_string(),
@@ -68,8 +76,9 @@ impl DenseExecutionPolicy {
                 point: **point,
             })),
             None => Qualification::Unqualified(format!(
-                "policy {id:?} measured no point meeting {target} ppm recall for k={} depth {} \
-                 at selectivity {} ppm, {} precision, {} shape",
+                "policy {id:?} measured no point both meeting {target} ppm recall and faster \
+                 than the exhaustive technique for k={} depth {} at selectivity {} ppm, {} \
+                 precision, {} shape",
                 key.k,
                 key.candidate_depth,
                 key.filter_selectivity_ppm,

@@ -59,7 +59,24 @@ struct PolicyDecision {
     selectivity_ppm: u32,
 }
 
+/// What `OptimizeDensePolicy` binds its evidence to.
+pub(in crate::coordinator) struct FleetProfile {
+    pub(in crate::coordinator) caps: ProviderCaps,
+    pub(in crate::coordinator) identity: crate::dense_policy::LiveIdentity,
+    pub(in crate::coordinator) hosts: Vec<crate::pb::DenseHostProfile>,
+}
+
 impl CoordinatorServiceImpl {
+    /// The shard fleet's executable capabilities, identity and hardware.
+    pub(in crate::coordinator) async fn dense_fleet_profile(&self) -> Result<FleetProfile, Status> {
+        let facts = self.shard_dense_facts().await?;
+        Ok(FleetProfile {
+            caps: facts.caps(self.stream_search, true),
+            identity: facts.live_identity(),
+            hosts: facts.hosts.clone(),
+        })
+    }
+
     /// Prove the dense execution contract against every live shard before a
     /// dense route runs. Provider identity is generation-wide: mixed
     /// providers, score spaces, precisions or dimensions are refused rather
@@ -89,7 +106,8 @@ impl CoordinatorServiceImpl {
         }
         let (streaming, finish_windows) = self.route_transport(key);
         let caps = facts.caps(streaming, finish_windows);
-        let decision = match (&self.dense_execution_policy, request.mode) {
+        let policy = self.dense_execution_policy.current();
+        let decision = match (policy.as_deref(), request.mode) {
             (Some(policy), crate::pb::DenseExecutionMode::Auto) => {
                 self.decide_auto(policy, request, &facts, &caps, key, streaming)
                     .await?
@@ -206,7 +224,7 @@ impl CoordinatorServiceImpl {
         key: DenseRequestKey<'_>,
         streaming: bool,
     ) -> Result<PolicyDecision, Status> {
-        if let Err(drift) = policy.verify_identity(&facts.live_identity()) {
+        if let Err(drift) = check_policy_drift(policy, facts) {
             return auto_drift_fallback(request, caps, drift, 0);
         }
         let selectivity_ppm = self
@@ -275,6 +293,23 @@ fn auto_drift_fallback(
         qualified: None,
         selectivity_ppm,
     })
+}
+
+fn check_policy_drift(
+    policy: &DenseExecutionPolicy,
+    facts: &DenseProviderFacts,
+) -> Result<(), String> {
+    policy.verify_identity(&facts.live_identity())?;
+    let live_hardware = facts.hardware_fingerprint();
+    if policy.hardware_fingerprint() != live_hardware {
+        return Err(format!(
+            "policy {:?} hardware_fingerprint {} was measured on other hardware than the \
+             live fleet's {live_hardware}; run optimize on this fleet",
+            policy.policy_id(),
+            policy.hardware_fingerprint()
+        ));
+    }
+    Ok(())
 }
 
 /// The measured evidence behind a qualified AUTO plan.

@@ -593,6 +593,11 @@ service SearchService {
   // the cost is named and never a quieter answer. A stemmed field
   // proposes stems.
   rpc TermSuggest(TermSuggestRequest) returns (TermSuggestResponse);
+
+  // Measure the dense techniques this fleet serves on its own hardware,
+  // against the exhaustive technique for the same sample queries, and
+  // return (or install) the version-2 policy AUTO routes through. Admin.
+  rpc OptimizeDensePolicy(OptimizeDensePolicyRequest) returns (OptimizeDensePolicyResponse);
 }
 
 message TermSuggestRequest {
@@ -2073,6 +2078,9 @@ message GetVectorBackendResponse {
   VectorBackendDescriptor descriptor = 1;
   VectorBackendConfig config = 2;
   uint64 num_vectors = 3;
+  // The host the shard runs on: a dense policy's speed evidence is bound
+  // to it.
+  DenseHostProfile host = 5;
   // 4 was `indexed_vectors`, the rows a background-built structure covered;
   // every provider now links a row before its append returns.
   reserved 4;
@@ -6282,6 +6290,25 @@ message DensePolicyPoint {
   DenseScorePrecision output_precision = 15;
   DenseFilterStrategy filter_strategy = 16;
   DenseExecutionShape shape = 17;
+  // Measured latency of the approximate technique at this point and of the
+  // exhaustive technique for the same queries, through the same route and
+  // fleet. AUTO selects the point only where approximate_p50_us is lower.
+  // QPS fields record sequential single-query rate (queries / sum(latency_s)),
+  // i.e. 1 / mean latency, not concurrent multi-client throughput.
+  uint32 approximate_p50_us = 18;
+  uint32 approximate_p99_us = 19;
+  uint32 exhaustive_p50_us = 20;
+  uint32 exhaustive_p99_us = 21;
+  double approximate_qps = 22;
+  double exhaustive_qps = 23;
+}
+
+// One shard host's hardware as it bears on dense search speed.
+message DenseHostProfile {
+  string cpu_model = 1;
+  // Detected SIMD features the kernels use, sorted.
+  repeated string simd_features = 2;
+  uint32 logical_cores = 3;
 }
 
 // Whether a measurement ran through the unary or the streaming route; the
@@ -6311,9 +6338,48 @@ message DenseExecutionPolicyDocument {
   // The recall a point must have measured for AUTO to select it.
   uint32 target_recall_ppm = 10;
   repeated DensePolicyPoint points = 11;
+  // SHA-256 over the sorted, deduplicated set of normalized per-shard
+  // DenseHostProfiles (shard-count-invariant across homogeneous hosts; shard
+  // additions, removals, or restarts still change corpus_fingerprint).
+  // A live fleet with another fingerprint fails AUTO closed to EXHAUSTIVE.
+  string hardware_fingerprint = 12;
+  uint32 node_count = 13;
+  // The host profiles behind the fingerprint, for operators.
+  repeated DenseHostProfile hosts = 14;
   // Tombstone count and ordered per-shard mutation digest at measurement time.
   uint64 deleted_docs = 15;
   string corpus_fingerprint = 16;
+}
+
+message OptimizeDensePolicyRequest {
+  // The collection whose fleet is measured. Empty: the coordinator's own.
+  string collection = 1;
+  string policy_id = 2;
+  string embedding_model = 3;
+  // The recall a measured point must reach for AUTO to select it.
+  uint32 target_recall_ppm = 4;
+  // k bands to measure. Empty: 10, 100, 1000 and 10000 that fit the corpus
+  // and the coordinator's max_k.
+  repeated uint32 k = 5;
+  // Sample queries, concatenated at the fleet's dimension; at least one.
+  repeated float query_vectors = 6;
+  // Required bound on the sweep's wall time; cells unfinished when it is
+  // reached are not written.
+  uint32 max_runtime_ms = 7;
+  // Write the policy to the coordinator's configured policy path and serve
+  // it immediately; refused without a configured path.
+  bool install = 8;
+}
+
+message OptimizeDensePolicyResponse {
+  DenseExecutionPolicyDocument policy = 1;
+  string policy_fingerprint = 2;
+  uint64 elapsed_ms = 3;
+  // (k, depth, technique) cells measured for every sample query.
+  uint32 cells_measured = 4;
+  // The runtime bound ended the sweep early.
+  bool truncated = 5;
+  bool installed = 6;
 }
 
 // Public streaming query controls. The query itself is byte-for-byte the

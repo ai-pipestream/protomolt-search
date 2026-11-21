@@ -118,6 +118,27 @@ impl SearchService for CoordinatorServiceImpl {
         self.rpc_suggest(request).await
     }
 
+    async fn optimize_dense_policy(
+        &self,
+        request: Request<crate::pb::OptimizeDensePolicyRequest>,
+    ) -> Result<Response<crate::pb::OptimizeDensePolicyResponse>, Status> {
+        crate::metrics::timed(
+            crate::metrics::Route::OptimizeDensePolicy,
+            request,
+            |request| async move {
+                self.admit(&request.get_ref().collection)?;
+                if let Some(snapshot) = self.request_snapshot() {
+                    return Box::pin(SearchService::optimize_dense_policy(&snapshot, request))
+                        .await;
+                }
+                self.run_optimize_dense_policy(request.into_inner())
+                    .await
+                    .map(Response::new)
+            },
+        )
+        .await
+    }
+
     async fn term_suggest(
         &self,
         request: Request<crate::pb::TermSuggestRequest>,

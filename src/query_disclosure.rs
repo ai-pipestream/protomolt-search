@@ -140,6 +140,12 @@ fn redact_dense_execution(execution: &mut DenseExecutionOutcome) {
         output_precision: _,
         filter_strategy: _,
         shape: _,
+        approximate_p50_us: _,
+        approximate_p99_us: _,
+        exhaustive_p50_us: _,
+        exhaustive_p99_us: _,
+        approximate_qps: _,
+        exhaustive_qps: _,
     }) = policy_point
     {
         *filter_selectivity_ppm_min = 0;

@@ -53,6 +53,7 @@ pub fn merge_vector_backend(
         descriptor: Some(merged_descriptor),
         config: first.config.clone(),
         num_vectors,
+        host: uniform_child_host(reports),
         deleted_docs,
         wal_generation: reports.iter().map(|r| r.wal_generation).max().unwrap_or(0),
         wal_high_watermark: reports
@@ -63,6 +64,27 @@ pub fn merge_vector_backend(
             .fold(0u64, |acc, r| acc.wrapping_add(r.stats_epoch)),
         stats_incarnation: state_hash.finish().0.to_vec(),
     })
+}
+
+/// Propagate the child host profile when every child reports an identical
+/// profiled host; mixed or unprofiled children report `None` so
+/// `OptimizeDensePolicy` refuses and `AUTO` fails closed.
+fn uniform_child_host(
+    reports: &[crate::pb::GetVectorBackendResponse],
+) -> Option<crate::pb::DenseHostProfile> {
+    let first = reports.first()?.host.as_ref()?;
+    if !crate::dense_policy::is_profiled_host(first) {
+        return None;
+    }
+    let norm = crate::dense_policy::normalize_host(first);
+    reports[1..]
+        .iter()
+        .all(|r| {
+            r.host
+                .as_ref()
+                .is_some_and(|ch| crate::dense_policy::normalize_host(ch) == norm)
+        })
+        .then_some(norm)
 }
 
 fn unconfigured_child_error(shard: usize, child_name: &str) -> Status {

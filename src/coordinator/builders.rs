@@ -48,7 +48,7 @@ impl CoordinatorServiceImpl {
             clustered_vectors: None,
             dense_quality_profile: None,
             synonyms: None,
-            dense_execution_policy: None,
+            dense_execution_policy: Default::default(),
             topology_generation: 0,
             hash_ranges: Vec::new(),
             placement_codes: Vec::new(),
@@ -298,7 +298,21 @@ impl CoordinatorServiceImpl {
         mut self,
         policy: crate::dense_policy::DenseExecutionPolicy,
     ) -> Self {
-        self.dense_execution_policy = Some(Arc::new(policy));
+        self.dense_execution_policy =
+            Arc::new(crate::dense_policy::PolicySlot::new(Some(policy), None));
+        self.refresh_fixed_knobs();
+        self
+    }
+
+    /// Serve the policy loaded from `path` (or none yet), and install what
+    /// `OptimizeDensePolicy` measures there.
+    pub fn with_dense_execution_policy_at(
+        mut self,
+        path: std::path::PathBuf,
+        policy: Option<crate::dense_policy::DenseExecutionPolicy>,
+    ) -> Self {
+        self.dense_execution_policy =
+            Arc::new(crate::dense_policy::PolicySlot::new(policy, Some(path)));
         self.refresh_fixed_knobs();
         self
     }

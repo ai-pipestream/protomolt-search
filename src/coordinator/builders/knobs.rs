@@ -83,7 +83,7 @@ impl CoordinatorServiceImpl {
             FixedKnob {
                 name: "dense_execution_policy",
                 kind: KnobKind::Bool,
-                value: self.dense_execution_policy.is_some().to_string(),
+                value: self.dense_execution_policy.current().is_some().to_string(),
                 description: "A dense execution policy is installed (--dense-execution-policy).",
             },
         ]);

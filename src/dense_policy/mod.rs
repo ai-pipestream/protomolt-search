@@ -13,7 +13,10 @@
 //! point whose key it matches exactly (`k`, selectivity band, output
 //! precision, execution shape, and a named candidate depth): no
 //! interpolation between points and no evidence carried across a changed
-//! precision, routing or shape.
+//! precision, routing or shape. Each point also carries the latency of its
+//! approximate technique and of the exhaustive one on the measured fleet's
+//! hardware ([`fleet_fingerprint`]); AUTO selects a point only where it was
+//! measured faster, and only on that hardware.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,10 +25,15 @@ use prost::Message;
 
 use crate::pb::{DenseExecutionPolicyDocument, DensePolicyPoint};
 
+mod hardware;
 mod qualify;
+mod slot;
 #[cfg(test)]
 mod tests;
 mod validate;
+
+pub use hardware::{fleet_fingerprint, is_profiled_host, local_host_profile, normalize_host};
+pub use slot::PolicySlot;
 
 pub use qualify::{Qualification, Qualified, RequestKey};
 
@@ -193,6 +201,10 @@ impl DenseExecutionPolicy {
 
     pub fn points(&self) -> &[DensePolicyPoint] {
         &self.document.points
+    }
+
+    pub fn hardware_fingerprint(&self) -> &str {
+        &self.document.hardware_fingerprint
     }
 
     pub fn document(&self) -> &DenseExecutionPolicyDocument {

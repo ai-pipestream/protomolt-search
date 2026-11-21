@@ -12,6 +12,7 @@ mod candidate_fetch_tests;
 mod cascade;
 mod clustered;
 mod dense_execution;
+mod dense_optimize;
 mod filters;
 mod hybrid;
 mod hybrid_context;
@@ -317,7 +318,7 @@ pub struct CoordinatorServiceImpl {
     /// Synonym table applied to lexical queries unless disabled per request.
     synonyms: Option<Arc<crate::synonyms::SynonymTable>>,
     /// Generation-bound policy consulted by `AUTO` when installed.
-    dense_execution_policy: Option<Arc<crate::dense_policy::DenseExecutionPolicy>>,
+    dense_execution_policy: Arc<crate::dense_policy::PolicySlot>,
     /// Product shard-map generation (zero for the implicit static list).
     topology_generation: u64,
     /// Inclusive stable-key ranges parallel to `node_addrs`. Empty for the

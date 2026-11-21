@@ -22,6 +22,7 @@ pub(super) fn document(doc: &DenseExecutionPolicyDocument) -> Result<(), String>
         ("provider_backend", &doc.provider_backend),
         ("scoring_fingerprint", &doc.scoring_fingerprint),
         ("corpus_fingerprint", &doc.corpus_fingerprint),
+        ("hardware_fingerprint", &doc.hardware_fingerprint),
     ] {
         if value.trim().is_empty() {
             return Err(format!("{name} is empty"));
@@ -44,6 +45,29 @@ pub(super) fn document(doc: &DenseExecutionPolicyDocument) -> Result<(), String>
     }
     if doc.points.is_empty() {
         return Err("a policy measures at least one point".into());
+    }
+    if doc.node_count == 0 {
+        return Err("hardware_fingerprint and node_count name the measured fleet".into());
+    }
+    if doc.hosts.is_empty() {
+        return Err("hosts must list the measured shard DenseHostProfiles".into());
+    }
+    if doc.hosts.len() != doc.node_count as usize {
+        return Err(format!(
+            "hosts length {} does not match node_count {}",
+            doc.hosts.len(),
+            doc.node_count
+        ));
+    }
+    if doc.hosts.iter().any(|h| !super::is_profiled_host(h)) {
+        return Err("hosts contains an unprofiled DenseHostProfile".into());
+    }
+    let expected_hw = super::fleet_fingerprint(&doc.hosts);
+    if doc.hardware_fingerprint != expected_hw {
+        return Err(format!(
+            "hardware_fingerprint {:?} does not match hosts fingerprint {expected_hw:?}",
+            doc.hardware_fingerprint
+        ));
     }
     for (index, point) in doc.points.iter().enumerate() {
         self::point(point, doc.corpus_rows).map_err(|why| format!("point {index}: {why}"))?;
@@ -123,7 +147,37 @@ fn point(point: &DensePolicyPoint, corpus_rows: u64) -> Result<(), String> {
             point.measured_recall_ppm
         ));
     }
+    latency(point)?;
     controls(point, corpus_rows)
+}
+
+/// Both techniques' latencies and QPS are measured: a positive p50 at most
+/// the p99 and a finite positive QPS.
+fn latency(point: &DensePolicyPoint) -> Result<(), String> {
+    for (name, p50, p99, qps) in [
+        (
+            "approximate",
+            point.approximate_p50_us,
+            point.approximate_p99_us,
+            point.approximate_qps,
+        ),
+        (
+            "exhaustive",
+            point.exhaustive_p50_us,
+            point.exhaustive_p99_us,
+            point.exhaustive_qps,
+        ),
+    ] {
+        if p50 == 0 || p99 < p50 {
+            return Err(format!(
+                "{name} latency p50 {p50} us / p99 {p99} us is not a measurement"
+            ));
+        }
+        if !qps.is_finite() || qps <= 0.0 {
+            return Err(format!("{name} qps {qps} must be finite and positive"));
+        }
+    }
+    Ok(())
 }
 
 fn controls(point: &DensePolicyPoint, corpus_rows: u64) -> Result<(), String> {

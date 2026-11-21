@@ -188,8 +188,15 @@ fn staged_policy(
         output_precision: output as i32,
         filter_strategy: DenseFilterStrategy::Default as i32,
         shape: DenseExecutionShape::Unary as i32,
+        approximate_p50_us: 10,
+        approximate_p99_us: 20,
+        exhaustive_p50_us: 100,
+        exhaustive_p99_us: 200,
+        approximate_qps: 1000.0,
+        exhaustive_qps: 100.0,
         ..Default::default()
     };
+    let hosts = vec![pipestream_search::dense_policy::local_host_profile()];
     DenseExecutionPolicy::from_document(DenseExecutionPolicyDocument {
         format_version: pipestream_search::dense_policy::FORMAT_VERSION,
         policy_id: "staged-v2".into(),
@@ -203,6 +210,9 @@ fn staged_policy(
         dimensions: live.dimensions,
         measured_queries: 32,
         target_recall_ppm: 950_000,
+        hardware_fingerprint: pipestream_search::dense_policy::fleet_fingerprint(&hosts),
+        node_count: 1,
+        hosts,
         points: vec![
             point(DenseScorePrecision::Quantized, q_depth),
             point(DenseScorePrecision::Fp32, fp32_depth),

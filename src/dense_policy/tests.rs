@@ -20,11 +20,18 @@ fn point(k: u32, candidates: u32, recall: u32) -> DensePolicyPoint {
         output_precision: Precision::Fp32 as i32,
         filter_strategy: Strategy::EnumerateSmall as i32,
         shape: Shape::Unary as i32,
+        approximate_p50_us: 10,
+        approximate_p99_us: 20,
+        exhaustive_p50_us: 100,
+        exhaustive_p99_us: 200,
+        approximate_qps: 1000.0,
+        exhaustive_qps: 100.0,
         ..Default::default()
     }
 }
 
 fn document(points: Vec<DensePolicyPoint>) -> DenseExecutionPolicyDocument {
+    let hosts = vec![local_host_profile()];
     DenseExecutionPolicyDocument {
         format_version: FORMAT_VERSION,
         policy_id: "graph-v2".into(),
@@ -39,6 +46,9 @@ fn document(points: Vec<DensePolicyPoint>) -> DenseExecutionPolicyDocument {
         measured_queries: 32,
         target_recall_ppm: 950_000,
         points,
+        hardware_fingerprint: fleet_fingerprint(&hosts),
+        node_count: 1,
+        hosts,
     }
 }
 
@@ -93,6 +103,21 @@ fn malformed_header_cases() -> Vec<(Mutation, &'static str)> {
             Box::new(|d| d.corpus_fingerprint = "\t ".into()),
             "corpus_fingerprint",
         ),
+        (
+            Box::new(|d| d.hardware_fingerprint = "  ".into()),
+            "hardware_fingerprint",
+        ),
+        (
+            Box::new(|d| d.hardware_fingerprint = "other-hw".into()),
+            "hardware_fingerprint",
+        ),
+        (Box::new(|d| d.hosts.clear()), "hosts"),
+        (Box::new(|d| d.node_count = 2), "node_count"),
+        (
+            Box::new(|d| d.hosts = vec![crate::pb::DenseHostProfile::default()]),
+            "unprofiled",
+        ),
+        (Box::new(|d| d.points[0].approximate_qps = 0.0), "qps"),
         (Box::new(|d| d.deleted_docs = 1001), "deleted_docs"),
         (Box::new(|d| d.target_recall_ppm = 0), "target_recall_ppm"),
         (Box::new(|d| d.points.clear()), "at least one point"),
@@ -302,6 +327,75 @@ fn qualification_binds_every_key_field_and_the_recall_target() {
             "{unqualified:?}"
         );
     }
+}
+
+#[test]
+fn a_point_that_meets_recall_but_measured_slower_routes_to_exhaustive() {
+    let mut slow = point(10, 40, 990_000);
+    slow.approximate_p50_us = 150;
+    slow.approximate_p99_us = 300;
+    let mut fewer_but_slower = point(10, 20, 990_000);
+    fewer_but_slower.approximate_p50_us = 60;
+    fewer_but_slower.approximate_p99_us = 90;
+    let mut deeper_but_faster = point(10, 80, 990_000);
+    deeper_but_faster.approximate_p50_us = 15;
+    deeper_but_faster.approximate_p99_us = 30;
+    let policy = DenseExecutionPolicy::from_document(document(vec![slow])).unwrap();
+    let Qualification::Unqualified(reason) = policy.qualify(key(10, 0, UNFILTERED_PPM)) else {
+        panic!("slower than exhaustive")
+    };
+    assert!(reason.contains("faster"), "{reason}");
+    let policy =
+        DenseExecutionPolicy::from_document(document(vec![fewer_but_slower, deeper_but_faster]))
+            .unwrap();
+    let Qualification::Qualified(hit) = policy.qualify(key(10, 0, UNFILTERED_PPM)) else {
+        panic!("qualifies")
+    };
+    assert_eq!(
+        hit.point.candidates, 80,
+        "fastest p50 (15 us) wins over fewer candidates (20 at 60 us)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_slot_installs_keep_serving_and_persisted_fingerprints_identical() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let dir = std::env::temp_dir().join(format!("dense-slot-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("policy.binpb");
+    let slot = Arc::new(PolicySlot::new(None, Some(path.clone())));
+    let running = Arc::new(AtomicBool::new(true));
+    let reader_slot = Arc::clone(&slot);
+    let reader_flag = Arc::clone(&running);
+    let reader = tokio::spawn(async move {
+        while reader_flag.load(Ordering::Relaxed) {
+            if let Some(p) = reader_slot.current() {
+                assert!(!p.fingerprint().is_empty());
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+    let mut writers = Vec::with_capacity(32);
+    for idx in 0..32u32 {
+        let slot = Arc::clone(&slot);
+        writers.push(tokio::spawn(async move {
+            let mut doc = document(vec![point(10, 20 + idx, 990_000)]);
+            doc.policy_id = format!("slot-{idx}");
+            let policy = DenseExecutionPolicy::from_document(doc).unwrap();
+            slot.install(policy).await.unwrap();
+        }));
+    }
+    for task in writers {
+        task.await.unwrap();
+    }
+    running.store(false, Ordering::Relaxed);
+    reader.await.unwrap();
+    let serving = slot.current().unwrap();
+    let reloaded = DenseExecutionPolicy::load(&path).unwrap();
+    assert_eq!(serving.fingerprint(), reloaded.fingerprint());
+    assert_eq!(serving.document(), reloaded.document());
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
