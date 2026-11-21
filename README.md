@@ -1451,11 +1451,13 @@ cache as searches touch them; writable tails remain heap-owned. See [Mapped vect
   nodes and regenerated gRPC/JSON clients together: `StringRangePredicate` and
   `StringPrefixPredicate` move map context to `optional string map_key` (tags
   `5` and `4`, reserving `key` tag `2`) and the mixed-peer
-  `Bm25QueryStreamResponse.done` and `typed_map_contract_version` guards are
-  removed, so mixed-fleet peers would silently misread map-context string
-  predicates as plain facet-column predicates without an error. Under proto3
-  JSON (`WIRE_JSON`), `FilterExpr.mapNumber`/`mapHasKey` and `ValueExpr.map`
-  bind to the unified all-plane map variants (tags `15`, `16`, and `16`), and
+  `Bm25QueryStreamResponse.done`, `FetchValuesResponse` tag `11`
+  (`typed_map_contract_version`), and `QueryStreamRevision` tag `7`
+  (`content_fingerprint_version`) guards/version fields are removed, so
+  mixed-fleet peers would silently misread map-context string predicates as
+  plain facet-column predicates without an error. Under proto3 JSON
+  (`WIRE_JSON`), `FilterExpr.mapNumber`/`mapHasKey` and `ValueExpr.map` bind to
+  the unified all-plane map variants (tags `15`, `16`, and `16`), and
   range-facet edges/bounds take `FilterBound` messages. Stored index formats
   are unchanged. See [map columns](docs/map-columns.md) and
   [range facets](docs/range-facets.md).
