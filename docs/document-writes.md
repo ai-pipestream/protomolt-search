@@ -186,6 +186,39 @@ Fault injection (`fault-injection`): `arm_postcommit_pause` holds a write
 after its commit returned and before its outcome is judged, the window
 the outcomes exist for.
 
+## Managed publication
+
+An activated source projects its accepted history onto its target indexes in
+sequence order (`node::next_publication`, `node::publish_next`, under current
+Admin). Each step reads the earliest sequence some target has not committed,
+with its settled outcome:
+
+| Outcome | Publication | Status | Target state |
+|---|---|---|---|
+| `ACCEPTED` | staged and published like any source version | `ACCEPTED_FINAL` | `PUBLISHED` |
+| `UNCONFIRMED` | every target stalls at the sequence; nothing is staged | `UNRESOLVED` | `PENDING` |
+| `FENCED` | skipped: a decision at its sequence whose manifest changes only its epoch, with no rows and no retirements, so the previous version stays visible | `FENCED` | `SKIPPED_FENCED` |
+
+A target whose journal holds the version's prepared transition reports
+`STAGED`. Every target state is bound to its node's
+`(stats_epoch, stats_incarnation)` at observation
+(`node::publication_status`, `DocumentPublicationStatus`). Staging and
+journal preparation refuse unconfirmed and fenced versions by name.
+
+An outcome read for publication is final: every write holds a shared
+judgement barrier from before its commit until its outcome is judged, and the
+publisher takes it exclusively for the read, so a version read `ACCEPTED`
+can no longer become `UNCONFIRMED`. A process that exits between a commit and
+its judgement leaves the write `ACCEPTED`, the residual "Write outcomes"
+already names.
+
+After a restart or a leader failover, the pending-actor reconciler
+(`HostedDocumentWriteService::reconcile_unconfirmed`) lists the unconfirmed
+writes under an Admin lease and settles each under a fresh lease of its own
+actor, whose Ingest right is the one judged. A write no fresh lease can
+decide stays unconfirmed for the next pass. Tests:
+`src/document_catalog/managed/tests/publication.rs`.
+
 ## Embedded and mobile use
 
 Configure `EmbeddedSearchConfig.document_catalog` with the collection and a

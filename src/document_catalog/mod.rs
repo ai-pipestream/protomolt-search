@@ -41,7 +41,10 @@ pub use checkpoint::CatalogCheckpoint;
 #[cfg(all(feature = "net", feature = "raft"))]
 pub(crate) use managed::header_binding;
 #[cfg(feature = "net")]
-pub use managed::{Acceptance, ActiveManagedCatalog, PreparedManagedCatalog, Settlement};
+pub use managed::{
+    Acceptance, ActiveManagedCatalog, PendingOperation, PreparedManagedCatalog, Reconciled,
+    Settlement,
+};
 pub use publication::{MaintenanceRecovery, ProjectionRecovery};
 pub use restore::VerifiedSourceRestore;
 

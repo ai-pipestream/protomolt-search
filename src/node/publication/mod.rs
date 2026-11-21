@@ -2,6 +2,8 @@
 use super::*;
 mod backup;
 mod maintenance;
+#[cfg(feature = "net")]
+mod managed;
 mod rewrite;
 mod rows;
 use crate::document_catalog::{DocumentCatalog, ProjectionRecovery};
@@ -10,6 +12,11 @@ use crate::segments::{OpenedSegmentSet, SegmentRowRetirement, SegmentSource};
 use crate::stats_identity::StatsClaim;
 #[cfg(test)]
 pub(crate) use maintenance::{AFTER_MAINTENANCE_VERIFIED, INTERRUPT_MAINTENANCE};
+#[cfg(feature = "net")]
+pub use managed::{
+    next_publication_blocking, publication_status_blocking, publish_next, ManagedTarget,
+    NextPublication,
+};
 #[cfg(test)]
 pub(crate) use rewrite::set_rewrite_test_hooks;
 use rows::{install_prepared_serving_state, read_backend_and_next_claim, PreparedServingState};
@@ -17,11 +24,47 @@ use rows::{install_prepared_serving_state, read_backend_and_next_claim, Prepared
 #[cfg(test)]
 thread_local! { pub(crate) static FAIL_PROJECTION_DECISION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
+/// What a source decision publishes: a staged candidate's rows, or the
+/// skip of a fenced version, which stages none.
+#[derive(Clone, Copy)]
+enum Projected<'a> {
+    Staged(&'a StagedDocumentCandidate),
+    Fenced(&'a crate::pb::storage::DocumentVersion),
+}
+
 #[derive(Clone, Copy)]
 struct SourcePublication<'a> {
     catalog: &'a DocumentCatalog,
     index_key: &'a [u8],
-    candidate: &'a StagedDocumentCandidate,
+    projected: Projected<'a>,
+}
+
+impl SourcePublication<'_> {
+    /// The staged rows the decision appends; none for a fenced skip.
+    fn segments(&self) -> Option<&OpenedSegmentSet> {
+        match self.projected {
+            Projected::Staged(candidate) => candidate.segments(),
+            Projected::Fenced(_) => None,
+        }
+    }
+
+    /// Persist the decision's intent for the `before` to `after` transition.
+    fn prepare(
+        &self,
+        before: &OpenedSegmentSet,
+        after: &OpenedSegmentSet,
+    ) -> Result<ProjectionIntent, Status> {
+        match self.projected {
+            Projected::Staged(candidate) => {
+                self.catalog
+                    .prepare_index_publication(self.index_key, candidate, before, after)
+            }
+            Projected::Fenced(version) => {
+                self.catalog
+                    .prepare_fenced_skip(self.index_key, version, before, after)
+            }
+        }
+    }
 }
 
 type PublicationBackend = Option<(usize, crate::vector::VectorBackendConfig)>;
@@ -187,7 +230,49 @@ impl NodeServiceImpl {
             Some(SourcePublication {
                 catalog: source,
                 index_key,
-                candidate,
+                projected: Projected::Staged(candidate),
+            }),
+        )?;
+        let intent = intent.expect("source publication produced an intent");
+        Ok(activation(&intent, claim, intent.after_epoch))
+    }
+}
+
+impl NodeServiceImpl {
+    /// Commit the skip of the fenced `version`: a decision at its sequence
+    /// whose manifest changes only its epoch, with no staged rows and no
+    /// retirements, so the version it would have replaced stays visible.
+    /// Call on a blocking worker.
+    pub fn skip_fenced_projection_blocking(
+        &self,
+        source: &DocumentCatalog,
+        index_key: &[u8],
+        version: &crate::pb::storage::DocumentVersion,
+    ) -> Result<DocumentProjectionActivation, Status> {
+        if source.collection()? != self.config.collection {
+            return Err(Status::failed_precondition(
+                "publication source and target collections differ",
+            ));
+        }
+        let (expected, epoch) = {
+            let guard = read_shard(&self.state);
+            let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
+                return Err(Status::failed_precondition(
+                    "source publication requires a segmented target",
+                ));
+            };
+            let claim = StatsClaim::required(guard.stats_epoch, &guard.stats_incarnation.bytes()?)?;
+            (claim, shard.snapshot().epoch())
+        };
+        let (claim, intent) = self.publish_rows_inner(
+            expected,
+            epoch,
+            &[],
+            Vec::new(),
+            Some(SourcePublication {
+                catalog: source,
+                index_key,
+                projected: Projected::Fenced(version),
             }),
         )?;
         let intent = intent.expect("source publication produced an intent");

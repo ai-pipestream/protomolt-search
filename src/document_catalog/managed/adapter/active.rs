@@ -66,11 +66,14 @@ impl ActiveManagedCatalog {
             .managed_activation
             .clone()
             .expect("recovered activation");
+        let unconfirmed = Self::unconfirmed_present(&inner)?;
         Ok(Self {
-            inner,
+            inner: Arc::new(inner),
             binding: binding.clone(),
             activation,
             authority: authority.clone(),
+            judging: std::sync::RwLock::new(()),
+            unconfirmed: UnconfirmedSignal::new(unconfirmed),
             #[cfg(any(test, feature = "fault-injection"))]
             settle_pause: std::sync::Mutex::new(None),
         })
@@ -108,6 +111,11 @@ impl ActiveManagedCatalog {
     /// The collection this activated source serves, from its binding.
     pub fn collection(&self) -> &str {
         &self.key().collection
+    }
+
+    /// Admission to a local, non-Raft authority for a status read.
+    pub fn local_admission(&self, principal: &str) -> Result<SourceAdmission<'_>, Status> {
+        self.authority.admission(principal)
     }
 
     fn key(&self) -> &crate::pb::storage::LogicalSourceOwner {

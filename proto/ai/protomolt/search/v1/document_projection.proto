@@ -3,6 +3,7 @@ package ai.protomolt.search.v1;
 
 import "ai/protomolt/search/v1/source.proto";
 import "ai/protomolt/search/v1/search.proto";
+import "ai/protomolt/search/v1/document_write.proto";
 
 // Trusted local preparation of one immutable accepted source version. This is
 // neither an ingest RPC nor evidence that any row is durable or searchable.
@@ -125,4 +126,78 @@ message CompactDocumentIndexRequest {
   // vocabulary once per batch of each segment, so a smaller batch only adds
   // passes. The certificate is identical at any size.
   uint32 proof_batch_rows = 5;
+}
+
+// Where one accepted version stands in managed publication. UNRESOLVED: the
+// write is durable but its lease outcome is not settled, and projection
+// stalls at it. ACCEPTED_FINAL: the write was admitted and its outcome can no
+// longer move. FENCED: settled without the actor's right; every target skips
+// it without staging rows, and the previous version stays visible.
+enum DocumentPublicationState {
+  DOCUMENT_PUBLICATION_STATE_UNSPECIFIED = 0;
+  DOCUMENT_PUBLICATION_STATE_UNRESOLVED = 1;
+  DOCUMENT_PUBLICATION_STATE_ACCEPTED_FINAL = 2;
+  DOCUMENT_PUBLICATION_STATE_FENCED = 3;
+}
+
+// One target index's progress on one accepted version. PENDING: the target's
+// committed sequence is below the version and nothing is prepared for it.
+// STAGED: the target journal holds the version's prepared transition and its
+// manifest commit is unresolved. PUBLISHED: the version's rows are the
+// target's committed decision. SKIPPED_FENCED: the target committed a skip of
+// the fenced version without staging rows.
+enum DocumentPublicationTargetState {
+  DOCUMENT_PUBLICATION_TARGET_STATE_UNSPECIFIED = 0;
+  DOCUMENT_PUBLICATION_TARGET_STATE_PENDING = 1;
+  DOCUMENT_PUBLICATION_TARGET_STATE_STAGED = 2;
+  DOCUMENT_PUBLICATION_TARGET_STATE_PUBLISHED = 3;
+  DOCUMENT_PUBLICATION_TARGET_STATE_SKIPPED_FENCED = 4;
+}
+
+// A target's state observed at one read version of its node. The receipt is
+// bound to that (stats_epoch, stats_incarnation); a later read version must
+// be observed again.
+message DocumentPublicationTarget {
+  bytes index_key = 1;
+  DocumentPublicationTargetState state = 2;
+  uint64 committed_sequence = 3;
+  uint64 stats_epoch = 4;
+  bytes stats_incarnation = 5;
+}
+
+// A trusted owner's observation of one accepted version across its targets.
+// It does not rewrite the original acceptance or retry receipt.
+message DocumentPublicationStatus {
+  bytes history_id = 1;
+  bytes document_key = 2;
+  uint64 version = 3;
+  uint64 accepted_sequence = 4;
+  DocumentPublicationState state = 5;
+  uint64 fenced_at_revision = 6;
+  repeated DocumentPublicationTarget targets = 7;
+}
+
+
+// Receiving-side adapter for explicitly provisioned local source catalogs.
+// This service does not activate, transfer or replicate a managed source owner.
+service DocumentWriteService {
+  // Requires Ingest. Returns only the exact local resource/history binding;
+  // it grants no ownership, source disclosure or permission to write.
+  rpc GetWriteTarget(GetDocumentWriteTargetRequest) returns (DocumentWriteTarget);
+  // One logical source transaction. Requires version-2 history-pinned input.
+  // Cancellation or a lost reply leaves the outcome unknown; retry the same
+  // operation under current permission. A committed write may outlive the RPC.
+  // Successful acceptance reports searchable=false until separate publication.
+  rpc AcceptDocument(DocumentWriteRequest) returns (DocumentWriteReceipt);
+  // Requires Admin or Ingest. Reports each named target at one accepted sequence.
+  rpc GetDocumentPublicationStatus(GetDocumentPublicationStatusRequest) returns (DocumentPublicationStatus);
+}
+
+message GetDocumentPublicationStatusRequest {
+  // Exact collection; empty names the explicitly configured unnamed catalog.
+  string collection = 1;
+  // Exact positive accepted sequence to inspect.
+  uint64 accepted_sequence = 2;
+  // Logical target indexes to report. At least one is required.
+  repeated bytes index_keys = 3;
 }

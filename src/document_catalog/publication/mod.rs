@@ -24,10 +24,12 @@ macro_rules! maintenance_table {
 mod anchors;
 mod audit;
 mod decision;
+mod fenced;
 mod maintenance;
 mod prepare;
 pub(super) use anchors::checkpoint_states;
 pub(super) use audit::verify_checkpoint_chain;
+pub(super) use fenced::require_publishable;
 pub use maintenance::MaintenanceRecovery;
 use maintenance::*;
 
@@ -108,6 +110,8 @@ fn validate_intent(intent: &ProjectionIntent, key: &[u8], history: &[u8]) -> Res
         || source.version == 0
         || source.accepted_sequence == 0
         || (source.deleted && (!source.source_sha256.is_empty() || intent.rows != 0))
+        || (source.outcome == crate::pb::storage::WriteOutcome::Fenced as i32 && intent.rows != 0)
+        || source.outcome == crate::pb::storage::WriteOutcome::Unconfirmed as i32
         || (!source.deleted && source.source_sha256.len() != 32)
         || intent.before_manifest_sha256.len() != 32
         || intent.after_manifest_sha256.len() != 32

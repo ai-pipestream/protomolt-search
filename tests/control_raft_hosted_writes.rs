@@ -6,17 +6,15 @@
 //! admits nothing and leaves no row and no retry record; off-leader and
 //! isolated members refuse by name.
 //!
-//! Compiled only with `raft`, `tls` and `fault-injection` together (the
-//! `control_raft_admission` convention: the lease scenarios need the pause
-//! hook `arm_grant_delay`, and the group needs the mTLS transport). The
-//! write service itself serves plain loopback HTTP here with a bearer
-//! principal; in production it registers on the process's secured listener.
+//! Compiled with `raft`, `tls` and `fault-injection`; loopback HTTP uses a
+//! bearer principal, while production uses the secured listener.
 #![cfg(all(feature = "raft", feature = "tls", feature = "fault-injection"))]
-// Every test holds the target-wide `serial()` guard for its whole body,
-// across awaits, on purpose.
+// Every test holds the target-wide serial guard across awaits.
 #![allow(clippy::await_holding_lock)]
 
 mod control_adversarial;
+#[path = "control_raft_hosted_writes/status_and_reconcile.rs"]
+mod status_and_reconcile;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -52,8 +50,6 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 
 const WORKFLOW: &[u8] = b"hosted-owner-one";
 
-/// The hosted policy: alice and bob Admin, plus the Ingest grant the
-/// write-admission entry check requires (mirrors the in-crate fixtures).
 fn hosted_policy() -> AccessPolicy {
     let mut policy = kit::policy();
     for grant in &mut policy.grants {
@@ -61,6 +57,9 @@ fn hosted_policy() -> AccessPolicy {
             grant.actions.push(AccessAction::Ingest as i32);
         }
     }
+    let mut reader = kit::grant("reader", kit::COLLECTION);
+    reader.actions = vec![AccessAction::Search as i32];
+    policy.grants.push(reader);
     policy
 }
 
@@ -68,12 +67,10 @@ fn principals() -> pipestream_search::security::Principals {
     principals_with(Arc::new(PolicyAuthority::new(hosted_policy()).unwrap()))
 }
 
-/// Transport principals over an authority the test keeps a handle on, so
-/// it can replace the policy under a call.
 fn principals_with(authority: Arc<PolicyAuthority>) -> pipestream_search::security::Principals {
     use pipestream_search::security::{PrincipalConfig, Principals};
     let authority: Arc<dyn Authorizer> = authority;
-    Principals::from_configs(&["alice", "bob"].map(|name| PrincipalConfig {
+    Principals::from_configs(&["alice", "bob", "reader"].map(|name| PrincipalConfig {
         name: name.into(),
         token: format!("{name}-token-0123456789"),
         concurrency: 8,

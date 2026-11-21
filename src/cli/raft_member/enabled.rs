@@ -20,6 +20,8 @@ pub(in crate::cli) struct RaftSurfaces {
     /// Owner writes for the managed catalogs, on the coordinator or relay
     /// listener.
     hosted_writes: Option<HostedDocumentWriteService>,
+    /// Startup reconciliation for the configured managed principal.
+    reconcile: Option<(HostedDocumentWriteService, String)>,
     /// The operator service, on every listener of a member.
     operator: Option<RaftOperatorServiceImpl>,
 }
@@ -54,9 +56,16 @@ impl RaftSurfaces {
                     .is_some_and(|tls| tls.client_ca_pem.is_some()),
             )
         });
+        let reconcile = hosted_writes.clone().and_then(|service| {
+            cfg.raft
+                .as_ref()
+                .and_then(|member| member.managed_principal.clone())
+                .map(|principal| (service, principal))
+        });
         Ok(Self {
             host,
             hosted_writes,
+            reconcile,
             operator,
         })
     }
@@ -109,6 +118,9 @@ impl RaftSurfaces {
         shutdown_rx: &tokio::sync::watch::Receiver<bool>,
         handles: &mut Vec<TaskHandle>,
     ) {
+        if let Some((service, principal)) = self.reconcile {
+            handles.push(service.spawn_reconciler(principal, shutdown_rx.clone()));
+        }
         let Some(host) = self.host else {
             return;
         };

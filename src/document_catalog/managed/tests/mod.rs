@@ -8,6 +8,8 @@ mod binding_crash;
 mod binding_refusals;
 mod fixtures;
 mod outcomes;
+mod publication;
+mod publication_fixtures;
 mod readiness;
 
 use super::*;

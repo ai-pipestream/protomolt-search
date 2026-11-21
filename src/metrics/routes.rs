@@ -79,6 +79,7 @@ pub enum Route {
     /// `NodeService.EvaluateBoolean`.
     EvaluateBoolean,
     GetDocumentWriteTarget,
+    GetDocumentPublicationStatus,
     AcceptSourceDocument,
     /// `RaftOperatorService.GetMemberStatus`.
     GetMemberStatus,
@@ -97,7 +98,7 @@ pub enum Route {
 /// Route names as they appear in the `rpc` label, parallel to the
 /// counter tables, with whether the route answers with a response
 /// stream (and so reports two latency phases).
-pub(super) const REQUEST_ROUTES: [(Route, &str, bool); 73] = [
+pub(super) const REQUEST_ROUTES: [(Route, &str, bool); 74] = [
     (Route::SearchShard, "search_shard", true),
     (Route::StreamSearch, "stream_search", true),
     (Route::BrowseShard, "browse_shard", false),
@@ -174,6 +175,11 @@ pub(super) const REQUEST_ROUTES: [(Route, &str, bool); 73] = [
     (
         Route::GetDocumentWriteTarget,
         "get_document_write_target",
+        false,
+    ),
+    (
+        Route::GetDocumentPublicationStatus,
+        "get_document_publication_status",
         false,
     ),
     (Route::AcceptSourceDocument, "accept_source_document", false),
