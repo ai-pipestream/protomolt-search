@@ -175,7 +175,7 @@ impl<'a> SegmentSealer<'a> {
         };
         let schema = self.inputs.schema(self.request.bm25_fields);
         let mut image = finish_child(&self.inputs.manifest, partition, slot, &schema, analyze)?;
-        if divergent {
+        if divergent || self.request.vectors_only {
             image.parents_colocated = false;
         }
         self.segments.push(SegmentedChildImage {

@@ -185,7 +185,10 @@ pub(super) fn finish_child_ordered(
 /// shared one source shard; a caller that routes parents apart clears it.
 fn rows_prove_parents_colocated(replay: &Replay) -> bool {
     replay.documents.iter().all(|(id, doc)| {
-        crate::colocation::row_proves_parent_colocated(doc, replay.stable_keys.contains_key(id))
+        crate::colocation::row_proves_parent_colocated(
+            doc,
+            replay.stable_keys.get(id).is_some_and(|k| !k.is_empty()),
+        )
     })
 }
 

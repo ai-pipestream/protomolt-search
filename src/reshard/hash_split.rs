@@ -116,7 +116,7 @@ pub fn split_logs_with(
     let n = request.n;
     let bucket_count = inputs.manifest.bucket_count as usize;
     let cheap = n <= bucket_count && bucket_count.is_multiple_of(n);
-    let children = if cheap
+    let mut children = if cheap
         && !logs_hold_foreign_parents(request.gens, &inputs.manifest, request.vectors_only)?
     {
         split_bucket_ranges(request, &inputs, analyze)?
@@ -128,6 +128,12 @@ pub fn split_logs_with(
         );
         split_rehashed(request, &inputs, analyze)?
     };
+    if request.vectors_only {
+        // No document replayed, so lineage is unknown, never proven.
+        for child in &mut children {
+            child.parents_colocated = false;
+        }
+    }
     sealed(&inputs.manifest, inputs.next_generation()?, children)
 }
 
@@ -284,7 +290,13 @@ pub fn split_stable_logs_with(
             (crate::coordinator::stable_routing_hash(key) >> shift) as usize
         })
     })?;
-    let children = build_children(request, &inputs, partitions, &vec![false; n], analyze)?;
+    let children = build_children(
+        request,
+        &inputs,
+        partitions,
+        &vec![request.vectors_only; n],
+        analyze,
+    )?;
     Ok(StableReshardOutput {
         images: sealed(&inputs.manifest, inputs.next_generation()?, children)?,
         source_cutoffs,
@@ -345,6 +357,11 @@ pub fn split_stable_logs_ranged(
         )?);
     }
     clear_scattered(&mut children, &scattered);
+    if vectors_only {
+        for child in &mut children {
+            child.parents_colocated = false;
+        }
+    }
     Ok(StableReshardOutput {
         images: sealed(&inputs.manifest, inputs.next_generation()?, children)?,
         source_cutoffs,

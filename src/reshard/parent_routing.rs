@@ -147,9 +147,12 @@ pub(super) fn clear_scattered(children: &mut [ChildImage], scattered: &[bool]) {
     }
 }
 
-/// Whether any live document of the logs names a lineage parent other than
-/// itself, read one WAL bucket at a time: such logs cannot split by whole
-/// bucket ranges, which route by row id.
+/// Whether any live document of the logs names a lineage parent at all,
+/// read one WAL bucket at a time: such logs cannot split by whole bucket
+/// ranges, which route by row id. A parent id lives in the source
+/// document's id space, so even a row whose parent id equals its own
+/// positional id counts: its keyed siblings route by the parent's key
+/// hash, never by that coincidence.
 pub(super) fn logs_hold_foreign_parents(
     gens: &[PathBuf],
     manifest: &WalManifest,
@@ -169,8 +172,8 @@ pub(super) fn logs_hold_foreign_parents(
         }
         replay.compact();
         if parent_routes(&replay)
-            .iter()
-            .any(|(id, parent)| matches!(parent, ParentKey::Lineage(p) if p != id))
+            .values()
+            .any(|parent| matches!(parent, ParentKey::Lineage(_)))
         {
             return Ok(true);
         }

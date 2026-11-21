@@ -230,6 +230,11 @@ pub fn split_placement_logs_with(
         )?);
     }
     super::parent_routing::clear_scattered(&mut out, &scattered);
+    if request.vectors_only {
+        for child in &mut out {
+            child.parents_colocated = false;
+        }
+    }
     Ok(PlacementReshardOutput {
         images: super::child_catalog::sealed(&inputs.manifest, inputs.next_generation()?, out)?,
         source_cutoffs,
