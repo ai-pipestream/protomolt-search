@@ -341,6 +341,9 @@ async fn read_start(
             "relay: scoped vector scans require child read receipt composition",
         ));
     }
+    if let Some(msg) = crate::node::collapse_conflict(&start) {
+        return Err(Status::invalid_argument(msg));
+    }
     crate::node::validate_geo_filters(&start.geo_filters)?;
     if let Some(f) = start.filter.as_ref() {
         crate::filter::validate_filter(f)?;

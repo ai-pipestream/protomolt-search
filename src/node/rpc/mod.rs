@@ -6,6 +6,8 @@ mod browse_values;
 mod lexical;
 mod vector_search;
 
+pub(crate) use vector_search::collapse_conflict;
+
 use crate::node::*;
 
 #[tonic::async_trait]

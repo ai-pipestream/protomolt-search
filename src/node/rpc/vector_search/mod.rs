@@ -6,6 +6,8 @@ mod search_shard;
 mod stream_scan;
 mod stream_search;
 
+pub(crate) use search_shard::collapse_conflict;
+
 use crate::node::*;
 
 pub(super) fn validate_scan_filters(

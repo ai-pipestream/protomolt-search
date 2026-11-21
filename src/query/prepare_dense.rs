@@ -106,6 +106,7 @@ pub(super) async fn resolve_dense(base: &Base<'_>, filter: &str) -> Result<Dense
     let key = crate::coordinator::DenseRequestKey {
         k: base.req.k,
         candidate_depth: base.req.selection_k,
+        route_mode: route_mode(&base.plan.shape),
         filters: filters.as_ref(),
     };
     let planned = base
@@ -123,6 +124,22 @@ pub(super) async fn resolve_dense(base: &Base<'_>, filter: &str) -> Result<Dense
         quality: None,
         quality_default: false,
     })
+}
+
+fn route_mode(shape: &Shape<'_>) -> crate::coordinator::DenseRouteMode {
+    use super::selection::Strategy;
+    use crate::coordinator::DenseRouteMode;
+    match shape {
+        Shape::Composite {
+            strategy: Strategy::Decomposed(_),
+            ..
+        } => DenseRouteMode::CompositeDecomposed,
+        Shape::Composite {
+            strategy: Strategy::Rrf(_) | Strategy::Blend(_) | Strategy::Cascade,
+            ..
+        } => DenseRouteMode::CompositeUnary,
+        Shape::Dense { .. } | Shape::Browse | Shape::Lexical { .. } => DenseRouteMode::SingleLeaf,
+    }
 }
 
 /// Whether the selection is a single dense leaf rescoring an FP32 pool;
@@ -155,7 +172,7 @@ pub(super) fn fp32_pool(shape: &Shape<'_>, dense: &DensePlan) -> Result<bool, St
             }
             if dense.knobs.finish_settle_us.is_some() {
                 return Err(refuse(
-                    "composite fusion runs non-streaming leg rounds and cannot serve \
+                    "composite fusion does not drive settle-finish timers and cannot serve \
                      finish_settle_us",
                 ));
             }

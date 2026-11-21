@@ -140,8 +140,10 @@ pub use browse::BrowseAfter;
 pub use browse::BrowseRows;
 use dense_execution::provider_mismatch_of;
 pub(crate) use dense_execution::ExactRerankScores;
-pub(crate) use dense_execution::{clustered_scan_execution, dense_status, DenseScanExecution};
-pub use dense_execution::{DenseRequestKey, FleetVectorIdentity};
+pub use dense_execution::FleetVectorIdentity;
+pub(crate) use dense_execution::{
+    clustered_scan_execution, dense_status, DenseRequestKey, DenseRouteMode, DenseScanExecution,
+};
 use filters::mark_known;
 pub(crate) use filters::BooleanFanout;
 pub(crate) use filters::BooleanFanoutPlan;

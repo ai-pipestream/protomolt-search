@@ -374,13 +374,15 @@ async fn recv_start_shard_search(
     }
 }
 
-fn collapse_conflict(start: &StartShardSearch) -> Option<&'static str> {
+pub(crate) fn collapse_conflict(start: &StartShardSearch) -> Option<&'static str> {
     if !start.collapse_parents {
         None
     } else if start.exact_fp32_scan {
         Some("collapse_parents and exact_fp32_scan are mutually exclusive")
     } else if start.tie_complete {
         Some("collapse_parents and tie_complete are mutually exclusive")
+    } else if start.staged_selection {
+        Some("collapse_parents and staged_selection are mutually exclusive")
     } else {
         None
     }

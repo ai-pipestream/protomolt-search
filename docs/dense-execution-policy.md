@@ -65,12 +65,14 @@ fails startup by name:
    disjoint-interval bitwise AND) without materializing document ID sets
    (`1,000,000` ppm when unfiltered and unrestricted).
 3. **Exact-key qualification.** A point qualifies when its `k`, selectivity
-   band, output precision, and execution shape (`STREAMING` when
-   `--stream-search` or finish-window controls stream the dense search, else
-   `UNARY`) match the request, any explicit `selection_k` equals `candidates`,
-   and `measured_recall_ppm >= target_recall_ppm`. Among qualifying points the
-   fewest `candidates` wins, then `FAST` before `BALANCED`. Nothing is
-   interpolated across keys, precisions, routings, or shapes.
+   band, output precision, and execution shape (`STREAMING` on single-leaf
+   `--stream-search`/finish-window scans and `DECOMPOSED` composite scans;
+   `UNARY` on single-leaf unary scans and `RRF`/`SCORE_BLEND`/`CASCADE`
+   composite leg rounds) match the request, any explicit `selection_k` equals
+   `candidates`, and `measured_recall_ppm >= target_recall_ppm`. Among
+   qualifying points the fewest `candidates` wins, then `FAST` before
+   `BALANCED`. Nothing is interpolated across keys, precisions, routings, or
+   shapes.
 4. **Live capability drift.** The live fleet must advertise every capability
    the qualifying point requires (`walks`, `staged_top_k`, `mask_enumeration`,
    `patience_early_stop`, `candidate_stream`, `floor_pruning`, matching native

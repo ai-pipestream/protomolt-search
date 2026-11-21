@@ -64,6 +64,7 @@ pub(crate) use self::publication::{
     set_rewrite_test_hooks, AFTER_MAINTENANCE_VERIFIED, FAIL_PROJECTION_DECISION,
     INTERRUPT_MAINTENANCE,
 };
+pub(crate) use self::rpc::collapse_conflict;
 pub(crate) use self::shard::{
     f64_from_order_bits, f64_order_bits, i64_from_order_bits, i64_order_bits, parse_score_stages,
     physical_rows, read_shard, timestamp_to_epoch_micros, validate_geo_filter,

@@ -56,6 +56,7 @@ async fn auto_ann_qualifies_the_document_view_instead_of_the_unfiltered_point() 
     let key = DenseRequestKey {
         k: 1,
         candidate_depth: 0,
+        route_mode: crate::coordinator::DenseRouteMode::SingleLeaf,
         filters: None,
     };
     let unrestricted = owner

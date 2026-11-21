@@ -144,3 +144,23 @@ fn qualified_points_bind_their_technique_and_refuse_unserved_regimes() {
     no_floor.floor_pruning = false;
     assert!(qualified(auto, &no_floor, &graph).is_err());
 }
+
+#[test]
+fn raw_controls_reject_collapse_parents_with_staged_selection() {
+    let collapse_only = RawDenseControls {
+        collapse_parents: true,
+        ..Default::default()
+    };
+    assert!(validate_raw_controls(&collapse_only, None).is_ok());
+
+    let both = RawDenseControls {
+        collapse_parents: true,
+        staged_selection: true,
+        ..Default::default()
+    };
+    let err = validate_raw_controls(&both, None).unwrap_err();
+    assert!(matches!(err, DenseExecutionError::InvalidRequest(_)));
+    assert!(err
+        .to_string()
+        .contains("collapse_parents and staged_selection are mutually exclusive"));
+}
