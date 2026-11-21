@@ -1442,6 +1442,20 @@ cache as searches touch them; writable tails remain heap-owned. See [Mapped vect
 
 ## TODO
 
+- **2026-11-20 — Dense execution policy v2 and staged bit-plane selection.**
+  `DenseExecutionPolicy` loads version-2 binary `DenseExecutionPolicyDocument`
+  protobuf files (`--dense-execution-policy` / `dense_execution_policy`,
+  refusing retired version-1 TOML files), binding recall-qualified `AUTO`
+  points (`HNSW_WALK` and `BITPLANE_STAGED`) to per-shard `num_vectors`,
+  `deleted_docs`, WAL watermarks, `stats_epoch`, and `stats_incarnation`
+  (`corpus_fingerprint`), counting filter/visibility selectivity directly over
+  compact wire bitmaps, and failing closed to `EXHAUSTIVE`
+  (`turbovec_dense_policy_drift_total`) on corpus mutation, node/relay
+  restart, or live capability loss. Owned `embedded-turbovec` images with
+  `>= 32,768` rows and supported `2`-/`4`-bit geometry advertise
+  `staged_top_k` (`bitplane-balanced-v1`), intersected across relay children
+  and partitioned cleanly inside coalesced shard batches. See
+  [Dense execution policy](docs/dense-execution-policy.md).
 - **2026-11-20 — Dense execution v2 modes, precision, and receipts
   (simultaneous upgrade).** `DenseExecutionMode` reserves tags `1..=3`
   (`DENSE_EXECUTION_MODE_EXACT`, `DENSE_EXECUTION_MODE_ANN`, and the retired
@@ -1456,9 +1470,8 @@ cache as searches touch them; writable tails remain heap-owned. See [Mapped vect
   `clustered-turbovec` quantized scans refuse `EXHAUSTIVE` and serve `BALANCED`
   with `CANDIDATE_SET` coverage and zero invented part counts, while single-leaf
   `EXHAUSTIVE` + `FP32` certifies via shard-local sidecars). Retired version-1
-  TOML `dense_execution_policy` keys and
-  `--dense-execution-policy` flags refuse at startup; upgrade coordinators,
-  relays, nodes, and regenerated gRPC/JSON clients together. See
+  TOML policy files refuse at load; upgrade coordinators, relays, nodes, and
+  regenerated gRPC/JSON clients together. See
   [Query API](docs/query-api.md#dense-execution-contract).
 - **2026-11-20 — Canonical `search.proto` request forms (simultaneous
   upgrade).** Range facets, score stages, map string/number filters and map

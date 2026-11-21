@@ -86,10 +86,11 @@ impl CoordinatorServiceImpl {
                 facts.dimensions
             )));
         }
-        let caps = facts.caps(self.stream_search);
+        let streaming = self.request_streams(key.filters);
+        let caps = facts.caps(streaming);
         let decision = match (&self.dense_execution_policy, request.mode) {
             (Some(policy), crate::pb::DenseExecutionMode::Auto) => {
-                self.decide_auto(policy, request, &facts, &caps, key)
+                self.decide_auto(policy, request, &facts, &caps, key, streaming)
                     .await?
             }
             _ => PolicyDecision {
@@ -171,6 +172,12 @@ impl CoordinatorServiceImpl {
         Ok(facts.live_identity())
     }
 
+    fn request_streams(&self, filters: Option<&RequestFilters>) -> bool {
+        self.stream_search
+            || filters
+                .is_some_and(|f| f.finish_settle_us.is_some() || f.finish_deadline_us.is_some())
+    }
+
     async fn decide_auto(
         &self,
         policy: &DenseExecutionPolicy,
@@ -178,6 +185,7 @@ impl CoordinatorServiceImpl {
         facts: &DenseProviderFacts,
         caps: &ProviderCaps,
         key: DenseRequestKey<'_>,
+        streaming: bool,
     ) -> Result<PolicyDecision, Status> {
         if let Err(drift) = policy.verify_identity(&facts.live_identity()) {
             return auto_drift_fallback(request, caps, drift, 0);
@@ -185,7 +193,7 @@ impl CoordinatorServiceImpl {
         let selectivity_ppm = self
             .dense_filter_selectivity(key.filters, facts.rows)
             .await?;
-        let shape = if self.stream_search {
+        let shape = if streaming {
             crate::pb::DenseExecutionShape::Streaming
         } else {
             crate::pb::DenseExecutionShape::Unary
@@ -262,4 +270,31 @@ fn stamp_provenance(
     outcome.filter_selectivity_ppm = selectivity_ppm;
     outcome.candidate_depth = hit.point.candidates;
     outcome.evidence_scope = crate::pb::DenseEvidenceScope::SelectivityBandBenchmark as i32;
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::coordinator::{CoordinatorServiceImpl, RequestFilters};
+
+    #[test]
+    fn request_streams_tracks_stream_search_and_finish_windows() {
+        let unary = CoordinatorServiceImpl::new(Vec::new());
+        assert!(!unary.request_streams(None));
+        assert!(!unary.request_streams(Some(&RequestFilters::default())));
+
+        let settle = RequestFilters {
+            finish_settle_us: Some(250),
+            ..Default::default()
+        };
+        assert!(unary.request_streams(Some(&settle)));
+
+        let deadline = RequestFilters {
+            finish_deadline_us: Some(1_000),
+            ..Default::default()
+        };
+        assert!(unary.request_streams(Some(&deadline)));
+
+        let streaming = unary.with_stream_search(true);
+        assert!(streaming.request_streams(None));
+    }
 }

@@ -1,7 +1,11 @@
 //! The embedded TurboVec adapter: the only code that names the native engine.
 
+mod planes;
+
 use std::ops::Range;
 use std::path::Path;
+
+use self::planes::{bit_planes_eligible, STAGED_MIN_ROWS};
 
 use serde::{Deserialize, Serialize};
 use turbovec::{CalibrationState, SearchOptions, StreamControl, TurboQuantIndex};
@@ -116,62 +120,6 @@ fn wrap(index: TurboQuantIndex) -> VectorIndex {
 
 struct EmbeddedTurboVec {
     index: TurboQuantIndex,
-}
-
-/// Rows at which turbovec searches an owned image through its bit-plane
-/// cache, on a host and geometry whose kernels read it.
-const STAGED_MIN_ROWS: usize = 32_768;
-
-fn vector_major_enabled() -> bool {
-    if std::env::var("TURBOVEC_NO_VECTOR_MAJOR").is_ok_and(|v| v != "0")
-        || std::env::var("TURBOVEC_NO_VNNI").is_ok_and(|v| v != "0")
-    {
-        return false;
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        std::arch::is_x86_feature_detected!("avx512vbmi")
-            && std::arch::is_x86_feature_detected!("avx512vnni")
-            && std::arch::is_x86_feature_detected!("avx512bw")
-            && std::arch::is_x86_feature_detected!("avx512f")
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        std::arch::is_aarch64_feature_detected!("dotprod")
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        false
-    }
-}
-
-/// Mirror `turbovec::pack::planes_wanted` so `staged_top_k` is advertised and
-/// reported only when the engine's bit-plane shortlist path actually runs.
-fn bit_planes_eligible(bits: usize, dim: usize) -> bool {
-    if dim == 0 || !dim.is_multiple_of(8) {
-        return false;
-    }
-    let n_byte_groups = (bits * dim) / 8;
-    let vm8_2bit = std::env::var_os("TURBOVEC_2BIT_VM8").is_some_and(|v| v == "1");
-    let sign_scans = if cfg!(target_arch = "x86_64") {
-        vector_major_enabled()
-    } else {
-        cfg!(target_arch = "aarch64") && !vm8_2bit
-    };
-    match bits {
-        2 => {
-            n_byte_groups.is_multiple_of(8)
-                && !std::env::var_os("TURBOVEC_2BIT_PLANES").is_some_and(|v| v == "0")
-                && sign_scans
-        }
-        4 => {
-            n_byte_groups.is_multiple_of(16)
-                && !std::env::var_os("TURBOVEC_4BIT_PLANES").is_some_and(|v| v == "0")
-                && sign_scans
-                && vector_major_enabled()
-        }
-        _ => false,
-    }
 }
 
 impl EmbeddedTurboVec {
