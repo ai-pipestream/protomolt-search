@@ -6,8 +6,6 @@
 
 mod common;
 
-use std::path::PathBuf;
-
 use common::{fit_calibration, start_empty_node, start_opened_node, unit_vectors};
 use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
 use pipestream_search::config::ShardMap;
@@ -30,6 +28,10 @@ use prost_types::{DescriptorProto, FieldDescriptorProto, FileDescriptorProto, Fi
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
+
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
 
 const DIM: usize = 16;
 const BIT_WIDTH: usize = 4;
@@ -198,13 +200,6 @@ fn bind() -> MappedBind {
 // ---------------------------------------------------------------------
 // Nodes and the coordinator
 // ---------------------------------------------------------------------
-
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("placement-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn config(leaf: Option<i64>, slot_offset: u64) -> NodeConfig {
     NodeConfig {

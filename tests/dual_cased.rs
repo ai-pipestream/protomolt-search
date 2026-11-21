@@ -24,9 +24,15 @@ use pipestream_search::pb::{
     FlushRequest, QueryField,
 };
 use pipestream_search::postings::{Bm25Index, Bm25Reader};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request};
+
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
+
+#[path = "common/ingest.rs"]
+mod ingest;
+use ingest::ingest;
 
 const DOCS: [&str; 4] = [
     "COURT court Court holds\nthe appeal fails",
@@ -34,14 +40,6 @@ const DOCS: [&str; 4] = [
     "court reporter\nnothing else",
     "APPEAL denied\nno court here",
 ];
-
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("dual_cased_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn config(analysis: &str, index_path: Option<PathBuf>) -> pipestream_search::node::NodeConfig {
     pipestream_search::node::NodeConfig {
@@ -63,17 +61,8 @@ fn doc(text: &str) -> AddDocumentsRequest {
     }
 }
 
-async fn ingest(addr: &str, docs: Vec<AddDocumentsRequest>) -> Result<u64, tonic::Status> {
-    let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
-    let (tx, rx) = mpsc::channel(8);
-    for d in docs {
-        tx.send(d).await.unwrap();
-    }
-    drop(tx);
-    client
-        .add_documents(ReceiverStream::new(rx))
-        .await
-        .map(|r| r.into_inner().added)
+async fn ingest_added(addr: &str, docs: Vec<AddDocumentsRequest>) -> Result<u64, tonic::Status> {
+    ingest(addr, docs).await.map(|response| response.added)
 }
 
 fn leg(field: &str, spec: AnalysisSpec) -> QueryField {
@@ -119,7 +108,7 @@ async fn one_analysis_yields_both_identities_and_each_field_answers_its_own() {
     let (addr, node) = start_empty_node(config(&analysis, Some(index_path.clone()))).await;
     let before = calls.load(std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
-        ingest(&addr, DOCS.iter().map(|t| doc(t)).collect())
+        ingest_added(&addr, DOCS.iter().map(|t| doc(t)).collect())
             .await
             .unwrap(),
         4
@@ -235,7 +224,7 @@ async fn two_shards_equal_one_on_the_cased_leg() {
             ..config(&analysis, None)
         })
         .await;
-        ingest(
+        ingest_added(
             &addr,
             DOCS[shard * 2..shard * 2 + 2]
                 .iter()
@@ -248,7 +237,7 @@ async fn two_shards_equal_one_on_the_cased_leg() {
         nodes.push(node);
     }
     let (one_addr, one_node) = start_empty_node(config(&analysis, None)).await;
-    ingest(&one_addr, DOCS.iter().map(|t| doc(t)).collect())
+    ingest_added(&one_addr, DOCS.iter().map(|t| doc(t)).collect())
         .await
         .unwrap();
     let distributed = coordinator(addrs, &analysis);
@@ -282,7 +271,7 @@ async fn the_native_analyzer_produces_the_pair_from_one_pass() {
     let (addr, node) =
         start_empty_node(config(NATIVE_ANALYSIS_BACKEND, Some(index_path.clone()))).await;
     assert_eq!(
-        ingest(&addr, DOCS.iter().map(|t| doc(t)).collect())
+        ingest_added(&addr, DOCS.iter().map(|t| doc(t)).collect())
             .await
             .unwrap(),
         4
@@ -368,7 +357,7 @@ async fn wal_replay_analyzes_each_document_once_and_keeps_the_pair() {
     let backend_req =
         pipestream_search::harness::embedded_backend_request(DIM, BIT_WIDTH, &shift, &scale);
     client.configure_vector_backend(backend_req).await.unwrap();
-    ingest(&addr, DOCS.iter().map(|t| doc(t)).collect())
+    ingest_added(&addr, DOCS.iter().map(|t| doc(t)).collect())
         .await
         .unwrap();
     assert!(
@@ -428,7 +417,7 @@ async fn refusals_name_their_cause() {
     let (addr, node) = start_empty_node(config(&analysis, None)).await;
     let refuse = |request: AddDocumentsRequest| {
         let addr = addr.clone();
-        async move { ingest(&addr, vec![request]).await.unwrap_err() }
+        async move { ingest_added(&addr, vec![request]).await.unwrap_err() }
     };
     let body = refuse(AddDocumentsRequest {
         cased_field: "body".into(),
@@ -502,7 +491,7 @@ async fn refusals_name_their_cause() {
     // capability it lacks, before any document is analyzed.
     let (older, older_mock, older_calls) = start_mock_analysis_without_dual_identity().await;
     let (addr, node) = start_empty_node(config(&older, None)).await;
-    let error = ingest(&addr, vec![doc(DOCS[0])]).await.unwrap_err();
+    let error = ingest_added(&addr, vec![doc(DOCS[0])]).await.unwrap_err();
     assert_eq!(error.code(), Code::FailedPrecondition);
     assert!(
         error
@@ -514,7 +503,7 @@ async fn refusals_name_their_cause() {
     assert_eq!(older_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     // Without a cased field that sidecar serves as before.
     assert_eq!(
-        ingest(
+        ingest_added(
             &addr,
             vec![AddDocumentsRequest {
                 cased_field: String::new(),

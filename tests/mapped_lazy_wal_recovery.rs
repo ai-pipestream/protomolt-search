@@ -1,6 +1,6 @@
 //! End-to-end regression coverage for lazy WAL manifest locking on mapped ingest.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use pipestream_search::analyzer::*;
@@ -16,15 +16,11 @@ use prost::Message as _;
 use prost_types::field_descriptor_proto::{Label, Type};
 use prost_types::{DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet};
 
-const DIM: usize = 8;
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
 
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("mapped_lazy_wal_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
+const DIM: usize = 8;
 
 fn mapped_stream(vectors: &[f32], count: usize) -> Vec<IngestMappedRequest> {
     let fields = [

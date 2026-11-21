@@ -39,6 +39,8 @@ use pipestream_search::source_authority::AuthorityMapSource;
 use raft_kit::Voters;
 use tonic::Code;
 
+use control_adversarial::kit::scratch::scratch_path;
+
 const FLEET_MAP: &str = include_str!("fixtures/fleet/root-map-v10.toml");
 const WORKFLOW: &[u8] = b"migration-owner";
 
@@ -197,11 +199,9 @@ fn fleet_routes() -> (
     u64,
 ) {
     let map = {
-        let path = std::env::temp_dir().join(format!("root-map-v10-{}.toml", std::process::id()));
+        let path = scratch_path(&format!("root-map-v10-{}.toml", std::process::id()));
         std::fs::write(&path, FLEET_MAP).unwrap();
-        let map = load_shard_map(&path).unwrap();
-        let _ = std::fs::remove_file(&path);
-        map
+        load_shard_map(&path).unwrap()
     };
     let tree = map
         .placement

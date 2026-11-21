@@ -23,6 +23,10 @@ use tonic::Request;
 
 use common::{mock::start_mock_analysis, start_empty_node};
 
+#[path = "common/cluster.rs"]
+mod cluster;
+use cluster::{start_shard, ShardGuard, ShardSpec};
+
 const SHARD_DOCS: usize = 4;
 const N_DOCS: usize = 2 * SHARD_DOCS;
 
@@ -43,65 +47,64 @@ fn court_of(id: usize) -> &'static str {
 
 /// Two shards, every doc matching "document", columns per the fns
 /// above. Returns the coordinator plus server handles.
-async fn start_cluster(
+async fn start_fleet(
     materialize: Option<MaterializeSpec>,
     extra_numeric: &[&str],
     extra_integer: &[&str],
-) -> (
-    CoordinatorServiceImpl,
-    Vec<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>>,
-) {
+) -> (CoordinatorServiceImpl, Vec<ShardGuard>) {
     let (analysis, mock) = start_mock_analysis().await;
-    let mut handles = vec![mock];
+    let mut handles = vec![ShardGuard::from(mock)];
     let mut addrs = Vec::new();
     for shard in 0..2usize {
         let mut numeric_fields: Vec<String> = vec!["price".into()];
         numeric_fields.extend(extra_numeric.iter().map(|s| s.to_string()));
         let mut integer_fields: Vec<String> = vec!["year".into()];
         integer_fields.extend(extra_integer.iter().map(|s| s.to_string()));
-        let (addr, handle) = start_empty_node(NodeConfig {
-            slot_offset: (shard * SHARD_DOCS) as u64,
-            analysis_addr: Some(analysis.clone()),
-            numeric_fields,
-            integer_fields,
-            facet_fields: vec!["court".into()],
-            ..Default::default()
+        let docs = (0..SHARD_DOCS)
+            .map(|i| {
+                let id = shard * SHARD_DOCS + i;
+                AddDocumentsRequest {
+                    text: format!("document number {id}"),
+                    numerics: price_of(id)
+                        .map(|v| {
+                            vec![NumericValue {
+                                field: "price".into(),
+                                value: v,
+                            }]
+                        })
+                        .unwrap_or_default(),
+                    integers: year_of(id)
+                        .map(|v| {
+                            vec![IntegerValue {
+                                field: "year".into(),
+                                value: v,
+                            }]
+                        })
+                        .unwrap_or_default(),
+                    facets: vec![FacetValue {
+                        field: "court".into(),
+                        value: court_of(id).into(),
+                    }],
+                    materialize: materialize.clone(),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        let (addr, handle) = start_shard(ShardSpec {
+            config: NodeConfig {
+                slot_offset: (shard * SHARD_DOCS) as u64,
+                analysis_addr: Some(analysis.clone()),
+                numeric_fields,
+                integer_fields,
+                facet_fields: vec!["court".into()],
+                ..Default::default()
+            },
+            backend: None,
+            docs,
+            vectors: Vec::new(),
+            dim: 0,
         })
         .await;
-        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
-        let (tx, rx) = mpsc::channel(16);
-        for i in 0..SHARD_DOCS {
-            let id = shard * SHARD_DOCS + i;
-            tx.send(AddDocumentsRequest {
-                text: format!("document number {id}"),
-                numerics: price_of(id)
-                    .map(|v| {
-                        vec![NumericValue {
-                            field: "price".into(),
-                            value: v,
-                        }]
-                    })
-                    .unwrap_or_default(),
-                integers: year_of(id)
-                    .map(|v| {
-                        vec![IntegerValue {
-                            field: "year".into(),
-                            value: v,
-                        }]
-                    })
-                    .unwrap_or_default(),
-                facets: vec![FacetValue {
-                    field: "court".into(),
-                    value: court_of(id).into(),
-                }],
-                materialize: materialize.clone(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        }
-        drop(tx);
-        client.add_documents(ReceiverStream::new(rx)).await.unwrap();
         addrs.push(addr);
         handles.push(handle);
     }
@@ -168,7 +171,7 @@ fn oracle(expr: &str, id: usize) -> Option<projected_value::Value> {
 /// pair where stock CEL yields a value.
 #[tokio::test]
 async fn projections_agree_with_the_stock_cel_oracle() {
-    let (coordinator, handles) = start_cluster(None, &[], &[]).await;
+    let (coordinator, handles) = start_fleet(None, &[], &[]).await;
     let expressions = [
         "price",
         "year",
@@ -250,7 +253,7 @@ async fn projections_agree_with_the_stock_cel_oracle() {
 /// zero.
 #[tokio::test]
 async fn absence_and_integer_edges_are_absent_not_errors() {
-    let (coordinator, handles) = start_cluster(None, &[], &[]).await;
+    let (coordinator, _handles) = start_fleet(None, &[], &[]).await;
     let rows = run_projections(
         &coordinator,
         vec![
@@ -283,9 +286,6 @@ async fn absence_and_integer_edges_are_absent_not_errors() {
             "doc {id}: i64 overflow is absent, not an error"
         );
     }
-    for h in handles {
-        h.abort();
-    }
 }
 
 /// The conditional layer's deviations, pinned: Kleene logic absorbs
@@ -297,7 +297,7 @@ async fn absence_and_integer_edges_are_absent_not_errors() {
 /// never absent.
 #[tokio::test]
 async fn kleene_absence_and_dictionary_misses_are_pinned() {
-    let (coordinator, handles) = start_cluster(None, &[], &[]).await;
+    let (coordinator, handles) = start_fleet(None, &[], &[]).await;
     let rows = run_projections(
         &coordinator,
         vec![
@@ -366,7 +366,7 @@ async fn math_functions_match_their_pinned_semantics() {
             kind: MaterializeKind::F64 as i32,
         }],
     };
-    let (coordinator, handles) = start_cluster(Some(spec), &["lnp"], &[]).await;
+    let (coordinator, handles) = start_fleet(Some(spec), &["lnp"], &[]).await;
     let rows = run_projections(
         &coordinator,
         vec![
@@ -471,7 +471,7 @@ async fn math_functions_match_their_pinned_semantics() {
 /// doubles, duplicate and empty names.
 #[tokio::test]
 async fn projection_refusals_name_the_problem() {
-    let (coordinator, handles) = start_cluster(None, &[], &[]).await;
+    let (coordinator, handles) = start_fleet(None, &[], &[]).await;
     let cases: [(&str, &str); 10] = [
         ("pricee * 2.0", "no shard has column pricee"),
         ("price + year", "double()"),
@@ -530,7 +530,7 @@ async fn materialized_columns_are_ordinary_columns() {
             },
         ],
     };
-    let (coordinator, handles) = start_cluster(Some(spec), &["price2"], &["decade"]).await;
+    let (coordinator, handles) = start_fleet(Some(spec), &["price2"], &["decade"]).await;
 
     // Project the derived columns back out and check the arithmetic
     // AND the absence propagation (doc 3 has no price, doc 5 no year).
@@ -648,7 +648,7 @@ async fn ternary_materialization_buckets_and_bool_refuses() {
             kind: MaterializeKind::I64 as i32,
         }],
     };
-    let (coordinator, handles) = start_cluster(Some(spec), &[], &["tier"]).await;
+    let (coordinator, handles) = start_fleet(Some(spec), &[], &["tier"]).await;
     let rows = run_projections(&coordinator, vec![projection("t", "tier")])
         .await
         .unwrap();
@@ -731,7 +731,7 @@ async fn ternary_materialization_buckets_and_bool_refuses() {
 /// on shapes whose route does not serve them yet.
 #[tokio::test]
 async fn query_projections_agree_across_shapes() {
-    let (coordinator, handles) = start_cluster(None, &[], &[]).await;
+    let (coordinator, handles) = start_fleet(None, &[], &[]).await;
     let leaf = SelectionQuery {
         node: Some(selection_query::Node::Search(SearchQuery {
             id: "lex".into(),

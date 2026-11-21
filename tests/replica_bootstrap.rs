@@ -39,15 +39,15 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 
-const DOCS: usize = 40;
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
 
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("replica_bootstrap_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
+#[path = "common/ingest.rs"]
+mod ingest;
+use ingest::ingest;
+
+const DOCS: usize = 40;
 
 fn shard_config(index_path: PathBuf) -> NodeConfig {
     NodeConfig {
@@ -104,7 +104,7 @@ async fn client(addr: &str) -> NodeServiceClient<tonic::transport::Channel> {
 }
 
 /// Documents `from..to` with a court facet, then the matching vectors.
-async fn ingest(addr: &str, from: usize, to: usize) {
+async fn ingest_range(addr: &str, from: usize, to: usize) {
     ingest_documents(addr, from, to).await;
     let mut c = client(addr).await;
     let corpus = unit_vectors(to, DIM, 0x5EED_CA11);
@@ -128,29 +128,18 @@ async fn ingest(addr: &str, from: usize, to: usize) {
 }
 
 async fn ingest_documents(addr: &str, from: usize, to: usize) {
-    let mut c = client(addr).await;
-    let (tx, rx) = mpsc::channel(8);
-    tokio::spawn(async move {
-        for i in from..to {
-            let _ = tx
-                .send(AddDocumentsRequest {
-                    text: doc_text(i),
-                    analysis: Some(body_spec()),
-                    facets: vec![FacetValue {
-                        field: "court".into(),
-                        value: COURTS[i % COURTS.len()].into(),
-                    }],
-                    ..Default::default()
-                })
-                .await;
-        }
-    });
-    let added = c
-        .add_documents(ReceiverStream::new(rx))
-        .await
-        .unwrap()
-        .into_inner()
-        .added;
+    let docs = (from..to)
+        .map(|i| AddDocumentsRequest {
+            text: doc_text(i),
+            analysis: Some(body_spec()),
+            facets: vec![FacetValue {
+                field: "court".into(),
+                value: COURTS[i % COURTS.len()].into(),
+            }],
+            ..Default::default()
+        })
+        .collect();
+    let added = ingest(addr, docs).await.unwrap().added;
     assert_eq!(added as usize, to - from);
 }
 
@@ -299,7 +288,7 @@ async fn a_replica_bootstraps_from_the_primary_and_takes_over() {
         ))
         .await
         .unwrap();
-    ingest(&addr_a, 0, DOCS).await;
+    ingest_range(&addr_a, 0, DOCS).await;
     flush(&addr_a).await;
 
     // The coordinator over s0 at A, with a durable control plane that

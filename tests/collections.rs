@@ -6,8 +6,6 @@
 
 mod common;
 
-use std::path::PathBuf;
-
 use common::start_empty_node;
 use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
 use pipestream_search::collections::{ClusterControlSet, CollectionSet};
@@ -24,9 +22,15 @@ use pipestream_search::pb::{
     ReportShardRequest, ShardReplicaState,
 };
 use pipestream_search::wal::{self, WalManifest};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request};
+
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
+
+#[path = "common/ingest.rs"]
+mod ingest;
+use ingest::ingest;
 
 const CORPUS_A: [&str; 3] = ["court one", "court two", "court three"];
 const CORPUS_B: [&str; 3] = ["court only", "other doc", "third doc"];
@@ -39,24 +43,17 @@ fn config(collection: &str) -> NodeConfig {
     }
 }
 
-async fn ingest(addr: &str, docs: &[&str], collection: &str) -> Result<u64, tonic::Status> {
-    let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
-    let (tx, rx) = mpsc::channel(8);
-    for text in docs {
-        tx.send(AddDocumentsRequest {
+async fn ingest_into(addr: &str, docs: &[&str], collection: &str) -> Result<u64, tonic::Status> {
+    let requests = docs
+        .iter()
+        .map(|text| AddDocumentsRequest {
             text: text.to_string(),
             analysis: Some(body_spec()),
             collection: collection.to_string(),
             ..Default::default()
         })
-        .await
-        .unwrap();
-    }
-    drop(tx);
-    client
-        .add_documents(ReceiverStream::new(rx))
-        .await
-        .map(|r| r.into_inner().added)
+        .collect();
+    ingest(addr, requests).await.map(|response| response.added)
 }
 
 fn coordinator(addr: &str, collection: &str) -> CoordinatorServiceImpl {
@@ -110,8 +107,8 @@ async fn fleet() -> Fleet {
     let (a, ha) = start_empty_node(config("a")).await;
     let (b, hb) = start_empty_node(config("b")).await;
     let (empty, he) = start_empty_node(config("empty")).await;
-    assert_eq!(ingest(&a, &CORPUS_A, "").await.unwrap(), 3);
-    assert_eq!(ingest(&b, &CORPUS_B, "b").await.unwrap(), 3);
+    assert_eq!(ingest_into(&a, &CORPUS_A, "").await.unwrap(), 3);
+    assert_eq!(ingest_into(&b, &CORPUS_B, "b").await.unwrap(), 3);
     Fleet {
         a,
         b,
@@ -249,7 +246,7 @@ async fn a_node_serves_one_collection_and_says_so() {
     assert_eq!(health.collection, "a");
     // A document naming another collection refuses; the node's own name
     // and no name are both accepted.
-    let error = ingest(&f.a, &["stray"], "b").await.unwrap_err();
+    let error = ingest_into(&f.a, &["stray"], "b").await.unwrap_err();
     assert_eq!(error.code(), Code::InvalidArgument);
     assert!(
         error
@@ -258,11 +255,11 @@ async fn a_node_serves_one_collection_and_says_so() {
         "{}",
         error.message()
     );
-    assert_eq!(ingest(&f.a, &["court four"], "a").await.unwrap(), 1);
-    assert_eq!(ingest(&f.a, &["court five"], "").await.unwrap(), 1);
+    assert_eq!(ingest_into(&f.a, &["court four"], "a").await.unwrap(), 1);
+    assert_eq!(ingest_into(&f.a, &["court five"], "").await.unwrap(), 1);
     // A node outside any collection refuses a named document.
     let (unnamed, hu) = start_empty_node(config("")).await;
-    let error = ingest(&unnamed, &["stray"], "a").await.unwrap_err();
+    let error = ingest_into(&unnamed, &["stray"], "a").await.unwrap_err();
     assert!(
         error.message().contains("serves no named collection"),
         "{}",
@@ -288,13 +285,6 @@ async fn a_node_serves_one_collection_and_says_so() {
     for h in f.handles {
         h.abort();
     }
-}
-
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("collections-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
 }
 
 fn manifest(collection: &str) -> WalManifest {
@@ -330,7 +320,7 @@ async fn the_wal_manifest_carries_the_collection_and_refuses_a_foreign_one() {
         ..config("a")
     })
     .await;
-    assert_eq!(ingest(&addr, &CORPUS_A, "").await.unwrap(), 3);
+    assert_eq!(ingest_into(&addr, &CORPUS_A, "").await.unwrap(), 3);
     // Flush is the durability point: the log is fsynced before the
     // index images are written, so its records are readable after.
     NodeServiceClient::connect(addr.clone())

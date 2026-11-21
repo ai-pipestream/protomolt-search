@@ -30,19 +30,16 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
+
 const DIM: usize = 16;
 const BIT_WIDTH: usize = 4;
 const N: usize = 360;
 /// Rows per sealed segment of the source: several segments per bucket.
 const SEAL: usize = 48;
 const BLOCK: usize = 24;
-
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("transplant-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn node(name: &str, cel: Option<&str>) -> PlacementNodeConfig {
     PlacementNodeConfig {

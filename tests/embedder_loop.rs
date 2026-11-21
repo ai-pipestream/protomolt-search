@@ -12,7 +12,6 @@
 
 mod common;
 
-use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use common::fit_calibration;
@@ -22,6 +21,10 @@ use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, FusionMode, HybridLegOptions, HybridSearchRequest,
 };
 use protomolt_embedder::StaticEmbedder;
+
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::{scratch_path, ScratchPath};
 
 const DIM: usize = 32;
 const BIT_WIDTH: usize = 4;
@@ -42,12 +45,12 @@ const WORDS: [(&str, usize, usize); 9] = [
     ("loan", 0, 15),
 ];
 
-fn synthetic_model_dir() -> PathBuf {
+fn synthetic_model_dir() -> ScratchPath {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
+    let dir = scratch_path(&format!(
         "protomolt-embedder-loop-{}-{nonce}",
         std::process::id()
     ));
@@ -216,5 +219,4 @@ async fn embed_ingest_hybrid_loop() {
     assert_eq!(fused.hits[0].bm25_rank, Some(1));
 
     drop(runtime);
-    std::fs::remove_dir_all(&model_dir).ok();
 }

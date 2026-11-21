@@ -10,19 +10,14 @@
 mod common;
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
 
 use pipestream_search::node::{segments_root, NodeConfig, NodeServiceImpl};
 use pipestream_search::postings::{AnalyzedDoc, Bm25Store};
 use pipestream_search::segments::{SegmentCatalog, SegmentSetManifest};
 
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("recovery_io_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
 
 fn is_effective_root() -> bool {
     // SAFETY: `geteuid` is thread-safe and takes no arguments.

@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+use crate::scratch::{scratch_path, ScratchPath};
+
 #[derive(Debug)]
 pub struct TurboOutcome {
     pub baseline: (u32, u32, u32),
@@ -12,23 +14,17 @@ pub struct TurboOutcome {
     pub reversed_fingerprint: u64,
 }
 
-struct ProbeDir(PathBuf);
+struct ProbeDir(ScratchPath);
 
 impl ProbeDir {
     fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = scratch_path(&format!(
             "turbo-glossary-probe-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         Self(dir)
-    }
-}
-
-impl Drop for ProbeDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

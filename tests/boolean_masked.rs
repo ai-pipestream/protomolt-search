@@ -27,19 +27,20 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
+
+#[path = "common/ingest.rs"]
+mod ingest;
+use ingest::ingest;
+
 const DIM: usize = 16;
 const BIT_WIDTH: usize = 4;
 const ROWS: usize = 3_000;
 /// Rows per sealed segment: six segments plus no tail.
 const SEAL: usize = 500;
 const BLOCK: usize = 250;
-
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("boolmask-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn config(index_path: PathBuf) -> NodeConfig {
     NodeConfig {
@@ -68,7 +69,7 @@ fn corpus() -> Vec<f32> {
     unit_vectors(ROWS, DIM, 0xB00_1EA4)
 }
 
-async fn ingest(addr: &str) {
+async fn load_shard(addr: &str) {
     let vectors = corpus();
     let sample = &vectors[..vectors.len().min(64 * DIM)];
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, sample);
@@ -82,18 +83,14 @@ async fn ingest(addr: &str) {
     for block in 0..ROWS.div_ceil(BLOCK) {
         let start = block * BLOCK;
         let end = (start + BLOCK).min(ROWS);
-        let (tx, rx) = mpsc::channel(BLOCK);
-        for i in start..end {
-            tx.send(AddDocumentsRequest {
+        let docs = (start..end)
+            .map(|i| AddDocumentsRequest {
                 text: text(i),
                 analysis: Some(body_spec()),
                 ..Default::default()
             })
-            .await
-            .unwrap();
-        }
-        drop(tx);
-        client.add_documents(ReceiverStream::new(rx)).await.unwrap();
+            .collect();
+        ingest(addr, docs).await.unwrap();
         let (tx, rx) = mpsc::channel(2);
         tx.send(AddVectorsRequest {
             materialized_rows: Vec::new(),
@@ -182,7 +179,7 @@ fn bits(hits: &[QueryHit]) -> Vec<(u64, u32, u32)> {
 async fn the_signal_batch_moves_no_answer() {
     let dir = tempdir("batch");
     let (addr, handle) = start_empty_node(config(dir.join("bool.tv"))).await;
-    ingest(&addr).await;
+    load_shard(&addr).await;
     let c = coordinator(&addr);
     assert_eq!(
         c.signal_batch(),

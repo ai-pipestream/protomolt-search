@@ -9,8 +9,6 @@
 
 mod common;
 
-use std::path::PathBuf;
-
 use common::mock::{start_mock_analysis_metered, start_mock_analysis_without_sentences};
 use common::start_empty_node;
 use pipestream_search::analyzer::{
@@ -30,6 +28,14 @@ use pipestream_search::reshard;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request};
+
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
+
+#[path = "common/ingest.rs"]
+mod ingest;
+use ingest::ingest;
 
 /// Lines are sentences under the newline detector. Document 4 is one
 /// sentence far wider than any snippet budget; document 3 matches
@@ -58,23 +64,16 @@ fn config(slot_offset: u64, sentences: bool) -> NodeConfig {
     }
 }
 
-async fn ingest(addr: &str, docs: &[&str]) -> Result<u64, tonic::Status> {
-    let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
-    let (tx, rx) = mpsc::channel(8);
-    for text in docs {
-        tx.send(AddDocumentsRequest {
+async fn ingest_texts(addr: &str, docs: &[&str]) -> Result<u64, tonic::Status> {
+    let requests = docs
+        .iter()
+        .map(|text| AddDocumentsRequest {
             text: text.to_string(),
             analysis: Some(body_spec()),
             ..Default::default()
         })
-        .await
-        .unwrap();
-    }
-    drop(tx);
-    client
-        .add_documents(ReceiverStream::new(rx))
-        .await
-        .map(|r| r.into_inner().added)
+        .collect();
+    ingest(addr, requests).await.map(|response| response.added)
 }
 
 fn coordinator(addrs: Vec<String>, analysis: &str) -> CoordinatorServiceImpl {
@@ -175,9 +174,12 @@ type NodeHandle = tokio::task::JoinHandle<Result<(), tonic::transport::Error>>;
 async fn fleet(sentences: bool) -> (CoordinatorServiceImpl, Vec<NodeHandle>) {
     let (a, ha) = start_empty_node(config(0, sentences)).await;
     let (b, hb) = start_empty_node(config(SPLIT as u64, sentences)).await;
-    assert_eq!(ingest(&a, &CORPUS[..SPLIT]).await.unwrap(), SPLIT as u64);
     assert_eq!(
-        ingest(&b, &CORPUS[SPLIT..]).await.unwrap(),
+        ingest_texts(&a, &CORPUS[..SPLIT]).await.unwrap(),
+        SPLIT as u64
+    );
+    assert_eq!(
+        ingest_texts(&b, &CORPUS[SPLIT..]).await.unwrap(),
         (CORPUS.len() - SPLIT) as u64
     );
     (
@@ -563,7 +565,7 @@ async fn multi_field_hits_snippet_the_stored_body_only() {
 async fn distributed_snippets_equal_the_monolith() {
     let (fleet_c, handles) = fleet(true).await;
     let (m, hm) = start_empty_node(config(0, true)).await;
-    ingest(&m, &CORPUS).await.unwrap();
+    ingest_texts(&m, &CORPUS).await.unwrap();
     let mono = coordinator(vec![m], NATIVE_ANALYSIS_BACKEND);
     for (text, spec) in [
         ("court appeal", spec(HighlightMode::Sentence, 0, 0)),
@@ -735,7 +737,7 @@ async fn highlighting_adds_no_analysis_call_and_a_layerless_sidecar_refuses_inge
         ..config(0, true)
     })
     .await;
-    let error = ingest(&addr, &CORPUS[..1]).await.unwrap_err();
+    let error = ingest_texts(&addr, &CORPUS[..1]).await.unwrap_err();
     assert_eq!(error.code(), Code::FailedPrecondition);
     assert!(
         error.message().contains("sentence field \"body\"")
@@ -839,13 +841,6 @@ async fn offsets_predate_normalization_and_compose_with_lineage() {
         }
     }
     handle.abort();
-}
-
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("highlight-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
 }
 
 #[allow(clippy::type_complexity)]
@@ -963,7 +958,7 @@ async fn snippets_survive_flush_reopen_and_wal_replay() {
         &scale,
     );
     client.configure_vector_backend(backend_req).await.unwrap();
-    ingest(&addr, &CORPUS).await.unwrap();
+    ingest_texts(&addr, &CORPUS).await.unwrap();
     let c = coordinator(vec![addr.clone()], NATIVE_ANALYSIS_BACKEND);
     assert!(
         client

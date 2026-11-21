@@ -6,6 +6,10 @@ use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::*;
 use tonic::transport::Channel;
 
+#[path = "common/ingest.rs"]
+mod ingest;
+use ingest::ingest;
+
 const ROWS: [(&str, &str, &str); 4] = [
     ("alpha alpha", "red red", "public"),
     ("alpha secret secret secret", "private private", "private"),
@@ -116,32 +120,28 @@ async fn stats(addr: &str, visibility: Option<WireVisibility>) -> TermStatsRespo
     actual
 }
 
-async fn ingest(addr: &str, rows: &[(&str, &str, &str)]) {
-    let mut client = NodeServiceClient::connect(addr.to_owned()).await.unwrap();
-    client
-        .add_documents(tokio_stream::iter(
-            rows.iter()
-                .map(|(body, title, audience)| AddDocumentsRequest {
-                    text: if body.is_empty() { " " } else { body }.to_string(),
+async fn ingest_rows(addr: &str, rows: &[(&str, &str, &str)]) {
+    let requests = rows
+        .iter()
+        .map(|(body, title, audience)| AddDocumentsRequest {
+            text: if body.is_empty() { " " } else { body }.to_string(),
+            analysis: Some(body_spec()),
+            fields: (!title.is_empty())
+                .then(|| DocumentField {
+                    field: "title".into(),
+                    text: (*title).into(),
                     analysis: Some(body_spec()),
-                    fields: (!title.is_empty())
-                        .then(|| DocumentField {
-                            field: "title".into(),
-                            text: (*title).into(),
-                            analysis: Some(body_spec()),
-                        })
-                        .into_iter()
-                        .collect(),
-                    facets: vec![FacetValue {
-                        field: "audience".into(),
-                        value: (*audience).into(),
-                    }],
-                    ..Default::default()
                 })
-                .collect::<Vec<_>>(),
-        ))
-        .await
-        .unwrap();
+                .into_iter()
+                .collect(),
+            facets: vec![FacetValue {
+                field: "audience".into(),
+                value: (*audience).into(),
+            }],
+            ..Default::default()
+        })
+        .collect();
+    ingest(addr, requests).await.unwrap();
 }
 
 fn config() -> NodeConfig {
@@ -157,8 +157,8 @@ fn config() -> NodeConfig {
 async fn visibility_statistics_equal_a_physically_restricted_corpus() {
     let (all, all_handle) = common::start_empty_node(config()).await;
     let (visible, visible_handle) = common::start_empty_node(config()).await;
-    ingest(&all, &ROWS).await;
-    ingest(&visible, &[ROWS[0], ROWS[2], ROWS[3]]).await;
+    ingest_rows(&all, &ROWS).await;
+    ingest_rows(&visible, &[ROWS[0], ROWS[2], ROWS[3]]).await;
     let scoped = stats(&all, Some(visibility("public"))).await;
     let reference = stats(&visible, None).await;
     assert_eq!(scoped.doc_count, reference.doc_count);
@@ -208,7 +208,7 @@ async fn distinct_views_cannot_share_cache_entries_or_ignore_a_missing_echo() {
     use pipestream_search::stats_cache::StatsCache;
     use pipestream_search::visibility::VisibilityScope;
     let (addr, handle) = common::start_empty_node(config()).await;
-    ingest(&addr, &ROWS).await;
+    ingest_rows(&addr, &ROWS).await;
     let cache = StatsCache::new(1);
     for audience in [None, Some("public"), Some("private"), Some("nobody")] {
         let req = request(audience.map(visibility));
@@ -256,7 +256,7 @@ async fn distinct_views_cannot_share_cache_entries_or_ignore_a_missing_echo() {
             .doc_count,
         2
     );
-    ingest(&addr, &[("alpha", "red", "public")]).await;
+    ingest_rows(&addr, &[("alpha", "red", "public")]).await;
     let changed = stats(&addr, None).await;
     cache.store(0, &req.terms, &req.fields, &changed).unwrap();
     assert!(cache.lookup_body_scoped(0, &req.terms, &scope).is_none());
@@ -274,8 +274,8 @@ async fn relay_levels_compose_the_same_visibility_and_reject_legacy_shares() {
         ..config()
     })
     .await;
-    ingest(&a, &ROWS[..2]).await;
-    ingest(&b, &ROWS[2..]).await;
+    ingest_rows(&a, &ROWS[..2]).await;
+    ingest_rows(&b, &ROWS[2..]).await;
     let (one, _, one_handle) = start_relay(vec![a.clone(), b.clone()]).await;
     let (two, _, two_handle) = start_relay(vec![one.clone()]).await;
     for audience in ["public", "private", "nobody"] {
@@ -369,7 +369,7 @@ async fn visibility_survives_tombstones_flush_compaction_and_reopen() {
         .await
         .unwrap();
     for (i, rows) in ROWS.chunks(2).enumerate() {
-        ingest(&addr, rows).await;
+        ingest_rows(&addr, rows).await;
         client
             .add_vectors(tokio_stream::iter([AddVectorsRequest {
                 materialized_rows: Vec::new(),
@@ -447,7 +447,7 @@ async fn version_probe_carries_the_version_and_rejects_statistics_inputs() {
         ..config()
     })
     .await;
-    ingest(&addr, &ROWS).await;
+    ingest_rows(&addr, &ROWS).await;
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     let probe = client
         .term_stats(TermStatsRequest {

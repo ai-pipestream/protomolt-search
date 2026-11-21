@@ -2,7 +2,6 @@
 
 mod common;
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pipestream_search::coordinator::CoordinatorServiceImpl;
@@ -13,17 +12,21 @@ use pipestream_search::pb::{ScoreSpladeRequest, SpladeTermWeight};
 use pipestream_search::postings::{AnalyzedDoc, AnalyzedField, Bm25Store};
 use tonic::{Code, Request};
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::{scratch_path, ScratchPath};
+
 struct Fixture {
-    root: PathBuf,
     node: NodeServiceImpl,
     addr: String,
     server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    _root: ScratchPath,
 }
 
 impl Fixture {
     async fn new(max_k: u32) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch_path(&format!(
             "splade-limits-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
@@ -75,10 +78,10 @@ impl Fixture {
                 .await
         });
         Self {
-            root,
             node,
             addr,
             server,
+            _root: root,
         }
     }
 }
@@ -86,7 +89,6 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.server.abort();
-        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 

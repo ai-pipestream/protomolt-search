@@ -38,18 +38,16 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request};
 
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
+
+#[path = "common/ingest.rs"]
+mod ingest;
+use ingest::ingest;
+
 const DOCS: usize = 24;
 const SLOT: u64 = 1_000;
-
-fn tempdir(tag: &str) -> PathBuf {
-    // CARGO_TARGET_TMPDIR lives under target/ (a real disk), not the
-    // tmpfs /tmp — index files in tests must not consume RAM.
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("snapshot_repo_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn config(index_path: PathBuf) -> NodeConfig {
     NodeConfig {
@@ -93,31 +91,21 @@ async fn seed(addr: &str) {
 
 /// Ingest documents `from..to` (text plus a court facet) and the
 /// matching vectors, one row each, so both layouts stay aligned.
-async fn ingest(addr: &str, from: usize, to: usize) {
-    let mut c = client(addr).await;
-    let (tx, rx) = mpsc::channel(8);
-    tokio::spawn(async move {
-        for i in from..to {
-            tx.send(AddDocumentsRequest {
-                text: doc_text(i),
-                analysis: Some(body_spec()),
-                facets: vec![FacetValue {
-                    field: "court".into(),
-                    value: COURTS[i % COURTS.len()].into(),
-                }],
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        }
-    });
-    let added = c
-        .add_documents(ReceiverStream::new(rx))
-        .await
-        .unwrap()
-        .into_inner()
-        .added;
+async fn ingest_range(addr: &str, from: usize, to: usize) {
+    let docs = (from..to)
+        .map(|i| AddDocumentsRequest {
+            text: doc_text(i),
+            analysis: Some(body_spec()),
+            facets: vec![FacetValue {
+                field: "court".into(),
+                value: COURTS[i % COURTS.len()].into(),
+            }],
+            ..Default::default()
+        })
+        .collect();
+    let added = ingest(addr, docs).await.unwrap().added;
     assert_eq!(added as usize, to - from);
+    let mut c = client(addr).await;
     let corpus = unit_vectors(to, DIM, 0x5EED_CA11);
     let (tx, rx) = mpsc::channel(8);
     tokio::spawn(async move {
@@ -289,9 +277,9 @@ async fn source_shard(
     let path = dir.join("source.tv");
     let (addr, handle) = start_empty_node(config(path.clone())).await;
     seed(&addr).await;
-    ingest(&addr, 0, DOCS / 2).await;
+    ingest_range(&addr, 0, DOCS / 2).await;
     flush(&addr).await;
-    ingest(&addr, DOCS / 2, DOCS).await;
+    ingest_range(&addr, DOCS / 2, DOCS).await;
     flush(&addr).await;
     (addr, handle, path)
 }
@@ -957,7 +945,7 @@ async fn the_manifest_cutoff_is_where_replication_resumes() {
     .await
     .unwrap();
     // The primary moves on after the export.
-    ingest(&primary, DOCS, DOCS + 6).await;
+    ingest_range(&primary, DOCS, DOCS + 6).await;
     flush(&primary).await;
     let ahead = health(&primary).await;
     assert_eq!(ahead.num_vectors, (DOCS + 6) as u64);

@@ -29,6 +29,14 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
+
+#[path = "common/ingest.rs"]
+mod ingest;
+use ingest::ingest;
+
 const DIM: usize = 16;
 const BIT_WIDTH: usize = 4;
 /// Rows per year, and the seal bound: one sealed segment per year.
@@ -37,13 +45,6 @@ const YEARS: [i64; 3] = [2000, 2001, 2002];
 /// The three full years plus the one-row 2003 tail, sealed by the flush
 /// after ingest.
 const SEALED: u32 = 4;
-
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("segprune-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn config(index_path: PathBuf, segment_pruning: bool) -> NodeConfig {
     NodeConfig {
@@ -96,7 +97,7 @@ async fn reopen(dir: &std::path::Path, segment_pruning: bool) -> Served {
 
 /// Ingest the corpus in blocks of `PER_YEAR` documents followed by their
 /// vectors, so the tail seals with both counts agreeing at every bound.
-async fn ingest(addr: &str) {
+async fn load_shard(addr: &str) {
     let all = rows();
     let vectors = corpus();
     let sample = &vectors[..vectors.len().min(8 * DIM)];
@@ -109,9 +110,9 @@ async fn ingest(addr: &str) {
         .await
         .unwrap();
     for (block, chunk) in all.chunks(PER_YEAR).enumerate() {
-        let (tx, rx) = mpsc::channel(8);
-        for (year, text, court) in chunk {
-            tx.send(AddDocumentsRequest {
+        let docs = chunk
+            .iter()
+            .map(|(year, text, court)| AddDocumentsRequest {
                 text: text.clone(),
                 analysis: Some(body_spec()),
                 facets: vec![FacetValue {
@@ -124,11 +125,8 @@ async fn ingest(addr: &str) {
                 }],
                 ..Default::default()
             })
-            .await
-            .unwrap();
-        }
-        drop(tx);
-        client.add_documents(ReceiverStream::new(rx)).await.unwrap();
+            .collect();
+        ingest(addr, docs).await.unwrap();
         let start = block * PER_YEAR * DIM;
         let end = (start + chunk.len() * DIM).min(vectors.len());
         let (tx, rx) = mpsc::channel(2);
@@ -345,7 +343,7 @@ fn cases() -> Vec<(&'static str, SelectionQuery, (u32, u32))> {
 async fn a_year_filter_prunes_the_segments_it_cannot_match_on_every_route() {
     let dir = tempdir("routes");
     let (addr, handle) = start(&dir, true).await;
-    ingest(&addr).await;
+    load_shard(&addr).await;
     let set =
         pipestream_search::segments::OpenedSegmentSet::open(segments_root(&dir.join("prune.tv")))
             .unwrap();
@@ -440,7 +438,7 @@ async fn a_year_filter_prunes_the_segments_it_cannot_match_on_every_route() {
 async fn a_segment_without_a_summary_is_never_pruned() {
     let dir = tempdir("stripped");
     let (addr, handle) = start(&dir, true).await;
-    ingest(&addr).await;
+    load_shard(&addr).await;
     handle.abort();
     // Strip the summary from the middle segment in the set manifest and
     // its own file, as a segment sealed before summaries existed reads.
@@ -483,7 +481,7 @@ async fn a_segment_without_a_summary_is_never_pruned() {
 async fn facets_aggregation_browse_and_the_stream_report_the_counts() {
     let dir = tempdir("shard-routes");
     let (addr, handle) = start(&dir, true).await;
-    ingest(&addr).await;
+    load_shard(&addr).await;
     let c = coordinator(&addr);
 
     // Facets over a filtered match set on the public BM25 route.

@@ -5,7 +5,7 @@
 
 mod common;
 
-use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use common::{fit_calibration, start_empty_node, unit_vectors};
@@ -31,48 +31,59 @@ use pipestream_search::security::{PrincipalConfig, Principals};
 use prost::Message;
 use prost_types::field_descriptor_proto::{Label, Type};
 use prost_types::{DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet};
-use std::sync::Arc;
 use tokio_stream::StreamExt;
 use tonic::Request;
+
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::{scratch_path, ScratchPath};
 
 const DIM: usize = 32;
 const SHARD_ROWS: usize = 3;
 
-fn lexical_query(text: &str) -> QueryRequest {
+fn single_leaf_query(
+    req_id: &str,
+    leaf_id: &str,
+    k: u32,
+    query: search_query::Query,
+) -> QueryRequest {
     QueryRequest {
-        request_id: "embedded-parity".into(),
-        k: 10,
-        selection_k: 10,
+        request_id: req_id.into(),
+        k,
+        selection_k: k,
         selection: Some(SelectionQuery {
             node: Some(selection_query::Node::Search(SearchQuery {
-                id: "lexical".into(),
-                query: Some(search_query::Query::Lexical(LexicalQuery {
-                    text: text.into(),
-                    analysis: Some(body_spec()),
-                    ..Default::default()
-                })),
+                id: leaf_id.into(),
+                query: Some(query),
             })),
         }),
         ..Default::default()
     }
 }
 
-fn dense_query(vector: Vec<f32>) -> QueryRequest {
-    QueryRequest {
-        request_id: "embedded-dense".into(),
-        k: 4,
-        selection_k: 4,
-        selection: Some(SelectionQuery {
-            node: Some(selection_query::Node::Search(SearchQuery {
-                id: "dense".into(),
-                query: Some(search_query::Query::Dense(DenseQuery {
-                    vector,
-                    ..Default::default()
-                })),
-            })),
+fn lexical_query(text: &str) -> QueryRequest {
+    single_leaf_query(
+        "embedded-parity",
+        "lexical",
+        10,
+        search_query::Query::Lexical(LexicalQuery {
+            text: text.into(),
+            analysis: Some(body_spec()),
+            ..Default::default()
         }),
-        ..Default::default()
-    }
+    )
+}
+
+fn dense_query(vector: Vec<f32>) -> QueryRequest {
+    single_leaf_query(
+        "embedded-dense",
+        "dense",
+        4,
+        search_query::Query::Dense(DenseQuery {
+            vector,
+            ..Default::default()
+        }),
+    )
 }
 
 fn local_shards() -> Vec<EmbeddedShardConfig> {
@@ -99,49 +110,36 @@ fn named_shards(names: &[&str]) -> Vec<EmbeddedShardConfig> {
 }
 
 fn named_principals() -> Arc<Principals> {
+    let res = |workspace: &str, collection: &str| CollectionResource {
+        workspace: workspace.into(),
+        collection: collection.into(),
+    };
+    let grant = |principal: &str, workspace: &str, collection: &str| CollectionGrant {
+        principal: principal.into(),
+        workspace: workspace.into(),
+        collection: collection.into(),
+        actions: vec![AccessAction::Search as i32],
+        ..Default::default()
+    };
     let policy = AccessPolicy {
         format_version: 3,
         revision: 1,
-        resources: vec![
-            CollectionResource {
-                workspace: "workspace-a".into(),
-                collection: "books".into(),
-            },
-            CollectionResource {
-                workspace: "workspace-b".into(),
-                collection: String::new(),
-            },
-        ],
+        resources: vec![res("workspace-a", "books"), res("workspace-b", "")],
         grants: vec![
-            CollectionGrant {
-                principal: "books-reader".into(),
-                workspace: "workspace-a".into(),
-                collection: "books".into(),
-                actions: vec![AccessAction::Search as i32],
-                ..Default::default()
-            },
-            CollectionGrant {
-                principal: "unnamed-reader".into(),
-                workspace: "workspace-b".into(),
-                collection: String::new(),
-                actions: vec![AccessAction::Search as i32],
-                ..Default::default()
-            },
+            grant("books-reader", "workspace-a", "books"),
+            grant("unnamed-reader", "workspace-b", ""),
         ],
+    };
+    let pc = |name: &str, token: &str| PrincipalConfig {
+        name: name.into(),
+        token: token.into(),
+        ..Default::default()
     };
     let authority = Arc::new(PolicyAuthority::new(policy).unwrap());
     Arc::new(
         Principals::from_configs(&[
-            PrincipalConfig {
-                name: "books-reader".into(),
-                token: "books-reader-token-0123456789".into(),
-                ..Default::default()
-            },
-            PrincipalConfig {
-                name: "unnamed-reader".into(),
-                token: "unnamed-reader-token-0123456789".into(),
-                ..Default::default()
-            },
+            pc("books-reader", "books-reader-token-0123456789"),
+            pc("unnamed-reader", "unnamed-reader-token-0123456789"),
         ])
         .unwrap()
         .with_authorizer(authority),
@@ -550,7 +548,6 @@ async fn local_mutations_and_persistence_survive_reopen() {
     .err()
     .expect("create must refuse existing private data");
     assert!(matches!(refusal, EmbeddedError::ExistingData(_)));
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
@@ -690,13 +687,14 @@ fn record_document(id: &str, body: &str, embedding: &[f32]) -> Vec<u8> {
     out
 }
 
-fn unique_temp_dir(label: &str) -> PathBuf {
+fn unique_temp_dir(label: &str) -> ScratchPath {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!(
+    let tag = format!(
         "protomolt-search-embedded-{label}-{}-{nonce}",
         std::process::id()
-    ))
+    );
+    scratch_path(&tag)
 }

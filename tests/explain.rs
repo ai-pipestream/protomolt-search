@@ -9,23 +9,23 @@ mod common;
 
 use pipestream_search::coordinator::CoordinatorServiceImpl;
 use pipestream_search::node::NodeConfig;
-use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     score_signal, search_query, selection_query, selection_score_strategy, AddDocumentsRequest,
-    AddVectorsRequest, BlendScore, BooleanQuery, BoostQuery, CascadeScore, CompositeScoreOperation,
-    CompositeScorer, CompositeSearchStrategy, DecomposedScore, DenseQuery, DenseScoreMode,
-    DocLineage, Explanation, FacetValue, FilterQuery, IntegerValue, LexicalQuery, QueryHit,
-    QueryRequest, QueryResponse, QuerySort, QueryStreamRequest, RrfScore, ScoreDimension, ScoreOp,
-    ScoreSignal, ScoreStage, SearchQuery, SelectionOperator, SelectionQuery,
-    SelectionScoreStrategy, TermPrefix,
+    BlendScore, BooleanQuery, BoostQuery, CascadeScore, CompositeScoreOperation, CompositeScorer,
+    CompositeSearchStrategy, DecomposedScore, DenseQuery, DenseScoreMode, DocLineage, Explanation,
+    FacetValue, FilterQuery, IntegerValue, LexicalQuery, QueryHit, QueryRequest, QueryResponse,
+    QuerySort, QueryStreamRequest, RrfScore, ScoreDimension, ScoreOp, ScoreSignal, ScoreStage,
+    SearchQuery, SelectionOperator, SelectionQuery, SelectionScoreStrategy, TermPrefix,
 };
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 
-use common::{fit_calibration, start_empty_node, unit_vectors};
+use common::{fit_calibration, unit_vectors};
 use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
+
+#[path = "common/cluster.rs"]
+mod cluster;
+use cluster::{start_shard, ShardGuard, ShardSpec};
 
 const DIM: usize = 64;
 const SHARD_DOCS: usize = 4;
@@ -35,75 +35,59 @@ const COURTS: [&str; 3] = ["ca9", "ca2", "scotus"];
 /// The query adapter's corpus: even docs mention "zebra", every doc
 /// carries `year = i`; vectors are the seeded unit corpus and the
 /// query vector is doc 0's own.
-async fn start_cluster() -> (
-    CoordinatorServiceImpl,
-    Vec<f32>,
-    Vec<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>>,
-) {
+async fn start_fleet() -> (CoordinatorServiceImpl, Vec<f32>, Vec<ShardGuard>) {
     let analysis = NATIVE_ANALYSIS_BACKEND.to_string();
     let corpus = unit_vectors(N_DOCS, DIM, 0xC0FE_0001);
     let (shift, scale) = fit_calibration(DIM, 4, &corpus);
     let mut handles = Vec::new();
     let mut addrs = Vec::new();
     for shard in 0..2usize {
-        let (addr, handle) = start_empty_node(NodeConfig {
-            slot_offset: (shard * SHARD_DOCS) as u64,
-            analysis_addr: Some(analysis.clone()),
-            integer_fields: vec!["year".into()],
-            facet_fields: vec!["court".into()],
-            ..Default::default()
-        })
-        .await;
-        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
-        client
-            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-                DIM, 4, &shift, &scale,
-            ))
-            .await
-            .unwrap();
-        let (tx, rx) = mpsc::channel(16);
-        for i in 0..SHARD_DOCS {
-            let id = shard * SHARD_DOCS + i;
-            let text = if id.is_multiple_of(2) {
-                format!("zebra document {id} zebra")
-            } else {
-                format!("plain document {id}")
-            };
-            tx.send(AddDocumentsRequest {
-                text,
-                analysis: Some(body_spec()),
-                integers: vec![IntegerValue {
-                    field: "year".into(),
-                    value: id as i64,
-                }],
-                facets: vec![FacetValue {
-                    field: "court".into(),
-                    value: COURTS[id % 3].into(),
-                }],
-                lineage: Some(DocLineage {
-                    parent_id: (id / 2) as u64,
-                    group_id: (id / 4) as u64,
-                    span_start: 0,
-                    span_end: 0,
-                }),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        }
-        drop(tx);
-        client.add_documents(ReceiverStream::new(rx)).await.unwrap();
         let start = shard * SHARD_DOCS;
-        let (vtx, vrx) = mpsc::channel(4);
-        vtx.send(AddVectorsRequest {
-            materialized_rows: Vec::new(),
+        let docs = (0..SHARD_DOCS)
+            .map(|i| {
+                let id = shard * SHARD_DOCS + i;
+                let text = if id.is_multiple_of(2) {
+                    format!("zebra document {id} zebra")
+                } else {
+                    format!("plain document {id}")
+                };
+                AddDocumentsRequest {
+                    text,
+                    analysis: Some(body_spec()),
+                    integers: vec![IntegerValue {
+                        field: "year".into(),
+                        value: id as i64,
+                    }],
+                    facets: vec![FacetValue {
+                        field: "court".into(),
+                        value: COURTS[id % 3].into(),
+                    }],
+                    lineage: Some(DocLineage {
+                        parent_id: (id / 2) as u64,
+                        group_id: (id / 4) as u64,
+                        span_start: 0,
+                        span_end: 0,
+                    }),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        let (addr, handle) = start_shard(ShardSpec {
+            config: NodeConfig {
+                slot_offset: (shard * SHARD_DOCS) as u64,
+                analysis_addr: Some(analysis.clone()),
+                integer_fields: vec!["year".into()],
+                facet_fields: vec!["court".into()],
+                ..Default::default()
+            },
+            backend: Some(pipestream_search::harness::embedded_backend_request(
+                DIM, 4, &shift, &scale,
+            )),
+            docs,
             vectors: corpus[start * DIM..(start + SHARD_DOCS) * DIM].to_vec(),
             dim: DIM as u32,
         })
-        .await
-        .unwrap();
-        drop(vtx);
-        client.add_vectors(ReceiverStream::new(vrx)).await.unwrap();
+        .await;
         addrs.push(addr);
         handles.push(handle);
     }
@@ -251,7 +235,7 @@ fn find<'a>(node: &'a Explanation, prefix: &str) -> &'a Explanation {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lexical_leaf_explains_each_term_from_its_bm25_inputs() {
-    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let (coordinator, _qvec, _handles) = start_fleet().await;
     let response = explained(
         &coordinator,
         QueryRequest {
@@ -306,7 +290,7 @@ async fn a_lexical_leaf_explains_each_term_from_its_bm25_inputs() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn score_stages_and_prefix_expansions_get_their_own_nodes() {
-    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let (coordinator, _qvec, _handles) = start_fleet().await;
     let response = explained(
         &coordinator,
         QueryRequest {
@@ -378,7 +362,7 @@ async fn score_stages_and_prefix_expansions_get_their_own_nodes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dense_leaves_report_the_native_score_and_the_rerank_estimate() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
     let native = explained(
         &coordinator,
         QueryRequest {
@@ -429,7 +413,7 @@ async fn dense_leaves_report_the_native_score_and_the_rerank_estimate() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn composite_trees_recompose_their_fusion_arithmetic() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
     let leaves = || {
         vec![
             dense_leaf("vec", &qvec, DenseScoreMode::Native),
@@ -555,7 +539,7 @@ async fn composite_trees_recompose_their_fusion_arithmetic() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn boolean_roots_sum_their_clauses() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
     let response = explained(
         &coordinator,
         QueryRequest {
@@ -585,7 +569,7 @@ async fn boolean_roots_sum_their_clauses() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_scorer_and_a_window_boost_wrap_the_selection_tree() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
     let boost = || BoostQuery {
         query: Some(SearchQuery {
             id: "boost".into(),
@@ -699,7 +683,7 @@ async fn the_scorer_and_a_window_boost_wrap_the_selection_tree() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shapes_without_a_score_refuse_explain_by_name() {
-    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let (coordinator, _qvec, _handles) = start_fleet().await;
     let browse = query(
         &coordinator,
         QueryRequest {

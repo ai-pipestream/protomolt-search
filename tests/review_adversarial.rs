@@ -47,6 +47,10 @@ use tonic::transport::Server;
 use tonic::{Code, Request};
 use turbo_client::OnePassQueryBuilder;
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::scratch_path;
+
 #[test]
 fn block_skip_must_include_unaligned_query_terms() {
     for scale in [1.0_f32, 0.01] {
@@ -84,14 +88,11 @@ fn differing_document_scales_must_not_saturate_and_reverse_ranking() {
 
 #[test]
 fn new_column_payloads_are_crc_covered_and_roundtrip() {
-    let dir = std::env::temp_dir().join(format!(
-        "review125-crc-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = scratch_path(&format!("review125-crc-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("columns.bm25");
     let mut store = Bm25Store::with_text_fields(&["body"]).with_positions(&["body"]);
@@ -143,7 +144,6 @@ fn new_column_payloads_are_crc_covered_and_roundtrip() {
             );
         }
     }
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -226,18 +226,21 @@ async fn spawn_tcp_node(node: Arc<NodeServiceImpl>) -> (String, tokio::task::Joi
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_shard_splade_over_tcp_propagates_running_floor_and_filter() {
-    let dir = std::env::temp_dir().join(format!(
-        "review125-remote-splade-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    struct AbortVec(Vec<tokio::task::JoinHandle<()>>);
+    impl Drop for AbortVec {
+        fn drop(&mut self) {
+            self.0.iter().for_each(|h| h.abort());
+        }
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = scratch_path(&format!("review125-splade-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
     let mut addrs = Vec::new();
-    let mut handles = Vec::new();
+    let mut handles = AbortVec(Vec::new());
     for (shard_idx, (offset, scale, q_impact)) in
         [(0u64, 0.01_f32, 150u16), (100u64, 0.02_f32, 200u16)]
             .into_iter()
@@ -275,7 +278,7 @@ async fn remote_shard_splade_over_tcp_propagates_running_floor_and_filter() {
         );
         let (addr, h) = spawn_tcp_node(node).await;
         addrs.push(addr);
-        handles.push(h);
+        handles.0.push(h);
     }
 
     let coord = CoordinatorServiceImpl::new(addrs);
@@ -291,11 +294,7 @@ async fn remote_shard_splade_over_tcp_propagates_running_floor_and_filter() {
     assert!((hits[0].1 - 4.0).abs() < 1e-4);
     assert_eq!(hits[1].0, 0);
     assert!((hits[1].1 - 1.5).abs() < 1e-4);
-
-    for h in handles {
-        h.abort();
-    }
-    let _ = std::fs::remove_dir_all(dir);
+    drop(handles);
 }
 
 fn get_documents_rpc_count() -> u64 {

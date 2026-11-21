@@ -28,19 +28,15 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Endpoint;
 use tonic::Code;
 
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
+
 fn pem(name: &str) -> Vec<u8> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/certs")
         .join(name);
     std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-}
-
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("snapshot_https_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
 }
 
 fn client_tls() -> ClientTls {

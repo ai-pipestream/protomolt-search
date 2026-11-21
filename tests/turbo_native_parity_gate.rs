@@ -1,5 +1,7 @@
 #[path = "turbo_native_parity_gate/glossary_support.rs"]
 mod glossary_support;
+#[path = "common/scratch.rs"]
+mod scratch;
 #[cfg(feature = "local-core")]
 #[path = "turbo_native_parity_gate/static_embed.rs"]
 mod static_embed;

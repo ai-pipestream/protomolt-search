@@ -21,9 +21,15 @@ use pipestream_search::pb::{
 use pipestream_search::postings::{Bm25Index, Bm25Store};
 use pipestream_search::segmented::SegmentedShard;
 use pipestream_search::segments::OpenedSegmentSet;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
+
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
+
+#[path = "common/ingest.rs"]
+mod ingest;
+use ingest::ingest;
 
 /// Three batches: the same corpus reaches a segmented shard as two
 /// sealed segments plus a tail, and a second shard as one sealed segment.
@@ -62,11 +68,10 @@ fn config(index_path: Option<PathBuf>) -> NodeConfig {
     }
 }
 
-async fn ingest(addr: &str, docs: &[(&str, &str)]) -> u64 {
-    let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
-    let (tx, rx) = mpsc::channel(8);
-    for (text, court) in docs {
-        tx.send(AddDocumentsRequest {
+async fn ingest_courts(addr: &str, docs: &[(&str, &str)]) -> u64 {
+    let requests = docs
+        .iter()
+        .map(|(text, court)| AddDocumentsRequest {
             text: text.to_string(),
             analysis: Some(body_spec()),
             facets: vec![FacetValue {
@@ -75,16 +80,8 @@ async fn ingest(addr: &str, docs: &[(&str, &str)]) -> u64 {
             }],
             ..Default::default()
         })
-        .await
-        .unwrap();
-    }
-    drop(tx);
-    client
-        .add_documents(ReceiverStream::new(rx))
-        .await
-        .unwrap()
-        .into_inner()
-        .added
+        .collect();
+    ingest(addr, requests).await.unwrap().added
 }
 
 async fn flush(addr: &str) -> bool {
@@ -186,13 +183,6 @@ fn signature(resp: &Bm25SearchResponse) -> String {
     )
 }
 
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("segments-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn many_sealed_segments_answer_every_query_like_one_segment() {
     let dir = tempdir("exact");
@@ -202,8 +192,8 @@ async fn many_sealed_segments_answer_every_query_like_one_segment() {
     let (one, ho) = start_empty_node(config(Some(one_path.clone()))).await;
     // Two flushes seal two segments; the third batch stays in the tail.
     for (i, batch) in BATCHES.iter().enumerate() {
-        assert_eq!(ingest(&seg, batch).await, batch.len() as u64);
-        assert_eq!(ingest(&one, batch).await, batch.len() as u64);
+        assert_eq!(ingest_courts(&seg, batch).await, batch.len() as u64);
+        assert_eq!(ingest_courts(&one, batch).await, batch.len() as u64);
         if i < 2 {
             assert!(flush(&seg).await);
         }
@@ -297,7 +287,7 @@ async fn the_tail_seals_itself_at_the_configured_size() {
         ..config(Some(path.clone()))
     })
     .await;
-    assert_eq!(ingest(&addr, BATCHES[0]).await, 3);
+    assert_eq!(ingest_courts(&addr, BATCHES[0]).await, 3);
     let root = segments_root(&path);
     let set = OpenedSegmentSet::open(&root).unwrap();
     assert_eq!(
@@ -308,7 +298,7 @@ async fn the_tail_seals_itself_at_the_configured_size() {
     assert_eq!(set.metadata(0).rows, 2);
     let c = coordinator(&addr);
     assert_eq!(bm25(&c, probes()[0].clone()).await.hits.len(), 3);
-    assert_eq!(ingest(&addr, BATCHES[1]).await, 3);
+    assert_eq!(ingest_courts(&addr, BATCHES[1]).await, 3);
     let set = OpenedSegmentSet::open(&root).unwrap();
     assert_eq!(
         set.len(),
@@ -338,7 +328,7 @@ async fn one_stream_seals_bounded_segments_before_it_ends() {
         all.len() > 2 * 3,
         "the stream must cross the bound at least twice"
     );
-    assert_eq!(ingest(&addr, &all).await, all.len() as u64);
+    assert_eq!(ingest_courts(&addr, &all).await, all.len() as u64);
     // No flush: the seals happened inside the stream.
     let root = segments_root(&path);
     let set = OpenedSegmentSet::open(&root).unwrap();
@@ -591,7 +581,7 @@ async fn in_memory_shards_stay_in_heap_whatever_the_layout_says() {
     // A shard without an index path has no catalog to seal into: it
     // stays the heap store it always was.
     let (addr, handle) = start_empty_node(config(None)).await;
-    assert_eq!(ingest(&addr, BATCHES[0]).await, 3);
+    assert_eq!(ingest_courts(&addr, BATCHES[0]).await, 3);
     assert!(!flush(&addr).await, "nothing persists without a path");
     let c = coordinator(&addr);
     assert_eq!(bm25(&c, probes()[0].clone()).await.hits.len(), 3);
@@ -624,7 +614,7 @@ async fn sealed_segments_serve_mapped_and_equal_the_heap_load_bit_for_bit() {
         ))
         .await
         .unwrap();
-    assert_eq!(ingest(&addr, &docs).await, docs.len() as u64);
+    assert_eq!(ingest_courts(&addr, &docs).await, docs.len() as u64);
     client
         .add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
             materialized_rows: Vec::new(),

@@ -25,6 +25,10 @@ use tonic::transport::Server;
 
 use common::{fit_calibration, mock::start_mock_analysis, start_empty_node, unit_vectors};
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::scratch_path;
+
 const DIM: usize = 32;
 const SHARD_DOCS: usize = 4;
 const BFF: &str = "/bff/v1/ai.protomolt.console.bff.v1.ConsoleBffService";
@@ -387,7 +391,7 @@ async fn streams(c: SocketAddr) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connections_pipeline_bodies_are_capped_and_the_ui_dir_is_fenced() {
     let (coordinator, nodes, _handles) = cluster().await;
-    let dir = std::env::temp_dir().join(format!("console-bff-ui-{}", std::process::id()));
+    let dir = scratch_path(&format!("console-bff-ui-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("ui")).unwrap();
     std::fs::write(dir.join("secret.js"), "secret").unwrap();

@@ -9,18 +9,19 @@ mod common;
 
 use pipestream_search::coordinator::CoordinatorServiceImpl;
 use pipestream_search::node::NodeConfig;
-use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     aggregate_result::Value as W, percentile_value::Value as P, AddDocumentsRequest, AggregateOp,
     AggregateRequest, AggregateResponse, Aggregation, FacetValue, HistogramSpec, IntegerValue,
     NumericValue, PercentileSpec,
 };
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 
-use common::{mock::start_mock_analysis, start_empty_node};
+use common::mock::start_mock_analysis;
+
+#[path = "common/cluster.rs"]
+mod cluster;
+use cluster::{start_shard, ShardGuard, ShardSpec};
 
 const SHARD_DOCS: usize = 4;
 const N_DOCS: usize = 2 * SHARD_DOCS;
@@ -40,60 +41,59 @@ fn court_of(id: usize) -> Option<&'static str> {
     (id != 6).then(|| ["scotus", "ca9", "ca2"][id % 3])
 }
 
-async fn start_cluster() -> (
-    CoordinatorServiceImpl,
-    Vec<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>>,
-) {
+async fn start_fleet() -> (CoordinatorServiceImpl, Vec<ShardGuard>) {
     let (analysis, mock) = start_mock_analysis().await;
-    let mut handles = vec![mock];
+    let mut handles = vec![ShardGuard::from(mock)];
     let mut addrs = Vec::new();
     for shard in 0..2usize {
-        let (addr, handle) = start_empty_node(NodeConfig {
-            slot_offset: (shard * SHARD_DOCS) as u64,
-            analysis_addr: Some(analysis.clone()),
-            numeric_fields: vec!["price".into()],
-            integer_fields: vec!["year".into()],
-            facet_fields: vec!["court".into()],
-            ..Default::default()
+        let docs = (0..SHARD_DOCS)
+            .map(|i| {
+                let id = shard * SHARD_DOCS + i;
+                AddDocumentsRequest {
+                    text: format!("document number {id}"),
+                    numerics: price_of(id)
+                        .map(|v| {
+                            vec![NumericValue {
+                                field: "price".into(),
+                                value: v,
+                            }]
+                        })
+                        .unwrap_or_default(),
+                    integers: year_of(id)
+                        .map(|v| {
+                            vec![IntegerValue {
+                                field: "year".into(),
+                                value: v,
+                            }]
+                        })
+                        .unwrap_or_default(),
+                    facets: court_of(id)
+                        .map(|v| {
+                            vec![FacetValue {
+                                field: "court".into(),
+                                value: v.into(),
+                            }]
+                        })
+                        .unwrap_or_default(),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        let (addr, handle) = start_shard(ShardSpec {
+            config: NodeConfig {
+                slot_offset: (shard * SHARD_DOCS) as u64,
+                analysis_addr: Some(analysis.clone()),
+                numeric_fields: vec!["price".into()],
+                integer_fields: vec!["year".into()],
+                facet_fields: vec!["court".into()],
+                ..Default::default()
+            },
+            backend: None,
+            docs,
+            vectors: Vec::new(),
+            dim: 0,
         })
         .await;
-        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
-        let (tx, rx) = mpsc::channel(16);
-        for i in 0..SHARD_DOCS {
-            let id = shard * SHARD_DOCS + i;
-            tx.send(AddDocumentsRequest {
-                text: format!("document number {id}"),
-                numerics: price_of(id)
-                    .map(|v| {
-                        vec![NumericValue {
-                            field: "price".into(),
-                            value: v,
-                        }]
-                    })
-                    .unwrap_or_default(),
-                integers: year_of(id)
-                    .map(|v| {
-                        vec![IntegerValue {
-                            field: "year".into(),
-                            value: v,
-                        }]
-                    })
-                    .unwrap_or_default(),
-                facets: court_of(id)
-                    .map(|v| {
-                        vec![FacetValue {
-                            field: "court".into(),
-                            value: v.into(),
-                        }]
-                    })
-                    .unwrap_or_default(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        }
-        drop(tx);
-        client.add_documents(ReceiverStream::new(rx)).await.unwrap();
         addrs.push(addr);
         handles.push(handle);
     }
@@ -206,7 +206,7 @@ fn price_shards() -> Vec<Vec<f64>> {
 /// contract: the same request answers the same bits twice.
 #[tokio::test]
 async fn exact_aggregates_match_the_reference_folds() {
-    let (coordinator, handles) = start_cluster().await;
+    let (coordinator, handles) = start_fleet().await;
     let aggregations = vec![
         agg("n_price", "price", AggregateOp::Count),
         agg("sum_price", "price", AggregateOp::Sum),
@@ -284,7 +284,7 @@ async fn exact_aggregates_match_the_reference_folds() {
 /// aggregate, and `matched` is the admitted count.
 #[tokio::test]
 async fn the_filter_scopes_the_fold() {
-    let (coordinator, handles) = start_cluster().await;
+    let (coordinator, handles) = start_fleet().await;
     let response = run(
         &coordinator,
         "court == \"ca9\"",
@@ -345,7 +345,7 @@ async fn the_filter_scopes_the_fold() {
 /// value anywhere else, never a fabricated zero.
 #[tokio::test]
 async fn an_empty_selection_reports_no_values() {
-    let (coordinator, handles) = start_cluster().await;
+    let (coordinator, handles) = start_fleet().await;
     let response = run(
         &coordinator,
         "court == \"nonexistent\"",
@@ -370,7 +370,7 @@ async fn an_empty_selection_reports_no_values() {
 /// per-document values fit, only the exact total overflows.
 #[tokio::test]
 async fn int_sum_overflow_refuses_naming_the_fix() {
-    let (coordinator, handles) = start_cluster().await;
+    let (coordinator, handles) = start_fleet().await;
     let status = run(
         &coordinator,
         "",
@@ -402,7 +402,7 @@ async fn int_sum_overflow_refuses_naming_the_fix() {
 /// booleans, typos, name hygiene, and the unspecified op.
 #[tokio::test]
 async fn refusals_name_the_aggregation() {
-    let (coordinator, handles) = start_cluster().await;
+    let (coordinator, handles) = start_fleet().await;
     let cases: [(&str, AggregateOp, &str); 5] = [
         ("year", AggregateOp::Mean, "takes a double"),
         ("court", AggregateOp::Sum, "only under COUNT"),
@@ -473,7 +473,7 @@ async fn refusals_name_the_aggregation() {
 /// fleet-wide totals still cover every admitted doc.
 #[tokio::test]
 async fn group_by_facet_folds_per_group() {
-    let (coordinator, handles) = start_cluster().await;
+    let (coordinator, handles) = start_fleet().await;
     let request = AggregateRequest {
         aggregations: vec![
             agg("n", "price", AggregateOp::Count),
@@ -556,7 +556,7 @@ async fn group_by_facet_folds_per_group() {
 /// silently.
 #[tokio::test]
 async fn histograms_bucket_exactly() {
-    let (coordinator, handles) = start_cluster().await;
+    let (coordinator, handles) = start_fleet().await;
     let response = coordinator
         .aggregate(Request::new(AggregateRequest {
             histograms: vec![
@@ -602,7 +602,7 @@ async fn histograms_bucket_exactly() {
 /// validation names the problem.
 #[tokio::test]
 async fn caps_and_shapes_refuse_loudly() {
-    let (coordinator, handles) = start_cluster().await;
+    let (coordinator, handles) = start_fleet().await;
     let base = |aggregations, group_by: &str, max_groups, histograms| AggregateRequest {
         aggregations,
         group_by: group_by.into(),
@@ -735,7 +735,7 @@ fn nearest_rank(sorted: &[f64], p: f64) -> (u64, f64) {
 /// same request answers the same bits twice.
 #[tokio::test]
 async fn percentiles_answer_exact_order_statistics() {
-    let (coordinator, handles) = start_cluster().await;
+    let (coordinator, handles) = start_fleet().await;
     let asked = [0.0, 10.0, 25.0, 50.0, 75.0, 90.0, 95.0, 100.0];
     let specs = vec![
         pct("price", "price", &asked),
@@ -803,7 +803,7 @@ async fn percentiles_answer_exact_order_statistics() {
 /// 0 with no value.
 #[tokio::test]
 async fn percentiles_respect_the_filter() {
-    let (coordinator, handles) = start_cluster().await;
+    let (coordinator, handles) = start_fleet().await;
     let response = run_percentiles(
         &coordinator,
         "court == \"ca9\"",
@@ -845,7 +845,7 @@ async fn percentiles_respect_the_filter() {
 /// Percentile refusals name the spec and the problem.
 #[tokio::test]
 async fn percentile_refusals_name_the_spec() {
-    let (coordinator, handles) = start_cluster().await;
+    let (coordinator, handles) = start_fleet().await;
     for (spec, needle) in [
         (pct("p", "price", &[101.0]), "not a percentile"),
         (pct("p", "price", &[f64::NAN]), "not a percentile"),
@@ -909,7 +909,7 @@ fn int_of(response: &AggregateResponse, name: &str) -> i64 {
 /// with doubles canonical (one zero, one NaN) and absence excluded.
 #[tokio::test]
 async fn cardinality_counts_distinct_values_exactly() {
-    let (coordinator, handles) = start_cluster().await;
+    let (coordinator, handles) = start_fleet().await;
     let response = run(
         &coordinator,
         "",
@@ -993,7 +993,7 @@ async fn cardinality_counts_distinct_values_exactly() {
 /// other op refuses at compile time.
 #[tokio::test]
 async fn cardinality_groups_and_caps_loudly() {
-    let (coordinator, handles) = start_cluster().await;
+    let (coordinator, handles) = start_fleet().await;
     let response = coordinator
         .aggregate(Request::new(AggregateRequest {
             aggregations: vec![card("years", "year", 0)],
@@ -1137,43 +1137,42 @@ fn filed_instants() -> Vec<i64> {
     ]
 }
 
-async fn start_dated_cluster() -> (
-    CoordinatorServiceImpl,
-    Vec<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>>,
-) {
+async fn start_dated_cluster() -> (CoordinatorServiceImpl, Vec<ShardGuard>) {
     let (analysis, mock) = start_mock_analysis().await;
-    let mut handles = vec![mock];
+    let mut handles = vec![ShardGuard::from(mock)];
     let mut addrs = Vec::new();
     let instants = filed_instants();
     for shard in 0..2usize {
-        let (addr, handle) = start_empty_node(NodeConfig {
-            slot_offset: (shard * SHARD_DOCS) as u64,
-            analysis_addr: Some(analysis.clone()),
-            integer_fields: vec!["filed".into()],
-            ..Default::default()
+        let docs = (0..SHARD_DOCS)
+            .map(|i| {
+                let id = shard * SHARD_DOCS + i;
+                let micros = instants[id];
+                AddDocumentsRequest {
+                    text: format!("filing {id}"),
+                    timestamps: vec![pipestream_search::pb::TimestampValue {
+                        field: "filed".into(),
+                        value: Some(prost_types::Timestamp {
+                            seconds: micros.div_euclid(1_000_000),
+                            nanos: (micros.rem_euclid(1_000_000) * 1000) as i32,
+                        }),
+                    }],
+                    ..Default::default()
+                }
+            })
+            .collect();
+        let (addr, handle) = start_shard(ShardSpec {
+            config: NodeConfig {
+                slot_offset: (shard * SHARD_DOCS) as u64,
+                analysis_addr: Some(analysis.clone()),
+                integer_fields: vec!["filed".into()],
+                ..Default::default()
+            },
+            backend: None,
+            docs,
+            vectors: Vec::new(),
+            dim: 0,
         })
         .await;
-        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
-        let (tx, rx) = mpsc::channel(16);
-        for i in 0..SHARD_DOCS {
-            let id = shard * SHARD_DOCS + i;
-            let micros = instants[id];
-            tx.send(AddDocumentsRequest {
-                text: format!("filing {id}"),
-                timestamps: vec![pipestream_search::pb::TimestampValue {
-                    field: "filed".into(),
-                    value: Some(prost_types::Timestamp {
-                        seconds: micros.div_euclid(1_000_000),
-                        nanos: (micros.rem_euclid(1_000_000) * 1000) as i32,
-                    }),
-                }],
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        }
-        drop(tx);
-        client.add_documents(ReceiverStream::new(rx)).await.unwrap();
         addrs.push(addr);
         handles.push(handle);
     }

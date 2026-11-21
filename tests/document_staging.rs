@@ -8,8 +8,12 @@ use pipestream_search::{
     pb::*,
 };
 use prost::Message;
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 use tonic::{Code, Request};
+
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::{scratch_path, ScratchPath};
 
 const DESCRIPTOR: &[u8] = include_bytes!("fixtures/unsigned-mapping/descriptor.bin");
 const TYPE: &str = "unsigned_mapping.Parent";
@@ -156,14 +160,14 @@ fn source(count: usize, bad_last: bool) -> ProtobufSource {
     }
 }
 struct Fixture {
-    root: PathBuf,
     config: NodeConfig,
     catalog: Arc<DocumentCatalog>,
+    root: ScratchPath,
 }
 impl Fixture {
     fn new() -> Self {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch_path(&format!(
             "document-stage-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -197,9 +201,9 @@ impl Fixture {
         let catalog =
             Arc::new(DocumentCatalog::create(&root.join("sources.redb"), "books").unwrap());
         Self {
-            root,
             config,
             catalog,
+            root,
         }
     }
     fn accept(&self, version: u64, source: Option<ProtobufSource>) -> DocumentWriteReceipt {
@@ -258,11 +262,6 @@ impl Fixture {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => panic!("read manifest: {error}"),
         }
-    }
-}
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 

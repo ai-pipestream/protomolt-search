@@ -4,12 +4,16 @@
 //! the plain scored walk, the exhaustive oracle, and the block-max pruned
 //! scorer (unseeded and floor-seeded).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use pipestream_search::bm25::{self, Bm25Params, CorpusStats, ScoredDoc};
 use pipestream_search::postings::{
     AnalyzedDoc, Bm25Index, Bm25Reader, Bm25Store, DocTerms, SpillBuilder,
 };
+
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::{scratch_path, ScratchPath};
 
 struct Lcg(u64);
 
@@ -29,8 +33,8 @@ impl Lcg {
     }
 }
 
-fn test_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("v6fmt_{name}_{}", std::process::id()));
+fn test_dir(name: &str) -> ScratchPath {
+    let dir = scratch_path(&format!("v6fmt_{name}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir

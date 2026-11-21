@@ -38,6 +38,9 @@ use pipestream_search::pb::{
 use pipestream_search::source_authority::{PlanningContext, SourceAuthorityStore};
 use pipestream_search::test_support::ForkGuarded;
 
+#[path = "../common/scratch.rs"]
+pub(crate) mod scratch;
+
 pub const WORKER_ENV: &str = "PSEARCH_ADV_WORKER";
 pub const WORKER_DIR_ENV: &str = "PSEARCH_ADV_DIR";
 pub const WORKER_ARM_ENV: &str = "PSEARCH_ADV_ARM";
@@ -52,14 +55,12 @@ pub struct TestDir(PathBuf);
 
 impl TestDir {
     pub fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "control-adversarial-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tag = format!("control-adversarial-{name}-{}-{nanos}", std::process::id());
+        let path = PathBuf::from(scratch::scratch_path(&tag));
         std::fs::create_dir_all(&path).unwrap();
         Self(path)
     }
@@ -74,7 +75,6 @@ impl TestDir {
     pub fn path(&self) -> &Path {
         &self.0
     }
-
     pub fn authority(&self) -> PathBuf {
         self.0.join("authority.redb")
     }

@@ -2,6 +2,10 @@ use pipestream_search::{document_catalog::DocumentCatalog, mapping, pb::*};
 use prost::Message;
 use tonic::Code;
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::scratch_path;
+
 const DESCRIPTOR: &[u8] = include_bytes!("fixtures/unsigned-mapping/descriptor.bin");
 const TYPE: &str = "unsigned_mapping.Parent";
 
@@ -318,7 +322,7 @@ fn explicit_flat_projection_preserves_absent_chunk_ordinal_and_source_only_value
 
 #[test]
 fn prepared_batch_is_reproducible_after_durable_reopen() {
-    let directory = std::env::temp_dir().join(format!(
+    let directory = scratch_path(&format!(
         "psearch-projection-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()

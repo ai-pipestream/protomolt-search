@@ -34,19 +34,20 @@ use tokio_stream::StreamExt;
 use tonic::transport::{Channel, Server};
 use tonic::{Code, Request};
 
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
+
+#[path = "common/ingest.rs"]
+mod ingest;
+use ingest::ingest;
+
 const DIM: usize = 16;
 const BIT_WIDTH: usize = 4;
 const PER_YEAR: usize = 4;
 const YEARS: [i64; 3] = [2000, 2001, 2002];
 const ADMIN: &str = "ops-admin-token-0123456789";
 const PLAIN: &str = "console-token-0123456789";
-
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("diag-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn config(index_path: PathBuf) -> NodeConfig {
     NodeConfig {
@@ -76,7 +77,7 @@ fn corpus() -> Vec<f32> {
     unit_vectors(rows().len(), DIM, 0xD1A6_0001)
 }
 
-async fn ingest(addr: &str) {
+async fn load_shard(addr: &str) {
     let all = rows();
     let vectors = corpus();
     let sample = &vectors[..vectors.len().min(8 * DIM)];
@@ -89,9 +90,9 @@ async fn ingest(addr: &str) {
         .await
         .unwrap();
     for (block, chunk) in all.chunks(PER_YEAR).enumerate() {
-        let (tx, rx) = mpsc::channel(8);
-        for (year, text, court) in chunk {
-            tx.send(AddDocumentsRequest {
+        let docs = chunk
+            .iter()
+            .map(|(year, text, court)| AddDocumentsRequest {
                 text: text.clone(),
                 analysis: Some(body_spec()),
                 facets: vec![FacetValue {
@@ -104,11 +105,8 @@ async fn ingest(addr: &str) {
                 }],
                 ..Default::default()
             })
-            .await
-            .unwrap();
-        }
-        drop(tx);
-        client.add_documents(ReceiverStream::new(rx)).await.unwrap();
+            .collect();
+        ingest(addr, docs).await.unwrap();
         let start = block * PER_YEAR * DIM;
         let end = (start + chunk.len() * DIM).min(vectors.len());
         let (tx, rx) = mpsc::channel(2);
@@ -229,7 +227,7 @@ fn skipped(response: &QueryResponse) -> (u32, u32) {
 async fn fleet(tag: &str) -> (String, String) {
     let dir = tempdir(tag);
     let (node, _handle) = start_empty_node(config(dir.join("d.tv"))).await;
-    ingest(&node).await;
+    load_shard(&node).await;
     let coord = serve_set(CollectionSet::single(coordinator(&node))).await;
     (node, coord)
 }
@@ -609,7 +607,7 @@ async fn shard_diagnostics_describe_the_catalog_and_a_heap_shard() {
         ..config(PathBuf::new())
     };
     let (memory, _handle) = start_empty_node(memory_config).await;
-    ingest(&memory).await;
+    load_shard(&memory).await;
     let mut sdiag = DiagnosticsServiceClient::new(channel(&memory).await);
     let out = sdiag
         .get_shard_diagnostics(ShardDiagnosticsRequest { shard: None })
@@ -720,7 +718,7 @@ fn principals() -> Arc<Principals> {
 async fn the_coordinator_service_needs_an_admin_principal() {
     let dir = tempdir("admin");
     let (node, _handle) = start_empty_node(config(dir.join("a.tv"))).await;
-    ingest(&node).await;
+    load_shard(&node).await;
     let guarded =
         serve_set(CollectionSet::single(coordinator(&node)).with_principals(principals())).await;
     let mut diag = DiagnosticsServiceClient::new(channel(&guarded).await);

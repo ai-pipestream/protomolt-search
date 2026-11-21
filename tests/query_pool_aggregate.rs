@@ -9,20 +9,21 @@ mod common;
 
 use pipestream_search::coordinator::CoordinatorServiceImpl;
 use pipestream_search::node::NodeConfig;
-use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     aggregate_result, search_query, selection_query, selection_score_strategy, AddDocumentsRequest,
-    AddVectorsRequest, AggregateOp, AggregateRequest, AggregateResponse, Aggregation, BooleanQuery,
-    CollapseSpec, CompositeSearchStrategy, DenseQuery, DocLineage, FacetValue, FilterQuery,
-    IntegerValue, LexicalQuery, QueryHit, QueryRequest, QueryResponse, QuerySort, RrfScore,
-    SearchQuery, SelectionOperator, SelectionQuery, SelectionScoreStrategy,
+    AggregateOp, AggregateRequest, AggregateResponse, Aggregation, BooleanQuery, CollapseSpec,
+    CompositeSearchStrategy, DenseQuery, DocLineage, FacetValue, FilterQuery, IntegerValue,
+    LexicalQuery, QueryHit, QueryRequest, QueryResponse, QuerySort, RrfScore, SearchQuery,
+    SelectionOperator, SelectionQuery, SelectionScoreStrategy,
 };
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 
-use common::{fit_calibration, mock::start_mock_analysis, start_empty_node, unit_vectors};
+use common::{fit_calibration, mock::start_mock_analysis, unit_vectors};
+
+#[path = "common/cluster.rs"]
+mod cluster;
+use cluster::{start_shard, ShardGuard, ShardSpec};
 
 const DIM: usize = 64;
 const SHARD_DOCS: usize = 4;
@@ -31,74 +32,58 @@ const COURTS: [&str; 3] = ["ca9", "ca2", "scotus"];
 
 /// The `tests/query_api.rs` corpus: even ids say "zebra", odd ids say
 /// "plain"; year = id; court round-robin over three values.
-async fn start_cluster() -> (
-    CoordinatorServiceImpl,
-    Vec<f32>,
-    Vec<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>>,
-) {
+async fn start_fleet() -> (CoordinatorServiceImpl, Vec<f32>, Vec<ShardGuard>) {
     let (analysis, mock) = start_mock_analysis().await;
     let corpus = unit_vectors(N_DOCS, DIM, 0xC0FE_0001);
     let (shift, scale) = fit_calibration(DIM, 4, &corpus);
-    let mut handles = vec![mock];
+    let mut handles = vec![ShardGuard::from(mock)];
     let mut addrs = Vec::new();
     for shard in 0..2usize {
-        let (addr, handle) = start_empty_node(NodeConfig {
-            slot_offset: (shard * SHARD_DOCS) as u64,
-            analysis_addr: Some(analysis.clone()),
-            integer_fields: vec!["year".into()],
-            facet_fields: vec!["court".into()],
-            ..Default::default()
-        })
-        .await;
-        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
-        client
-            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-                DIM, 4, &shift, &scale,
-            ))
-            .await
-            .unwrap();
-        let (tx, rx) = mpsc::channel(16);
-        for i in 0..SHARD_DOCS {
-            let id = shard * SHARD_DOCS + i;
-            let text = if id.is_multiple_of(2) {
-                format!("zebra document {id}")
-            } else {
-                format!("plain document {id}")
-            };
-            tx.send(AddDocumentsRequest {
-                text,
-                integers: vec![IntegerValue {
-                    field: "year".into(),
-                    value: id as i64,
-                }],
-                facets: vec![FacetValue {
-                    field: "court".into(),
-                    value: COURTS[id % 3].into(),
-                }],
-                lineage: Some(DocLineage {
-                    parent_id: (id / 2) as u64,
-                    group_id: (id / 4) as u64,
-                    span_start: 0,
-                    span_end: 0,
-                }),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        }
-        drop(tx);
-        client.add_documents(ReceiverStream::new(rx)).await.unwrap();
         let start = shard * SHARD_DOCS;
-        let (vtx, vrx) = mpsc::channel(4);
-        vtx.send(AddVectorsRequest {
-            materialized_rows: Vec::new(),
+        let docs = (0..SHARD_DOCS)
+            .map(|i| {
+                let id = shard * SHARD_DOCS + i;
+                let text = if id.is_multiple_of(2) {
+                    format!("zebra document {id}")
+                } else {
+                    format!("plain document {id}")
+                };
+                AddDocumentsRequest {
+                    text,
+                    integers: vec![IntegerValue {
+                        field: "year".into(),
+                        value: id as i64,
+                    }],
+                    facets: vec![FacetValue {
+                        field: "court".into(),
+                        value: COURTS[id % 3].into(),
+                    }],
+                    lineage: Some(DocLineage {
+                        parent_id: (id / 2) as u64,
+                        group_id: (id / 4) as u64,
+                        span_start: 0,
+                        span_end: 0,
+                    }),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        let (addr, handle) = start_shard(ShardSpec {
+            config: NodeConfig {
+                slot_offset: (shard * SHARD_DOCS) as u64,
+                analysis_addr: Some(analysis.clone()),
+                integer_fields: vec!["year".into()],
+                facet_fields: vec!["court".into()],
+                ..Default::default()
+            },
+            backend: Some(pipestream_search::harness::embedded_backend_request(
+                DIM, 4, &shift, &scale,
+            )),
+            docs,
             vectors: corpus[start * DIM..(start + SHARD_DOCS) * DIM].to_vec(),
             dim: DIM as u32,
         })
-        .await
-        .unwrap();
-        drop(vtx);
-        client.add_vectors(ReceiverStream::new(vrx)).await.unwrap();
+        .await;
         addrs.push(addr);
         handles.push(handle);
     }
@@ -261,7 +246,7 @@ fn assert_same_page(with: &QueryResponse, without: &QueryResponse) {
 
 #[tokio::test]
 async fn a_lexical_leaf_aggregates_its_selection_k_pool_and_pages_inside_it() {
-    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let (coordinator, _qvec, _handles) = start_fleet().await;
     // "zebra" matches the four even ids; the pool is all of them and
     // the page is the best two.
     let plain = query(
@@ -341,7 +326,7 @@ async fn a_lexical_leaf_aggregates_its_selection_k_pool_and_pages_inside_it() {
 
 #[tokio::test]
 async fn a_dense_leaf_and_a_composite_aggregate_their_pools() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
     for (label, selection) in [
         ("dense", dense_leaf("vec", &qvec)),
         (
@@ -400,7 +385,7 @@ async fn a_dense_leaf_and_a_composite_aggregate_their_pools() {
 
 #[tokio::test]
 async fn a_collapse_aggregates_the_pool_before_grouping() {
-    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let (coordinator, _qvec, _handles) = start_fleet().await;
     // Four zebra docs over three courts: two groups asked for, the
     // fold covers the four documents, not the groups.
     let response = query(
@@ -427,7 +412,7 @@ async fn a_collapse_aggregates_the_pool_before_grouping() {
 
 #[tokio::test]
 async fn a_browse_aggregates_the_exact_filter_match_set() {
-    let (coordinator, _qvec, _handles) = start_cluster().await;
+    let (coordinator, _qvec, _handles) = start_fleet().await;
     // A page of two over the five documents with year >= 3: the fold
     // covers the five.
     let response = query(
@@ -466,7 +451,7 @@ async fn a_browse_aggregates_the_exact_filter_match_set() {
 
 #[tokio::test]
 async fn pool_aggregation_refuses_by_name() {
-    let (coordinator, qvec, _handles) = start_cluster().await;
+    let (coordinator, qvec, _handles) = start_fleet().await;
     let cases: Vec<(&str, QueryRequest, &str)> = vec![
         (
             "boolean root",

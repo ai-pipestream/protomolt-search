@@ -31,13 +31,18 @@ use pipestream_search::pb::{
     AddDocumentsRequest, AnalysisSpec, DeleteDocumentsRequest, FlushRequest, SuggestRequest,
     SuggestResponse, SuggestTermsRequest, Suggestion,
 };
-use pipestream_search::phrases::GlossaryEntry;
-use pipestream_search::phrases::PhraseIndex;
+use pipestream_search::phrases::{GlossaryEntry, PhraseIndex};
 use pipestream_search::postings::{AnalyzedDoc, Bm25Index, Bm25Reader, Bm25Store};
 use pipestream_search::security::{PrincipalConfig, Principals};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request};
+
+#[path = "common/dir.rs"]
+mod dir;
+use dir::tempdir;
+
+#[path = "common/ingest.rs"]
+mod ingest;
+use ingest::ingest;
 
 /// A corpus whose dictionary has a dense "cou…" neighbourhood with
 /// repeated stems, so df varies and ties exist among the singletons.
@@ -62,15 +67,7 @@ fn config(slot_offset: u64) -> NodeConfig {
     }
 }
 
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("suggest_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-async fn ingest(addr: &str, docs: &[&str]) {
+async fn ingest_texts(addr: &str, docs: &[&str]) {
     ingest_requests(
         addr,
         docs.iter()
@@ -85,19 +82,8 @@ async fn ingest(addr: &str, docs: &[&str]) {
 }
 
 async fn ingest_requests(addr: &str, docs: Vec<AddDocumentsRequest>) {
-    let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
-    let (tx, rx) = mpsc::channel(8);
     let n = docs.len();
-    for doc in docs {
-        tx.send(doc).await.unwrap();
-    }
-    drop(tx);
-    let added = client
-        .add_documents(ReceiverStream::new(rx))
-        .await
-        .unwrap()
-        .into_inner()
-        .added;
+    let added = ingest(addr, docs).await.unwrap().added;
     assert_eq!(added as usize, n);
 }
 
@@ -203,9 +189,9 @@ async fn suggestions_equal_the_ranked_brute_force_scan_and_two_shards_equal_one(
     let (a, ha) = start_empty_node(config(0)).await;
     let (b, hb) = start_empty_node(config(SPLIT as u64)).await;
     let (m, hm) = start_empty_node(config(0)).await;
-    ingest(&a, &CORPUS[..SPLIT]).await;
-    ingest(&b, &CORPUS[SPLIT..]).await;
-    ingest(&m, &CORPUS).await;
+    ingest_texts(&a, &CORPUS[..SPLIT]).await;
+    ingest_texts(&b, &CORPUS[SPLIT..]).await;
+    ingest_texts(&m, &CORPUS).await;
     let fleet = coordinator(vec![a, b]);
     let mono = coordinator(vec![m]);
     let corpus = analyzed(&CORPUS);
@@ -271,8 +257,8 @@ async fn suggestions_equal_the_ranked_brute_force_scan_and_two_shards_equal_one(
 async fn the_limit_and_its_default() {
     let (a, ha) = start_empty_node(config(0)).await;
     let (b, hb) = start_empty_node(config(SPLIT as u64)).await;
-    ingest(&a, &CORPUS[..SPLIT]).await;
-    ingest(&b, &CORPUS[SPLIT..]).await;
+    ingest_texts(&a, &CORPUS[..SPLIT]).await;
+    ingest_texts(&b, &CORPUS[SPLIT..]).await;
     let c = coordinator(vec![a, b]);
     let want = oracle(&analyzed(&CORPUS), "c");
     assert!(want.len() > DEFAULT_SUGGEST_LIMIT);
@@ -307,8 +293,8 @@ async fn the_limit_and_its_default() {
 async fn the_refusal_table() {
     let (a, ha) = start_empty_node(config(0)).await;
     let (b, hb) = start_empty_node(config(SPLIT as u64)).await;
-    ingest(&a, &CORPUS[..SPLIT]).await;
-    ingest(&b, &CORPUS[SPLIT..]).await;
+    ingest_texts(&a, &CORPUS[..SPLIT]).await;
+    ingest_texts(&b, &CORPUS[SPLIT..]).await;
     let c = coordinator(vec![a, b]);
     let corpus = analyzed(&CORPUS);
     let (left, right) = corpus.split_at(SPLIT);
@@ -491,7 +477,7 @@ async fn the_cased_twin_and_the_glossary_field_complete() {
         phrases,
     )
     .await;
-    ingest(
+    ingest_texts(
         &addr,
         &[
             "New York City food",
@@ -536,8 +522,8 @@ async fn many_segments_equal_one_segment_and_reopen_from_disk() {
         .into_iter()
         .enumerate()
     {
-        ingest(&seg, batch).await;
-        ingest(&one, batch).await;
+        ingest_texts(&seg, batch).await;
+        ingest_texts(&one, batch).await;
         if i < 2 {
             assert!(flush(&seg).await);
         }
@@ -597,7 +583,7 @@ async fn many_segments_equal_one_segment_and_reopen_from_disk() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_tombstone_flag_reports_that_df_counts_deleted_rows() {
     let (addr, handle) = start_empty_node(config(0)).await;
-    ingest(&addr, &CORPUS).await;
+    ingest_texts(&addr, &CORPUS).await;
     let c = coordinator(vec![addr.clone()]);
     let before = suggest(&c, all("cou")).await;
     assert!(!before.df_includes_tombstoned_rows);
@@ -652,8 +638,8 @@ async fn collections_do_not_share_dictionaries_and_a_named_set_wants_a_name() {
     };
     let (a, ha) = start_empty_node(named("a")).await;
     let (b, hb) = start_empty_node(named("b")).await;
-    ingest(&a, &["court one", "court two", "court three"]).await;
-    ingest(&b, &["court only", "other doc", "third doc"]).await;
+    ingest_texts(&a, &["court one", "court two", "court three"]).await;
+    ingest_texts(&b, &["court only", "other doc", "third doc"]).await;
     let set = CollectionSet::named(
         vec![
             ("a".to_string(), coordinator(vec![a]).with_collection("a")),
@@ -704,7 +690,7 @@ async fn collections_do_not_share_dictionaries_and_a_named_set_wants_a_name() {
 async fn the_bearer_gate_applies_as_on_every_public_route() {
     const TOKEN: &str = "console-token-0123456789abcdef";
     let (addr, handle) = start_empty_node(config(0)).await;
-    ingest(&addr, &CORPUS).await;
+    ingest_texts(&addr, &CORPUS).await;
     let principals = Arc::new(
         Principals::from_configs(&[PrincipalConfig {
             name: "console".into(),
@@ -760,7 +746,7 @@ async fn past_the_scan_bound_refuses_with_the_count_and_materializes_nothing() {
     for i in 0..5000u32 {
         text.push_str(&format!("t{:05} ", (i * 7919) % 100_000));
     }
-    ingest(&addr, &[text.as_str()]).await;
+    ingest_texts(&addr, &[text.as_str()]).await;
     assert!(flush(&addr).await);
     let doc = analyze_document_native(&text, Some(&body_spec())).unwrap();
     let want = oracle(std::slice::from_ref(&doc), "t");
