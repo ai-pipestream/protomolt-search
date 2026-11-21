@@ -34,6 +34,7 @@ mod lineage;
 #[cfg(test)]
 mod lineage_read_tests;
 mod membership;
+mod membership_bitmaps;
 mod phrase;
 mod placement;
 mod query_progress;
@@ -69,6 +70,8 @@ mod vector_fanout;
 mod vector_field_read_tests;
 mod vector_rows;
 
+#[doc(hidden)]
+pub use membership_bitmaps::membership_id_decodes;
 pub(crate) use vector_rows::ShardVectorRowProbe;
 
 use crate::stats_identity::StatsClaim;

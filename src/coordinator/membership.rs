@@ -1,77 +1,9 @@
 //! Distributed document membership and lexical selection.
 
+use super::membership_bitmaps::CompactMembershipBitmaps;
 use super::*;
 
 impl CoordinatorServiceImpl {
-    pub(super) fn merge_membership_bitmap(
-        out: &mut MembershipSet,
-        response: &crate::pb::MembershipBitmapResponse,
-    ) -> Result<(), Status> {
-        let label_count = usize::try_from(response.label_count).map_err(|_| {
-            Status::resource_exhausted("membership label count does not fit this platform")
-        })?;
-        let expected = usize::try_from(response.label_count.div_ceil(8))
-            .map_err(|_| Status::resource_exhausted("membership bitmap does not fit usize"))?;
-        if response.bits.len() != expected {
-            return Err(Status::internal(format!(
-                "membership bitmap has {} bytes for {} labels; expected {expected}",
-                response.bits.len(),
-                response.label_count
-            )));
-        }
-        let end = response
-            .base_label
-            .checked_add(response.label_count)
-            .ok_or_else(|| Status::internal("membership bitmap label range overflows u64"))?;
-        if response.label_count > 0 {
-            if out
-                .ranges
-                .iter()
-                .any(|&(held_base, held_end)| response.base_label < held_end && held_base < end)
-            {
-                return Err(Status::failed_precondition(format!(
-                    "membership label range [{}, {end}) overlaps another shard",
-                    response.base_label
-                )));
-            }
-            out.ranges.push((response.base_label, end));
-        }
-        if !response.label_count.is_multiple_of(8)
-            && response.bits.last().is_some_and(|last| {
-                let used = (response.label_count % 8) as u8;
-                *last & !((1u8 << used) - 1) != 0
-            })
-        {
-            return Err(Status::internal(
-                "membership bitmap sets padding bits beyond its label count",
-            ));
-        }
-        out.wire_bytes = out
-            .wire_bytes
-            .checked_add(response.bits.len() as u64)
-            .ok_or_else(|| Status::resource_exhausted("membership byte count overflow"))?;
-        for (byte_index, byte) in response.bits.iter().copied().enumerate() {
-            let mut held = byte;
-            while held != 0 {
-                let bit = held.trailing_zeros() as usize;
-                let position = byte_index * 8 + bit;
-                if position < label_count {
-                    let id = response
-                        .base_label
-                        .checked_add(position as u64)
-                        .ok_or_else(|| Status::internal("membership stable-id overflow"))?;
-                    if !out.ids.insert(id) {
-                        return Err(Status::failed_precondition(format!(
-                            "membership id {id} is owned by more than one shard; slot ranges overlap"
-                        )));
-                    }
-                }
-                held &= held - 1;
-            }
-        }
-        Ok(())
-    }
-
     pub(super) fn membership_from_filter(
         response: crate::pb::FilterBitmapResponse,
     ) -> crate::pb::MembershipBitmapResponse {
@@ -126,6 +58,16 @@ impl CoordinatorServiceImpl {
         &self,
         filters: &RequestFilters,
     ) -> Result<MembershipSet, Status> {
+        Ok(self
+            .filter_membership_bitmaps(filters)
+            .await?
+            .into_membership_set())
+    }
+
+    pub(in crate::coordinator) async fn filter_membership_bitmaps(
+        &self,
+        filters: &RequestFilters,
+    ) -> Result<CompactMembershipBitmaps, Status> {
         if let Some(fields) = &self.field_permissions {
             fields.filter(&filters.geo, filters.tree.as_ref())?;
         }
@@ -160,7 +102,7 @@ impl CoordinatorServiceImpl {
             ));
         }
         let mut known = Self::filter_known(filters, mask.as_ref());
-        let mut merged = MembershipSet {
+        let mut merged = CompactMembershipBitmaps {
             epochs: vec![StatsClaim::default(); self.node_addrs.len()],
             ..Default::default()
         };
@@ -180,7 +122,7 @@ impl CoordinatorServiceImpl {
             let response = Self::membership_from_filter(response);
             merged.epochs[shard] =
                 self.check_read_view(shard, &scope, &response, &mut visibility_known)?;
-            Self::merge_membership_bitmap(&mut merged, &response)?;
+            merged.push_validated(response)?;
         }
         self.check_visibility_columns(&visibility_known)?;
         known.refuse_unknown(filters)?;
@@ -222,7 +164,7 @@ impl CoordinatorServiceImpl {
                     .map(|response| response.into_inner())
             }));
         }
-        let mut merged = MembershipSet::default();
+        let mut merged = CompactMembershipBitmaps::default();
         for (shard, task) in tasks.into_iter().enumerate() {
             let response = task.await.map_err(|error| {
                 Status::internal(format!("lexical membership task failed: {error}"))
@@ -237,17 +179,28 @@ impl CoordinatorServiceImpl {
                 segments_total: response.segments_total,
                 segments_skipped: response.segments_skipped,
             });
-            Self::merge_membership_bitmap(&mut merged, &response)?;
+            merged.push_validated(response)?;
         }
         self.check_visibility_columns(&visibility_known)?;
-        merged.terms = terms;
-        Ok(merged)
+        let mut set = merged.into_membership_set();
+        set.terms = terms;
+        Ok(set)
     }
 
     /// Resolve every live provider-backed vector row. This is the membership
     /// rule of a dense Boolean clause; native scores are fetched only for the
     /// candidates that survive the Boolean set plan.
     pub async fn vector_membership(&self, field: &str) -> Result<MembershipSet, Status> {
+        Ok(self
+            .vector_membership_bitmaps(field)
+            .await?
+            .into_membership_set())
+    }
+
+    pub(in crate::coordinator) async fn vector_membership_bitmaps(
+        &self,
+        field: &str,
+    ) -> Result<CompactMembershipBitmaps, Status> {
         if let Some(fields) = &self.field_permissions {
             fields.vector(field)?;
         }
@@ -267,7 +220,7 @@ impl CoordinatorServiceImpl {
                     .map(|response| response.into_inner())
             }));
         }
-        let mut merged = MembershipSet::default();
+        let mut merged = CompactMembershipBitmaps::default();
         let mut held_binding = None;
         for (shard, task) in tasks.into_iter().enumerate() {
             let response = task.await.map_err(|error| {
@@ -280,7 +233,7 @@ impl CoordinatorServiceImpl {
                 &response,
                 &mut visibility_known,
             )?);
-            Self::merge_membership_bitmap(&mut merged, &response)?;
+            merged.push_validated(response)?;
         }
         self.check_visibility_columns(&visibility_known)?;
         Ok(merged)

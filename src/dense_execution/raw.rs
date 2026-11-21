@@ -81,11 +81,14 @@ pub(crate) fn validate_raw_controls(
             || raw.enumerate_max_rows.is_some()
             || raw.patience_saturation_ppm.is_some()
             || raw.finish_settle_us.is_some()
-            || raw.finish_deadline_us.is_some())
+            || raw.finish_deadline_us.is_some()
+            || raw.floor_prune == Some(true)
+            || raw.floor_greediness_ppm.is_some()
+            || raw.floor_clamp_min.is_some())
     {
         return Err(DenseExecutionError::InvalidRequest(
             "staged_selection is unary bit-plane selection and cannot be combined with \
-             filter_strategy, enumerate_max_rows, patience, or early-finish controls"
+             filter_strategy, enumerate_max_rows, patience, floor pruning, or early-finish controls"
                 .to_string(),
         ));
     }
