@@ -1,0 +1,521 @@
+{
+  "engines": [
+    {
+      "builds": [
+        {
+          "build_s": 8.413202968,
+          "cells": [
+            {
+              "filter": "uncorrelated-50",
+              "k": 10,
+              "points": [
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 16,
+                  "exact_scores_mean": 977.736,
+                  "hops_mean": 42.894,
+                  "k": 10,
+                  "p50_ms": 0.038964,
+                  "p99_ms": 0.048241,
+                  "predicate_ms_mean": 0.019641882607839275,
+                  "qps_all_cores": 25487.428241275215,
+                  "qps_one_core": 25384.504037560113,
+                  "recall_mean": 0.8455999999999992,
+                  "recall_worst": 0.0,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 500
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 64,
+                  "exact_scores_mean": 2546.94,
+                  "hops_mean": 138.436,
+                  "k": 10,
+                  "p50_ms": 0.085371,
+                  "p99_ms": 0.101983,
+                  "predicate_ms_mean": 0.019838567137200894,
+                  "qps_all_cores": 11623.958481696081,
+                  "qps_one_core": 11617.665120802892,
+                  "recall_mean": 0.9893999999999998,
+                  "recall_worst": 0.0,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 500
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 128,
+                  "exact_scores_mean": 3752.88,
+                  "hops_mean": 267.592,
+                  "k": 10,
+                  "p50_ms": 0.132972,
+                  "p99_ms": 0.20777299999999999,
+                  "predicate_ms_mean": 0.01991516958041958,
+                  "qps_all_cores": 7459.995921848898,
+                  "qps_one_core": 7435.1659007837525,
+                  "recall_mean": 1.0,
+                  "recall_worst": 1.0,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 500
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 256,
+                  "exact_scores_mean": 4968.272,
+                  "hops_mean": 522.692,
+                  "k": 10,
+                  "p50_ms": 0.202604,
+                  "p99_ms": 0.287435,
+                  "predicate_ms_mean": 0.020050475567368636,
+                  "qps_all_cores": 4919.563098520784,
+                  "qps_one_core": 4890.476655421673,
+                  "recall_mean": 1.0,
+                  "recall_worst": 1.0,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 500
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 1000,
+                  "exact_scores_mean": 6307.152,
+                  "hops_mean": 2001.416,
+                  "k": 10,
+                  "p50_ms": 0.435615,
+                  "p99_ms": 0.561493,
+                  "predicate_ms_mean": 0.020102330850131463,
+                  "qps_all_cores": 2289.654614759982,
+                  "qps_one_core": 2281.6258772416572,
+                  "recall_mean": 1.0,
+                  "recall_worst": 1.0,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 500
+                  },
+                  "threads": 1
+                }
+              ]
+            },
+            {
+              "filter": "uncorrelated-50",
+              "k": 100,
+              "points": [
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 128,
+                  "exact_scores_mean": 3752.88,
+                  "hops_mean": 267.592,
+                  "k": 100,
+                  "p50_ms": 0.132862,
+                  "p99_ms": 0.203435,
+                  "predicate_ms_mean": 0.019913973129114606,
+                  "qps_all_cores": 7445.408678197369,
+                  "qps_one_core": 7442.056116580678,
+                  "recall_mean": 0.9987000000000007,
+                  "recall_worst": 0.98,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 500
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 256,
+                  "exact_scores_mean": 4968.272,
+                  "hops_mean": 522.692,
+                  "k": 100,
+                  "p50_ms": 0.201491,
+                  "p99_ms": 0.285311,
+                  "predicate_ms_mean": 0.020068058967059783,
+                  "qps_all_cores": 4974.594093020386,
+                  "qps_one_core": 4917.140965639021,
+                  "recall_mean": 0.9999600000000001,
+                  "recall_worst": 0.99,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 500
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 1000,
+                  "exact_scores_mean": 6307.152,
+                  "hops_mean": 2001.416,
+                  "k": 100,
+                  "p50_ms": 0.43374199999999996,
+                  "p99_ms": 0.552236,
+                  "predicate_ms_mean": 0.020177150655021833,
+                  "qps_all_cores": 2320.62980617143,
+                  "qps_one_core": 2289.2608594785174,
+                  "recall_mean": 0.99998,
+                  "recall_worst": 0.99,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 0,
+                    "plain": 500
+                  },
+                  "threads": 1
+                }
+              ]
+            },
+            {
+              "filter": "uncorrelated-10",
+              "k": 10,
+              "points": [
+                {
+                  "bridges_mean": 350.638,
+                  "budget_handoffs": 0,
+                  "ef": 16,
+                  "exact_scores_mean": 551.64,
+                  "hops_mean": 26.258,
+                  "k": 10,
+                  "p50_ms": 0.045225999999999995,
+                  "p99_ms": 0.050886,
+                  "predicate_ms_mean": 0.004031556879690698,
+                  "qps_all_cores": 22205.907158485104,
+                  "qps_one_core": 21984.541402466344,
+                  "recall_mean": 0.9797999999999994,
+                  "recall_worst": 0.0,
+                  "regimes": {
+                    "enumerate": 0,
+                    "filter_aware": 500,
+                    "plain": 0
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 1380.358,
+                  "budget_handoffs": 3,
+                  "ef": 64,
+                  "exact_scores_mean": 768.422,
+                  "hops_mean": 74.266,
+                  "k": 10,
+                  "p50_ms": 0.13953500000000002,
+                  "p99_ms": 0.165874,
+                  "predicate_ms_mean": 0.004153868028169014,
+                  "qps_all_cores": 7105.572137973712,
+                  "qps_one_core": 7099.605219352172,
+                  "recall_mean": 0.992,
+                  "recall_worst": 0.0,
+                  "regimes": {
+                    "enumerate": 3,
+                    "filter_aware": 497,
+                    "plain": 0
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 128,
+                  "exact_scores_mean": 10171.796,
+                  "hops_mean": 9.186,
+                  "k": 10,
+                  "p50_ms": 0.085732,
+                  "p99_ms": 0.09177400000000001,
+                  "predicate_ms_mean": 0.004291412068965517,
+                  "qps_all_cores": 11669.23174445887,
+                  "qps_one_core": 11599.234032981398,
+                  "recall_mean": 1.0,
+                  "recall_worst": 1.0,
+                  "regimes": {
+                    "enumerate": 500,
+                    "filter_aware": 0,
+                    "plain": 0
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 256,
+                  "exact_scores_mean": 10171.796,
+                  "hops_mean": 9.186,
+                  "k": 10,
+                  "p50_ms": 0.085562,
+                  "p99_ms": 0.091544,
+                  "predicate_ms_mean": 0.004314492172716325,
+                  "qps_all_cores": 11648.72972932048,
+                  "qps_one_core": 11625.434038994681,
+                  "recall_mean": 1.0,
+                  "recall_worst": 1.0,
+                  "regimes": {
+                    "enumerate": 500,
+                    "filter_aware": 0,
+                    "plain": 0
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 1000,
+                  "exact_scores_mean": 10083.0,
+                  "hops_mean": 0.0,
+                  "k": 10,
+                  "p50_ms": 0.083578,
+                  "p99_ms": 0.090221,
+                  "predicate_ms_mean": 0.0042925243697479,
+                  "qps_all_cores": 11917.832815125419,
+                  "qps_one_core": 11899.199326675705,
+                  "recall_mean": 1.0,
+                  "recall_worst": 1.0,
+                  "regimes": {
+                    "enumerate": 500,
+                    "filter_aware": 0,
+                    "plain": 0
+                  },
+                  "threads": 1
+                }
+              ]
+            },
+            {
+              "filter": "uncorrelated-10",
+              "k": 100,
+              "points": [
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 128,
+                  "exact_scores_mean": 10171.796,
+                  "hops_mean": 9.186,
+                  "k": 100,
+                  "p50_ms": 0.106942,
+                  "p99_ms": 0.113825,
+                  "predicate_ms_mean": 0.004247628209259856,
+                  "qps_all_cores": 9346.329522359054,
+                  "qps_one_core": 9308.004294856566,
+                  "recall_mean": 0.99998,
+                  "recall_worst": 0.99,
+                  "regimes": {
+                    "enumerate": 500,
+                    "filter_aware": 0,
+                    "plain": 0
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 256,
+                  "exact_scores_mean": 10171.796,
+                  "hops_mean": 9.186,
+                  "k": 100,
+                  "p50_ms": 0.107033,
+                  "p99_ms": 0.113344,
+                  "predicate_ms_mean": 0.00426601924110502,
+                  "qps_all_cores": 9351.47887948796,
+                  "qps_one_core": 9302.063449647763,
+                  "recall_mean": 0.99998,
+                  "recall_worst": 0.99,
+                  "regimes": {
+                    "enumerate": 500,
+                    "filter_aware": 0,
+                    "plain": 0
+                  },
+                  "threads": 1
+                },
+                {
+                  "bridges_mean": 0.0,
+                  "budget_handoffs": 0,
+                  "ef": 1000,
+                  "exact_scores_mean": 10083.0,
+                  "hops_mean": 0.0,
+                  "k": 100,
+                  "p50_ms": 0.104288,
+                  "p99_ms": 0.11099,
+                  "predicate_ms_mean": 0.004238140102693073,
+                  "qps_all_cores": 9588.983069167549,
+                  "qps_one_core": 9542.503799344937,
+                  "recall_mean": 0.99998,
+                  "recall_worst": 0.99,
+                  "regimes": {
+                    "enumerate": 500,
+                    "filter_aware": 0,
+                    "plain": 0
+                  },
+                  "threads": 1
+                }
+              ]
+            }
+          ],
+          "disk_bytes": 40181024,
+          "disk_bytes_per_row": 401.81024,
+          "params": {
+            "bits": 0,
+            "ef_construction": 200,
+            "m": 16
+          },
+          "retained_bytes_per_row": 272.1792,
+          "retained_rss_bytes": 27217920
+        }
+      ],
+      "engine": "hnsw",
+      "filter": "allow bitmap (VectorSearchOptions::with_bits); enumerate, filter-aware walk",
+      "library": "ours: src/hnsw/ (HNSW over FP32 rows, parallel build)",
+      "license": "ours",
+      "version": "0.1.0"
+    }
+  ],
+  "fixture": {
+    "base_sha256": "ffe7206193b1ff53e8487329bb5be648bc632f3b6975f3724605618e273d38c6",
+    "dim": 64,
+    "dir": "<scratch>/fixture",
+    "filters": [
+      {
+        "actual_mean_percent": 50.05099999999969,
+        "column": "bucket",
+        "name": "uncorrelated-50",
+        "set": "uncorrelated",
+        "target_percent": 50
+      },
+      {
+        "actual_mean_percent": 10.083000000000027,
+        "column": "bucket",
+        "name": "uncorrelated-10",
+        "set": "uncorrelated",
+        "target_percent": 10
+      },
+      {
+        "actual_mean_percent": 1.0510000000000017,
+        "column": "bucket",
+        "name": "uncorrelated-1",
+        "set": "uncorrelated",
+        "target_percent": 1
+      },
+      {
+        "actual_mean_percent": 50.27864800000004,
+        "column": "cell",
+        "name": "near-50",
+        "set": "near",
+        "target_percent": 50
+      },
+      {
+        "actual_mean_percent": 10.251697999999989,
+        "column": "cell",
+        "name": "near-10",
+        "set": "near",
+        "target_percent": 10
+      },
+      {
+        "actual_mean_percent": 1.273284000000001,
+        "column": "cell",
+        "name": "near-1",
+        "set": "near",
+        "target_percent": 1
+      },
+      {
+        "actual_mean_percent": 50.26764799999999,
+        "column": "cell",
+        "name": "far-50",
+        "set": "far",
+        "target_percent": 50
+      },
+      {
+        "actual_mean_percent": 10.27731200000002,
+        "column": "cell",
+        "name": "far-10",
+        "set": "far",
+        "target_percent": 10
+      },
+      {
+        "actual_mean_percent": 1.3080160000000003,
+        "column": "cell",
+        "name": "far-1",
+        "set": "far",
+        "target_percent": 1
+      }
+    ],
+    "name": "challenge-100000x64",
+    "queries": 500,
+    "rows": 100000
+  },
+  "format": "protomolt-ann-bench-results-v1",
+  "harness": {
+    "commit": "",
+    "runner": "ann_bench",
+    "started_at": 1795189693,
+    "version": "0.1.0"
+  },
+  "host": {
+    "arch": "x86_64",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "cpu_features": [
+      "sse4.2",
+      "avx2",
+      "fma",
+      "avx512f"
+    ],
+    "kernel": "7.3.0-10-generic",
+    "name": "krick-1",
+    "threads": 1
+  },
+  "segments": [
+    [
+      0,
+      100000
+    ]
+  ],
+  "settings": {
+    "ef": [
+      16,
+      64,
+      128,
+      256,
+      1000
+    ],
+    "ef_construction": [
+      200
+    ],
+    "k": [
+      10,
+      100
+    ],
+    "m": [
+      16
+    ],
+    "min_qps": 0.0,
+    "min_time_ms": 1000,
+    "recall_stop": 2.0,
+    "rerank": [
+      10,
+      20,
+      50,
+      100,
+      200,
+      500,
+      1000,
+      2000,
+      5000
+    ],
+    "threads": 1
+  },
+  "shape": "single"
+}

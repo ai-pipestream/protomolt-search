@@ -1,8 +1,6 @@
 //! Grafting of non-join layer-0 rows: a bounded local beam walk seeded from
 //! a row's surviving neighborhood and its join-set neighbors' merged lists.
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicU32, Ordering as Atomic};
 
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -93,22 +91,6 @@ impl GraftBuffers {
     }
 }
 
-/// Keep `item` in the result heap `res` of at most `ef` entries; true when it
-/// entered.
-#[inline]
-fn keep_best(res: &mut BinaryHeap<Reverse<Scored>>, ef: usize, item: Scored) -> bool {
-    if res.len() < ef {
-        res.push(Reverse(item));
-        true
-    } else if item > res.peek().expect("ef_graft > 0").0 {
-        res.pop();
-        res.push(Reverse(item));
-        true
-    } else {
-        false
-    }
-}
-
 struct Grafter<'a> {
     builder: &'a LinkBuilder<'a>,
     view: View<'a, [AtomicU32]>,
@@ -162,7 +144,7 @@ impl Grafter<'_> {
             .for_each_scored(self.view.row(node), cands, |w, score| {
                 let item = Scored { score, node: w };
                 pool.push(item);
-                keep_best(&mut scratch.res, self.ef_graft, item);
+                scratch.res.keep(self.ef_graft, item);
             });
         pool.sort_unstable_by(|a, b| b.cmp(a));
         for &top_intra in pool.iter().take(GRAFT_INTRA_SEEDS) {
@@ -216,10 +198,10 @@ impl Grafter<'_> {
             .for_each_scored(self.view.row(node), cands, |w, score| {
                 let item = Scored { score, node: w };
                 pool.push(item);
-                keep_best(&mut scratch.res, self.ef_graft, item);
+                scratch.res.keep(self.ef_graft, item);
             });
         pool.sort_unstable_by(|a, b| b.cmp(a));
-        let worst_res = scratch.res.peek().map_or(f32::NEG_INFINITY, |r| r.0.score);
+        let worst_res = scratch.res.worst().map_or(f32::NEG_INFINITY, |w| w.score);
         for (idx, &item) in pool.iter().enumerate() {
             if idx < GRAFT_CROSS_SEEDS || item.score >= worst_res {
                 scratch.cand.push(item);
@@ -246,7 +228,7 @@ impl Grafter<'_> {
         while let Some(c) = scratch.cand.pop() {
             if expansions >= GRAFT_MIN_EXPANSIONS
                 && scratch.res.len() >= ef_graft
-                && c < scratch.res.peek().expect("ef_graft > 0").0
+                && scratch.res.worst().is_some_and(|worst| c < worst)
             {
                 break;
             }
@@ -264,7 +246,7 @@ impl Grafter<'_> {
             if !cands.is_empty() {
                 self.view.for_each_scored(row_v, cands, |w, score| {
                     let item = Scored { score, node: w };
-                    if keep_best(&mut scratch.res, ef_graft, item) {
+                    if scratch.res.keep(ef_graft, item).entered() {
                         scratch.cand.push(item);
                     }
                 });
@@ -287,11 +269,7 @@ impl Grafter<'_> {
         let GraftBuffers { pool, sel, .. } = bufs;
         let view = &self.view;
         pool.clear();
-        pool.reserve(scratch.res.len());
-        for Reverse(item) in scratch.res.drain() {
-            pool.push(item);
-        }
-        pool.sort_unstable_by(|a, b| b.cmp(a));
+        scratch.res.drain_into(pool);
         scratch.cand.clear();
         view.select(view.inv_norm[node as usize], pool, view.m0, sel);
         let sel_recip_len = sel.len();

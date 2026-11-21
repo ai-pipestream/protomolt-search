@@ -38,11 +38,13 @@ mod enumerate;
 mod hooks;
 mod policy;
 mod probe;
+mod ranked;
 mod scratch;
 mod search_layer;
 mod select;
 mod store;
 mod view;
+mod visited;
 mod walk;
 
 pub(in crate::hnsw) use beam::LayerSearch;

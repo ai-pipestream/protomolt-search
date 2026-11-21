@@ -1,11 +1,9 @@
 //! One layer's beam: the request, the floor gate, and the patience window
 //! the plain and the filter-aware layer searches share.
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
-
 use crate::vector::Mask;
 
+use super::ranked::{Kept, Results};
 use super::{FloorPrune, Hook, LinkCells, Locks, Patience, Scored, Scratch, View, Walk};
 
 /// One layer search: the query, the beam, and what steers it.
@@ -31,7 +29,7 @@ struct Saturation {
     min_survived: usize,
     /// Nodes that entered the tracked window during the current expansion.
     added: Vec<u32>,
-    top: BinaryHeap<Reverse<Scored>>,
+    top: Results,
     consecutive: u32,
     /// The current expansion counts toward patience.
     counting: bool,
@@ -63,14 +61,8 @@ impl Saturation {
     /// Offer an entry point to the `top_k` window.
     #[inline]
     fn seed(&mut self, entry: Scored) {
-        if !self.use_top_k {
-            return;
-        }
-        if self.top.len() < self.window {
-            self.top.push(Reverse(entry));
-        } else if self.top.peek().is_some_and(|worst| entry > worst.0) {
-            self.top.pop();
-            self.top.push(Reverse(entry));
+        if self.use_top_k {
+            self.top.keep(self.window, entry);
         }
     }
 
@@ -92,36 +84,34 @@ impl Saturation {
         self.lost = 0;
     }
 
-    /// Push `scored` into the result beam of `ef` and into the tracked
-    /// window, counting the window members it displaced.
+    /// Keep `scored`, which [`View::offer`] let past the beam's worst, in
+    /// the result beam of `ef` and offer it to the tracked window, counting
+    /// the window members it displaced.
     #[inline]
-    fn admit(&mut self, res: &mut BinaryHeap<Reverse<Scored>>, ef: usize, scored: Scored) {
-        res.push(Reverse(scored));
-        if res.len() > ef {
-            if let Some(Reverse(evicted)) = res.pop() {
-                if self.counting && !self.use_top_k && !self.added.contains(&evicted.node) {
-                    self.lost += 1;
-                }
-            }
-            if self.counting && !self.use_top_k {
-                self.added.push(scored.node);
+    fn admit(&mut self, res: &mut Results, ef: usize, scored: Scored) {
+        let kept = res.keep(ef, scored);
+        debug_assert!(kept.entered(), "the beam turned an admitted row away");
+        if let Kept::Replaced(evicted) = kept {
+            if !self.use_top_k {
+                self.displace(evicted, scored);
             }
         }
-        if !self.use_top_k {
-            return;
+        if self.use_top_k {
+            if let Kept::Replaced(evicted) = self.top.keep(self.window, scored) {
+                self.displace(evicted, scored);
+            }
         }
-        if self.top.len() < self.window {
-            self.top.push(Reverse(scored));
-        } else if self.top.peek().is_some_and(|w| scored > w.0) {
-            if let Some(Reverse(evicted)) = self.top.pop() {
-                if self.counting && !self.added.contains(&evicted.node) {
-                    self.lost += 1;
-                }
+    }
+
+    /// `scored` took `evicted`'s place in the tracked window: while the
+    /// expansion counts, a member that was there when it opened is lost.
+    #[inline]
+    fn displace(&mut self, evicted: Scored, scored: Scored) {
+        if self.counting {
+            if !self.added.contains(&evicted.node) {
+                self.lost += 1;
             }
-            self.top.push(Reverse(scored));
-            if self.counting {
-                self.added.push(scored.node);
-            }
+            self.added.push(scored.node);
         }
     }
 
@@ -226,12 +216,9 @@ impl<L: LinkCells + ?Sized> View<'_, L> {
                 if beam.record {
                     scratch.scored_allowed.push(e);
                 }
-                scratch.res.push(Reverse(e));
+                scratch.res.keep(beam.ef, e);
                 beam.saturation.seed(e);
             }
-        }
-        while scratch.res.len() > beam.ef {
-            scratch.res.pop();
         }
     }
 
@@ -261,7 +248,7 @@ impl<L: LinkCells + ?Sized> View<'_, L> {
         hook: &H,
     ) -> Gate {
         if scratch.res.len() >= beam.ef {
-            let worst = scratch.res.peek().map_or(f32::NEG_INFINITY, |r| r.0.score);
+            let worst = scratch.res.worst().map_or(f32::NEG_INFINITY, |w| w.score);
             if c.score < worst {
                 return Gate::End(Walk::Completed);
             }
@@ -295,7 +282,7 @@ impl<L: LinkCells + ?Sized> View<'_, L> {
             }
         }
         let full = scratch.res.len() >= beam.ef;
-        let worst = scratch.res.peek().map_or(f32::NEG_INFINITY, |r| r.0.score);
+        let worst = scratch.res.worst().map_or(f32::NEG_INFINITY, |w| w.score);
         if !full || scored.score > worst {
             if self.floor_prunes(beam, scored, hook) {
                 beam.pruned_by_floor = true;

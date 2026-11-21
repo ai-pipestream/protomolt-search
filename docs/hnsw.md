@@ -171,10 +171,10 @@ inverse norms; one level byte per node; layer 0 for every node at a fixed
 stride of `2M + 1` cells (the count, then the neighbors); and for the nodes
 that have upper layers, a compact index (`upper_slot[node]`, `NO_NODE` for
 level-0 nodes) into one array of `M + 1`-cell blocks, a node's layers
-`1..=level` consecutive. There is no `Vec<Vec<u32>>`. The visited set is an
-epoch-stamped `u32` array reset in O(1); a walk uses one candidate heap and
-one result heap, both over 8-byte `(score, node)` entries ordered totally
-(score, then node), so heaps behave the same on every run.
+`1..=level` consecutive. There is no `Vec<Vec<u32>>`. The visited set is one
+bit per row; a walk uses one candidate heap and one result heap, both over
+8-byte `(score, node)` entries ordered totally (score, then node), so heaps
+behave the same on every run (see [Walk state](#walk-state)).
 
 **One traversal distance per visited node, scored in bulk.** Every row the
 walk visits is scored once from its FP32 row with the provider's own kernels
@@ -208,6 +208,96 @@ of the row count and requires every row to be reached. A node that raises
 the top level holds the entry lock through its insertion so no other
 insertion starts from an entry whose upper lists are not yet written.
 `FIXED_ORDER` runs the same insertion on one thread in row order.
+
+### Walk state
+
+What one walk keeps besides the graph is per thread and reused from walk to
+walk (`src/hnsw/graph/scratch.rs`).
+
+**Visited set** (`graph/visited.rs`). One bit per row in `u64` words, and a
+list of the words the walk dirtied, each listed once. Marking a row reads its
+word, writes the word's index into the next list slot, and keeps that slot
+only when the word was zero, so there is no branch on what the walk has
+already reached (with one, the bitset lost up to 11 percent to the stamps on
+one core). A reset zeroes the listed words, or fills the whole set once the
+walk dirtied one word in sixteen. At 100,000 rows that is 12.5 KB of bits
+and 6.25 KB of list per thread against 400 KB of 4-byte stamps. The
+set only grows: a thread that walked a larger graph keeps the larger set. A
+row beyond the covered words is an index panic, as a row beyond the stamps
+was; the rows that share the last word with the graph's last row (up to 63)
+read as unvisited instead.
+
+**Result and candidate heaps** (`graph/ranked.rs`). Both heaps hold one
+`u64` per entry: the score's place in `f32::total_cmp` order in the high
+half and the complement of the node in the low half. It orders exactly as
+`Scored` does (score, then the smaller node), NaNs of either sign and any
+payload, both zeros and infinities included, and maps back to the entry bit
+for bit, so a sift compares integers and the walk is the walk it was. The
+result heap is bounded at the beam: an entry that cannot beat its worst is
+turned away on one comparison, and one that does takes the worst's place
+with a single sift instead of a push and a pop. The patience window and the
+graft walk of a merge use the same bounded heap. The candidate heap is not
+bounded: a candidate that ties the beam's worst score, a disallowed row
+routing a plain filtered walk, and any candidate under a beam full of NaN
+scores are all still expanded, so dropping the worst candidate at `ef` would
+change walks.
+
+**Pinned.** `src/hnsw/tests/walk_identity.rs` and `search_identity.rs` hold
+digests of the fixed-order graph and of 18 walk regimes over it (every row
+scored and every hop in order, the outcome, the work counters, the results,
+the visited set left behind), of unary answers at k = 10, 100 and 1,000
+under masks and tombstones, of streams, and of the graphs that merging,
+healing and repair leave. They were taken with the stamp array and
+`BinaryHeap<Scored>` and did not change. The topical fixture runs the scalar
+kernel and the tying one uses small integers that every kernel sums exactly,
+so the digests do not depend on the kernel a host picks.
+
+**Measured** on krick-1 (Ryzen 9 9950X, AVX-512F), challenge fixture, `M =
+16`, `ef_construction = 200`, medians of three interleaved rounds, queries
+per second before and after (`benchmarks/ann/results/walk-state-krick1-4b2d748`).
+Recall is identical at every beam because the walks are identical; on one
+core the hops and scored rows are too.
+
+| filter | k | ef | recall | one core | | all 32 threads | |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| none | 10 | 16 | 0.718 | 121,644 → 127,628 | 1.05x | 2,008,830 → 2,118,757 | 1.06x |
+| none | 10 | 64 | 0.966 | 33,708 → 37,731 | 1.12x | 596,026 → 670,512 | 1.13x |
+| none | 10 | 128 | 0.990 | 17,345 → 19,404 | 1.12x | 322,279 → 367,221 | 1.14x |
+| none | 10 | 256 | 1.000 | 9,324 → 10,595 | 1.14x | 183,344 → 207,441 | 1.13x |
+| none | 10 | 1000 | 1.000 | 3,453 → 3,946 | 1.14x | 65,048 → 80,630 | 1.24x |
+| none | 100 | 128 | 0.979 | 17,015 → 19,463 | 1.14x | 325,141 → 371,887 | 1.14x |
+| none | 100 | 256 | 1.000 | 9,260 → 10,604 | 1.15x | 181,061 → 215,601 | 1.19x |
+| none | 1,000 | 1000 | 1.000 | 3,404 → 3,980 | 1.17x | 66,358 → 79,942 | 1.20x |
+| uncorrelated-50 | 10 | 16 | 0.846 | 25,385 → 25,550 | 1.01x | 453,506 → 461,340 | 1.02x |
+| uncorrelated-50 | 10 | 64 | 0.989 | 11,618 → 12,117 | 1.04x | 218,593 → 232,469 | 1.06x |
+| uncorrelated-50 | 100 | 128 | 0.999 | 7,442 → 7,860 | 1.06x | 142,987 → 157,845 | 1.10x |
+| uncorrelated-50 | 100 | 256 | 1.000 | 4,917 → 5,347 | 1.09x | 95,086 → 108,123 | 1.14x |
+
+Over all 25 cells the geometric mean is 1.07x on one core and 1.09x on all
+threads; the cells that enumerate instead of walking (`uncorrelated-10` from
+`ef = 128`) stay within 2 percent either way. At 1,000,000 rows
+(`synthetic:1000000:64`), where the stamps were 4 MB per thread, the same
+sweep is 1.06x to 1.12x on one core and 1.39x to 1.65x on all threads, and
+the graph builds in 180 s instead of 194 s on one thread and 32 s instead of
+39 s on 32.
+
+Where the time goes, unfiltered at k = 10 and `ef = 96` on one core (self
+time, 1 kHz sampler), in microseconds per query before and after: the two
+heaps 13.2 → 6.7 (27.0% → 15.7% of the query), the visited set and the
+neighbor filter 10.2 → 9.0 (20.8% → 21.2%), the layer search body 3.2 → 5.7
+(the key conversions and offer logic the compiler used to inline into heap
+code), link reads 2.2 → 1.6, the distance kernel 16.2 → 15.3, the whole
+query 49.0 → 42.3.
+
+**Measured and not kept.** Epoch tags per 64-row word instead of the word
+list: 0.95x of the stamps on one core where the word list is 0.99x, and
+1.01x against 1.06x on all threads (1.42x against 1.49x at 1,000,000 rows).
+Sorted arrays instead of heaps (results best first, candidates in a second
+array with the ones a full beam had passed parked behind it): slower than
+`BinaryHeap<Scored>` at every beam, 0.98x at `ef = 16` and 64, 0.95x at 128,
+0.92x at 256 and 0.84x at 1000, the shifts costing most while a wide beam
+fills. The bounded heap over `Scored` entries rather than integer keys:
+about 1.04x unfiltered at k = 10, where the keys give 1.05x to 1.14x.
 
 ## Appends and seal-time build
 
@@ -712,9 +802,11 @@ process building the challenge fixture (100,000 × 64, `ef_construction =
 40.2 MB image, 57.2 MB at `M = 32` against 52.9 MB; a single-thread build
 peaks at 43.3 MB at `M = 16`. The flat arrays grow once per batch to their
 final size (every array is reserved for the batch before it is filled), so
-the peak is the image plus the per-thread scratch (one `u32` visited stamp
-per row per thread, two heaps bounded by `ef_construction`, the lock
-stripes) and allocator slack: 8 to 10 percent over the image at this shape.
+the peak is the image plus the per-thread scratch (the visited set, two
+heaps bounded by `ef_construction`, the lock stripes) and allocator slack:
+8 to 10 percent over the image at this shape. These figures were taken with
+a 4-byte visited stamp per row per thread; the bitset of
+[Walk state](#walk-state) takes about 0.38 MB per thread off them here.
 Writing the image streams the arrays and allocates nothing of that size;
 loading it mapped allocates nothing.
 
