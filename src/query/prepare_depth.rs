@@ -17,7 +17,7 @@ pub(super) fn selection_depth(req: &QueryRequest, dense: &DensePlan) -> Result<u
     let selection_k = if let Some(resolution) = &dense.quality {
         resolution.selection_k
     } else if req.selection_k == 0 {
-        req.k
+        dense.policy_depth.unwrap_or(req.k)
     } else {
         req.selection_k
     };
@@ -68,14 +68,15 @@ pub(super) fn plan_depths(
         || req.collapse.is_some()
         || uses.aggregate;
     // A collapse over a single leaf deepens its pool itself, so the
-    // leaf's own depth rule (paging by fetching deeper) does not apply;
-    // every other collapse is a fixed pool.
+    // leaf's own depth rules (paging by fetching deeper, a policy depth)
+    // do not apply; every other collapse is a fixed pool.
     let collapse_may_deepen = req.collapse.is_some()
         && matches!(shape, Shape::Lexical { .. } | Shape::Dense { .. })
         && !uses.scorer
         && req.boosts.is_empty()
-        && !dense.fp32_pool;
-    if !pooled && selection_k != req.k {
+        && !dense.fp32_pool
+        && dense.policy_depth.is_none();
+    if !pooled && dense.policy_depth.is_none() && selection_k != req.k {
         return Err(refuse(
             "selection_k differs from k but nothing on a single-leaf shape uses the \
              extra depth; naming it would be a silent no-op",
@@ -83,7 +84,7 @@ pub(super) fn plan_depths(
     }
     let cursor = Cursor::from_request(req)?;
     let pool = pooled.then_some(selection_k);
-    let fetch_k = fetch_depth(base, cursor.as_ref(), pool)?;
+    let fetch_k = fetch_depth(base, cursor.as_ref(), pool, dense.policy_depth)?;
     if let (Some(outcome), Some(plan)) = (dense.execution.as_mut(), dense.plan.as_ref()) {
         if plan.approximate() {
             outcome.candidate_depth = fetch_k;
@@ -104,7 +105,12 @@ pub(super) fn plan_depths(
 /// ranks, blend normalization, the cascade gate), and a scorer's
 /// normalization statistics move with the pool — so paging stays inside
 /// the fixed selection_k pool.
-fn fetch_depth(base: &Base<'_>, cursor: Option<&Cursor>, pool: Option<u32>) -> Result<u32, Status> {
+fn fetch_depth(
+    base: &Base<'_>,
+    cursor: Option<&Cursor>,
+    pool: Option<u32>,
+    policy_depth: Option<u32>,
+) -> Result<u32, Status> {
     let req = base.req;
     match (&base.plan.shape, cursor, pool) {
         // Browse pages by an id floor (append-only ids are stable), so
@@ -126,7 +132,20 @@ fn fetch_depth(base: &Base<'_>, cursor: Option<&Cursor>, pool: Option<u32>) -> R
             }
             Ok(selection_k)
         }
-        (_, Some(c), None) => Ok(c.rank + req.k),
-        (_, None, None) => Ok(req.k),
+        (_, Some(c), None) => match policy_depth {
+            Some(depth) => {
+                if u64::from(c.rank) + u64::from(req.k) > u64::from(depth) {
+                    return Err(Status::failed_precondition(format!(
+                        "the policy candidate depth = {depth} is exhausted at rank {}; a deeper \
+                         traversal is a different measured point; re-run from the first page \
+                         with a selection_k the policy measured",
+                        c.rank
+                    )));
+                }
+                Ok(depth)
+            }
+            None => Ok(c.rank + req.k),
+        },
+        (_, None, None) => Ok(policy_depth.unwrap_or(req.k)),
     }
 }

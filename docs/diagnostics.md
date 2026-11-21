@@ -68,7 +68,7 @@ value that does not parse for the knob's kind returns
 | `shard_pruning` | coordinator | bool | yes | Skip shards whose placement leaf rules out the request's filter before fan-out (`--shard-pruning`, `docs/placement.md`). |
 | `signal_batch` | coordinator | int | yes | Members per FP32 scoring piece when a shard scores a boolean group's FP32 clause (`--signal-batch`, `docs/query-api.md`); the shards score their other clauses in one pass. Zero is rejected. |
 | `chunk_blocks`, `block_max`, `coalesce`, `scan_parallel`, `rerank_parallel`, `layout`, `vector_mmap`, `seal_tail_docs`, `bit_width`, `slot_offset`, `collection`, `vector_backend`, `placement_column`, `placement_leaf` | node | | no | Read at startup. |
-| `collection`, `nodes`, `replicas`, `stream_search`, `bm25_stream`, `max_rerank_bytes`, `shard_deadline_ms` | coordinator | | no | Read at startup. |
+| `collection`, `nodes`, `replicas`, `stream_search`, `bm25_stream`, `max_rerank_bytes`, `shard_deadline_ms`, `dense_execution_policy` | coordinator | | no | Read at startup. |
 
 A coordinator serving several collections shares one process-wide set
 of caps: `SetRuntimeKnob` applies to every collection's coordinator and

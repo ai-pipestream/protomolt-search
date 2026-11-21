@@ -18,6 +18,7 @@ pub(in crate::node) struct VectorLegControls {
     pub(in crate::node) enumerate_max_rows: Option<u32>,
     pub(in crate::node) filter_strategy: i32,
     pub(in crate::node) enumerate_all: bool,
+    pub(in crate::node) staged_selection: bool,
     pub(in crate::node) patience_saturation_ppm: Option<u32>,
     pub(in crate::node) patience_hops: Option<u32>,
     pub(in crate::node) floor_prune: Option<bool>,
@@ -149,7 +150,12 @@ impl NodeServiceImpl {
             )));
         }
         check_enumerate_threshold(index, ctl.enumerate_max_rows)?;
-        let controls = selection_controls(index, ctl.filter_strategy, ctl.enumerate_all)?;
+        let controls = selection_controls(
+            index,
+            ctl.filter_strategy,
+            ctl.enumerate_all,
+            ctl.staged_selection,
+        )?;
         let patience =
             check_patience_options(index, ctl.patience_saturation_ppm, ctl.patience_hops)?;
         let floor_prune = check_floor_prune_options(
@@ -315,6 +321,7 @@ fn hybrid_vector_controls(req: &HybridShardRequest) -> VectorLegControls {
         enumerate_max_rows: req.enumerate_max_rows,
         filter_strategy: req.filter_strategy,
         enumerate_all: req.enumerate_all,
+        staged_selection: req.staged_selection,
         patience_saturation_ppm: req.patience_saturation_ppm,
         patience_hops: req.patience_hops,
         floor_prune: req.floor_prune,

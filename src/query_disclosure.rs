@@ -134,6 +134,12 @@ fn redact_dense_execution(execution: &mut DenseExecutionOutcome) {
         finish_settle_us: _,
         floor_greediness_ppm: _,
         floor_clamp_min: _,
+        mode: _,
+        technique: _,
+        selection_precision: _,
+        output_precision: _,
+        filter_strategy: _,
+        shape: _,
     }) = policy_point
     {
         *filter_selectivity_ppm_min = 0;
@@ -216,6 +222,7 @@ mod tests {
                 finish_settle_us: Some(250),
                 floor_greediness_ppm: Some(500_000),
                 floor_clamp_min: Some(8),
+                ..Default::default()
             }),
             filter_selectivity_ppm: 500_000,
             candidate_depth: 100,

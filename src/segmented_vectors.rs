@@ -270,7 +270,19 @@ impl SegmentedProvider {
 
 impl VectorProvider for SegmentedProvider {
     fn descriptor(&self) -> VectorBackendDescriptor {
-        self.tail.descriptor()
+        let mut desc = self.tail.descriptor();
+        let images = self.images();
+        let all_staged = !images.is_empty()
+            && images.iter().all(|(_, _, img)| {
+                img.descriptor()
+                    .capabilities
+                    .contains(&crate::vector::VectorCapability::StagedTopK)
+            });
+        if !all_staged {
+            desc.capabilities
+                .retain(|c| *c != crate::vector::VectorCapability::StagedTopK);
+        }
+        desc
     }
 
     fn backend_config(&self) -> Result<VectorBackendConfig, VectorError> {

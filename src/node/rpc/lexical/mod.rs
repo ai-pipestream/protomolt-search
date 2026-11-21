@@ -148,6 +148,7 @@ impl NodeServiceImpl {
                         enumerate_max_rows: req.enumerate_max_rows,
                         filter_strategy: req.filter_strategy,
                         enumerate_all: req.enumerate_all,
+                        staged_selection: req.staged_selection,
                         patience_saturation_ppm: req.patience_saturation_ppm,
                         patience_hops: req.patience_hops,
                         floor_prune: req.floor_prune,

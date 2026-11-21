@@ -115,6 +115,8 @@ mod fixtures;
 pub(crate) use fixtures::*;
 #[path = "relay/aggregates_and_browse.rs"]
 mod aggregates_and_browse;
+#[path = "relay/backend_capability_intersection.rs"]
+mod backend_capability_intersection;
 #[path = "relay/dictionaries_and_diagnostics.rs"]
 mod dictionaries_and_diagnostics;
 #[path = "relay/fetches_and_bitmaps.rs"]

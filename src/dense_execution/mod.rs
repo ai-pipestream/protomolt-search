@@ -6,6 +6,9 @@
 //! FP32 rescoring of a candidate pool never certifies exhaustive coverage.
 
 mod plan;
+mod qualified;
+#[cfg(test)]
+mod qualified_tests;
 mod raw;
 mod receipt;
 #[cfg(test)]
@@ -14,9 +17,10 @@ mod tests;
 use plan::{HNSW_BALANCED, HNSW_FAST};
 
 pub(crate) use plan::{
-    parse_request, resolve, DenseExecutionError, DenseRequest, ProviderCaps, ResolvedDensePlan,
-    Route,
+    output_precision, parse_request, resolve, DenseExecutionError, DenseRequest, ProviderCaps,
+    ResolvedDensePlan, Route,
 };
+pub(crate) use qualified::qualified;
 pub(crate) use raw::{validate_raw_controls, RawDenseControls};
 pub(crate) use receipt::{
     planned_outcome, stamp, verify_exhaustive_scan, Evidence, ShardPartEvidence,

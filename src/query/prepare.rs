@@ -40,7 +40,7 @@ pub(super) async fn prepare<'a>(
         p.shards_total = total;
         p.shards_skipped = skipped;
     }
-    let mut dense = resolve_dense(&base).await?;
+    let mut dense = resolve_dense(&base, &filter).await?;
     dense.fp32_pool = fp32_pool(&plan.shape, &dense)?;
     check_ids(plan, &req.boosts)?;
     let scorer = validate_scorer(req, plan)?;

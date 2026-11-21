@@ -65,6 +65,7 @@ fn start_shard_search(shard: u32, ctx: &ShardQueryCtx) -> Result<SearchShardRequ
             enumerate_max_rows: ctx.filters.enumerate_max_rows,
             filter_strategy: ctx.filters.filter_strategy,
             enumerate_all: ctx.filters.enumerate_all,
+            staged_selection: ctx.filters.staged_selection,
             patience_saturation_ppm: ctx.filters.patience_saturation_ppm,
             patience_hops: ctx.filters.patience_hops,
             floor_prune: ctx.filters.floor_prune,

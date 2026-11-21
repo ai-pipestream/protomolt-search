@@ -107,6 +107,7 @@ fn search_request(run: &mut Run<'_>, query: &DenseQuery) -> SearchRequest {
         enumerate_max_rows: knobs.enumerate_max_rows,
         filter_strategy: knobs.filter_strategy,
         enumerate_all: knobs.enumerate_all,
+        staged_selection: knobs.staged_selection,
         patience_saturation_ppm: knobs.patience_saturation_ppm,
         patience_hops: knobs.patience_hops,
         finish_settle_us: knobs.finish_settle_us,

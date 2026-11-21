@@ -128,6 +128,7 @@ fn stream_filters(start: &crate::pb::StartStreamSearch) -> RequestFilters {
         enumerate_max_rows: start.enumerate_max_rows,
         filter_strategy: start.filter_strategy,
         enumerate_all: start.enumerate_all,
+        staged_selection: start.staged_selection,
         patience_saturation_ppm: start.patience_saturation_ppm,
         patience_hops: start.patience_hops,
         finish_settle_us: None,

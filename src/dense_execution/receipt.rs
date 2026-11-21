@@ -199,10 +199,12 @@ fn exhaustive_route_techniques(
                 evidence.parts_enumerated,
             )]))
         }
-        Route::Walk | Route::Fp32Pool | Route::UncertifiedScan => Err(contradiction(
-            route,
-            "approximate route reached exhaustive receipt validation",
-        )),
+        Route::Walk | Route::Staged | Route::Fp32Pool | Route::UncertifiedScan => {
+            Err(contradiction(
+                route,
+                "approximate route reached exhaustive receipt validation",
+            ))
+        }
     }
 }
 
@@ -306,6 +308,9 @@ fn approximate_receipt(
         let techniques = counts(&[(DenseTechnique::QuantizedScan, evidence.parts_scanned)]);
         return Ok((techniques, Coverage::CandidateSet, Termination::Exhausted));
     }
+    if route == Route::Staged || pool_selection == DenseTechnique::BitplaneStaged {
+        return staged_receipt(route, active, evidence);
+    }
     if evidence.parts_scanned > 0 || evidence.parts_staged > 0 {
         return Err(contradiction(
             route,
@@ -342,6 +347,29 @@ fn approximate_receipt(
     Ok((techniques, Coverage::CandidateSet, termination))
 }
 
+fn staged_receipt(
+    route: Route,
+    active: u32,
+    evidence: &Evidence,
+) -> Result<(Vec<DenseTechniqueCount>, Coverage, Termination), DenseExecutionError> {
+    let shards_staged = evidence
+        .shards
+        .iter()
+        .all(|s| s.parts_staged == s.active() && s.parts_walked == 0 && s.parts_scanned == 0);
+    if evidence.parts_staged != active
+        || evidence.parts_walked > 0
+        || evidence.parts_scanned > 0
+        || !shards_staged
+    {
+        return Err(contradiction(
+            route,
+            "staged candidate selection did not run staged top-k on every active part",
+        ));
+    }
+    let techniques = counts(&[(DenseTechnique::BitplaneStaged, evidence.parts_staged)]);
+    Ok((techniques, Coverage::CandidateSet, Termination::Converged))
+}
+
 /// Stamp the plan and the validated receipt onto the outcome. Contradictory
 /// evidence is an error, never a weaker certificate.
 pub(crate) fn stamp(
@@ -375,7 +403,7 @@ pub(crate) fn planned_outcome(plan: &ResolvedDensePlan) -> DenseExecutionOutcome
         output_precision: plan.output_precision as i32,
         filter_strategy: plan.filter_strategy as i32,
         preset: plan.preset.map(|p| p.name.to_string()).unwrap_or_default(),
-        policy_qualified: false,
+        policy_qualified: plan.policy_qualified,
         fallback_reason: plan.fallback_reason.clone(),
         planner_reason: plan.planner_reason.clone(),
         evidence_scope: crate::pb::DenseEvidenceScope::NotApplicable as i32,

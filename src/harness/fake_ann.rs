@@ -107,3 +107,113 @@ impl VectorProvider for FakeAnn {
         Ok(summary)
     }
 }
+
+pub const STAGED_BACKEND_KIND: &str = "fake-staged";
+
+/// Exhaustive quantized provider that deterministically advertises and stamps
+/// `StagedTopK` regardless of host CPU features or corpus row count.
+pub struct FakeStaged {
+    inner: VectorIndex,
+}
+
+pub fn fake_staged_index(inner: VectorIndex) -> VectorIndex {
+    VectorIndex::from_provider(FakeStaged { inner })
+}
+
+pub fn staged_fingerprint_of(inner: &VectorIndex) -> String {
+    format!(
+        "{STAGED_BACKEND_KIND}:{}",
+        inner.descriptor().scoring_fingerprint
+    )
+}
+
+impl VectorProvider for FakeStaged {
+    fn descriptor(&self) -> VectorBackendDescriptor {
+        let inner = self.inner.descriptor();
+        VectorBackendDescriptor {
+            backend_kind: STAGED_BACKEND_KIND.into(),
+            backend_version: "test".into(),
+            dimension: inner.dimension,
+            bits_per_dimension: inner.bits_per_dimension,
+            metric: inner.metric,
+            score_direction: inner.score_direction,
+            scoring_fingerprint: staged_fingerprint_of(&self.inner),
+            quality_contract: QualityContract::ExhaustiveQuantized,
+            capabilities: vec![
+                VectorCapability::BatchQuery,
+                VectorCapability::CandidateStream,
+                VectorCapability::LiveBoundInput,
+                VectorCapability::DenseMask,
+                VectorCapability::CandidateRescore,
+                VectorCapability::ExhaustiveCompletion,
+                VectorCapability::StagedTopK,
+            ],
+        }
+    }
+
+    fn backend_config(&self) -> Result<VectorBackendConfig, VectorError> {
+        let mut config = self.inner.backend_config()?;
+        config.backend_kind = STAGED_BACKEND_KIND.into();
+        Ok(config)
+    }
+
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn dimension(&self) -> Option<usize> {
+        self.inner.dim_opt()
+    }
+
+    fn add(&mut self, vectors: &[f32], dimension: usize) -> Result<(), VectorError> {
+        self.inner.add(vectors, dimension)
+    }
+
+    fn prepare(&mut self) -> Result<(), VectorError> {
+        self.inner.prepare()
+    }
+
+    fn write(&self, path: &Path) -> Result<(), VectorError> {
+        self.inner.write(path)
+    }
+
+    fn row_transcripts(
+        &self,
+        rows: std::ops::Range<usize>,
+        sink: &mut dyn FnMut(usize, &[u8]),
+    ) -> Result<(), VectorError> {
+        self.inner.row_transcripts(rows, sink)
+    }
+
+    fn representation_materialized(&self) -> Option<bool> {
+        self.inner.representation_materialized()
+    }
+
+    fn search(
+        &self,
+        queries: &[f32],
+        k: usize,
+        options: VectorSearchOptions<'_>,
+    ) -> Result<VectorSearchResults, VectorError> {
+        let staged = options.staged;
+        let mut results = self.inner.try_search(queries, k, options)?;
+        if staged {
+            results.parts.staged = results
+                .parts
+                .staged
+                .saturating_add(std::mem::take(&mut results.parts.scanned));
+        }
+        Ok(results)
+    }
+
+    fn search_streaming_controlled(
+        &self,
+        queries: &[f32],
+        options: VectorSearchOptions<'_>,
+        sink: &mut dyn FnMut(&VectorStreamBatch<'_>) -> VectorStreamControl,
+        control: &mut dyn FnMut() -> VectorStreamControl,
+    ) -> Result<VectorStreamSummary, VectorError> {
+        self.inner
+            .try_search_streaming_controlled(queries, options, sink, control)
+    }
+}

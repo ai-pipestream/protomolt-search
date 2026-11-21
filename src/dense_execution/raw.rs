@@ -7,8 +7,10 @@ use crate::pb::DenseFilterStrategy as Strategy;
 /// `HybridSearch` requests.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct RawDenseControls {
+    pub(crate) collapse_parents: bool,
     pub(crate) filter_strategy: i32,
     pub(crate) enumerate_all: bool,
+    pub(crate) staged_selection: bool,
     pub(crate) enumerate_max_rows: Option<u32>,
     pub(crate) patience_saturation_ppm: Option<u32>,
     pub(crate) patience_hops: Option<u32>,
@@ -23,6 +25,7 @@ impl RawDenseControls {
     pub(crate) fn has_any(&self) -> bool {
         self.filter_strategy != 0
             || self.enumerate_all
+            || self.staged_selection
             || self.enumerate_max_rows.is_some()
             || self.patience_saturation_ppm.is_some()
             || self.patience_hops.is_some()
@@ -58,6 +61,11 @@ pub(crate) fn validate_raw_controls(
             "floor_greediness_ppm and floor_clamp_min require floor_prune = true".to_string(),
         ));
     }
+    if raw.collapse_parents && raw.staged_selection {
+        return Err(DenseExecutionError::InvalidRequest(
+            "collapse_parents and staged_selection are mutually exclusive".to_string(),
+        ));
+    }
     let approx_controls = strategy != Strategy::Default
         || raw.enumerate_max_rows.is_some()
         || raw.patience_saturation_ppm.is_some()
@@ -66,9 +74,17 @@ pub(crate) fn validate_raw_controls(
         || raw.floor_prune == Some(true)
         || raw.floor_greediness_ppm.is_some()
         || raw.floor_clamp_min.is_some();
-    if raw.enumerate_all && approx_controls {
+    if raw.enumerate_all && (approx_controls || raw.staged_selection) {
         return Err(DenseExecutionError::InvalidRequest(
             "enumerate_all pins exhaustive enumeration and cannot be combined with \
+             staged_selection, filter_strategy, enumerate_max_rows, patience, floor pruning, \
+             or early-finish controls"
+                .to_string(),
+        ));
+    }
+    if raw.staged_selection && approx_controls {
+        return Err(DenseExecutionError::InvalidRequest(
+            "staged_selection is unary bit-plane selection and cannot be combined with \
              filter_strategy, enumerate_max_rows, patience, floor pruning, or early-finish controls"
                 .to_string(),
         ));
@@ -84,6 +100,12 @@ fn check_raw_caps(
     strategy: Strategy,
     caps: &ProviderCaps,
 ) -> Result<(), DenseExecutionError> {
+    if raw.staged_selection && !caps.staged {
+        return Err(DenseExecutionError::FailedPrecondition(format!(
+            "provider {} cannot serve staged_selection (staged_top_k not available on unary path)",
+            caps.provider
+        )));
+    }
     if raw.enumerate_all && !caps.enumerates {
         return Err(DenseExecutionError::FailedPrecondition(format!(
             "provider {} cannot pin enumeration of every admitted row (mask_enumeration not advertised)",

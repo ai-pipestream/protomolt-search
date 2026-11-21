@@ -1,7 +1,11 @@
 //! The embedded TurboVec adapter: the only code that names the native engine.
 
+mod planes;
+
 use std::ops::Range;
 use std::path::Path;
+
+use self::planes::{bit_planes_eligible, STAGED_MIN_ROWS};
 
 use serde::{Deserialize, Serialize};
 use turbovec::{CalibrationState, SearchOptions, StreamControl, TurboQuantIndex};
@@ -119,6 +123,37 @@ struct EmbeddedTurboVec {
 }
 
 impl EmbeddedTurboVec {
+    fn capabilities(&self) -> Vec<VectorCapability> {
+        let mut capabilities = vec![
+            VectorCapability::BatchQuery,
+            VectorCapability::CandidateStream,
+            VectorCapability::LiveBoundInput,
+            VectorCapability::DenseMask,
+            VectorCapability::CandidateRescore,
+            VectorCapability::Append,
+            VectorCapability::Flush,
+            VectorCapability::SnapshotInstall,
+            VectorCapability::RawVectorRebuild,
+            VectorCapability::ExhaustiveCompletion,
+        ];
+        if self.staged_eligible() {
+            capabilities.push(VectorCapability::StagedTopK);
+        }
+        capabilities
+    }
+
+    /// An owned image of at least [`STAGED_MIN_ROWS`] rows at a supported
+    /// bit-width and dimension geometry on a host whose kernels read bit
+    /// planes is searched in stages unless exhaustive search is required.
+    fn staged_eligible(&self) -> bool {
+        !self.index.is_mapped()
+            && self.index.len() >= STAGED_MIN_ROWS
+            && self
+                .index
+                .dim_opt()
+                .is_some_and(|dim| bit_planes_eligible(self.index.bit_width(), dim))
+    }
+
     fn payload(&self) -> ConfigPayload {
         let (shift, scale) = match self.index.calibration_state() {
             CalibrationState::Calibrated => (
@@ -140,12 +175,12 @@ impl EmbeddedTurboVec {
         options: VectorSearchOptions<'_>,
         allow: Option<&'a [bool]>,
     ) -> SearchOptions<'a> {
-        // This provider advertises `ExhaustiveQuantized`: every top-k
-        // is the whole-index scan's, bit for bit. On a bit-plane cache
-        // (32,768+ rows on aarch64 or AVX-512 VBMI + VNNI hosts) turbovec
-        // would otherwise search in stages, with an approximate id set
-        // that also depends on the caller's thread count.
-        let mut native = SearchOptions::new().with_exhaustive(true);
+        // This provider advertises `ExhaustiveQuantized`: unless a plan asks
+        // for staged selection, every top-k is the whole-index scan's, bit
+        // for bit. On a bit-plane cache (32,768+ rows on aarch64 or AVX-512
+        // VBMI + VNNI hosts) turbovec otherwise searches in stages, with an
+        // approximate id set that also depends on the caller's thread count.
+        let mut native = SearchOptions::new().with_exhaustive(!options.staged);
         if let Some(allow) = allow {
             native = native.with_mask(allow);
         }
@@ -263,18 +298,7 @@ impl VectorProvider for EmbeddedTurboVec {
             )
             .to_hex(),
             quality_contract: QualityContract::ExhaustiveQuantized,
-            capabilities: vec![
-                VectorCapability::BatchQuery,
-                VectorCapability::CandidateStream,
-                VectorCapability::LiveBoundInput,
-                VectorCapability::DenseMask,
-                VectorCapability::CandidateRescore,
-                VectorCapability::Append,
-                VectorCapability::Flush,
-                VectorCapability::SnapshotInstall,
-                VectorCapability::RawVectorRebuild,
-                VectorCapability::ExhaustiveCompletion,
-            ],
+            capabilities: self.capabilities(),
         }
     }
 
@@ -319,6 +343,7 @@ impl VectorProvider for EmbeddedTurboVec {
         options: VectorSearchOptions<'_>,
     ) -> Result<VectorSearchResults, VectorError> {
         let allow_mask = options.allow;
+        let ran_staged = options.staged && self.staged_eligible();
         let allow = allow_mask.map(|mask| mask.bools());
         let result = self
             .index
@@ -330,6 +355,12 @@ impl VectorProvider for EmbeddedTurboVec {
             PartCounts {
                 total: 1,
                 skipped: 1,
+                ..Default::default()
+            }
+        } else if ran_staged {
+            PartCounts {
+                total: 1,
+                staged: 1,
                 ..Default::default()
             }
         } else {

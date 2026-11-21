@@ -1540,6 +1540,9 @@ message StartShardSearch {
   // Score every admitted row: providers that choose a filter regime pin
   // enumeration over the whole admitted set, including an unfiltered one.
   bool enumerate_all = 19;
+  // Select by staged top-k over owned bit planes on a provider that
+  // advertises `staged_top_k`; every other provider refuses it.
+  bool staged_selection = 20;
   // Score every admitted row directly from the shard-local FP32 sidecar,
   // returning a tie-complete local top-k without streaming full-corpus
   // candidate lists to the coordinator.
@@ -1774,6 +1777,9 @@ message StartStreamSearch {
   // As `StartShardSearch.filter_strategy` and `enumerate_all`.
   DenseFilterStrategy filter_strategy = 20;
   bool enumerate_all = 21;
+  // Select by staged top-k over owned bit planes on a provider that
+  // advertises `staged_top_k`; every other provider refuses it.
+  bool staged_selection = 22;
   // Score every admitted row directly from the shard-local FP32 sidecar.
   bool exact_fp32_scan = 23;
 }
@@ -2070,6 +2076,13 @@ message GetVectorBackendResponse {
   // 4 was `indexed_vectors`, the rows a background-built structure covered;
   // every provider now links a row before its append returns.
   reserved 4;
+  // Shard mutation and tombstone state bound into `LiveIdentity` so policies
+  // do not outlive deletes, replacements, or same-row-count swaps.
+  uint64 deleted_docs = 6;
+  uint64 wal_generation = 7;
+  uint64 wal_high_watermark = 8;
+  uint64 stats_epoch = 9;
+  bytes stats_incarnation = 10;
 }
 
 message ConfigureVectorBackendRequest {
@@ -2333,6 +2346,9 @@ message SearchRequest {
   // Score every admitted row: providers that choose a filter regime pin
   // enumeration over the whole admitted set, including an unfiltered one.
   bool enumerate_all = 19;
+  // Select by staged top-k over owned bit planes on a provider that
+  // advertises `staged_top_k`; every other provider refuses it.
+  bool staged_selection = 20;
 }
 
 // Client-facing search response.
@@ -4740,6 +4756,7 @@ message HybridShardRequest {
   optional bool floor_prune = 25;
   optional uint32 floor_greediness_ppm = 26;
   optional uint32 floor_clamp_min = 27;
+  bool staged_selection = 28;
 }
 
 // One fused hit in a shard's hybrid result, with per-leg provenance.
@@ -4879,6 +4896,9 @@ message HybridSearchRequest {
   // vector leg.
   DenseFilterStrategy filter_strategy = 22;
   bool enumerate_all = 23;
+  // Select by staged top-k over owned bit planes on a provider that
+  // advertises `staged_top_k`; every other provider refuses it.
+  bool staged_selection = 24;
 }
 
 // Profile of one hybrid query; populated only when the request set
@@ -5026,6 +5046,7 @@ message ShardLegsRequest {
   optional bool floor_prune = 22;
   optional uint32 floor_greediness_ppm = 23;
   optional uint32 floor_clamp_min = 24;
+  bool staged_selection = 25;
 }
 
 // One raw leg hit.
@@ -6227,9 +6248,11 @@ message DenseExecutionOutcome {
   string fallback_reason = 28;
 }
 
-// One measured point of a dense execution policy (docs/query-api.md): the
-// exact key a request must match and the recall measured there against the
-// exhaustive traversal.
+// One measured point of a dense execution policy
+// (docs/dense-execution-policy.md): the key a request must match exactly, the
+// controls the approximate technique runs under, and the recall measured there
+// against the exhaustive selection. Recall evidence applies to the dense
+// candidates at `k`, never to a document aggregate.
 message DensePolicyPoint {
   uint32 k = 1;
   uint32 filter_selectivity_ppm_min = 2;
@@ -6241,18 +6264,56 @@ message DensePolicyPoint {
   // exactly. Absent on a point for a provider without filter regimes.
   optional uint32 enumerate_max_rows = 6;
   // Optional hop-to-hop beam saturation early-stop parameters the point was
-  // measured under and is served under (docs/hnsw.md, "Patience"). Set
-  // together or absent together.
+  // measured under and is served under. Set together or absent together.
   optional uint32 patience_saturation_ppm = 7;
   optional uint32 patience_hops = 8;
   // Optional settle window in microseconds the point was measured under and
-  // is served under for graceful stream finish (#100; docs/hnsw.md).
+  // is served under for graceful stream finish.
   optional uint32 finish_settle_us = 9;
   // Optional shared-floor pruning clamp parameters the point was measured
-  // under and is served under (#72; docs/hnsw.md, "Floor pruning"). Set
-  // together or absent together.
+  // under and is served under. Set together or absent together.
   optional uint32 floor_greediness_ppm = 10;
   optional uint32 floor_clamp_min = 11;
+  // BALANCED or FAST: the approximate mode the point measured.
+  DenseExecutionMode mode = 12;
+  // The approximate technique: HNSW_WALK or BITPLANE_STAGED.
+  DenseTechnique technique = 13;
+  DenseScorePrecision selection_precision = 14;
+  DenseScorePrecision output_precision = 15;
+  DenseFilterStrategy filter_strategy = 16;
+  DenseExecutionShape shape = 17;
+}
+
+// Whether a measurement ran through the unary or the streaming route; the
+// two complete differently, so evidence does not transfer between them.
+enum DenseExecutionShape {
+  DENSE_EXECUTION_SHAPE_UNSPECIFIED = 0;
+  DENSE_EXECUTION_SHAPE_UNARY = 1;
+  DENSE_EXECUTION_SHAPE_STREAMING = 2;
+}
+
+// The version-2 dense execution policy document, persisted as binary
+// protobuf. It binds measured evidence to one provider, score space,
+// corpus generation and shape; AUTO selects approximation only through a
+// point whose measured recall meets `target_recall_ppm`.
+message DenseExecutionPolicyDocument {
+  // Must be 2.
+  uint32 format_version = 1;
+  string policy_id = 2;
+  string embedding_model = 3;
+  string provider_backend = 4;
+  string scoring_fingerprint = 5;
+  uint64 corpus_generation = 6;
+  uint64 corpus_rows = 7;
+  uint32 dimensions = 8;
+  // Held-out queries behind every point.
+  uint32 measured_queries = 9;
+  // The recall a point must have measured for AUTO to select it.
+  uint32 target_recall_ppm = 10;
+  repeated DensePolicyPoint points = 11;
+  // Tombstone count and ordered per-shard mutation digest at measurement time.
+  uint64 deleted_docs = 15;
+  string corpus_fingerprint = 16;
 }
 
 // Public streaming query controls. The query itself is byte-for-byte the

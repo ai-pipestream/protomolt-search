@@ -64,6 +64,7 @@ impl<'a> StreamOpen<'a> {
                 enumerate_max_rows: filters.enumerate_max_rows,
                 filter_strategy: filters.filter_strategy,
                 enumerate_all: filters.enumerate_all,
+                staged_selection: filters.staged_selection,
                 patience_saturation_ppm: filters.patience_saturation_ppm,
                 patience_hops: filters.patience_hops,
                 floor_token,

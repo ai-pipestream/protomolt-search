@@ -226,7 +226,12 @@ fn run_solo_blocking(mut exec: SearchShardExec) -> Result<ScanOutcome, Status> {
         keep_ties: exec.start.tie_complete,
         allow: filters.allow.as_ref().map(crate::vector::Mask::Bits),
         enumerate_max_rows: exec.start.enumerate_max_rows.map(|r| r as usize),
-        controls: selection_controls(index, exec.start.filter_strategy, exec.start.enumerate_all)?,
+        controls: selection_controls(
+            index,
+            exec.start.filter_strategy,
+            exec.start.enumerate_all,
+            exec.start.staged_selection,
+        )?,
         patience,
         floor_prune,
     }];
@@ -289,6 +294,7 @@ async fn enqueue_coalesced_scan(
         enumerate_max_rows: exec.start.enumerate_max_rows,
         filter_strategy: exec.start.filter_strategy,
         enumerate_all: exec.start.enumerate_all,
+        staged_selection: exec.start.staged_selection,
         patience_saturation_ppm: exec.start.patience_saturation_ppm,
         patience_hops: exec.start.patience_hops,
         floor_prune: exec.start.floor_prune,
@@ -368,13 +374,15 @@ async fn recv_start_shard_search(
     }
 }
 
-fn collapse_conflict(start: &StartShardSearch) -> Option<&'static str> {
+pub(crate) fn collapse_conflict(start: &StartShardSearch) -> Option<&'static str> {
     if !start.collapse_parents {
         None
     } else if start.exact_fp32_scan {
         Some("collapse_parents and exact_fp32_scan are mutually exclusive")
     } else if start.tie_complete {
         Some("collapse_parents and tie_complete are mutually exclusive")
+    } else if start.staged_selection {
+        Some("collapse_parents and staged_selection are mutually exclusive")
     } else {
         None
     }

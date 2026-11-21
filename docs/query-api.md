@@ -291,17 +291,19 @@ precision they are ranked; the two are independent.
   graph.
 - `BALANCED` runs the provider's balanced technique under a versioned
   built-in preset (`hnsw-balanced-v1`: the request's depth as the beam,
-  `ENUMERATE_SMALL` routing). A provider without one runs its exhaustive
-  technique at the same precision and says so in `fallback_reason` (or, on
-  clustered TurboVec, runs its remote quantized/pool scan with `CANDIDATE_SET`
-  coverage).
+  `ENUMERATE_SMALL` routing; `bitplane-balanced-v1`: staged top-k on an
+  owned TurboVec image that advertises `staged_top_k`). A provider without
+  one runs its exhaustive technique at the same precision and says so in
+  `fallback_reason` (or, on clustered TurboVec, runs its remote quantized/pool
+  scan with `CANDIDATE_SET` coverage).
 - `FAST` runs a distinct speed preset (`hnsw-fast-v1`: patience 0.99 over 15
   hops, `SPEED` routing) and refuses where the provider has none. It is never
   replaced by another mode.
-- `AUTO` lets the coordinator choose. Approximation needs qualifying measured
-  evidence, so AUTO runs the exhaustive technique at the requested precision;
-  `dense_execution_policy` (`--dense-execution-policy`, including version-1 TOML
-  policies) is refused at startup config load on this build.
+- `AUTO` lets the coordinator choose. It approximates only through a
+  qualifying point of the installed version-2 policy
+  ([Dense execution policy](dense-execution-policy.md)); otherwise it runs
+  the exhaustive technique at the requested precision and says why in
+  `fallback_reason`.
 
 `DenseQuery.precision` is `AUTO` (the provider's native precision: FP32 for
 `hnsw`, quantized for TurboVec), `FP32` or `QUANTIZED`. Explicit precisions
