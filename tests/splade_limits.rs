@@ -47,9 +47,12 @@ impl Fixture {
                 },
             );
         }
-        let bm25 = root.join("index.bm25");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        let bm25 = stage.join("source.bm25");
         store.save(&bm25).unwrap();
         common::catalog::seal_bm25_file(&path, &bm25);
+        std::fs::remove_dir_all(&stage).unwrap();
         let node = NodeServiceImpl::open(
             NodeConfig {
                 max_k,
