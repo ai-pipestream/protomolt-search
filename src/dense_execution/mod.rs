@@ -18,4 +18,6 @@ pub(crate) use plan::{
     Route,
 };
 pub(crate) use raw::{validate_raw_controls, RawDenseControls};
-pub(crate) use receipt::{planned_outcome, stamp, verify_exhaustive_scan, Evidence};
+pub(crate) use receipt::{
+    planned_outcome, stamp, verify_exhaustive_scan, Evidence, ShardPartEvidence,
+};

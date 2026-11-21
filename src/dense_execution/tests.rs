@@ -220,24 +220,24 @@ fn exhaustive_receipts_require_every_consulted_part_without_walks_or_stops() {
     for bad in [
         Evidence {
             reported_shards: 1,
-            ..full_enum
+            ..full_enum.clone()
         },
         Evidence {
             parts_enumerated: 1,
             parts_walked: 1,
-            ..full_enum
+            ..full_enum.clone()
         },
         Evidence {
             parts_enumerated: 0,
-            ..full_enum
+            ..full_enum.clone()
         },
         Evidence {
             patience_stopped: 1,
-            ..full_enum
+            ..full_enum.clone()
         },
         Evidence {
             shards_finished_early: 1,
-            ..full_enum
+            ..full_enum.clone()
         },
     ] {
         assert!(stamp(&p, &bad, &mut planned_outcome(&p)).is_err());
@@ -314,4 +314,76 @@ fn approximate_receipts_distinguish_tail_enumeration_from_graph_walks() {
     .unwrap();
     assert_eq!(mixed.termination, DenseTermination::BudgetStopped as i32);
     assert_eq!(mixed.techniques.len(), 2);
+}
+
+#[test]
+fn per_shard_fp32_over_reporting_and_uncertified_backends_fail_closed() {
+    use super::receipt::{verify_exhaustive_scan, ShardPartEvidence};
+
+    let fp32 = plan(Mode::Exhaustive, Request::Fp32, &turbovec()).unwrap();
+    let piggybacked = Evidence {
+        consulted_shards: 2,
+        reported_shards: 2,
+        parts_total: 2,
+        parts_enumerated: 2,
+        fp32_rows_scored: 64,
+        rows: 128,
+        shards: vec![
+            ShardPartEvidence {
+                parts_total: 1,
+                parts_enumerated: 1,
+                fp32_rows_scored: 64,
+                ..Default::default()
+            },
+            ShardPartEvidence {
+                parts_total: 1,
+                parts_enumerated: 1,
+                fp32_rows_scored: 0,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    assert!(stamp(&fp32, &piggybacked, &mut planned_outcome(&fp32)).is_err());
+
+    let walk = plan(Mode::Balanced, Request::Auto, &hnsw()).unwrap();
+    let over_reported = Evidence {
+        consulted_shards: 2,
+        reported_shards: 2,
+        parts_total: 2,
+        parts_walked: 2,
+        shards_finished_early: 1,
+        rows: 100,
+        shards: vec![
+            ShardPartEvidence {
+                parts_total: 1,
+                parts_walked: 0,
+                finished_early: true,
+                ..Default::default()
+            },
+            ShardPartEvidence {
+                parts_total: 1,
+                parts_walked: 1,
+                parts_enumerated: 1,
+                finished_early: false,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    assert!(stamp(&walk, &over_reported, &mut planned_outcome(&walk)).is_err());
+
+    let native = plan(Mode::Exhaustive, Request::Auto, &turbovec()).unwrap();
+    let clustered = Evidence {
+        uncertified_backend: true,
+        rows: 200,
+        ..Default::default()
+    };
+    assert!(verify_exhaustive_scan(Route::NativeScan, &clustered).is_err());
+    let mut out = planned_outcome(&native);
+    stamp(&native, &clustered, &mut out).unwrap();
+    assert_eq!(out.coverage, DenseCoverage::CandidateSet as i32);
+    assert_eq!(out.termination, DenseTermination::Unspecified as i32);
+    assert!(out.techniques.is_empty());
+    assert!(out.planner_reason.contains("coverage is not certified"));
 }

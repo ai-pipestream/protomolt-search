@@ -13,9 +13,9 @@ use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     aggregate_result, search_query, selection_query, selection_score_strategy, AddDocumentsRequest,
     AggregateOp, AggregateRequest, AggregateResponse, Aggregation, BooleanQuery, CollapseSpec,
-    CompositeSearchStrategy, DocLineage, FacetValue, FilterQuery, IntegerValue,
-    LexicalQuery, QueryHit, QueryRequest, QueryResponse, QuerySort, RrfScore, SearchQuery,
-    SelectionOperator, SelectionQuery, SelectionScoreStrategy,
+    CompositeSearchStrategy, DocLineage, FacetValue, FilterQuery, IntegerValue, LexicalQuery,
+    QueryHit, QueryRequest, QueryResponse, QuerySort, RrfScore, SearchQuery, SelectionOperator,
+    SelectionQuery, SelectionScoreStrategy,
 };
 use tonic::Request;
 

@@ -7,10 +7,39 @@ use crate::pb::{
     DenseTechniqueCount, DenseTermination as Termination,
 };
 
-/// What the shards reported for one dense selection.
+/// Per-shard execution counts used to reject cross-shard masking of missing
+/// rows, skipped-part under-reports, or over-reported part counts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ShardPartEvidence {
+    pub(crate) parts_total: u32,
+    pub(crate) parts_skipped: u32,
+    pub(crate) parts_walked: u32,
+    pub(crate) parts_enumerated: u32,
+    pub(crate) parts_scanned: u32,
+    pub(crate) parts_staged: u32,
+    pub(crate) fp32_rows_scored: u64,
+    pub(crate) finished_early: bool,
+}
+
+impl ShardPartEvidence {
+    fn active(&self) -> u32 {
+        self.parts_total.saturating_sub(self.parts_skipped)
+    }
+
+    fn executed(&self) -> u32 {
+        self.parts_walked
+            .saturating_add(self.parts_enumerated)
+            .saturating_add(self.parts_scanned)
+            .saturating_add(self.parts_staged)
+    }
+}
+
+/// What the shards reported for one dense selection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Evidence {
     pub(crate) regimes: Option<DenseFilterRegimes>,
+    /// Set when a remote backend answered without per-part execution receipts.
+    pub(crate) uncertified_backend: bool,
     /// Consulted non-empty shards and how many reported explicit per-part counts.
     pub(crate) consulted_shards: u32,
     pub(crate) reported_shards: u32,
@@ -28,6 +57,8 @@ pub(crate) struct Evidence {
     pub(crate) fp32_rows_scored: u64,
     /// Physical rows the fleet holds.
     pub(crate) rows: u64,
+    /// Individual shard reports for per-shard invariant checks.
+    pub(crate) shards: Vec<ShardPartEvidence>,
 }
 
 impl Evidence {
@@ -42,6 +73,36 @@ impl Evidence {
     fn active_parts(&self) -> u32 {
         self.parts_total.saturating_sub(self.parts_skipped)
     }
+
+    fn executed_parts(&self) -> u32 {
+        self.parts_walked
+            .saturating_add(self.parts_enumerated)
+            .saturating_add(self.parts_scanned)
+            .saturating_add(self.parts_staged)
+    }
+}
+
+fn validate_part_bounds(route: Route, evidence: &Evidence) -> Result<(), DenseExecutionError> {
+    if evidence.parts_skipped > evidence.parts_total
+        || evidence
+            .shards
+            .iter()
+            .any(|s| s.parts_skipped > s.parts_total)
+    {
+        return Err(contradiction(
+            route,
+            "a shard reported more skipped parts than total parts",
+        ));
+    }
+    if evidence.executed_parts() > evidence.active_parts()
+        || evidence.shards.iter().any(|s| s.executed() > s.active())
+    {
+        return Err(contradiction(
+            route,
+            "executed part counts exceed active parts",
+        ));
+    }
+    Ok(())
 }
 
 fn contradiction(route: Route, why: &str) -> DenseExecutionError {
@@ -61,6 +122,92 @@ fn counts(entries: &[(DenseTechnique, u32)]) -> Vec<DenseTechniqueCount> {
         .collect()
 }
 
+fn check_exhaustive_fp32_shards(
+    route: Route,
+    active: u32,
+    evidence: &Evidence,
+) -> Result<(), DenseExecutionError> {
+    let shards_enumerated = evidence
+        .shards
+        .iter()
+        .all(|s| s.parts_enumerated == s.active() && s.parts_scanned == 0);
+    if evidence.parts_enumerated != active || evidence.parts_scanned > 0 || !shards_enumerated {
+        return Err(contradiction(
+            route,
+            "active parts did not all complete shard-local FP32 scanning",
+        ));
+    }
+    if (active == 0 && evidence.fp32_rows_scored != 0)
+        || evidence.fp32_rows_scored < u64::from(active)
+        || evidence.shards.iter().any(|s| {
+            (s.active() == 0 && s.fp32_rows_scored != 0)
+                || s.fp32_rows_scored < u64::from(s.active())
+        })
+    {
+        return Err(contradiction(
+            route,
+            "active parts were admitted, but an active shard did not score its admitted FP32 rows",
+        ));
+    }
+    Ok(())
+}
+
+fn exhaustive_route_techniques(
+    route: Route,
+    active: u32,
+    evidence: &Evidence,
+) -> Result<Vec<DenseTechniqueCount>, DenseExecutionError> {
+    match route {
+        Route::NativeScan => {
+            let shards_scanned = evidence
+                .shards
+                .iter()
+                .all(|s| s.parts_scanned == s.active() && s.parts_enumerated == 0);
+            if evidence.parts_scanned != active || evidence.parts_enumerated > 0 || !shards_scanned
+            {
+                return Err(contradiction(
+                    route,
+                    "active parts did not all complete an exhaustive quantized scan",
+                ));
+            }
+            Ok(counts(&[(
+                DenseTechnique::QuantizedScan,
+                evidence.parts_scanned,
+            )]))
+        }
+        Route::EnumerateAll => {
+            let shards_enumerated = evidence
+                .shards
+                .iter()
+                .all(|s| s.parts_enumerated == s.active() && s.parts_scanned == 0);
+            if evidence.parts_enumerated != active
+                || evidence.parts_scanned > 0
+                || !shards_enumerated
+            {
+                return Err(contradiction(
+                    route,
+                    "active parts did not all complete pinned FP32 enumeration",
+                ));
+            }
+            Ok(counts(&[(
+                DenseTechnique::Fp32Scan,
+                evidence.parts_enumerated,
+            )]))
+        }
+        Route::Fp32AllRows => {
+            check_exhaustive_fp32_shards(route, active, evidence)?;
+            Ok(counts(&[(
+                DenseTechnique::Fp32Scan,
+                evidence.parts_enumerated,
+            )]))
+        }
+        Route::Walk | Route::Fp32Pool => Err(contradiction(
+            route,
+            "approximate route reached exhaustive receipt validation",
+        )),
+    }
+}
+
 /// Exhaustive routes certify only when every consulted non-empty shard reported
 /// per-part accounting and every active part executed exhaustively without a
 /// graph walk, staged approximation, or early stop.
@@ -68,6 +215,12 @@ fn exhaustive_receipt(
     route: Route,
     evidence: &Evidence,
 ) -> Result<(Vec<DenseTechniqueCount>, Coverage, Termination), DenseExecutionError> {
+    if evidence.uncertified_backend {
+        return Err(contradiction(
+            route,
+            "clustered backend returned no per-part execution counts",
+        ));
+    }
     if evidence.reported_shards < evidence.consulted_shards {
         return Err(contradiction(
             route,
@@ -80,6 +233,7 @@ fn exhaustive_receipt(
             "non-empty consulted shards reported zero parts",
         ));
     }
+    validate_part_bounds(route, evidence)?;
     if evidence.parts_walked > 0
         || evidence.regime_walks() > 0
         || evidence.parts_staged > 0
@@ -90,48 +244,7 @@ fn exhaustive_receipt(
             "a part walked a graph, ran staged selection, or stopped early",
         ));
     }
-    let active = evidence.active_parts();
-    let techniques = match route {
-        Route::NativeScan => {
-            if evidence.parts_scanned != active || evidence.parts_enumerated > 0 {
-                return Err(contradiction(
-                    route,
-                    "active parts did not all complete an exhaustive quantized scan",
-                ));
-            }
-            counts(&[(DenseTechnique::QuantizedScan, evidence.parts_scanned)])
-        }
-        Route::EnumerateAll => {
-            if evidence.parts_enumerated != active || evidence.parts_scanned > 0 {
-                return Err(contradiction(
-                    route,
-                    "active parts did not all complete pinned FP32 enumeration",
-                ));
-            }
-            counts(&[(DenseTechnique::Fp32Scan, evidence.parts_enumerated)])
-        }
-        Route::Fp32AllRows => {
-            if evidence.parts_enumerated != active || evidence.parts_scanned > 0 {
-                return Err(contradiction(
-                    route,
-                    "active parts did not all complete shard-local FP32 scanning",
-                ));
-            }
-            if active > 0 && evidence.fp32_rows_scored == 0 {
-                return Err(contradiction(
-                    route,
-                    "active parts were admitted, but zero FP32 rows were scored",
-                ));
-            }
-            counts(&[(DenseTechnique::Fp32Scan, evidence.parts_enumerated)])
-        }
-        Route::Walk | Route::Fp32Pool => {
-            return Err(contradiction(
-                route,
-                "approximate route reached exhaustive receipt validation",
-            ))
-        }
-    };
+    let techniques = exhaustive_route_techniques(route, evidence.active_parts(), evidence)?;
     Ok((
         techniques,
         Coverage::ExhaustiveCertified,
@@ -163,9 +276,14 @@ fn approximate_receipt(
             "not every consulted shard reported per-part execution counts",
         ));
     }
+    validate_part_bounds(route, evidence)?;
     let active = evidence.active_parts();
     if route == Route::Fp32Pool && pool_selection == DenseTechnique::QuantizedScan {
-        if evidence.parts_scanned != active || evidence.parts_walked > 0 {
+        let shards_scanned = evidence
+            .shards
+            .iter()
+            .all(|s| s.parts_scanned == s.active() && s.parts_walked == 0);
+        if evidence.parts_scanned != active || evidence.parts_walked > 0 || !shards_scanned {
             return Err(contradiction(
                 route,
                 "quantized candidate pool did not scan every active part",
@@ -174,10 +292,23 @@ fn approximate_receipt(
         let techniques = counts(&[(DenseTechnique::QuantizedScan, evidence.parts_scanned)]);
         return Ok((techniques, Coverage::CandidateSet, Termination::Exhausted));
     }
+    if evidence.parts_scanned > 0 || evidence.parts_staged > 0 {
+        return Err(contradiction(
+            route,
+            "walk route reported quantized-scan or staged parts",
+        ));
+    }
     let executed = evidence
         .parts_walked
         .saturating_add(evidence.parts_enumerated);
-    if evidence.shards_finished_early == 0 && executed != active {
+    let shard_mismatch = evidence.shards.iter().any(|s| {
+        let s_exec = s.parts_walked.saturating_add(s.parts_enumerated);
+        s_exec > s.active() || (!s.finished_early && s_exec != s.active())
+    });
+    if executed > active
+        || (evidence.shards_finished_early == 0 && executed != active)
+        || shard_mismatch
+    {
         return Err(contradiction(
             route,
             "walk and enumeration part counts do not match active parts",
@@ -197,6 +328,9 @@ fn approximate_receipt(
     Ok((techniques, Coverage::CandidateSet, termination))
 }
 
+const UNCERTIFIED_CLUSTERED_NOTE: &str =
+    "; clustered backend returned no per-part scan counts, so coverage is not certified";
+
 /// Stamp the plan and the validated receipt onto the outcome. Contradictory
 /// evidence is an error, never a weaker certificate.
 pub(crate) fn stamp(
@@ -204,6 +338,20 @@ pub(crate) fn stamp(
     evidence: &Evidence,
     outcome: &mut DenseExecutionOutcome,
 ) -> Result<(), DenseExecutionError> {
+    if evidence.uncertified_backend {
+        outcome.techniques.clear();
+        outcome.coverage = Coverage::CandidateSet as i32;
+        outcome.termination = Termination::Unspecified as i32;
+        outcome.filter_regimes = None;
+        outcome.tail_enumerated_rows = 0;
+        outcome.patience_stopped = 0;
+        outcome.shards_finished_early = 0;
+        outcome.shards_floor_pruned = 0;
+        if !outcome.planner_reason.ends_with(UNCERTIFIED_CLUSTERED_NOTE) {
+            outcome.planner_reason.push_str(UNCERTIFIED_CLUSTERED_NOTE);
+        }
+        return Ok(());
+    }
     let (techniques, coverage, termination) = if plan.approximate() {
         approximate_receipt(plan.route, plan.pool_selection, evidence)?
     } else {

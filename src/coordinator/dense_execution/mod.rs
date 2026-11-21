@@ -16,7 +16,7 @@ pub(crate) struct ExactRerankScores {
     pub tasks: u32,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct DenseScanExecution {
     pub(crate) evidence: crate::dense_execution::Evidence,
     pub(crate) fp32_logical_bytes: u64,
@@ -34,7 +34,7 @@ pub(crate) fn dense_status(error: crate::dense_execution::DenseExecutionError) -
 }
 
 impl CoordinatorServiceImpl {
-    fn shard_is_nonempty(&self, shard: usize) -> bool {
+    pub(crate) fn shard_is_nonempty(&self, shard: usize) -> bool {
         let Some(addr) = self.node_addrs.get(shard) else {
             return true;
         };
@@ -64,6 +64,18 @@ impl CoordinatorServiceImpl {
             if nonempty && s.parts_total > 0 {
                 exec.evidence.reported_shards += 1;
             }
+            exec.evidence
+                .shards
+                .push(crate::dense_execution::ShardPartEvidence {
+                    parts_total: s.parts_total,
+                    parts_skipped: s.parts_skipped,
+                    parts_walked: s.parts_walked,
+                    parts_enumerated: s.parts_enumerated,
+                    parts_scanned: s.parts_scanned,
+                    parts_staged: s.parts_staged,
+                    fp32_rows_scored: s.fp32_rows_scored,
+                    finished_early: false,
+                });
             regimes.add(crate::vector::FilterRegimeCounts::from_proto(
                 s.filter_regimes.as_ref(),
             ));
@@ -123,6 +135,20 @@ impl CoordinatorServiceImpl {
                     exec.evidence.reported_shards += 1;
                 }
             }
+            let finished_early =
+                crate::vector::VectorStreamEndReason::from_proto(s.end_reason).is_early_finish();
+            exec.evidence
+                .shards
+                .push(crate::dense_execution::ShardPartEvidence {
+                    parts_total: s.parts_total,
+                    parts_skipped: s.parts_skipped,
+                    parts_walked: s.parts_walked,
+                    parts_enumerated: s.parts_enumerated,
+                    parts_scanned: s.parts_scanned,
+                    parts_staged: s.parts_staged,
+                    fp32_rows_scored: s.fp32_rows_scored,
+                    finished_early,
+                });
             regimes.add(crate::vector::FilterRegimeCounts::from_proto(
                 s.filter_regimes.as_ref(),
             ));
@@ -162,13 +188,9 @@ impl CoordinatorServiceImpl {
 }
 
 pub(crate) fn clustered_scan_execution(rows: u64) -> DenseScanExecution {
-    let active = u32::from(rows > 0);
     DenseScanExecution {
         evidence: crate::dense_execution::Evidence {
-            consulted_shards: active,
-            reported_shards: active,
-            parts_total: active,
-            parts_scanned: active,
+            uncertified_backend: true,
             rows,
             ..Default::default()
         },

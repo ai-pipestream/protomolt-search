@@ -80,12 +80,6 @@ impl CoordinatorServiceImpl {
                     .to_string(),
                 description: "Bound on one shard's attempt; 0 is none (--shard-deadline-ms).",
             },
-            FixedKnob {
-                name: "dense_execution_policy",
-                kind: KnobKind::Bool,
-                value: self.dense_execution_policy.is_some().to_string(),
-                description: "A dense execution policy is installed (--dense-execution-policy).",
-            },
         ]);
     }
 

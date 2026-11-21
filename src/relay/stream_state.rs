@@ -55,6 +55,7 @@ pub(super) struct StreamTotals {
     fp32_logical_bytes: u64,
     fp32_pages_touched: u64,
     fp32_tasks: u32,
+    missing_parts: bool,
     pub(super) end_reason: crate::vector::VectorStreamEndReason,
 }
 
@@ -112,6 +113,8 @@ pub(super) struct ForwardState {
     pub(super) remaining: usize,
     pub(super) identity: bool,
     pub(super) stride: usize,
+    child_nonempty: Vec<bool>,
+    exact_fp32: bool,
     geo_known: Vec<bool>,
     tree_known: Vec<bool>,
     pub(super) totals: StreamTotals,
@@ -135,6 +138,9 @@ impl ForwardState {
                 remaining -= 1;
             }
         }
+        let child_nonempty = (0..n)
+            .map(|i| args.coordinator.shard_is_nonempty(i))
+            .collect();
         let known = super::merge_util::KnownFlags::new(&args.filters, mask);
         ForwardState {
             terminal: summaries.clone(),
@@ -143,6 +149,8 @@ impl ForwardState {
             remaining,
             identity: args.start.identity_limits.is_some(),
             stride: if args.start.collapse_parents { 20 } else { 12 },
+            child_nonempty,
+            exact_fp32: args.start.exact_fp32_scan,
             geo_known: known.geo,
             tree_known: known.tree,
             totals: StreamTotals::default(),
@@ -153,6 +161,7 @@ impl ForwardState {
     /// The relay's own summary over what the children certified so far.
     pub(super) fn summary(&self, completed: bool, end_reason: i32) -> StreamSearchSummary {
         let t = &self.totals;
+        let keep_parts = !t.missing_parts;
         StreamSearchSummary {
             completed,
             emitted: t.emitted,
@@ -171,12 +180,12 @@ impl ForwardState {
             patience_stopped: t.patience_stopped,
             end_reason,
             floor_pruned: t.floor_pruned,
-            parts_total: t.parts_total,
-            parts_skipped: t.parts_skipped,
-            parts_walked: t.parts_walked,
-            parts_enumerated: t.parts_enumerated,
-            parts_scanned: t.parts_scanned,
-            parts_staged: t.parts_staged,
+            parts_total: if keep_parts { t.parts_total } else { 0 },
+            parts_skipped: if keep_parts { t.parts_skipped } else { 0 },
+            parts_walked: if keep_parts { t.parts_walked } else { 0 },
+            parts_enumerated: if keep_parts { t.parts_enumerated } else { 0 },
+            parts_scanned: if keep_parts { t.parts_scanned } else { 0 },
+            parts_staged: if keep_parts { t.parts_staged } else { 0 },
             fp32_rows_scored: t.fp32_rows_scored,
             fp32_logical_bytes: t.fp32_logical_bytes,
             fp32_pages_touched: t.fp32_pages_touched,
@@ -255,7 +264,52 @@ impl ForwardState {
         }
         super::merge_util::or_into(&mut self.geo_known, &summary.geo_columns_known);
         super::merge_util::or_into(&mut self.tree_known, &summary.filter_columns_known);
+        self.validate_child_parts(shard, summary)?;
         self.totals.add(summary);
+        Ok(())
+    }
+
+    fn validate_child_parts(
+        &mut self,
+        shard: usize,
+        summary: &StreamSearchSummary,
+    ) -> Result<(), Status> {
+        let nonempty = self.child_nonempty[shard]
+            || summary.emitted > 0
+            || summary.blocks_scanned > 0
+            || summary.fp32_rows_scored > 0;
+        if nonempty && summary.parts_total == 0 {
+            self.totals.missing_parts = true;
+        }
+        if summary.parts_skipped > summary.parts_total {
+            return Err(Status::internal(format!(
+                "relay: child {shard} reported {} skipped parts out of {}",
+                summary.parts_skipped, summary.parts_total
+            )));
+        }
+        let active = summary.parts_total - summary.parts_skipped;
+        let executed = summary
+            .parts_walked
+            .saturating_add(summary.parts_enumerated)
+            .saturating_add(summary.parts_scanned)
+            .saturating_add(summary.parts_staged);
+        let early =
+            crate::vector::VectorStreamEndReason::from_proto(summary.end_reason).is_early_finish();
+        if executed > active || (summary.parts_total > 0 && !early && executed != active) {
+            return Err(Status::internal(format!(
+                "relay: child {shard} executed {executed} parts across {active} active parts"
+            )));
+        }
+        if self.exact_fp32
+            && summary.parts_total > 0
+            && ((active == 0 && summary.fp32_rows_scored != 0)
+                || summary.fp32_rows_scored < u64::from(active))
+        {
+            return Err(Status::internal(format!(
+                "relay: child {shard} scored {} FP32 rows across {active} active parts",
+                summary.fp32_rows_scored
+            )));
+        }
         Ok(())
     }
 }

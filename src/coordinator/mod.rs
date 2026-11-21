@@ -311,8 +311,6 @@ pub struct CoordinatorServiceImpl {
     dense_quality_profile: Option<Arc<crate::quality::DenseQualityProfile>>,
     /// Synonym table applied to lexical queries unless disabled per request.
     synonyms: Option<Arc<crate::synonyms::SynonymTable>>,
-    /// Generation-bound policy consulted by `AUTO` on non-exhaustive providers.
-    dense_execution_policy: Option<Arc<crate::dense_policy::DenseExecutionPolicy>>,
     /// Product shard-map generation (zero for the implicit static list).
     topology_generation: u64,
     /// Inclusive stable-key ranges parallel to `node_addrs`. Empty for the

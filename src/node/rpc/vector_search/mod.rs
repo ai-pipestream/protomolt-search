@@ -1,6 +1,7 @@
 //! Streaming and rescored dense vector search RPC handlers.
 
 mod exact_scan;
+mod exact_stream;
 mod search_shard;
 mod stream_scan;
 mod stream_search;

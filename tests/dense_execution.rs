@@ -13,7 +13,6 @@ use std::path::PathBuf;
 use common::{fit_calibration, start_node, unit_vectors};
 use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
 use pipestream_search::coordinator::CoordinatorServiceImpl;
-use pipestream_search::dense_policy::DenseExecutionPolicy;
 use pipestream_search::harness::{fake_ann, seeded_index};
 use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
@@ -129,18 +128,6 @@ async fn start_fixture(shards: usize, fake: bool) -> Fixture {
         fingerprint,
         handles,
     }
-}
-
-/// Write a policy document the way an operator installs one and load it back.
-fn load_policy(tag: &str, bytes: &[u8]) -> Result<DenseExecutionPolicy, String> {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("dense_policy_{tag}_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("policy.toml");
-    std::fs::write(&path, bytes).unwrap();
-    let policy = DenseExecutionPolicy::load(&path);
-    let _ = std::fs::remove_dir_all(&dir);
-    policy
 }
 
 fn dense_leaf(vector: &[f32], mode: Mode, precision: Precision) -> SelectionQuery {
@@ -351,8 +338,12 @@ async fn a_configured_ann_provider_walks_under_a_preset_and_never_certifies() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn version_one_policy_refuses_at_load_and_filters_keep_the_contract() {
+async fn version_one_policy_refuses_at_config_load_and_filters_keep_the_contract() {
     let fixture = start_fixture(2, false).await;
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("dense_policy_v1_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let policy_path = dir.join("policy.toml");
     let v1 = format!(
         "format_version = 1\npolicy_id = \"court-ann-v1\"\nembedding_model = \"e\"\n\
          corpus_generation = {GENERATION}\ncorpus_rows = {N_DOCS}\ndimensions = {DIM}\n\
@@ -362,9 +353,25 @@ async fn version_one_policy_refuses_at_load_and_filters_keep_the_contract() {
         fake_ann::BACKEND_KIND,
         fixture.fingerprint
     );
-    let refused = load_policy("v1", v1.as_bytes()).unwrap_err();
+    std::fs::write(&policy_path, v1).unwrap();
+    let cfg_path = dir.join("config.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "role = \"coordinator\"\nnodes = [\"127.0.0.1:50051\"]\ndense_execution_policy = {:?}\n",
+            policy_path.display().to_string()
+        ),
+    )
+    .unwrap();
+    let refused = pipestream_search::config::parse(&[
+        format!("--config={}", cfg_path.display()),
+        "--allow-plaintext".to_string(),
+    ])
+    .unwrap_err();
+    let _ = std::fs::remove_dir_all(&dir);
     assert!(
-        refused.contains("version-1 TOML schema is not read"),
+        refused.contains("dense_execution_policy")
+            && refused.contains("not supported on this build"),
         "{refused}"
     );
     let leaf = |mode| dense_leaf(&fixture.query_vector, mode, Precision::Auto);

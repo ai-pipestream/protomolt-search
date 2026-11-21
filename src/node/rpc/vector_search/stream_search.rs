@@ -3,7 +3,7 @@
 use crate::node::*;
 use crate::pb::{StartStreamSearch, StreamIdentityLimits};
 
-use super::exact_scan::run_exact_fp32_stream_scan;
+use super::exact_stream::run_exact_fp32_stream_scan;
 use super::stream_scan::{run_stream_scan_blocking, StreamScanCtx, StreamScanResult};
 use super::validate_scan_filters;
 

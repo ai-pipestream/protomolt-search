@@ -368,6 +368,18 @@ async fn recv_start_shard_search(
     }
 }
 
+fn collapse_conflict(start: &StartShardSearch) -> Option<&'static str> {
+    if !start.collapse_parents {
+        None
+    } else if start.exact_fp32_scan {
+        Some("collapse_parents and exact_fp32_scan are mutually exclusive")
+    } else if start.tie_complete {
+        Some("collapse_parents and tie_complete are mutually exclusive")
+    } else {
+        None
+    }
+}
+
 async fn drive_search_shard(
     mut inbound: Streaming<SearchShardRequest>,
     tx: mpsc::Sender<Result<SearchShardResponse, Status>>,
@@ -390,12 +402,8 @@ async fn drive_search_shard(
     let floor_rx = spawn_floor_pump(inbound);
     let (external, publish) = make_floor_callbacks(&drv.knobs, floor_rx, tx.clone());
     let slot_offset = drv.config.slot_offset;
-    if start.collapse_parents && (start.tie_complete || start.exact_fp32_scan) {
-        let _ = tx
-            .send(Err(Status::invalid_argument(
-                "collapse_parents and tie_complete are mutually exclusive",
-            )))
-            .await;
+    if let Some(msg) = collapse_conflict(&start) {
+        let _ = tx.send(Err(Status::invalid_argument(msg))).await;
         return;
     }
     let collapse_parents = start.collapse_parents;

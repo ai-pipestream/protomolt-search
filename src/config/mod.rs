@@ -195,8 +195,6 @@ pub struct Config {
     pub dense_quality_profile: Option<PathBuf>,
     /// Optional synonym table, a TOML file.
     pub synonyms: Option<PathBuf>,
-    /// Optional generation-bound dense execution policy for AUTO.
-    pub dense_execution_policy: Option<PathBuf>,
     /// gRPC message size cap applied to clients and servers.
     pub max_message_bytes: usize,
     /// Issue one demo search against the coordinator at startup.

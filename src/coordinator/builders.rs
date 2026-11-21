@@ -48,7 +48,6 @@ impl CoordinatorServiceImpl {
             clustered_vectors: None,
             dense_quality_profile: None,
             synonyms: None,
-            dense_execution_policy: None,
             topology_generation: 0,
             hash_ranges: Vec::new(),
             placement_codes: Vec::new(),
@@ -291,14 +290,6 @@ impl CoordinatorServiceImpl {
         profile: crate::quality::DenseQualityProfile,
     ) -> Self {
         self.dense_quality_profile = Some(Arc::new(profile));
-        self
-    }
-
-    pub fn with_dense_execution_policy(
-        mut self,
-        policy: crate::dense_policy::DenseExecutionPolicy,
-    ) -> Self {
-        self.dense_execution_policy = Some(Arc::new(policy));
         self
     }
 

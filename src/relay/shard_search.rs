@@ -267,9 +267,15 @@ async fn relay_shard_search(
     )
     .await?;
     let mask = args.coordinator.shard_mask(args.filters.tree.as_ref());
+    let child_nonempty = (0..n)
+        .map(|i| args.coordinator.shard_is_nonempty(i))
+        .collect();
     let mut scan = ShardScan {
         known: KnownFlags::new(&args.filters, mask.as_ref()),
         children,
+        child_nonempty,
+        exact_fp32: args.start.exact_fp32_scan,
+        missing_parts: false,
         hits: Vec::new(),
         stats: None,
         done: vec![false; n],
@@ -296,11 +302,12 @@ async fn relay_shard_search(
             args.pinned.control_revision, args.pinned.topology_generation
         )));
     }
+    let stats = scan.finish_stats();
     let mut hits = scan.hits;
     hits.sort_by(|a, b| by_score_then_id((a.score, a.vector_id), (b.score, b.vector_id)));
     let done = crate::pb::SearchShardDone {
         hits,
-        stats: scan.stats,
+        stats,
         geo_columns_known: scan.known.geo,
         filter_columns_known: scan.known.tree,
     };

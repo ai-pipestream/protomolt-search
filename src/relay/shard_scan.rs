@@ -31,12 +31,59 @@ pub(super) fn shard_floor(floor: f32) -> SearchShardRequest {
 /// The scan's merged answer so far.
 pub(super) struct ShardScan {
     pub(super) children: Vec<String>,
+    pub(super) child_nonempty: Vec<bool>,
+    pub(super) exact_fp32: bool,
+    pub(super) missing_parts: bool,
     pub(super) hits: Vec<crate::pb::ScoredHit>,
     pub(super) stats: Option<ShardScanStats>,
     pub(super) done: Vec<bool>,
     pub(super) remaining: usize,
     pub(super) known: KnownFlags,
     pub(super) mask: Option<crate::placement::ShardMask>,
+}
+
+pub(super) fn clear_part_counts(stats: &mut ShardScanStats) {
+    stats.parts_total = 0;
+    stats.parts_skipped = 0;
+    stats.parts_walked = 0;
+    stats.parts_enumerated = 0;
+    stats.parts_scanned = 0;
+    stats.parts_staged = 0;
+}
+
+pub(super) fn check_child_part_stats(
+    share: &ShardScanStats,
+    child: usize,
+    exact_fp32: bool,
+) -> Result<(), Status> {
+    if share.parts_skipped > share.parts_total {
+        return Err(Status::internal(format!(
+            "relay: child {child} reported {} skipped parts out of {}",
+            share.parts_skipped, share.parts_total
+        )));
+    }
+    let active = share.parts_total - share.parts_skipped;
+    let executed = share
+        .parts_walked
+        .saturating_add(share.parts_enumerated)
+        .saturating_add(share.parts_scanned)
+        .saturating_add(share.parts_staged);
+    if executed > active {
+        return Err(Status::internal(format!(
+            "relay: child {child} executed {executed} parts across {active} active parts"
+        )));
+    }
+    if exact_fp32
+        && share.parts_total > 0
+        && ((active == 0 && share.fp32_rows_scored != 0)
+            || share.fp32_rows_scored < u64::from(active))
+    {
+        return Err(Status::internal(format!(
+            "relay: child {child} scored {} FP32 rows across {active} active parts",
+            share.fp32_rows_scored
+        )));
+    }
+    Ok(())
 }
 
 /// Add one child's scan counters into the relay's, each with a check.
@@ -197,7 +244,16 @@ impl ShardScan {
             &share.geo_columns_known,
             &share.filter_columns_known,
         )?;
+        let nonempty = self.child_nonempty[child]
+            || !share.hits.is_empty()
+            || share.stats.as_ref().is_some_and(|s| {
+                s.candidates_collected > 0 || s.chunk_calls > 0 || s.fp32_rows_scored > 0
+            });
+        if nonempty && share.stats.as_ref().map_or(0, |s| s.parts_total) == 0 {
+            self.missing_parts = true;
+        }
         if let Some(stats) = share.stats {
+            check_child_part_stats(&stats, child, self.exact_fp32)?;
             add_scan_stats(
                 self.stats.get_or_insert_with(Default::default),
                 stats,
@@ -206,6 +262,16 @@ impl ShardScan {
         }
         self.hits.extend(share.hits);
         Ok(())
+    }
+
+    pub(super) fn finish_stats(&mut self) -> Option<ShardScanStats> {
+        let mut stats = self.stats.take();
+        if self.missing_parts {
+            if let Some(s) = stats.as_mut() {
+                clear_part_counts(s);
+            }
+        }
+        stats
     }
 }
 

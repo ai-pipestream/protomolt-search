@@ -19,8 +19,9 @@ pub(super) struct DenseProviderFacts {
 }
 
 impl DenseProviderFacts {
-    /// The clustered backend always completes exhaustively under its
-    /// native score and exposes none of the per-shard graph regimes.
+    /// The clustered backend runs quantized collection searches remotely
+    /// without returning per-part scan counts and exposes none of the
+    /// per-shard graph regimes.
     pub(super) fn clustered(identity: crate::clustered_turbovec::ClusteredQualityIdentity) -> Self {
         Self {
             provider: "clustered-turbovec".to_string(),
