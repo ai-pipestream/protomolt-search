@@ -12,7 +12,6 @@ pub(crate) struct Fixture {
     pub(crate) addrs: Vec<String>,
     pub(crate) corpus: Vec<f32>,
     pub(crate) query_vector: Vec<f32>,
-    pub(crate) fingerprint: String,
     pub(crate) handles: Vec<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>>,
 }
 
@@ -101,7 +100,6 @@ pub(crate) async fn start_fixture() -> Fixture {
         addrs,
         corpus,
         query_vector: unit_vectors(1, DIM, 0x4A5E_0002),
-        fingerprint: graph_index().descriptor().scoring_fingerprint,
         handles,
     }
 }
@@ -115,7 +113,11 @@ pub(crate) fn dense_request(vector: &[f32], k: u32, mode: DenseExecutionMode) ->
                 query: Some(search_query::Query::Dense(DenseQuery {
                     vector: vector.to_vec(),
                     execution_mode: mode as i32,
-                    score_mode: DenseScoreMode::Unspecified as i32,
+                    filter_strategy: if mode == DenseExecutionMode::Balanced {
+                        DenseFilterStrategy::Speed as i32
+                    } else {
+                        DenseFilterStrategy::Default as i32
+                    },
                     ..Default::default()
                 })),
             })),
@@ -146,18 +148,6 @@ pub(crate) fn fp32_top(corpus: &[f32], query: &[f32], k: usize) -> Vec<(u64, f32
     all.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     all.truncate(k);
     all
-}
-
-/// A policy document through the file, as a coordinator loads it.
-pub(crate) fn load_policy(tag: &str, text: &str) -> DenseExecutionPolicy {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("hnsw_policy_{tag}_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("policy.toml");
-    std::fs::write(&path, text).unwrap();
-    let policy = DenseExecutionPolicy::load(&path).unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-    policy
 }
 
 pub(crate) const FILTERED_SHARD_DOCS: usize = 7800;
@@ -235,7 +225,6 @@ pub(crate) async fn start_filtered_fixture() -> (Fixture, Vec<String>) {
         addrs: addrs.clone(),
         corpus,
         query_vector: Vec::new(),
-        fingerprint: String::new(),
         handles,
     };
     (fixture, addrs)

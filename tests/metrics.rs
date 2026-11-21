@@ -224,6 +224,7 @@ fn dense_leaf(vector: &[f32]) -> SelectionQuery {
             id: "vec".into(),
             query: Some(search_query::Query::Dense(DenseQuery {
                 vector: vector.to_vec(),
+                execution_mode: pipestream_search::pb::DenseExecutionMode::Exhaustive as i32,
                 ..Default::default()
             })),
         })),

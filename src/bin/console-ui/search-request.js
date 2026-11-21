@@ -167,8 +167,8 @@ export function lexicalLeafWithOptions(id, text) {
 
 export function denseLeaf(id, vector) {
   const dense = { vector };
-  if ($('score-mode').value === 'fp32') dense.score_mode = enums.fp32;
-  if ($('exec-mode').value) dense.execution_mode = $('exec-mode').value;
+  dense.execution_mode = $('exec-mode').value;
+  if ($('precision').value) dense.precision = $('precision').value;
   return { search: { id, dense } };
 }
 

@@ -287,6 +287,14 @@ impl<'a> HybridRound<'a> {
             geo_filters: self.query.input.filters.geo.clone(),
             filter,
             include_rerank_candidate: self.query.input.filters.include_rerank_candidate,
+            enumerate_max_rows: self.query.input.filters.enumerate_max_rows,
+            filter_strategy: self.query.input.filters.filter_strategy,
+            enumerate_all: self.query.input.filters.enumerate_all,
+            patience_saturation_ppm: self.query.input.filters.patience_saturation_ppm,
+            patience_hops: self.query.input.filters.patience_hops,
+            floor_prune: self.query.input.filters.floor_prune,
+            floor_greediness_ppm: self.query.input.filters.floor_greediness_ppm,
+            floor_clamp_min: self.query.input.filters.floor_clamp_min,
         }
     }
 }
@@ -315,5 +323,13 @@ pub(super) fn local_fusion_request(
         geo_filters: request.geo_filters,
         filter: request.filter,
         include_rerank_candidate: request.include_rerank_candidate,
+        enumerate_max_rows: request.enumerate_max_rows,
+        filter_strategy: request.filter_strategy,
+        enumerate_all: request.enumerate_all,
+        patience_saturation_ppm: request.patience_saturation_ppm,
+        patience_hops: request.patience_hops,
+        floor_prune: request.floor_prune,
+        floor_greediness_ppm: request.floor_greediness_ppm,
+        floor_clamp_min: request.floor_clamp_min,
     }
 }

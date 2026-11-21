@@ -143,6 +143,8 @@ pub struct Answer {
     /// Rows scored by enumeration because this index was unlinked (heap tail,
     /// frozen tail, or sealed segment below [`MIN_GRAPH_ROWS`]).
     pub tail_enumerated_rows: u64,
+    /// True when every allowed row of this part was scored by enumeration.
+    pub enumerated_part: bool,
 }
 
 impl Answer {
@@ -155,6 +157,7 @@ impl Answer {
             patience_stopped: false,
             floor_pruned: false,
             tail_enumerated_rows: 0,
+            enumerated_part: regime == Some(FilterRegime::Enumerate),
         }
     }
 }

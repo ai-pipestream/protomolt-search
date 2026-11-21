@@ -26,6 +26,42 @@ pub(in crate::node) fn check_enumerate_threshold(
     )))
 }
 
+/// The plan's selection controls. Whole-set enumeration on a provider
+/// without an enumerate regime is refused: its own scan already scores
+/// every row, and only a regime provider can be pinned to.
+pub(in crate::node) fn selection_controls(
+    index: &VectorIndex,
+    strategy: i32,
+    enumerate_all: bool,
+) -> Result<crate::vector::SelectionControls, Status> {
+    use crate::pb::DenseFilterStrategy as Strategy;
+    let filter_routing = match Strategy::try_from(strategy) {
+        Ok(Strategy::Default | Strategy::Speed) => crate::vector::FilterRouting::Speed,
+        Ok(Strategy::EnumerateSmall) => crate::vector::FilterRouting::Exact,
+        Err(_) => {
+            return Err(Status::invalid_argument(format!(
+                "unknown dense filter_strategy {strategy}"
+            )))
+        }
+    };
+    if enumerate_all
+        && !index
+            .descriptor()
+            .capabilities
+            .contains(&crate::vector::VectorCapability::MaskEnumeration)
+    {
+        return Err(Status::failed_precondition(format!(
+            "vector backend {:?} cannot pin enumeration of every admitted row (it does \
+             not advertise mask_enumeration)",
+            index.descriptor().backend_kind
+        )));
+    }
+    Ok(crate::vector::SelectionControls {
+        filter_routing,
+        enumerate_all,
+    })
+}
+
 pub(in crate::node) fn check_patience_options(
     index: &VectorIndex,
     saturation_ppm: Option<u32>,

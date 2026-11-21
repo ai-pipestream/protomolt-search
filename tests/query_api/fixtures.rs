@@ -118,15 +118,12 @@ pub(crate) fn lexical_leaf(id: &str, text: &str) -> SelectionQuery {
 }
 
 pub(crate) fn dense_leaf(id: &str, vector: &[f32]) -> SelectionQuery {
-    SelectionQuery {
-        node: Some(selection_query::Node::Search(SearchQuery {
-            id: id.to_string(),
-            query: Some(search_query::Query::Dense(DenseQuery {
-                vector: vector.to_vec(),
-                ..Default::default()
-            })),
-        })),
-    }
+    common::dense_selection(
+        id,
+        vector.to_vec(),
+        DenseExecutionMode::Exhaustive as i32,
+        0,
+    )
 }
 
 pub(crate) fn fp32_dense_leaf(id: &str, vector: &[f32]) -> SelectionQuery {
@@ -135,7 +132,8 @@ pub(crate) fn fp32_dense_leaf(id: &str, vector: &[f32]) -> SelectionQuery {
             id: id.to_string(),
             query: Some(search_query::Query::Dense(DenseQuery {
                 vector: vector.to_vec(),
-                score_mode: DenseScoreMode::Fp32Rerank as i32,
+                execution_mode: pipestream_search::pb::DenseExecutionMode::Balanced as i32,
+                precision: pipestream_search::pb::DensePrecisionRequest::Fp32 as i32,
                 ..Default::default()
             })),
         })),

@@ -2,8 +2,8 @@
 //! exact medians, response checks, and the human-readable reports.
 
 use crate::pb::{
-    search_query, selection_query, DenseExecutionMode, DenseQuery, DenseScoreMode, QueryResponse,
-    SearchQuery, SelectionQuery,
+    search_query, selection_query, DenseExecutionMode, DensePrecisionRequest, DenseQuery,
+    DenseScorePrecision, QueryResponse, SearchQuery, SelectionQuery,
 };
 
 use super::super::UnmetTarget;
@@ -28,11 +28,11 @@ pub(super) fn fp32_leaf(vector: &[f32]) -> SelectionQuery {
             id: "dense".into(),
             query: Some(search_query::Query::Dense(DenseQuery {
                 vector: vector.to_vec(),
-                score_mode: DenseScoreMode::Fp32Rerank as i32,
-                // The profile describes an exhaustive selection reranked
-                // in FP32; a provider that cannot prove one refuses here
-                // rather than measuring a different thing.
-                execution_mode: DenseExecutionMode::Exact as i32,
+                // The profile describes an exhaustive quantized selection
+                // whose pool is rescored in FP32; check_exact refuses any
+                // other technique rather than measuring a different thing.
+                execution_mode: DenseExecutionMode::Balanced as i32,
+                precision: DensePrecisionRequest::Fp32 as i32,
                 ..Default::default()
             })),
         })),
@@ -54,7 +54,16 @@ pub(super) fn check_exact(response: &QueryResponse, k: u32, index: usize) -> Res
         ));
     }
     match &response.dense_execution {
-        Some(outcome) if outcome.resolved_mode == DenseExecutionMode::Exact as i32 => Ok(()),
+        Some(outcome)
+            if outcome.selection_precision == DenseScorePrecision::Quantized as i32
+                && !outcome.techniques.is_empty()
+                && outcome
+                    .techniques
+                    .iter()
+                    .all(|t| t.technique == crate::pb::DenseTechnique::QuantizedScan as i32) =>
+        {
+            Ok(())
+        }
         Some(outcome) => Err(format!(
             "query {index} did not run an exhaustive selection: {}",
             outcome.planner_reason
@@ -100,4 +109,46 @@ pub fn ladder_table(measured: &MeasuredProfile) -> String {
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_exact;
+    use crate::pb::{
+        DenseExecutionOutcome, DenseScorePrecision, DenseTechnique, DenseTechniqueCount, QueryHit,
+        QueryResponse,
+    };
+
+    #[test]
+    fn check_exact_rejects_empty_or_non_quantized_techniques() {
+        let make = |techniques: Vec<DenseTechniqueCount>| QueryResponse {
+            hits: vec![QueryHit::default(); 2],
+            dense_execution: Some(DenseExecutionOutcome {
+                selection_precision: DenseScorePrecision::Quantized as i32,
+                planner_reason: "remote quantized scan".into(),
+                techniques,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(check_exact(&make(Vec::new()), 2, 0).is_err());
+        assert!(check_exact(
+            &make(vec![DenseTechniqueCount {
+                technique: DenseTechnique::HnswWalk as i32,
+                parts: 1,
+            }]),
+            2,
+            0
+        )
+        .is_err());
+        assert!(check_exact(
+            &make(vec![DenseTechniqueCount {
+                technique: DenseTechnique::QuantizedScan as i32,
+                parts: 2,
+            }]),
+            2,
+            0
+        )
+        .is_ok());
+    }
 }

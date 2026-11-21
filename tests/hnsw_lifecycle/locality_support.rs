@@ -43,16 +43,7 @@ fn cel_filtered_ann(qv: &[f32], cel: &str) -> QueryRequest {
             node: Some(selection_query::Node::Composite(CompositeSearchStrategy {
                 operator: SelectionOperator::And as i32,
                 clauses: vec![
-                    SelectionQuery {
-                        node: Some(selection_query::Node::Search(SearchQuery {
-                            id: "vec".into(),
-                            query: Some(search_query::Query::Dense(DenseQuery {
-                                vector: qv.to_vec(),
-                                execution_mode: DenseExecutionMode::Ann as i32,
-                                ..Default::default()
-                            })),
-                        })),
-                    },
+                    speed_dense_leaf(qv),
                     SelectionQuery {
                         node: Some(selection_query::Node::Filter(FilterQuery {
                             id: "flt".into(),
@@ -76,16 +67,7 @@ async fn eval_unfiltered(
 ) -> Vec<(String, u32)> {
     let req = QueryRequest {
         k: K as u32,
-        selection: Some(SelectionQuery {
-            node: Some(selection_query::Node::Search(SearchQuery {
-                id: "vec".into(),
-                query: Some(search_query::Query::Dense(DenseQuery {
-                    vector: qv.to_vec(),
-                    execution_mode: DenseExecutionMode::Ann as i32,
-                    ..Default::default()
-                })),
-            })),
-        }),
+        selection: Some(speed_dense_leaf(qv)),
         ..Default::default()
     };
     let resp = coord.query(Request::new(req)).await.unwrap().into_inner();
@@ -162,16 +144,7 @@ async fn eval_col_collapse(
     let col_req = QueryRequest {
         k: 4,
         selection_k: 40,
-        selection: Some(SelectionQuery {
-            node: Some(selection_query::Node::Search(SearchQuery {
-                id: "vec".into(),
-                query: Some(search_query::Query::Dense(DenseQuery {
-                    vector: qv.to_vec(),
-                    execution_mode: DenseExecutionMode::Ann as i32,
-                    ..Default::default()
-                })),
-            })),
-        }),
+        selection: Some(speed_dense_leaf(qv)),
         collapse: Some(CollapseSpec {
             column: "court".into(),
             inner_hits: 2,

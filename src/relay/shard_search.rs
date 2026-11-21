@@ -81,6 +81,8 @@ fn child_start(
         geo_filters: filters.geo.clone(),
         filter: CoordinatorServiceImpl::shard_filter_tree(filters, mask, child),
         enumerate_max_rows: filters.enumerate_max_rows,
+        filter_strategy: filters.filter_strategy,
+        enumerate_all: filters.enumerate_all,
         patience_saturation_ppm: filters.patience_saturation_ppm,
         patience_hops: filters.patience_hops,
         floor_prune: filters.floor_prune,
@@ -89,6 +91,7 @@ fn child_start(
         floor_greediness_ppm: filters.floor_greediness_ppm,
         floor_clamp_min: filters.floor_clamp_min,
         include_rerank_candidate: start.include_rerank_candidate,
+        exact_fp32_scan: start.exact_fp32_scan,
     }
 }
 
@@ -264,9 +267,15 @@ async fn relay_shard_search(
     )
     .await?;
     let mask = args.coordinator.shard_mask(args.filters.tree.as_ref());
+    let child_nonempty = (0..n)
+        .map(|i| args.coordinator.shard_is_nonempty(i))
+        .collect();
     let mut scan = ShardScan {
         known: KnownFlags::new(&args.filters, mask.as_ref()),
         children,
+        child_nonempty,
+        exact_fp32: args.start.exact_fp32_scan,
+        missing_parts: false,
         hits: Vec::new(),
         stats: None,
         done: vec![false; n],
@@ -293,11 +302,12 @@ async fn relay_shard_search(
             args.pinned.control_revision, args.pinned.topology_generation
         )));
     }
+    let stats = scan.finish_stats();
     let mut hits = scan.hits;
     hits.sort_by(|a, b| by_score_then_id((a.score, a.vector_id), (b.score, b.vector_id)));
     let done = crate::pb::SearchShardDone {
         hits,
-        stats: scan.stats,
+        stats,
         geo_columns_known: scan.known.geo,
         filter_columns_known: scan.known.tree,
     };
@@ -342,6 +352,8 @@ fn shard_filters(start: &crate::pb::StartShardSearch) -> RequestFilters {
         geo: start.geo_filters.clone(),
         tree: start.filter.clone(),
         enumerate_max_rows: start.enumerate_max_rows,
+        filter_strategy: start.filter_strategy,
+        enumerate_all: start.enumerate_all,
         patience_saturation_ppm: start.patience_saturation_ppm,
         patience_hops: start.patience_hops,
         finish_settle_us: None,
@@ -352,6 +364,7 @@ fn shard_filters(start: &crate::pb::StartShardSearch) -> RequestFilters {
         floor_greediness_ppm: start.floor_greediness_ppm,
         floor_clamp_min: start.floor_clamp_min,
         include_rerank_candidate: start.include_rerank_candidate,
+        exact_fp32_scan: start.exact_fp32_scan,
     }
 }
 

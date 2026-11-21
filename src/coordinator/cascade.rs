@@ -25,20 +25,21 @@ impl CoordinatorServiceImpl {
         &self,
         query: CascadeQuery<'_>,
     ) -> Result<(Vec<CascadeHit>, Option<HybridDebug>), Status> {
-        self.fanout_cascade_with_terms(query).await
+        let (hits, debug, _) = self.fanout_cascade_with_terms(query).await?;
+        Ok((hits, debug))
     }
 
     pub(super) async fn fanout_cascade_with_terms(
         &self,
         query: CascadeQuery<'_>,
-    ) -> Result<(Vec<CascadeHit>, Option<HybridDebug>), Status> {
+    ) -> Result<(Vec<CascadeHit>, Option<HybridDebug>, DenseScanExecution), Status> {
         let input = query.input();
         if input.k() == 0 || input.vector().is_empty() {
-            return Ok((Vec::new(), None));
+            return Ok((Vec::new(), None, DenseScanExecution::default()));
         }
         let total = std::time::Instant::now();
         let legs_started = std::time::Instant::now();
-        let mut candidates = self.cascade_candidates(input).await?;
+        let (mut candidates, exec) = self.cascade_candidates(input).await?;
         let phase1_ms = legs_started.elapsed().as_secs_f32() * 1e3;
         let pool = cascade_pool(&candidates, query);
         let (terms, analysis_ms) = self.analyze_hybrid_input(input, false).await?;
@@ -63,12 +64,19 @@ impl CoordinatorServiceImpl {
                 legs_ms,
             },
         );
-        Ok((hits, debug))
+        Ok((hits, debug, exec))
     }
 
-    async fn cascade_candidates(&self, input: HybridInput<'_>) -> Result<FanoutResult, Status> {
+    async fn cascade_candidates(
+        &self,
+        input: HybridInput<'_>,
+    ) -> Result<(FanoutResult, DenseScanExecution), Status> {
         #[cfg(feature = "net")]
         if self.clustered_vectors.is_some() {
+            let rows = self
+                .clustered_quality_identity()
+                .await?
+                .map_or(0, |id| id.rows);
             let candidates = self
                 .clustered_vector_candidates(
                     input.request_id(),
@@ -87,26 +95,39 @@ impl CoordinatorServiceImpl {
                 let owner = Self::product_owner(&ranges, doc_id)?;
                 shard_hits[owner as usize].1.push((doc_id, score));
             }
-            return Ok(FanoutResult {
-                shard_stats: vec![None; self.node_addrs.len()],
-                shard_wall_ms: (0..self.node_addrs.len())
-                    .map(|shard| (shard as u32, 0.0))
-                    .collect(),
-                shard_hits,
-                hits: Vec::new(),
-                hedges_fired: 0,
-                hedge_wins: 0,
-                rerank_candidates: HashMap::new(),
-            });
+            return Ok((
+                FanoutResult {
+                    shard_stats: vec![None; self.node_addrs.len()],
+                    shard_wall_ms: (0..self.node_addrs.len())
+                        .map(|shard| (shard as u32, 0.0))
+                        .collect(),
+                    shard_hits,
+                    hits: Vec::new(),
+                    hedges_fired: 0,
+                    hedge_wins: 0,
+                    rerank_candidates: HashMap::new(),
+                },
+                clustered_scan_execution(rows),
+            ));
         }
-        self.fanout_search(
-            input.request_id(),
-            input.vector(),
-            input.k(),
-            true,
-            input.filters(),
-        )
-        .await
+        self.ensure_shard_vector_rows().await;
+        let result = self
+            .fanout_search(
+                input.request_id(),
+                input.vector(),
+                input.k(),
+                true,
+                input.filters(),
+            )
+            .await?;
+        let refs: Vec<(usize, Option<&ShardScanStats>)> = result
+            .shard_hits
+            .iter()
+            .zip(&result.shard_stats)
+            .map(|((shard, _), stats)| (*shard as usize, stats.as_ref()))
+            .collect();
+        let exec = self.evidence_from_shard_stats(&refs, 0);
+        Ok((result, exec))
     }
 
     async fn cascade_rescore(

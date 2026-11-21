@@ -1,6 +1,7 @@
 //! Analyzer identity must survive each route that uses analyzed terms, including
 //! an absent optional column and a relay. Identical tokens under different specs
 //! deliberately exercise the contract rather than an accidental no-match result.
+mod common;
 use pipestream_search::{
     analyzer::{analysis_fingerprint, body_spec, cased_body_spec},
     coordinator::CoordinatorServiceImpl,
@@ -423,23 +424,14 @@ async fn public_queries_carry_identity_through_scoring_sorting_boosts_and_member
                 );
             }
             expect(response, valid, "Boolean membership and candidate scoring");
-            let response = coord
-                .query(Request::new(QueryRequest {
-                    k: DOCS,
-                    selection: Some(selection(SearchQuery {
-                        id: "dense".into(),
-                        query: Some(search_query::Query::Dense(DenseQuery {
-                            vector: fixture.vector.clone(),
-                            ..Default::default()
-                        })),
-                    })),
-                    boosts: vec![BoostQuery {
-                        query: Some(lexical(spec.clone())),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }))
-                .await;
+            let bq = BoostQuery {
+                query: Some(lexical(spec.clone())),
+                ..Default::default()
+            };
+            let mode = DenseExecutionMode::Exhaustive as i32;
+            let mut req = common::dense_query_request(DOCS, "dense", fixture.vector.clone(), mode);
+            req.boosts.push(bq);
+            let response = coord.query(Request::new(req)).await;
             expect(response, valid, "candidate lexical boost");
             for mode in [
                 FusionMode::GlobalRank,

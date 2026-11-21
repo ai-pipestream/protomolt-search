@@ -10,9 +10,8 @@ use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     search_query, selection_query, AddDocumentsRequest, AddVectorsRequest, ClusterHealthRequest,
-    DenseQualityPolicy, DenseQuery, DenseScoreMode, DocLineage, FacetValue, FusionMode,
-    HybridLegOptions, HybridSearchRequest, QueryRequest, SearchQuery, SearchRequest,
-    SelectionQuery,
+    DenseQualityPolicy, DenseQuery, DocLineage, FacetValue, FusionMode, HybridLegOptions,
+    HybridSearchRequest, QueryRequest, SearchQuery, SearchRequest, SelectionQuery,
 };
 use pipestream_search::vector::{VectorIndex, VectorSearchOptions, EMBEDDED_TURBOVEC};
 use tokio::sync::mpsc;
@@ -383,56 +382,24 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
         .with_clustered_turbovec(external);
     let public_query = harness::unit_vectors(1, DIM, 0xC105_7E03);
     let expected_public = ranking(&embedded, &public_query, K, Some(&even_mask))[0].clone();
+    let routed_req = |request_id: &str| SearchRequest {
+        request_id: request_id.to_string(),
+        k: K as u32,
+        vector: public_query.clone(),
+        filter: r#"court == "scotus""#.to_string(),
+        ..Default::default()
+    };
     let routed_embedded = SearchService::search(
         &embedded_product,
-        Request::new(SearchRequest {
-            field: String::new(),
-            collection: String::new(),
-            request_id: "clustered-route".to_string(),
-            k: K as u32,
-            vector: public_query.clone(),
-            collapse_parents: false,
-            geo_filters: Vec::new(),
-            filter: r#"court == "scotus""#.to_string(),
-            enumerate_max_rows: None,
-            patience_saturation_ppm: None,
-            patience_hops: None,
-            finish_settle_us: None,
-            finish_deadline_us: None,
-            floor_prune: None,
-            floor_greediness_ppm: None,
-            floor_clamp_min: None,
-            include_rerank_candidate: false,
-        }),
+        Request::new(routed_req("clustered-route")),
     )
     .await
     .unwrap()
     .into_inner();
-    let routed = SearchService::search(
-        &product,
-        Request::new(SearchRequest {
-            field: String::new(),
-            collection: String::new(),
-            request_id: "clustered-route".to_string(),
-            k: K as u32,
-            vector: public_query.clone(),
-            collapse_parents: false,
-            geo_filters: Vec::new(),
-            filter: r#"court == "scotus""#.to_string(),
-            enumerate_max_rows: None,
-            patience_saturation_ppm: None,
-            patience_hops: None,
-            finish_settle_us: None,
-            finish_deadline_us: None,
-            floor_prune: None,
-            floor_greediness_ppm: None,
-            floor_clamp_min: None,
-            include_rerank_candidate: false,
-        }),
-    )
-    .await
-    .unwrap()
-    .into_inner();
+    let routed = SearchService::search(&product, Request::new(routed_req("clustered-route")))
+        .await
+        .unwrap()
+        .into_inner();
     assert_eq!(routed.request_id, "clustered-route");
     assert_eq!(routed.hits, routed_embedded.hits);
     assert_eq!(
@@ -445,25 +412,7 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
     );
     let routed_external = SearchService::search(
         &product_external,
-        Request::new(SearchRequest {
-            field: String::new(),
-            collection: String::new(),
-            request_id: "clustered-route-external".to_string(),
-            k: K as u32,
-            vector: public_query.clone(),
-            collapse_parents: false,
-            geo_filters: Vec::new(),
-            filter: r#"court == "scotus""#.to_string(),
-            enumerate_max_rows: None,
-            patience_saturation_ppm: None,
-            patience_hops: None,
-            finish_settle_us: None,
-            finish_deadline_us: None,
-            floor_prune: None,
-            floor_greediness_ppm: None,
-            floor_clamp_min: None,
-            include_rerank_candidate: false,
-        }),
+        Request::new(routed_req("clustered-route-external")),
     )
     .await
     .unwrap()
@@ -489,7 +438,8 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
                 id: "dense".to_string(),
                 query: Some(search_query::Query::Dense(DenseQuery {
                     vector: public_query.clone(),
-                    score_mode: DenseScoreMode::Fp32Rerank as i32,
+                    execution_mode: pipestream_search::pb::DenseExecutionMode::Balanced as i32,
+                    precision: pipestream_search::pb::DensePrecisionRequest::Fp32 as i32,
                     ..Default::default()
                 })),
             })),
@@ -556,12 +506,13 @@ candidates = {ROWS}
                     id: "dense".into(),
                     query: Some(search_query::Query::Dense(DenseQuery {
                         vector: public_query.clone(),
-                        score_mode: DenseScoreMode::Fp32Rerank as i32,
                         quality: Some(DenseQualityPolicy {
                             target_recall_ppm: 1_000_000,
                             max_candidates: ROWS as u32,
                             required_profile_fingerprint: String::new(),
                         }),
+                        execution_mode: pipestream_search::pb::DenseExecutionMode::Balanced as i32,
+                        precision: pipestream_search::pb::DensePrecisionRequest::Fp32 as i32,
                         ..Default::default()
                     })),
                 })),

@@ -9,6 +9,7 @@ struct QueuedQuerySpec {
     keep_ties: bool,
     include_rerank_candidate: bool,
     enumerate_max_rows: Option<usize>,
+    controls: crate::vector::SelectionControls,
     patience: Option<crate::vector::PatienceSpec>,
     floor_prune: Option<crate::vector::FloorPruneSpec>,
 }
@@ -22,6 +23,7 @@ struct BatchContext<'a> {
 
 /// What admission resolved for one job.
 struct AdmittedJob {
+    controls: crate::vector::SelectionControls,
     patience: Option<crate::vector::PatienceSpec>,
     floor_prune: Option<crate::vector::FloorPruneSpec>,
     allow: Option<crate::boolean_bits::Bits>,
@@ -41,6 +43,7 @@ impl BatchContext<'_> {
             )));
         }
         check_enumerate_threshold(index, job.enumerate_max_rows)?;
+        let controls = selection_controls(index, job.filter_strategy, job.enumerate_all)?;
         let patience =
             check_patience_options(index, job.patience_saturation_ppm, job.patience_hops)?;
         let floor_prune = check_floor_prune_options(
@@ -72,6 +75,7 @@ impl BatchContext<'_> {
             }
         }
         Ok(AdmittedJob {
+            controls,
             patience,
             floor_prune,
             allow,
@@ -126,6 +130,7 @@ impl AdmittedBatch {
             keep_ties: job.tie_complete,
             include_rerank_candidate: job.include_rerank_candidate,
             enumerate_max_rows: job.enumerate_max_rows.map(|rows| rows as usize),
+            controls: admitted.controls,
             patience: admitted.patience,
             floor_prune: admitted.floor_prune,
         });
@@ -150,6 +155,7 @@ impl AdmittedBatch {
                 keep_ties: spec.keep_ties,
                 allow: allow.as_ref().map(crate::vector::Mask::Bits),
                 enumerate_max_rows: spec.enumerate_max_rows,
+                controls: spec.controls,
                 patience: spec.patience,
                 floor_prune: spec.floor_prune,
             })

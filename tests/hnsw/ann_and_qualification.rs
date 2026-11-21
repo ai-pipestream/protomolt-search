@@ -1,4 +1,4 @@
-//! Explicit ANN recall, exact-mode refusal, policy qualification, floors, and depth.
+//! Explicit BALANCED recall, EXHAUSTIVE/AUTO enumeration, floors, and depth.
 
 use super::*;
 
@@ -11,7 +11,7 @@ async fn explicit_ann_returns_the_fp32_top_k_and_reports_the_graph() {
     for query_vector in queries.as_chunks::<DIM>().0 {
         let answer = query(
             &fixture.coordinator,
-            dense_request(query_vector, 5, DenseExecutionMode::Ann),
+            dense_request(query_vector, 5, DenseExecutionMode::Balanced),
         )
         .await
         .unwrap();
@@ -33,97 +33,44 @@ async fn explicit_ann_returns_the_fp32_top_k_and_reports_the_graph() {
     let response = response.unwrap();
     let outcome = response.dense_execution.unwrap();
     assert_eq!(outcome.provider_backend, HNSW);
-    assert_eq!(outcome.resolved_mode, DenseExecutionMode::Ann as i32);
+    assert_eq!(outcome.resolved_mode, DenseExecutionMode::Balanced as i32);
     assert_eq!(
         outcome.quality_contract,
         VectorQualityContract::ConfiguredAnn as i32
     );
-    assert!(!outcome.exhaustive_completion);
+    assert_eq!(outcome.coverage, DenseCoverage::CandidateSet as i32);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_graph_is_never_taken_for_exact() {
+async fn exhaustive_enumerates_every_row_and_matches_the_fp32_oracle() {
     let fixture = start_fixture().await;
-    for mode in [
-        DenseExecutionMode::Exact,
-        DenseExecutionMode::Unspecified,
-        DenseExecutionMode::Auto,
-    ] {
-        let error = query(
+    let truth = fp32_top(&fixture.corpus, &fixture.query_vector, 5);
+    for mode in [DenseExecutionMode::Exhaustive, DenseExecutionMode::Auto] {
+        let answer = query(
             &fixture.coordinator,
             dense_request(&fixture.query_vector, 5, mode),
         )
         .await
-        .unwrap_err();
-        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{mode:?}");
-        assert!(
-            error.message().contains(HNSW),
-            "{mode:?}: {}",
-            error.message()
-        );
+        .unwrap();
+        let got: Vec<u64> = answer.hits.iter().map(|hit| hit.doc_id).collect();
+        let want: Vec<u64> = truth.iter().map(|hit| hit.0).collect();
+        assert_eq!(got, want, "{mode:?}");
+        let outcome = answer.dense_execution.unwrap();
+        assert_eq!(outcome.resolved_mode, DenseExecutionMode::Exhaustive as i32);
+        assert_eq!(outcome.coverage, DenseCoverage::ExhaustiveCertified as i32);
+        assert_eq!(outcome.output_precision, DenseScorePrecision::Fp32 as i32);
+        assert!(outcome
+            .techniques
+            .iter()
+            .all(|t| t.technique == DenseTechnique::Fp32Scan as i32));
     }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn auto_qualifies_the_graph_only_through_its_own_fingerprint() {
-    let fixture = start_fixture().await;
-    let policy_for = |fingerprint: &str, tag: &str| {
-        let text = format!(
-            "format_version = 1\npolicy_id = \"hnsw-v1\"\nembedding_model = \"test-embed\"\n\
-             corpus_generation = {GENERATION}\ncorpus_rows = {N_DOCS}\ndimensions = {DIM}\n\
-             provider_backend = \"{HNSW}\"\nscoring_fingerprint = \"{fingerprint}\"\n\
-             measured_queries = 16\n\n[[points]]\nk = 5\n\
-             filter_selectivity_ppm_min = 1000000\nfilter_selectivity_ppm_max = 1000000\n\
-             candidates = 10\nmeasured_recall_ppm = 990000\n"
-        );
-        load_policy(tag, &text)
-    };
-
-    // A policy measured at another graph configuration does not qualify.
-    let other = VectorIndex::from_backend_config(
-        DIM,
-        &HnswConfig {
-            ef_construction: 300,
-            ..Default::default()
-        }
-        .backend_config()
-        .unwrap(),
-    )
-    .unwrap()
-    .descriptor()
-    .scoring_fingerprint;
-    assert_ne!(other, fixture.fingerprint);
-    let coordinator = fixture
-        .coordinator
-        .clone()
-        .with_dense_execution_policy(policy_for(&other, "other"));
     let error = query(
-        &coordinator,
-        dense_request(&fixture.query_vector, 5, DenseExecutionMode::Auto),
+        &fixture.coordinator,
+        dense_request(&fixture.query_vector, 5, DenseExecutionMode::Unspecified),
     )
     .await
     .unwrap_err();
-    assert!(
-        error.message().contains("scoring_fingerprint"),
-        "{}",
-        error.message()
-    );
-
-    let coordinator = fixture
-        .coordinator
-        .clone()
-        .with_dense_execution_policy(policy_for(&fixture.fingerprint, "own"));
-    let response = query(
-        &coordinator,
-        dense_request(&fixture.query_vector, 5, DenseExecutionMode::Auto),
-    )
-    .await
-    .unwrap();
-    assert_eq!(response.hits.len(), 5);
-    let outcome = response.dense_execution.unwrap();
-    assert_eq!(outcome.resolved_mode, DenseExecutionMode::Ann as i32);
-    assert_eq!(outcome.policy_id, "hnsw-v1");
-    assert_eq!(outcome.candidate_depth, 10);
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
 }
 
 /// The streaming scan reaches each node's graph walk with the request's
@@ -255,28 +202,14 @@ async fn candidate_depth_sizes_the_walk_and_is_reported() {
         assert_eq!(score.to_bits(), exact.to_bits(), "row {id}");
     }
 
-    // The outcome reports the depth the shards were asked for: k for a plain
-    // ANN selection, selection_k when the FP32 rerank names a deeper pool.
     for k in [5u32, 40] {
         let response = query(
             &fixture.coordinator,
-            dense_request(query_vector, k, DenseExecutionMode::Ann),
+            dense_request(query_vector, k, DenseExecutionMode::Balanced),
         )
         .await
         .unwrap();
         assert_eq!(response.hits.len(), k as usize);
         assert_eq!(response.dense_execution.unwrap().candidate_depth, k);
     }
-    let mut pooled = dense_request(query_vector, 5, DenseExecutionMode::Ann);
-    pooled.selection_k = 64;
-    if let Some(selection_query::Node::Search(search)) =
-        pooled.selection.as_mut().and_then(|s| s.node.as_mut())
-    {
-        if let Some(search_query::Query::Dense(dense)) = search.query.as_mut() {
-            dense.score_mode = DenseScoreMode::Fp32Rerank as i32;
-        }
-    }
-    let response = query(&fixture.coordinator, pooled).await.unwrap();
-    assert_eq!(response.hits.len(), 5);
-    assert_eq!(response.dense_execution.unwrap().candidate_depth, 64);
 }

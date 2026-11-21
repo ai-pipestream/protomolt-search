@@ -19,7 +19,6 @@ async fn floor_prune_multi_shard_prunes_cold_shard_handles_underfilled_and_dedup
 
     const LOCAL_DIM: usize = 16;
     const K: u32 = 32;
-    const LOCAL_GENERATION: u64 = 19;
 
     let mut q = vec![0.0_f32; LOCAL_DIM];
     q[0] = 1.0;
@@ -65,7 +64,7 @@ async fn floor_prune_multi_shard_prunes_cold_shard_handles_underfilled_and_dedup
         cold[r * LOCAL_DIM] = -2.5 - (r as f32) * 0.005;
     }
     // Shard 2 (empty participant, 0 rows).
-    let (node_hot, fingerprint) = make_hnsw_shard(&hot, 0, 0);
+    let (node_hot, _) = make_hnsw_shard(&hot, 0, 0);
     let (node_cold, _) = make_hnsw_shard(&cold, 1_000, 2);
     let (node_empty, _) = make_hnsw_shard(&[], 2_000, 0);
 
@@ -144,43 +143,6 @@ async fn floor_prune_multi_shard_prunes_cold_shard_handles_underfilled_and_dedup
     assert_eq!(underfilled.shards_floor_pruned, 0);
     assert_eq!(underfilled.hits.len(), 256 + 512);
 
-    // 3. Policy `AUTO` qualification on HNSW carries `floor_greediness_ppm` + `floor_clamp_min`
-    //    and reports `shards_floor_pruned` on `DenseExecutionOutcome`.
-    let policy = load_policy(
-        "hnsw-floor-prune",
-        &format!(
-            "format_version = 1\npolicy_id = \"hnsw-floor\"\n\
-             embedding_model = \"test-embed\"\ncorpus_generation = {LOCAL_GENERATION}\n\
-             corpus_rows = {}\ndimensions = {LOCAL_DIM}\nprovider_backend = \"{HNSW}\"\n\
-             scoring_fingerprint = \"{fingerprint}\"\nmeasured_queries = 16\n\n\
-             [[points]]\nk = {K}\nfilter_selectivity_ppm_min = 1000000\n\
-             filter_selectivity_ppm_max = 1000000\ncandidates = 96\n\
-             measured_recall_ppm = 995000\nfloor_greediness_ppm = 500000\n\
-             floor_clamp_min = 8\n",
-            256 + 512
-        ),
-    );
-    let auto_coord = CoordinatorServiceImpl::new(addrs)
-        .with_bm25(
-            Some(NATIVE_ANALYSIS_BACKEND.to_string()),
-            Default::default(),
-        )
-        .with_stream_search(true)
-        .with_topology_generation(LOCAL_GENERATION)
-        .with_dense_execution_policy(policy);
-    let qresp = query(&auto_coord, dense_request(&q, K, DenseExecutionMode::Auto))
-        .await
-        .unwrap();
-    assert_eq!(qresp.hits.len(), K as usize);
-    let outcome = qresp.dense_execution.unwrap();
-    assert!(outcome.shards_floor_pruned >= 1);
-    let pt = outcome.policy_point.unwrap();
-    assert_eq!(pt.floor_greediness_ppm, Some(500_000));
-    assert_eq!(pt.floor_clamp_min, Some(8));
-    assert!(outcome
-        .planner_reason
-        .contains("floor prune 500000 ppm (clamp 8)"));
-
     h0.abort();
     h1.abort();
     h2.abort();
@@ -244,6 +206,7 @@ async fn floor_prune_multi_shard_prunes_cold_shard_handles_underfilled_and_dedup
                 units_scanned: 1,
                 completed: true,
                 end_reason: VectorStreamEndReason::Exhausted,
+                parts: Default::default(),
                 regimes: FilterRegimeCounts::default(),
                 tail_enumerated_rows: 0,
                 patience_stopped: 0,

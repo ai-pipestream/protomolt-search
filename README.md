@@ -1442,6 +1442,24 @@ cache as searches touch them; writable tails remain heap-owned. See [Mapped vect
 
 ## TODO
 
+- **2026-11-20 — Dense execution v2 modes, precision, and receipts
+  (simultaneous upgrade).** `DenseExecutionMode` reserves tags `1..=3`
+  (`DENSE_EXECUTION_MODE_EXACT`, `DENSE_EXECUTION_MODE_ANN`, and the retired
+  `AUTO` tag) and replaces them with `EXHAUSTIVE = 4`, `BALANCED = 5`,
+  `FAST = 6`, and `AUTO = 7` (`DENSE_EXECUTION_MODE_AUTO` moves to `7` under
+  `WIRE_JSON`), while `UNSPECIFIED = 0` is refused on dense queries.
+  `DenseQuery.score_mode` (tag `2`) and
+  `DenseExecutionOutcome.exhaustive_completion` (tag `6`) are retired and
+  reserved in favor of `DensePrecisionRequest` (`AUTO`, `FP32`, `QUANTIZED`),
+  `DenseFilterStrategy` (`DEFAULT`, `SPEED`, `ENUMERATE_SMALL`), and typed
+  `DenseCoverage` / `DenseTermination` / per-technique part receipts (remote
+  `clustered-turbovec` quantized scans refuse `EXHAUSTIVE` and serve `BALANCED`
+  with `CANDIDATE_SET` coverage and zero invented part counts, while single-leaf
+  `EXHAUSTIVE` + `FP32` certifies via shard-local sidecars). Retired version-1
+  TOML `dense_execution_policy` keys and
+  `--dense-execution-policy` flags refuse at startup; upgrade coordinators,
+  relays, nodes, and regenerated gRPC/JSON clients together. See
+  [Query API](docs/query-api.md#dense-execution-contract).
 - **2026-11-20 — Canonical `search.proto` request forms (simultaneous
   upgrade).** Range facets, score stages, map string/number filters and map
   value reads each collapse to one canonical request/response shape with
@@ -2094,7 +2112,7 @@ cache as searches touch them; writable tails remain heap-owned. See [Mapped vect
   view when the caller supplies no filter. Document-only rows do not inflate
   selectivity, and membership reads validate one physical read set. Public
   document Query disclosure remains under audit. See
-  [dense execution policy](docs/dense-execution-policy.md).
+  [Query execution disclosure](docs/query-disclosure.md).
 - **2026-09-06 — Scoped decomposed selection and lexical rescores.** The first
   lexical pass now applies the mandatory document view, preserving visible rank
   provenance. BM25 candidate rescores enforce that view before scoring and carry

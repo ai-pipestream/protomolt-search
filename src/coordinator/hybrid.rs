@@ -22,13 +22,14 @@ impl CoordinatorServiceImpl {
         &self,
         query: HybridQuery<'_>,
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
-        self.fanout_hybrid_with_terms(query).await
+        let (hits, debug, _) = self.fanout_hybrid_with_terms(query).await?;
+        Ok((hits, debug))
     }
 
     pub(super) async fn fanout_hybrid_with_terms(
         &self,
         query: HybridQuery<'_>,
-    ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
+    ) -> Result<(Vec<HybridHit>, Option<HybridDebug>, DenseScanExecution), Status> {
         let input = query.input();
         self.check_vector_scan(input.filters(), false)?;
         if self.scoped_vector_scan() && self.query_read_versions.is_none() {
@@ -38,18 +39,21 @@ impl CoordinatorServiceImpl {
             return result;
         }
         if input.k() == 0 || input.vector().is_empty() {
-            return Ok((Vec::new(), None));
+            return Ok((Vec::new(), None, DenseScanExecution::default()));
+        }
+        if !self.hybrid_is_clustered() && query.legs().vector_weight > 0.0 {
+            self.ensure_shard_vector_rows().await;
         }
         let total_started = std::time::Instant::now();
         let (terms, analysis_ms) = self.analyze_hybrid_input(input, true).await?;
-        let (hits, mut debug, stats_ms) = self.hybrid_stats_rounds(query, &terms).await?;
+        let (hits, mut debug, stats_ms, exec) = self.hybrid_stats_rounds(query, &terms).await?;
         if let Some(debug) = debug.as_mut() {
             debug.terms = terms;
             debug.analysis_ms = analysis_ms;
             debug.stats_ms = stats_ms;
             debug.total_ms = total_started.elapsed().as_secs_f32() * 1e3;
         }
-        Ok((hits, debug))
+        Ok((hits, debug, exec))
     }
 
     pub(super) async fn analyze_hybrid_input(
@@ -85,7 +89,7 @@ impl CoordinatorServiceImpl {
         &self,
         query: HybridQuery<'_>,
         terms: &[String],
-    ) -> Result<(Vec<HybridHit>, Option<HybridDebug>, f32), Status> {
+    ) -> Result<(Vec<HybridHit>, Option<HybridDebug>, f32, DenseScanExecution), Status> {
         let started = std::time::Instant::now();
         let fingerprint = crate::analyzer::analysis_fingerprint(query.input().spec());
         let mut fresh = false;
@@ -111,7 +115,7 @@ impl CoordinatorServiceImpl {
                     fresh = true;
                 }
                 Err(error) => return Err(error),
-                Ok((hits, debug)) => return Ok((hits, debug, stats_ms)),
+                Ok((hits, debug, exec)) => return Ok((hits, debug, stats_ms, exec)),
             }
         }
     }
@@ -200,10 +204,31 @@ impl CoordinatorServiceImpl {
         Ok(vector_counts)
     }
 
+    async fn hybrid_leg_execution(
+        &self,
+        clustered: bool,
+        vector_weight: f32,
+        scans: &[(usize, Option<ShardScanStats>)],
+    ) -> Result<DenseScanExecution, Status> {
+        if vector_weight == 0.0 {
+            return Ok(DenseScanExecution::default());
+        }
+        if clustered {
+            let rows = self
+                .clustered_quality_identity()
+                .await?
+                .map_or(0, |id| id.rows);
+            return Ok(clustered_scan_execution(rows));
+        }
+        let refs: Vec<(usize, Option<&ShardScanStats>)> =
+            scans.iter().map(|(s, st)| (*s, st.as_ref())).collect();
+        Ok(self.evidence_from_shard_stats(&refs, 0))
+    }
+
     pub(super) async fn fanout_hybrid_global_rank(
         &self,
         round: HybridRound<'_>,
-    ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
+    ) -> Result<(Vec<HybridHit>, Option<HybridDebug>, DenseScanExecution), Status> {
         let started = std::time::Instant::now();
         let query = round.query();
         let clustered = self.hybrid_is_clustered();
@@ -217,6 +242,7 @@ impl CoordinatorServiceImpl {
         let tasks = self.spawn_global_hybrid(round, mask.as_ref(), &admission, clustered)?;
         let mut known = Self::filter_known(query.input().filters(), mask.as_ref());
         let mut shard_debug = Vec::new();
+        let mut scans = Vec::new();
         for task in tasks {
             let (shard, rpc_ms, response) = task
                 .await
@@ -244,10 +270,11 @@ impl CoordinatorServiceImpl {
                         response.vector_hits.len() as u32
                     },
                     bm25_hits: response.bm25_hits.len() as u32,
-                    scan: None,
+                    scan: response.vector_scan,
                 });
             }
             if !clustered {
+                scans.push((shard as usize, response.vector_scan));
                 merged.collect_raw(shard, response.vector_hits, true);
             }
             merged.collect_raw(shard, response.bm25_hits, false);
@@ -256,19 +283,23 @@ impl CoordinatorServiceImpl {
             admission.wait().await?;
         }
         known.refuse_unknown(query.input().filters())?;
+        let exec = self
+            .hybrid_leg_execution(clustered, query.legs().vector_weight, &scans)
+            .await?;
         let legs_ms = started.elapsed().as_secs_f32() * 1e3;
         let fusion_started = std::time::Instant::now();
         let hits = merged.finish(query);
         Ok((
             hits,
             hybrid_debug(query, shard_debug, legs_ms, fusion_started),
+            exec,
         ))
     }
 
     pub(super) async fn fanout_hybrid_two_level(
         &self,
         round: HybridRound<'_>,
-    ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
+    ) -> Result<(Vec<HybridHit>, Option<HybridDebug>, DenseScanExecution), Status> {
         let started = std::time::Instant::now();
         let query = round.query();
         let clustered = self.hybrid_is_clustered();
@@ -283,47 +314,25 @@ impl CoordinatorServiceImpl {
         let mut known = Self::filter_known(query.input().filters(), mask.as_ref());
         let mut shard_debug = Vec::new();
         let mut lists = Vec::new();
+        let mut scans = Vec::new();
+        let task_name = if clustered {
+            "shard legs"
+        } else {
+            "hybrid shard"
+        };
         for task in tasks {
-            let task_name = if clustered {
-                "shard legs"
-            } else {
-                "hybrid shard"
-            };
             let (shard, rpc_ms, reply) = task
                 .await
                 .map_err(|error| Status::internal(format!("{task_name} task failed: {error}")))??;
-            let mut hits = match reply {
-                LocalHybridReply::Clustered { response, vector } => {
-                    known.merge_shard(
-                        shard as usize,
-                        &response.geo_columns_known,
-                        &response.filter_columns_known,
-                    )?;
-                    fuse_clustered_shard(vector, response.bm25_hits, query.legs())
-                }
-                LocalHybridReply::Plain(response) => {
-                    accept_hybrid_receipt(
-                        &admission,
-                        shard,
-                        response.read_receipt.as_ref(),
-                        "hybrid fusion read receipt mismatch",
-                    )?;
-                    known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
-                    response.hits
-                }
-            };
-            if query.legs().min_vector_score > 0.0 {
-                hits.retain(|hit| {
-                    hit.vector_rank.is_some() && hit.vector_score >= query.legs().min_vector_score
-                });
-            }
+            let (hits, scan) =
+                unpack_two_level_reply(shard, reply, query, &admission, &mut known, &mut scans)?;
             if query.debug() {
                 shard_debug.push(HybridShardDebug {
                     shard,
                     rpc_ms,
                     vector_hits: hits.iter().filter(|hit| hit.vector_rank.is_some()).count() as u32,
                     bm25_hits: hits.iter().filter(|hit| hit.bm25_rank.is_some()).count() as u32,
-                    scan: None,
+                    scan,
                 });
             }
             lists.push((shard, hits));
@@ -332,14 +341,58 @@ impl CoordinatorServiceImpl {
             admission.wait().await?;
         }
         known.refuse_unknown(query.input().filters())?;
+        let exec = self
+            .hybrid_leg_execution(clustered, query.legs().vector_weight, &scans)
+            .await?;
         let legs_ms = started.elapsed().as_secs_f32() * 1e3;
         let fusion_started = std::time::Instant::now();
         let hits = finish_two_level(lists, query);
         Ok((
             hits,
             hybrid_debug(query, shard_debug, legs_ms, fusion_started),
+            exec,
         ))
     }
+}
+
+fn unpack_two_level_reply(
+    shard: u32,
+    reply: LocalHybridReply,
+    query: HybridQuery<'_>,
+    admission: &Option<Arc<crate::vector_read::VectorReadBarrier>>,
+    known: &mut FilterKnown,
+    scans: &mut Vec<(usize, Option<ShardScanStats>)>,
+) -> Result<(Vec<crate::pb::HybridLegHit>, Option<ShardScanStats>), Status> {
+    let (mut hits, scan) = match reply {
+        LocalHybridReply::Clustered { response, vector } => {
+            known.merge_shard(
+                shard as usize,
+                &response.geo_columns_known,
+                &response.filter_columns_known,
+            )?;
+            (
+                fuse_clustered_shard(vector, response.bm25_hits, query.legs()),
+                None,
+            )
+        }
+        LocalHybridReply::Plain(response) => {
+            accept_hybrid_receipt(
+                admission,
+                shard,
+                response.read_receipt.as_ref(),
+                "hybrid fusion read receipt mismatch",
+            )?;
+            known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
+            scans.push((shard as usize, response.vector_scan));
+            (response.hits, response.vector_scan)
+        }
+    };
+    if query.legs().min_vector_score > 0.0 {
+        hits.retain(|hit| {
+            hit.vector_rank.is_some() && hit.vector_score >= query.legs().min_vector_score
+        });
+    }
+    Ok((hits, scan))
 }
 
 type HybridAdmission = (

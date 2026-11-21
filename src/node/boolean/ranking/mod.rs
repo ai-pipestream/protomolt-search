@@ -7,6 +7,7 @@ mod options;
 
 pub(in crate::node) use options::{
     check_enumerate_threshold, check_floor_prune_options, check_patience_options,
+    selection_controls,
 };
 
 /// One ranked member: better is a higher score, then a lower slot, the

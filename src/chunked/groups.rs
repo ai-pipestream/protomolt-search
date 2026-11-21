@@ -43,8 +43,12 @@ impl<'q> KernelGroup<'q> {
     }
 }
 
+/// A mask's shape and identity (kind, address, length) beside the plan's
+/// selection controls.
+type GroupKey = (Option<(u8, usize, usize)>, crate::vector::SelectionControls);
+
 /// Partition query positions into groups that may share a kernel call:
-/// same allowlist in the same shape, compared by identity (address and length) rather than
+/// same selection controls and the same allowlist in the same shape, compared by identity (address and length) rather than
 /// contents. Two callers holding equal-but-distinct allowlists land in
 /// separate groups, which costs a kernel pass and never costs
 /// correctness. Order is preserved so a single-group batch runs exactly
@@ -57,10 +61,11 @@ fn group_by_allow(queries: &[BatchQuery<'_>]) -> Vec<Vec<usize>> {
             Mask::All(len) => (2u8, 0usize, len),
         })
     };
-    let mut keys: Vec<Option<(u8, usize, usize)>> = Vec::new();
+    let mut keys: Vec<GroupKey> = Vec::new();
     let mut groups: Vec<Vec<usize>> = Vec::new();
     for (qi, q) in queries.iter().enumerate() {
-        let k = key(q.allow);
+        // Two plans never share a kernel call merely because their masks match.
+        let k = (key(q.allow), q.controls);
         match keys.iter().position(|existing| *existing == k) {
             Some(gi) => groups[gi].push(qi),
             None => {

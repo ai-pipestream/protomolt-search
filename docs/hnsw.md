@@ -52,9 +52,9 @@ payload is the serialized `HnswConfig` message of
 
 `HnswConfig::backend_config()` builds it. Every field is part of the scoring
 fingerprint (with the dimension, the backend version and the config format),
-so a dense execution policy measured at one setting does not qualify
-another. The fingerprint hashes the canonical re-encoding of the decoded
-message, so field order or unknown fields on the wire do not change it.
+so two graphs built at different settings never share a fingerprint. The
+fingerprint hashes the canonical re-encoding of the decoded message, so field
+order or unknown fields on the wire do not change it.
 
 A shard with a write-ahead log locks its provider configuration in the
 log's manifest up to its first record, so configure the backend before the
@@ -63,23 +63,32 @@ replays from that manifest and refuses one without a usable configuration.
 
 ## What it may serve
 
-The descriptor advertises `CONFIGURED_ANN` without `exhaustive_completion`,
-so nothing about the exact path changes:
+The descriptor advertises `CONFIGURED_ANN` with `mask_enumeration`,
+`patience_stop`, and `floor_pruning` (without `exhaustive_completion` on graph
+walks):
 
-- `EXACT` and the legacy unspecified mode refuse the provider by name.
-- `ANN` runs it and reports `resolved_mode = ANN`, never exhaustive.
-- `AUTO` admits it only through a measured dense execution policy bound to
-  its `provider_backend` and `scoring_fingerprint`
-  ([Dense execution policy](dense-execution-policy.md)); without one it
-  refuses. No such policy ships with this milestone.
+- `UNSPECIFIED` and the retired mode values `1..=3` refuse on every dense
+  request.
+- `EXHAUSTIVE` pins every shard to the `Enumerate` regime across all live,
+  filter-admitted rows (filtered or unfiltered), scoring original FP32 rows
+  without walking the graph, and reports `resolved_mode = EXHAUSTIVE` with
+  `coverage = EXHAUSTIVE_CERTIFIED` (`Fp32Scan` over every active part).
+- `BALANCED` walks the graph under `hnsw-balanced-v1` (beam
+  `max(k, selection_k, 16)`, `ENUMERATE_SMALL` filter routing by default) and
+  reports `resolved_mode = BALANCED` with `coverage = CANDIDATE_SET`.
+- `FAST` walks the graph under `hnsw-fast-v1` (patience `0.99` over `15` hops,
+  `SPEED` filter routing by default) and reports `resolved_mode = FAST` with
+  `coverage = CANDIDATE_SET`.
+- `AUTO` requires qualifying measured policy evidence before approximating; on
+  this build (no policy type installed) `AUTO` resolves to `EXHAUSTIVE` and
+  pins whole-set enumeration on every shard (`docs/query-api.md`).
 - Recursive Boolean evaluation needs every member's score, which a walk
-  cannot give. The descriptor advertises `mask_enumeration`, and the shard
-  runs a Boolean dense pass pinned to the enumerate regime ("Filters"):
-  every member is scored exactly, so the leaf is exact without the graph
-  certifying anything. `ANN` inside a Boolean stays refused, as on every
+  cannot give. The shard runs a Boolean dense pass (`EXHAUSTIVE` or `AUTO`)
+  pinned to the `Enumerate` regime ("Filters"): every member is scored at exact
+  FP32. `BALANCED` and `FAST` inside a Boolean stay refused, as on every
   provider.
 
-`completed` on a stream means every walk finished, never that every row was
+`completed` on a walk stream means every walk finished, never that every row was
 evaluated.
 
 ## The beam
@@ -100,9 +109,9 @@ consider.
   part's options, and a relay forwards it. Without a depth the provider
   refuses the stream by name rather than guessing.
 - The depth a dense request executed at is reported:
-  `DenseExecutionOutcome.candidate_depth` is set whenever the resolved mode
-  is ANN (the request's `k` or `selection_k`, or the policy point's
-  `candidates` when AUTO qualified through one). `tests/hnsw.rs` drives two
+  `DenseExecutionOutcome.candidate_depth` is set whenever an approximate walk
+  runs (`BALANCED` or `FAST`, using the request's `k` or `selection_k`).
+  `tests/hnsw.rs` drives two
   depths through a real node's streaming path and checks that they change
   the walk and that the reported depth is the executed one.
 
@@ -386,8 +395,8 @@ hand such a query to enumerate, so the answer is exact and bounded in work:
   neighbor list read and probed). Across AVX2/AVX-512F and NEON (`d = 64` and
   `d = 256`), one random walk or bridge unit costs ~3.0–3.6× one sequential
   mask-ordered row in `enumerate` (`WALK_WORK_ENUMERATE_ROWS = 3.5` under the
-  default `ENUMERATE_ROWS_PER_WALK_ROW = 4`, or scaled proportionally by a
-  policy point's `enumerate_max_rows / (4 · ef · 2M)` with a floor of `1.0`).
+  default `ENUMERATE_ROWS_PER_WALK_ROW = 4`, or scaled proportionally by an
+  explicit `enumerate_max_rows / (4 · ef · 2M)` override with a floor of `1.0`).
   Once `work_units >= ceil(allowed / cost_ratio)` and the beam has not yet
   converged, the walk stops and hands the remaining unvisited allowed rows
   (`!scratch.seen(row)`) to `enumerate` (or `stream_rows`), merging with the
@@ -402,8 +411,8 @@ fills from the rows it routes through.
 
 None of the three applies to a pinned regime, which runs as pinned. All
 three apply under a request's threshold: they only ever move a query to the
-exact answer, and under a policy point the visit budget derives from that
-point's `enumerate_max_rows`.
+exact answer, and when `enumerate_max_rows` is supplied on the scan the visit
+budget scales from that threshold.
 
 Enumerating a far mask costs its allowed rows, as a filtered flat scan
 does. That is the price of the exact answer where the graph has none; the
@@ -489,9 +498,9 @@ Who selects which:
 | caller | routing | how |
 |---|---|---|
 | the provider API | either | `VectorSearchOptions::with_filter_routing` |
-| explicit `ANN` through the product | speed | the default; a request field for exact is #124 |
-| `AUTO` at a policy point | exact up to the point's threshold | the point's `enumerate_max_rows` is served as measured: every mask at or under it enumerates |
-| `EXACT` through the product | exhaustive | not a graph walk at all |
+| `BALANCED` through the product | `ENUMERATE_SMALL` (`Exact`) by default | `hnsw-balanced-v1`; `DenseQuery.filter_strategy = SPEED` selects `Speed` |
+| `FAST` through the product | `SPEED` (`Speed`) by default | `hnsw-fast-v1`; `DenseQuery.filter_strategy = ENUMERATE_SMALL` selects `Exact` |
+| `EXHAUSTIVE` or `AUTO` through the product | pinned `Enumerate` | scores every admitted row (`filter_strategy` must remain `DEFAULT`) |
 | the harness | either | `--hnsw-routing=speed` (default) or `--hnsw-routing=exact` |
 
 `--hnsw-regime=enumerate` (or `VectorSearchOptions::filter_regime`) pins
@@ -530,8 +539,8 @@ per-hop heap allocations (#95):
   never counts until at least `max(ef, ascent_gate)` allowed rows have been
   scored locally at layer 0, so a cold entry point ascending toward the query
   neighborhood cannot be cut short before reaching the target basin (#72).
-- **Determinism when off.** With `patience == 0` (the default on explicit `ANN`
-  and unparameterized policy points), zero extra heap operations run and a
+- **Determinism when off.** With `patience == 0` (the default on `BALANCED`
+  walks), zero extra heap operations run and a
   `FIXED_ORDER` walk visits the exact same nodes bit for bit.
 - **Measured Pareto wins (`protomolt-ann-bench patience`).** Across zero-jitter
   `pi500p` (`Neon`, 16 GB NVMe Pi 5) and `krick-1` (`Avx512f`), beam-window
@@ -541,9 +550,9 @@ per-hop heap allocations (#95):
   `2.30×` faster even at `recall >= 0.99` because plain HNSW cannot set
   `ef < k = 100`), `uncorrelated-10 k = 10` (`1.16×`–`1.18×`), and `court200k`
   `none` / `near-10` / `uncorrelated-50` `k = 10` (`+7.7%`–`+22.9%` over
-  interpolated plain-`ef` QPS). Patience is optional per policy point (`AUTO`
-  enables it only where a point names `patience_saturation_ppm` and
-  `patience_hops`), so cells where plain `ef` already sits on the Pareto
+  interpolated plain-`ef` QPS). `FAST` enables patience under `hnsw-fast-v1`
+  (`patience_saturation_ppm = 990_000`, `patience_hops = 15`), while `BALANCED`
+  leaves patience off so cells where plain `ef` already sits on the Pareto
   frontier pay zero cost.
 
 ### Through the product
@@ -553,13 +562,14 @@ per-hop heap allocations (#95):
   the columns") and hands the provider that bitmap on both scan routes.
   Segmented vectors give each sealed image its own span of it, so the
   regime is chosen per segment from that segment's allowed rows.
-- **One search per shard.** The unary scan (`SearchShard`) cuts an
-  exhaustive index into chunks and masks each. A graph has no chunks to
-  cut, and a mask naming one chunk's rows would make every chunk a filtered
-  search of the whole graph, so a provider without `exhaustive_completion`
-  is searched once per query at the request's depth
-  (`chunked::searched_topk`). The floor known at the start filters the
-  result and the k-th best found is offered once, at the end.
+- **One search per shard on walks.** The unary scan (`SearchShard`) cuts an
+  exhaustive scan index into chunks and masks each. A graph walk has no chunks
+  to cut, and a mask naming one chunk's rows would make every chunk a filtered
+  search of the whole graph, so a `BALANCED` or `FAST` graph walk runs once per
+  query at the request's depth (`chunked::searched_topk`); `EXHAUSTIVE` and
+  `AUTO` pin `Enumerate` across all admitted rows instead. The floor known at
+  the start filters the result and the k-th best found is offered once, at the
+  end.
 - **The regime is reported.** Every filtered search is counted under the
   regime that answered it, per segment, and the counts travel with the
   scan's statistics through relays to
@@ -571,22 +581,19 @@ per-hop heap allocations (#95):
   ones. Absent when no search was filtered; withheld, like the rest of the
   physical layout, from a document-scoped response
   ([Query execution disclosure](query-disclosure.md)).
-- **The threshold is the policy's.** `AUTO` serves a measured recall claim,
-  and a claim measured under one threshold must not be served under
-  another. A policy point for a filtered band names the
-  `enumerate_max_rows` it was measured with
-  ([Dense execution policy](dense-execution-policy.md), "Filter regimes");
-  the coordinator sends it with the scan and the provider chooses under it
-  instead of its own constant. Explicit `ANN` accepts the provider's
-  traversal and runs under the provider's threshold. The harness measures
-  a threshold the same way: `--hnsw-enumerate-max-rows=N`.
+- **The enumerate threshold.** Under `ENUMERATE_SMALL` (`Exact`) routing, every
+  mask of at most `ENUMERATE_ROWS_PER_WALK_ROW · ef · 2M` (or an explicit
+  `enumerate_max_rows` override on the shard scan, as the harness measures via
+  `--hnsw-enumerate-max-rows=N`) is enumerated, while larger masks are routed by
+  the probe. Under `SPEED` routing, only masks up to `ef · 2M` enumerate before
+  the probe looks ([Query API](query-api.md), "Dense execution contract").
 - **Boolean dense leaves** run pinned to enumerate, as "What it may serve"
   says.
 
-The plain share is the provider's constant, not a policy field: it is a
-property of the graph's walks, measured above, not of a recall claim. A
-policy point's `enumerate_max_rows` is served as measured: every mask at or
-below it enumerates, and the probe routes only the larger ones.
+The plain share is the provider's constant: it is a property of the graph's
+walks, measured above. Any `enumerate_max_rows` override on a scan is served as
+supplied: every mask at or below it enumerates, and the probe routes only the
+larger ones.
 
 ## Streaming
 
@@ -611,9 +618,10 @@ The control callback is polled after every expansion:
   candidates still at or above the latest floor, emits its normal terminal
   `StreamSearchSummary` (or `IdentityReady` followed by
   `ResolveStreamIdentities`), and closes the stream so its rows count as a
-  usable ANN result. Exhaustive providers (`EXHAUSTIVE_NATIVE_SCORE`) and the
-  exact `Enumerate` filter regime ignore `Finish` so an `EXACT` or
-  exhaustive-regime scan never returns truncated results claiming completion.
+  usable approximate walk result. Exhaustive scan providers
+  (`EXHAUSTIVE_NATIVE_SCORE`) and the exact `Enumerate` filter regime ignore
+  `Finish` so an `EXHAUSTIVE` or exhaustive-regime scan never returns truncated
+  results claiming completion.
 - A floor raised by either callback gates the rest of that query and every
   later one, and a buffered row that fell below a floor raised since it was
   scored is dropped before the sink sees it.
@@ -626,8 +634,8 @@ and an approximate traversal active, the coordinator may send
 `FinishStreamSearch` (paired with an advisory `TVS1` UDP `FINISH = 3`
 datagram, HMAC-SHA256 authenticated when `--udp-hmac-key` is configured) under
 two optional microsecond windows (`--stream-finish-settle-us` /
-`--stream-finish-deadline-us`, per-request `finish_settle_us` /
-`finish_deadline_us`, or policy-bound `DensePolicyPoint.finish_settle_us`):
+`--stream-finish-deadline-us` or per-request `finish_settle_us` /
+`finish_deadline_us`):
 
 - **Settle window (`finish_settle_us`).** Armed only after the merged global
   top-`k` heap (or `k` parent groups in collapse mode) is full **and** a shard
@@ -698,11 +706,10 @@ cut layer-0 walks short (`Walk::Floor`, `end_reason = FLOOR_PRUNED`,
   shared `ScoreFloor` as soon as `k` hits are collected, allowing later sealed
   segments to prune their layer-0 walks once their segment-proportional `gateK`
   is met.
-- **Provenance and telemetry.** `DenseExecutionPolicy` points may name
-  `floor_pruning = true` (with optional `floor_greediness_ppm` and
-  `floor_clamp_min`); shards ending via `Walk::Floor` report
-  `end_reason = FLOOR_PRUNED`, summed across relays into
-  `SearchResponse.shards_floor_pruned` and
+- **Provenance and telemetry.** When `floor_prune = true` (with optional
+  `floor_greediness_ppm` and `floor_clamp_min` on the shard scan), shards ending
+  via `Walk::Floor` report `end_reason = FLOOR_PRUNED`, summed across relays
+  into `SearchResponse.shards_floor_pruned` and
   `DenseExecutionOutcome.shards_floor_pruned` (withheld on document-scoped
   responses).
 

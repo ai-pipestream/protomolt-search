@@ -10,9 +10,8 @@ use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     search_query, selection_query, AddDocumentsRequest, AddVectorsRequest, Bm25SearchRequest,
     BrowseShardRequest, CommitReplacementsRequest, DeleteDocumentsRequest, DenseQuery,
-    DenseScoreMode, ExactVectorRescoreRequest, FetchValuesRequest, FlushRequest,
-    GetDocumentsRequest, HealthRequest, QueryRequest, Replacement, SearchQuery, SelectionQuery,
-    TermStatsRequest,
+    ExactVectorRescoreRequest, FetchValuesRequest, FlushRequest, GetDocumentsRequest,
+    HealthRequest, QueryRequest, Replacement, SearchQuery, SelectionQuery, TermStatsRequest,
 };
 use tonic::Request;
 
@@ -184,6 +183,25 @@ async fn descending_deletes_and_replacement_stay_hidden_after_reopen() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+fn fp32_balanced_query(vector: &[f32], k: u32) -> QueryRequest {
+    QueryRequest {
+        k,
+        selection_k: k,
+        selection: Some(SelectionQuery {
+            node: Some(selection_query::Node::Search(SearchQuery {
+                id: "dense".into(),
+                query: Some(search_query::Query::Dense(DenseQuery {
+                    vector: vector.to_vec(),
+                    execution_mode: pipestream_search::pb::DenseExecutionMode::Balanced as i32,
+                    precision: pipestream_search::pb::DensePrecisionRequest::Fp32 as i32,
+                    ..Default::default()
+                })),
+            })),
+        }),
+        ..Default::default()
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delete_and_append_then_replace_are_consistent_across_read_paths() {
     let (analysis, analysis_handle) = common::mock::start_mock_analysis().await;
@@ -320,21 +338,7 @@ async fn delete_and_append_then_replace_are_consistent_across_read_paths() {
 
     let exact = SearchService::query(
         &coordinator,
-        Request::new(QueryRequest {
-            k: 4,
-            selection_k: 4,
-            selection: Some(SelectionQuery {
-                node: Some(selection_query::Node::Search(SearchQuery {
-                    id: "dense".into(),
-                    query: Some(search_query::Query::Dense(DenseQuery {
-                        vector: corpus[..DIM].to_vec(),
-                        score_mode: DenseScoreMode::Fp32Rerank as i32,
-                        ..Default::default()
-                    })),
-                })),
-            }),
-            ..Default::default()
-        }),
+        Request::new(fp32_balanced_query(&corpus[..DIM], 4)),
     )
     .await
     .unwrap()

@@ -4,8 +4,9 @@
 use std::ops::ControlFlow;
 
 use crate::vector::{
-    FilterRegime, FilterRegimeCounts, Mask, VectorError, VectorProvider, VectorSearchOptions,
-    VectorStreamBatch, VectorStreamControl, VectorStreamEndReason, VectorStreamSummary,
+    FilterRegime, FilterRegimeCounts, Mask, PartCounts, VectorError, VectorProvider,
+    VectorSearchOptions, VectorStreamBatch, VectorStreamControl, VectorStreamEndReason,
+    VectorStreamSummary,
 };
 
 use super::distance::{self, prefetch};
@@ -26,6 +27,7 @@ struct QueryOutcome {
     reason: VectorStreamEndReason,
     answered: Option<FilterRegime>,
     budget_handoff: bool,
+    enumerated_part: bool,
 }
 
 impl QueryOutcome {
@@ -38,6 +40,7 @@ impl QueryOutcome {
             reason: VectorStreamEndReason::Exhausted,
             answered,
             budget_handoff: false,
+            enumerated_part: true,
         }
     }
 }
@@ -51,6 +54,7 @@ struct StreamTotals {
     tail_enumerated_rows: u64,
     patience_stopped: u32,
     floor_pruned: u32,
+    enumerated_part: bool,
 }
 
 impl HnswIndex {
@@ -248,8 +252,40 @@ impl HnswIndex {
                         plan.regime
                     },
                     budget_handoff: false,
+                    enumerated_part: false,
                 }
             }
+        }
+    }
+
+    pub(super) fn part_summary(
+        &self,
+        query_count: usize,
+        completed: bool,
+        plan: &Plan<'_>,
+        enumerated_part: bool,
+    ) -> PartCounts {
+        if self.is_empty() || query_count == 0 {
+            return PartCounts::default();
+        }
+        if plan.allow.is_some() && plan.allowed == 0 {
+            return PartCounts {
+                total: 1,
+                skipped: 1,
+                ..Default::default()
+            };
+        }
+        if !completed {
+            return PartCounts {
+                total: 1,
+                ..Default::default()
+            };
+        }
+        PartCounts {
+            total: 1,
+            enumerated: u32::from(enumerated_part),
+            walked: u32::from(!enumerated_part),
+            ..Default::default()
         }
     }
 
@@ -295,6 +331,7 @@ impl HnswIndex {
                     StreamHook::new(index, query, n2r, &mut floor, early_finish, sink, control);
                 let outcome = self.stream_query(ef, &plan, &mut hook, scratch, &mut totals);
                 hook.flush();
+                totals.enumerated_part |= outcome.enumerated_part;
                 if outcome.budget_handoff {
                     totals.regimes.count_budget_handoff();
                 } else if let Some(regime) = outcome.answered {
@@ -317,12 +354,14 @@ impl HnswIndex {
         if !stopped && end_reason == VectorStreamEndReason::Unspecified {
             end_reason = VectorStreamEndReason::Exhausted;
         }
+        let parts = self.part_summary(query_count, !stopped, &plan, totals.enumerated_part);
         Ok(VectorStreamSummary {
             query_count,
             emitted: totals.emitted,
             units_scanned: totals.units,
             completed: !stopped,
             end_reason,
+            parts,
             regimes: totals.regimes,
             tail_enumerated_rows: totals.tail_enumerated_rows,
             patience_stopped: totals.patience_stopped,

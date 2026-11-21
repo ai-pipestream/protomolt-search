@@ -105,15 +105,12 @@ fn lexical_leaf(id: &str, text: &str) -> SelectionQuery {
 }
 
 fn dense_leaf(id: &str, vector: &[f32]) -> SelectionQuery {
-    SelectionQuery {
-        node: Some(selection_query::Node::Search(SearchQuery {
-            id: id.to_string(),
-            query: Some(search_query::Query::Dense(DenseQuery {
-                vector: vector.to_vec(),
-                ..Default::default()
-            })),
-        })),
-    }
+    common::dense_selection(
+        id,
+        vector.to_vec(),
+        pipestream_search::pb::DenseExecutionMode::Exhaustive as i32,
+        0,
+    )
 }
 
 /// OR(dense, lexical) under global-rank RRF: the union pool whose legs

@@ -13,10 +13,10 @@ use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     score_signal, search_query, selection_query, selection_score_strategy, AddDocumentsRequest,
     BlendScore, BooleanQuery, BoostQuery, CascadeScore, CompositeScoreOperation, CompositeScorer,
-    CompositeSearchStrategy, DecomposedScore, DenseQuery, DenseScoreMode, DocLineage, Explanation,
-    FacetValue, FilterQuery, IntegerValue, LexicalQuery, QueryHit, QueryRequest, QueryResponse,
-    QuerySort, QueryStreamRequest, RrfScore, ScoreDimension, ScoreOp, ScoreSignal, ScoreStage,
-    SearchQuery, SelectionOperator, SelectionQuery, SelectionScoreStrategy, TermPrefix,
+    CompositeSearchStrategy, DecomposedScore, DenseQuery, DocLineage, Explanation, FacetValue,
+    IntegerValue, LexicalQuery, QueryHit, QueryRequest, QueryResponse, QuerySort,
+    QueryStreamRequest, RrfScore, ScoreDimension, ScoreOp, ScoreSignal, ScoreStage, SearchQuery,
+    SelectionOperator, SelectionQuery, SelectionScoreStrategy, TermPrefix,
 };
 use tonic::Request;
 
@@ -113,28 +113,15 @@ fn lexical_leaf(id: &str, query: LexicalQuery) -> SelectionQuery {
     }
 }
 
-fn dense_leaf(id: &str, vector: &[f32], mode: DenseScoreMode) -> SelectionQuery {
-    SelectionQuery {
-        node: Some(selection_query::Node::Search(SearchQuery {
-            id: id.to_string(),
-            query: Some(search_query::Query::Dense(DenseQuery {
-                vector: vector.to_vec(),
-                score_mode: mode as i32,
-                ..Default::default()
-            })),
-        })),
-    }
+fn dense_leaf(id: &str, vector: &[f32], fp32: bool) -> SelectionQuery {
+    use pipestream_search::pb::{DenseExecutionMode as M, DensePrecisionRequest as P};
+    let mode = if fp32 { M::Balanced } else { M::Exhaustive } as i32;
+    let precision = if fp32 { P::Fp32 } else { P::Auto } as i32;
+    common::dense_selection(id, vector.to_vec(), mode, precision)
 }
 
 fn cel_filter(id: &str, cel: &str) -> SelectionQuery {
-    SelectionQuery {
-        node: Some(selection_query::Node::Filter(FilterQuery {
-            id: id.to_string(),
-            predicate: Some(pipestream_search::pb::filter_query::Predicate::Cel(
-                cel.to_string(),
-            )),
-        })),
-    }
+    common::cel_selection(id, cel)
 }
 
 fn composite(
@@ -361,15 +348,12 @@ async fn score_stages_and_prefix_expansions_get_their_own_nodes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dense_leaves_report_the_native_score_and_the_rerank_estimate() {
     let (coordinator, qvec, _handles) = start_fleet().await;
-    let native = explained(
-        &coordinator,
-        QueryRequest {
-            k: 4,
-            selection: Some(dense_leaf("vec", &qvec, DenseScoreMode::Native)),
-            ..Default::default()
-        },
-    )
-    .await;
+    let native_req = QueryRequest {
+        k: 4,
+        selection: Some(dense_leaf("vec", &qvec, false)),
+        ..Default::default()
+    };
+    let native = explained(&coordinator, native_req).await;
     for hit in &native.hits {
         let root = tree(hit);
         assert!(root
@@ -377,16 +361,13 @@ async fn dense_leaves_report_the_native_score_and_the_rerank_estimate() {
             .starts_with("dense leaf \"vec\": the provider's native"));
         assert!(root.details.is_empty());
     }
-    let reranked = explained(
-        &coordinator,
-        QueryRequest {
-            k: 4,
-            selection_k: 8,
-            selection: Some(dense_leaf("vec", &qvec, DenseScoreMode::Fp32Rerank)),
-            ..Default::default()
-        },
-    )
-    .await;
+    let rerank_req = QueryRequest {
+        k: 4,
+        selection_k: 8,
+        selection: Some(dense_leaf("vec", &qvec, true)),
+        ..Default::default()
+    };
+    let reranked = explained(&coordinator, rerank_req).await;
     let estimates: std::collections::HashMap<u64, f32> = native
         .hits
         .iter()
@@ -414,7 +395,7 @@ async fn composite_trees_recompose_their_fusion_arithmetic() {
     let (coordinator, qvec, _handles) = start_fleet().await;
     let leaves = || {
         vec![
-            dense_leaf("vec", &qvec, DenseScoreMode::Native),
+            dense_leaf("vec", &qvec, false),
             lexical_leaf("lex", lexical_query("zebra")),
         ]
     };
@@ -547,7 +528,7 @@ async fn boolean_roots_sum_their_clauses() {
                     must: vec![cel_filter("recent", "year >= 2")],
                     should: vec![
                         lexical_leaf("lex", lexical_query("zebra")),
-                        dense_leaf("vec", &qvec, DenseScoreMode::Native),
+                        dense_leaf("vec", &qvec, false),
                     ],
                     ..Default::default()
                 })),

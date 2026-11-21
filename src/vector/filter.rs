@@ -28,6 +28,16 @@ impl FilterRouting {
     }
 }
 
+/// The selection controls a dense plan pins on a provider that chooses a
+/// filter regime: its mask routing, and whether every admitted row is
+/// enumerated even without a filter. A provider that scans every row
+/// ignores both.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct SelectionControls {
+    pub filter_routing: FilterRouting,
+    pub enumerate_all: bool,
+}
+
 /// How a provider that can steer its search by the mask answers a filtered
 /// query. A provider with one way to filter ignores it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

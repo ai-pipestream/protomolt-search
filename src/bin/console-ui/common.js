@@ -305,8 +305,6 @@ export function copyText(text) {
 export const enums = {
   and: 'SELECTION_OPERATOR_AND',
   or: 'SELECTION_OPERATOR_OR',
-  native: 'DENSE_SCORE_MODE_NATIVE',
-  fp32: 'DENSE_SCORE_MODE_FP32_RERANK',
   normalization: {
     min_max: 'SCORE_NORMALIZATION_MIN_MAX',
     z_score: 'SCORE_NORMALIZATION_Z_SCORE',

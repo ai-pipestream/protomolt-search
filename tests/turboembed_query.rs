@@ -237,6 +237,16 @@ async fn one_pass_analyze_query_binds_structured_filters_across_lexical_dense_an
     //    exact vector is queried, the synthesized one-pass CEL filter gates the entire selection
     //    so only Doc 0 survives!
     let doc3_vec = corpus_vecs[3 * DIM..4 * DIM].to_vec();
+    let doc3_dense = || SelectionQuery {
+        node: Some(selection_query::Node::Search(SearchQuery {
+            id: "vec".into(),
+            query: Some(search_query::Query::Dense(DenseQuery {
+                vector: doc3_vec.clone(),
+                execution_mode: pipestream_search::pb::DenseExecutionMode::Exhaustive as i32,
+                ..Default::default()
+            })),
+        })),
+    };
     let comp_resp = SearchService::query(
         &coord,
         Request::new(QueryRequest {
@@ -246,15 +256,7 @@ async fn one_pass_analyze_query_binds_structured_filters_across_lexical_dense_an
                 node: Some(selection_query::Node::Composite(CompositeSearchStrategy {
                     operator: SelectionOperator::Or as i32,
                     clauses: vec![
-                        SelectionQuery {
-                            node: Some(selection_query::Node::Search(SearchQuery {
-                                id: "vec".into(),
-                                query: Some(search_query::Query::Dense(DenseQuery {
-                                    vector: doc3_vec.clone(),
-                                    ..Default::default()
-                                })),
-                            })),
-                        },
+                        doc3_dense(),
                         SelectionQuery {
                             node: Some(selection_query::Node::Search(SearchQuery {
                                 id: "lex".into(),
@@ -297,15 +299,7 @@ async fn one_pass_analyze_query_binds_structured_filters_across_lexical_dense_an
         Request::new(QueryRequest {
             k: 10,
             selection_k: 10,
-            selection: Some(SelectionQuery {
-                node: Some(selection_query::Node::Search(SearchQuery {
-                    id: "vec".into(),
-                    query: Some(search_query::Query::Dense(DenseQuery {
-                        vector: doc3_vec,
-                        ..Default::default()
-                    })),
-                })),
-            }),
+            selection: Some(doc3_dense()),
             ..Default::default()
         }),
     )

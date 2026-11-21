@@ -21,9 +21,9 @@ use pipestream_search::pb::{
     selection_query, stream_search_request, stream_search_response, AddDocumentsRequest,
     AddVectorsRequest, AggregateOp, AggregateRequest, AggregateShardRequest, Aggregation,
     Bm25SearchRequest, BooleanQuery, BrowseShardRequest, CompiledAggregation,
-    CompositeSearchStrategy, DenseQuery, FacetValue, FilterQuery, FlushRequest, IntegerValue,
-    LexicalQuery, QueryHit, QueryRequest, QueryResponse, SearchQuery, SelectionOperator,
-    SelectionQuery, StartStreamSearch, StreamSearchRequest, ValueExpr,
+    CompositeSearchStrategy, FacetValue, FilterQuery, FlushRequest, IntegerValue, LexicalQuery,
+    QueryHit, QueryRequest, QueryResponse, SearchQuery, SelectionOperator, SelectionQuery,
+    StartStreamSearch, StreamSearchRequest, ValueExpr,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -179,17 +179,12 @@ fn lexical(id: &str, text: &str) -> SelectionQuery {
 }
 
 fn dense(id: &str) -> SelectionQuery {
-    SelectionQuery {
-        node: Some(selection_query::Node::Search(SearchQuery {
-            id: id.to_string(),
-            query: Some(pipestream_search::pb::search_query::Query::Dense(
-                DenseQuery {
-                    vector: corpus()[..DIM].to_vec(),
-                    ..Default::default()
-                },
-            )),
-        })),
-    }
+    common::dense_selection(
+        id,
+        corpus()[..DIM].to_vec(),
+        pipestream_search::pb::DenseExecutionMode::Exhaustive as i32,
+        0,
+    )
 }
 
 fn and(clauses: Vec<SelectionQuery>) -> SelectionQuery {

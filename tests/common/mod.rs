@@ -170,3 +170,80 @@ pub fn access_policy(
             .collect(),
     }
 }
+
+pub fn dense_selection(
+    id: &str,
+    vector: Vec<f32>,
+    mode: i32,
+    precision: i32,
+) -> pipestream_search::pb::SelectionQuery {
+    dense_field_selection(id, "", vector, mode, precision)
+}
+
+pub fn dense_field_selection(
+    id: &str,
+    field: &str,
+    vector: Vec<f32>,
+    mode: i32,
+    precision: i32,
+) -> pipestream_search::pb::SelectionQuery {
+    use pipestream_search::pb::{
+        search_query, selection_query, DenseQuery, SearchQuery, SelectionQuery,
+    };
+    SelectionQuery {
+        node: Some(selection_query::Node::Search(SearchQuery {
+            id: id.into(),
+            query: Some(search_query::Query::Dense(DenseQuery {
+                field: field.into(),
+                vector,
+                execution_mode: mode,
+                precision,
+                ..Default::default()
+            })),
+        })),
+    }
+}
+
+pub fn dense_query_request(
+    k: u32,
+    id: &str,
+    vector: Vec<f32>,
+    mode: i32,
+) -> pipestream_search::pb::QueryRequest {
+    pipestream_search::pb::QueryRequest {
+        k,
+        selection: Some(dense_selection(id, vector, mode, 0)),
+        ..Default::default()
+    }
+}
+
+pub fn dense_boost(
+    id: &str,
+    field: &str,
+    vector: Vec<f32>,
+    mode: i32,
+) -> pipestream_search::pb::BoostQuery {
+    use pipestream_search::pb::{search_query, BoostQuery, DenseQuery, SearchQuery};
+    BoostQuery {
+        query: Some(SearchQuery {
+            id: id.into(),
+            query: Some(search_query::Query::Dense(DenseQuery {
+                field: field.into(),
+                vector,
+                execution_mode: mode,
+                ..Default::default()
+            })),
+        }),
+        ..Default::default()
+    }
+}
+
+pub fn cel_selection(id: &str, cel: &str) -> pipestream_search::pb::SelectionQuery {
+    use pipestream_search::pb::{filter_query, selection_query, FilterQuery, SelectionQuery};
+    SelectionQuery {
+        node: Some(selection_query::Node::Filter(FilterQuery {
+            id: id.into(),
+            predicate: Some(filter_query::Predicate::Cel(cel.into())),
+        })),
+    }
+}

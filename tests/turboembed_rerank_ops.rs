@@ -40,7 +40,7 @@ use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::storage::VocabChannel;
 use pipestream_search::pb::{
     search_query, selection_query, selection_score_strategy, AddDocumentsRequest,
-    AddVectorsRequest, CompositeSearchStrategy, DenseQuery, DocLineage, HighlightSpec,
+    AddVectorsRequest, CompositeSearchStrategy, DenseExecutionMode, DocLineage, HighlightSpec,
     LexicalQuery, QueryRequest, RrfScore, SearchQuery, SelectionOperator, SelectionQuery,
     SelectionScoreStrategy,
 };

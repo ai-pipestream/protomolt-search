@@ -117,6 +117,7 @@ fn hybrid_query(strategy: selection_score_strategy::Strategy, field: &str) -> Qu
                             query: Some(search_query::Query::Dense(DenseQuery {
                                 field: field.into(),
                                 vector: vec![0.25; 16],
+                                execution_mode: crate::pb::DenseExecutionMode::Exhaustive as i32,
                                 ..Default::default()
                             })),
                         })),

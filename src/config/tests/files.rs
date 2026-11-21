@@ -242,3 +242,55 @@ nodes = ["host-b:50051"]
     assert!(error.contains("not multiplexed through a relay"), "{error}");
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn dense_execution_policy_is_refused_in_file_collections_and_cli() {
+    let top_file = temp_file(
+        "pipestream_search_dense_policy_top",
+        r#"
+role = "coordinator"
+nodes = ["host-a:50051"]
+dense_execution_policy = "/etc/pipestream/policy.toml"
+"#,
+    );
+    let top_err = parse(&args(&[&config_flag(&top_file)])).unwrap_err();
+    let _ = std::fs::remove_file(&top_file);
+    assert!(
+        top_err.contains("dense_execution_policy")
+            && top_err.contains("not supported on this build")
+            && top_err.contains("version-1 TOML"),
+        "{top_err}"
+    );
+
+    let col_file = temp_file(
+        "pipestream_search_dense_policy_collection",
+        r#"
+role = "coordinator"
+
+[[collections]]
+name = "books"
+nodes = ["host-a:50051"]
+dense_execution_policy = "/etc/pipestream/books-policy.toml"
+"#,
+    );
+    let col_err = parse(&args(&[&config_flag(&col_file)])).unwrap_err();
+    let _ = std::fs::remove_file(&col_file);
+    assert!(
+        col_err.contains("collections[0]")
+            && col_err.contains("dense_execution_policy")
+            && col_err.contains("not supported on this build"),
+        "{col_err}"
+    );
+
+    let cli_err = parse(&args(&[
+        "--role=coordinator",
+        "--nodes=host-a:50051",
+        "--dense-execution-policy=/etc/pipestream/policy.toml",
+    ]))
+    .unwrap_err();
+    assert!(
+        cli_err.contains("dense_execution_policy")
+            && cli_err.contains("not supported on this build"),
+        "{cli_err}"
+    );
+}

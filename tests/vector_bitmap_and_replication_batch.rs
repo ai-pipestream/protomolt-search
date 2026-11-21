@@ -151,6 +151,7 @@ fn a_bitmap_batch_shares_passes_exactly_like_its_flags() {
                 keep_ties: qi == 3,
                 allow: allows[qi],
                 enumerate_max_rows: None,
+                controls: Default::default(),
                 patience: None,
                 floor_prune: None,
             })

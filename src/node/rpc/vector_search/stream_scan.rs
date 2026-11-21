@@ -43,6 +43,17 @@ fn build_stream_options<'a>(
     if let Some(rows) = start.enumerate_max_rows {
         options = options.with_enumerate_max_rows(rows as usize);
     }
+    let controls = selection_controls(index, start.filter_strategy, start.enumerate_all)?;
+    options.filter_routing = controls.filter_routing;
+    if controls.enumerate_all {
+        options.allow = Some(
+            options
+                .allow
+                .unwrap_or(crate::vector::Mask::All(index.len())),
+        );
+        options.filter_regime = Some(crate::vector::FilterRegime::Enumerate);
+        options.enumerate_max_rows = None;
+    }
     if let Some(patience) =
         check_patience_options(index, start.patience_saturation_ppm, start.patience_hops)?
     {
@@ -94,7 +105,7 @@ fn pack_stream_batch(
     hits
 }
 
-fn poll_stream_control(
+pub(super) fn poll_stream_control(
     signals: &StreamSignals,
     stream_poll_delay: Option<std::time::Duration>,
     allow_early_finish: bool,
@@ -124,7 +135,7 @@ fn poll_stream_control(
     VectorStreamControl::Continue
 }
 
-fn build_scan_identities(
+pub(super) fn build_scan_identities(
     guard: &ShardState,
     slot_offset: u64,
     index_len: usize,
@@ -236,10 +247,20 @@ fn build_stream_summary(
         patience_stopped: summary.patience_stopped,
         end_reason,
         floor_pruned: summary.floor_pruned,
+        parts_total: summary.parts.total,
+        parts_skipped: summary.parts.skipped,
+        parts_walked: summary.parts.walked,
+        parts_enumerated: summary.parts.enumerated,
+        parts_scanned: summary.parts.scanned,
+        parts_staged: summary.parts.staged,
+        fp32_rows_scored: 0,
+        fp32_logical_bytes: 0,
+        fp32_pages_touched: 0,
+        fp32_tasks: 0,
     }
 }
 
-fn emit_stream_batch(
+pub(super) fn emit_stream_batch(
     batch: &crate::vector::VectorStreamBatch<'_>,
     ctx: &StreamScanCtx,
     parents: Option<&ParentMap>,

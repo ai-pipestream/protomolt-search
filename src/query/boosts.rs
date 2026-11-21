@@ -5,11 +5,11 @@ use tonic::Status;
 
 use super::refuse;
 use super::response::ms;
-use super::selection::{dense_score_mode, Shape};
+use super::selection::Shape;
 use crate::coordinator::CoordinatorServiceImpl;
 use crate::pb::{
-    search_query, BoostQuery, BoostRescore, DenseQuery, DenseScoreMode, LexicalQuery, QueryHit,
-    QuerySignal, SearchQuery,
+    search_query, BoostQuery, BoostRescore, DenseQuery, LexicalQuery, QueryHit, QuerySignal,
+    SearchQuery,
 };
 
 /// One validated boost query, ready to score adapter-side through the
@@ -69,6 +69,18 @@ pub(super) fn weight_or_one(weight: f32) -> f64 {
     } else {
         f64::from(weight)
     }
+}
+
+/// A dense boost scores a fixed pool with the provider's native scores: it
+/// selects nothing, so it names no execution mode, precision or routing.
+pub(super) fn native_boost_scoring(dense: &DenseQuery) -> Result<(), Status> {
+    if dense.execution_mode != 0 || dense.precision != 0 || dense.filter_strategy != 0 {
+        return Err(refuse(
+            "a dense boost scores its pool with provider-native candidate scoring; leave \
+             execution_mode, precision and filter_strategy unset",
+        ));
+    }
+    Ok(())
 }
 
 /// The boost's search query, which every boost must carry.
@@ -197,12 +209,7 @@ fn lexical_boost<'a>(
 }
 
 fn dense_boost<'a>(id: &str, dense: &'a DenseQuery) -> Result<BoostKind<'a>, Status> {
-    if dense_score_mode(dense)? == DenseScoreMode::Fp32Rerank {
-        return Err(refuse(
-            "FP32 rerank is a selection mode, not a dense boost mode; dense boosts \
-             continue to use provider-native candidate scoring",
-        ));
-    }
+    native_boost_scoring(dense)?;
     if dense.vector.is_empty() {
         return Err(refuse(format!("dense boost {id:?} has an empty vector")));
     }

@@ -8,6 +8,7 @@ use crate::stats_identity::StatsClaim;
 
 use super::fanout::{fan_out, shares_only, Opened};
 use super::merge_util::merge_known;
+use super::shard_scan::{add_scan_stats, check_child_part_stats, clear_part_counts};
 use super::{grpc_timeout, RelayService};
 
 type Binding = Option<Option<crate::pb::MappedVectorBinding>>;
@@ -50,8 +51,14 @@ impl RelayService {
                     )
                 })
                 .transpose()?;
+            if req.k > 0 && !req.vector.is_empty() {
+                opened.frozen.ensure_shard_vector_rows().await;
+            }
+            let child_nonempty: Vec<bool> = (0..opened.children.len())
+                .map(|i| opened.frozen.shard_is_nonempty(i))
+                .collect();
             let shares = shard_legs_shares(&opened, &req, read_claims.as_deref(), timeout).await?;
-            let (mut merged, receipts, binding) = merge_leg_shares(&req, shares)?;
+            let (mut merged, receipts, binding) = merge_leg_shares(&req, shares, &child_nonempty)?;
             if let Some(context) = &req.read_context {
                 let mut receipt = self.read_receipt(
                     &opened.pinned,
@@ -113,6 +120,7 @@ async fn shard_legs_shares(
 fn merge_leg_shares(
     req: &ShardLegsRequest,
     shares: Vec<ShardLegsResponse>,
+    child_nonempty: &[bool],
 ) -> Result<
     (
         ShardLegsResponse,
@@ -126,6 +134,8 @@ fn merge_leg_shares(
     let mut filter_known = None;
     let mut receipts = Vec::with_capacity(shares.len());
     let mut binding = None;
+    let runs_vector = req.k > 0 && !req.vector.is_empty();
+    let mut missing_parts = false;
     for (shard, share) in shares.into_iter().enumerate() {
         match (&req.read_context, share.read_receipt.as_ref()) {
             (Some(context), Some(receipt)) => {
@@ -152,8 +162,32 @@ fn merge_leg_shares(
             &mut filter_known,
             &share.filter_columns_known,
         )?;
+        if runs_vector {
+            let nonempty = child_nonempty[shard]
+                || !share.vector_hits.is_empty()
+                || share
+                    .vector_scan
+                    .as_ref()
+                    .is_some_and(|s| s.candidates_collected > 0 || s.chunk_calls > 0);
+            if nonempty && share.vector_scan.as_ref().map_or(0, |s| s.parts_total) == 0 {
+                missing_parts = true;
+            }
+        }
+        if let Some(scan) = share.vector_scan {
+            check_child_part_stats(&scan, shard, false)?;
+            add_scan_stats(
+                merged.vector_scan.get_or_insert_with(Default::default),
+                scan,
+                shard,
+            )?;
+        }
         merged.vector_hits.extend(share.vector_hits);
         merged.bm25_hits.extend(share.bm25_hits);
+    }
+    if missing_parts {
+        if let Some(scan) = merged.vector_scan.as_mut() {
+            clear_part_counts(scan);
+        }
     }
     merged.geo_columns_known = geo_known.unwrap_or_default();
     merged.filter_columns_known = filter_known.unwrap_or_default();

@@ -39,6 +39,7 @@ pub mod console;
 pub mod control_plane;
 pub mod coordinator;
 pub mod demo;
+pub(crate) mod dense_execution;
 pub mod dense_policy;
 pub mod derived;
 pub mod diagnostics;

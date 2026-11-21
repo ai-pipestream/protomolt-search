@@ -744,19 +744,17 @@ async fn public_named_dense_selection_matches_the_legacy_field_and_refuses_an_al
             .unwrap_err();
         assert_eq!(wrong.code(), Code::FailedPrecondition);
         for field in ["", "semantic", "signal"] {
+            let sel = common::dense_field_selection(
+                "dense",
+                field,
+                fixture.vector.clone(),
+                DenseExecutionMode::Exhaustive as i32,
+                0,
+            );
             let query = QueryRequest {
                 k: 4,
                 selection_k: 4,
-                selection: Some(SelectionQuery {
-                    node: Some(selection_query::Node::Search(SearchQuery {
-                        id: "dense".into(),
-                        query: Some(search_query::Query::Dense(DenseQuery {
-                            field: field.into(),
-                            vector: fixture.vector.clone(),
-                            ..Default::default()
-                        })),
-                    })),
-                }),
+                selection: Some(sel),
                 ..Default::default()
             };
             let response = coordinator.query(tonic::Request::new(query)).await;

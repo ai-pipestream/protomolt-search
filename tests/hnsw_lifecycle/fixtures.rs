@@ -107,6 +107,20 @@ pub(crate) fn coordinator(addr: &str) -> CoordinatorServiceImpl {
     )
 }
 
+pub(crate) fn speed_dense_leaf(vector: &[f32]) -> SelectionQuery {
+    SelectionQuery {
+        node: Some(selection_query::Node::Search(SearchQuery {
+            id: "vec".into(),
+            query: Some(search_query::Query::Dense(DenseQuery {
+                vector: vector.to_vec(),
+                execution_mode: DenseExecutionMode::Balanced as i32,
+                filter_strategy: DenseFilterStrategy::Speed as i32,
+                ..Default::default()
+            })),
+        })),
+    }
+}
+
 /// Explicit ANN through the coordinator's query planner: `(global id,
 /// score)` best first, plus `tail_enumerated_rows`.
 pub(crate) async fn ann_with_tail_stats(
@@ -117,16 +131,7 @@ pub(crate) async fn ann_with_tail_stats(
     let response = coordinator
         .query(Request::new(QueryRequest {
             k: k as u32,
-            selection: Some(SelectionQuery {
-                node: Some(selection_query::Node::Search(SearchQuery {
-                    id: "vec".into(),
-                    query: Some(search_query::Query::Dense(DenseQuery {
-                        vector: vector.to_vec(),
-                        execution_mode: DenseExecutionMode::Ann as i32,
-                        ..Default::default()
-                    })),
-                })),
-            }),
+            selection: Some(speed_dense_leaf(vector)),
             ..Default::default()
         }))
         .await
@@ -134,7 +139,7 @@ pub(crate) async fn ann_with_tail_stats(
         .into_inner();
     let outcome = response.dense_execution.unwrap();
     assert_eq!(outcome.provider_backend, HNSW);
-    assert_eq!(outcome.resolved_mode, DenseExecutionMode::Ann as i32);
+    assert_eq!(outcome.resolved_mode, DenseExecutionMode::Balanced as i32);
     (
         response.hits.iter().map(|h| (h.doc_id, h.score)).collect(),
         outcome.tail_enumerated_rows,

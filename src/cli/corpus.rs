@@ -25,7 +25,6 @@ pub(super) struct CorpusSpec<'a> {
     bm25_b: f32,
     dense_quality_profile: Option<&'a Path>,
     synonyms: Option<&'a Path>,
-    dense_execution_policy: Option<&'a Path>,
     pub(super) replica_state_path: Option<&'a Path>,
     pub(super) control_state_path: Option<&'a Path>,
     clustered_turbovec: Option<&'a ClusteredTurboVecConfig>,
@@ -46,7 +45,6 @@ impl<'a> CorpusSpec<'a> {
             bm25_b: cfg.bm25_b,
             dense_quality_profile: cfg.dense_quality_profile.as_deref(),
             synonyms: cfg.synonyms.as_deref(),
-            dense_execution_policy: cfg.dense_execution_policy.as_deref(),
             replica_state_path: cfg.replica_state_path.as_deref(),
             control_state_path,
             clustered_turbovec: cfg.clustered_turbovec.as_ref(),
@@ -66,7 +64,6 @@ impl<'a> CorpusSpec<'a> {
             bm25_b: c.bm25_b,
             dense_quality_profile: c.dense_quality_profile.as_deref(),
             synonyms: c.synonyms.as_deref(),
-            dense_execution_policy: c.dense_execution_policy.as_deref(),
             replica_state_path: c.replica_state_path.as_deref(),
             control_state_path: c.control_state_path.as_deref(),
             clustered_turbovec: None,
@@ -179,8 +176,7 @@ fn with_turbo(
     Ok(coordinator)
 }
 
-/// The dataset's measured dense profile, synonym table and dense
-/// execution policy.
+/// The dataset's measured dense profile and synonym table.
 fn with_tuning(
     dataset: &CorpusSpec<'_>,
     mut coordinator: CoordinatorServiceImpl,
@@ -198,17 +194,6 @@ fn with_tuning(
         let table = pipestream_search::synonyms::SynonymTable::load(path)?;
         eprintln!("synonyms: {} ({} rules)", path.display(), table.len());
         coordinator = coordinator.with_synonyms(table);
-    }
-    if let Some(path) = dataset.dense_execution_policy {
-        let policy = pipestream_search::dense_policy::DenseExecutionPolicy::load(path)?;
-        eprintln!(
-            "dense execution policy: {} ({}, {} measured queries, {} points)",
-            path.display(),
-            policy.policy_id(),
-            policy.measured_queries(),
-            policy.points().len()
-        );
-        coordinator = coordinator.with_dense_execution_policy(policy);
     }
     Ok(coordinator)
 }

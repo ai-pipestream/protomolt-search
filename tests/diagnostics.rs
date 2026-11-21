@@ -20,11 +20,10 @@ use pipestream_search::pb::diagnostics_service_client::DiagnosticsServiceClient;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_client::SearchServiceClient;
 use pipestream_search::pb::{
-    selection_query, AddDocumentsRequest, AddVectorsRequest, CompositeSearchStrategy, DenseQuery,
-    FacetValue, FilterQuery, FlushRequest, GetRuntimeKnobsRequest, IntegerValue, KnobScope,
-    MetricsSnapshot, MetricsSnapshotRequest, QueryRequest, QueryResponse, RecentQueriesRequest,
-    SearchQuery, SelectionOperator, SelectionQuery, SetRuntimeKnobRequest, ShardDiagnosticsRequest,
-    StreamMetricsRequest,
+    selection_query, AddDocumentsRequest, AddVectorsRequest, CompositeSearchStrategy, FacetValue,
+    FilterQuery, FlushRequest, GetRuntimeKnobsRequest, IntegerValue, KnobScope, MetricsSnapshot,
+    MetricsSnapshotRequest, QueryRequest, QueryResponse, RecentQueriesRequest, SelectionOperator,
+    SelectionQuery, SetRuntimeKnobRequest, ShardDiagnosticsRequest, StreamMetricsRequest,
 };
 use pipestream_search::security::{PrincipalConfig, Principals};
 use tokio::net::TcpListener;
@@ -177,17 +176,12 @@ fn cel(cel: &str) -> SelectionQuery {
 }
 
 fn dense() -> SelectionQuery {
-    SelectionQuery {
-        node: Some(selection_query::Node::Search(SearchQuery {
-            id: "v".to_string(),
-            query: Some(pipestream_search::pb::search_query::Query::Dense(
-                DenseQuery {
-                    vector: corpus()[..DIM].to_vec(),
-                    ..Default::default()
-                },
-            )),
-        })),
-    }
+    common::dense_selection(
+        "v",
+        corpus()[..DIM].to_vec(),
+        pipestream_search::pb::DenseExecutionMode::Exhaustive as i32,
+        0,
+    )
 }
 
 fn filtered_dense(filter: &str) -> QueryRequest {

@@ -127,7 +127,7 @@ without vectors do not inflate selectivity. Both membership passes check the
 same physical read set; field Use, binding, authority and deletion checks remain
 in force. Tests reproduce the previous 1,000,000 versus 500,000 ppm error and
 prove that the corrected key selects a different measured candidate depth.
-See [dense execution policy](dense-execution-policy.md) for the measurement scope.
+See [Query execution disclosure](query-disclosure.md) for the measurement scope.
 
 The shared executor applies
 document-specific disclosure to physical rerank work, shard/segment counts,

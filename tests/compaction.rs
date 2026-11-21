@@ -38,9 +38,9 @@ use pipestream_search::pb::{
     search_query, selection_query, AddDocumentsRequest, AddDocumentsResponse, AddVectorsRequest,
     AddVectorsResponse, Bm25SearchRequest, BrowseShardRequest, BrowseSort,
     CommitReplacementsRequest, CompactShardRequest, CompactShardResponse, DeleteDocumentsRequest,
-    DenseQuery, DocLineage, FacetValue, FlushRequest, GetDocumentsRequest, HealthRequest,
-    HybridSearchRequest, IntegerValue, QueryRequest, Replacement, ResolveParentsRequest,
-    SearchQuery, SearchRequest, SelectionQuery,
+    DocLineage, FacetValue, FlushRequest, GetDocumentsRequest, HealthRequest, HybridSearchRequest,
+    IntegerValue, QueryRequest, Replacement, ResolveParentsRequest, SearchQuery, SearchRequest,
+    SelectionQuery,
 };
 use pipestream_search::segments::{SegmentCatalog, SegmentMetadata, SegmentSetManifest};
 use tonic::transport::Channel;

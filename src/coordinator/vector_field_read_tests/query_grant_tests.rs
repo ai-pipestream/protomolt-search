@@ -14,9 +14,15 @@ async fn public_field_granted_dense_queries_require_the_indexed_name() {
     let reader = owner.for_access(Some(&decision), "query").unwrap();
     for streaming in [false, true] {
         let reader = reader.clone().with_stream_search(streaming);
-        for mode in [
-            crate::pb::DenseScoreMode::Native,
-            crate::pb::DenseScoreMode::Fp32Rerank,
+        for (mode, precision) in [
+            (
+                crate::pb::DenseExecutionMode::Exhaustive,
+                crate::pb::DensePrecisionRequest::Auto,
+            ),
+            (
+                crate::pb::DenseExecutionMode::Balanced,
+                crate::pb::DensePrecisionRequest::Fp32,
+            ),
         ] {
             let make_query = |field: &str| QueryRequest {
                 k: 4,
@@ -26,7 +32,8 @@ async fn public_field_granted_dense_queries_require_the_indexed_name() {
                         query: Some(search_query::Query::Dense(DenseQuery {
                             field: field.into(),
                             vector: vec![0.25; 16],
-                            score_mode: mode as i32,
+                            execution_mode: mode as i32,
+                            precision: precision as i32,
                             ..Default::default()
                         })),
                     })),
@@ -75,7 +82,10 @@ fn body_disclosing_decision() -> AccessDecision {
 fn selection_shape_requests() -> Vec<QueryRequest> {
     use selection_score_strategy::Strategy;
     let mut requests = vec![];
-    for mode in [DenseScoreMode::Unspecified, DenseScoreMode::Fp32Rerank] {
+    for (mode, precision) in [
+        (DenseExecutionMode::Exhaustive, DensePrecisionRequest::Auto),
+        (DenseExecutionMode::Balanced, DensePrecisionRequest::Fp32),
+    ] {
         requests.push(QueryRequest {
             k: 4,
             selection_k: 4,
@@ -85,7 +95,8 @@ fn selection_shape_requests() -> Vec<QueryRequest> {
                     query: Some(search_query::Query::Dense(DenseQuery {
                         field: "semantic".into(),
                         vector: vec![0.25; 16],
-                        score_mode: mode as i32,
+                        execution_mode: mode as i32,
+                        precision: precision as i32,
                         ..Default::default()
                     })),
                 })),
@@ -155,7 +166,10 @@ fn assert_execution_details_redacted(reply: &QueryResponse) {
     );
     if let Some(execution) = &reply.dense_execution {
         assert!(execution.planner_reason.is_empty());
-        assert!(execution.exhaustive_completion);
+        assert_ne!(
+            execution.coverage,
+            crate::pb::DenseCoverage::Unspecified as i32
+        );
         assert_eq!(
             execution.evidence_scope,
             DenseEvidenceScope::NotApplicable as i32
