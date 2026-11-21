@@ -82,10 +82,8 @@ async fn exact_integer_maps_require_separate_use_and_disclosure_grants() {
     let mut scored = query();
     scored.score_stages = vec![ScoreStage {
         column: "unsigned".into(),
-        operation: Some(score_stage::Operation::TypedMapOp(MapScoreOperation {
-            op: ScoreOp::AddLinear as i32,
-            key: "".into(),
-        })),
+        op: ScoreOp::AddLinear as i32,
+        map_key: Some(String::new()),
         weight: 2e-19,
         ..Default::default()
     }];
@@ -146,21 +144,11 @@ async fn exact_integer_maps_require_separate_use_and_disclosure_grants() {
     let mut bucketed = query();
     bucketed.range_facet_fields = vec![RangeFacetField {
         column: "unsigned".into(),
-        typed_map: Some(MapRangeFacet {
-            key: "".into(),
-            typed_edges: vec![
-                FilterBound {
-                    value: Some(filter_bound::Value::Uint(u64::MAX)),
-                    exclusive: false,
-                },
-                FilterBound {
-                    value: Some(filter_bound::Value::Num(18_446_744_073_709_551_616.0)),
-                    exclusive: false,
-                },
-            ],
-            ..Default::default()
-        }),
-        ..Default::default()
+        map_key: Some(String::new()),
+        edges: vec![
+            FilterBound::uint(u64::MAX),
+            FilterBound::num(18_446_744_073_709_551_616.0),
+        ],
     }];
     let before = owner.stats_cache().fetch_count();
     for denied in [&reader, &use_only] {
@@ -183,14 +171,8 @@ async fn exact_integer_maps_require_separate_use_and_disclosure_grants() {
         .remove(0);
     assert_eq!(counts.buckets[0].count, 1);
     assert_eq!(
-        counts.buckets[0].typed_from,
-        bucketed.range_facet_fields[0]
-            .typed_map
-            .as_ref()
-            .unwrap()
-            .typed_edges
-            .first()
-            .cloned()
+        counts.buckets[0].from,
+        bucketed.range_facet_fields[0].edges.first().copied()
     );
     let explanation = allowed
         .bm25_search(request(scored))

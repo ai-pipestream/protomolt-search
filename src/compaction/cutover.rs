@@ -14,8 +14,8 @@ use super::{Analyze, Preflight, Shadow, CUTOVER_RETRIES, MAX_TAIL_PASSES, STALLE
 mod install;
 
 impl NodeServiceImpl {
-    /// The tail loop and the cutover. Returns `(records applied under the
-    /// lock, write-lock hold in ms, unlocked passes)`.
+    /// The tail loop and the cutover. Returns `(write-lock hold in ms,
+    /// unlocked passes)`.
     pub(super) fn tail_and_cut_over(
         &self,
         pre: &Preflight,
@@ -23,7 +23,7 @@ impl NodeServiceImpl {
         tail_bound: usize,
         analyze: &mut Analyze<'_>,
         flush_shadow: &mut dyn FnMut(&mut Shadow) -> Result<(), Status>,
-    ) -> Result<(u64, u64, u64), Status> {
+    ) -> Result<(u64, u64), Status> {
         let (mut tail, mut passes) = self.catch_up_compaction(pre, shadow, tail_bound, analyze)?;
 
         // Reserve commits before taking the seal lock, matching Flush's
@@ -65,7 +65,7 @@ impl NodeServiceImpl {
             let held = started.elapsed().as_millis() as u64;
             drop(guard);
             drop(previous);
-            return Ok((0, held, passes));
+            return Ok((held, passes));
         }
     }
 

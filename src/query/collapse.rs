@@ -59,7 +59,7 @@ async fn collapse_keys(
         name: column.clone(),
         expr: Some(crate::pb::ValueExpr {
             expr: Some(match &selector.map {
-                Some(map) => crate::pb::value_expr::Expr::TypedMap(map.clone()),
+                Some(map) => crate::pb::value_expr::Expr::Map(map.clone()),
                 None => crate::pb::value_expr::Expr::Column(column.clone()),
             }),
         }),

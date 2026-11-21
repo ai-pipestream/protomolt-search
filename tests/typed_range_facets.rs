@@ -75,7 +75,7 @@ fn fields() -> (Vec<pb::RangeFacetField>, Vec<Vec<i128>>) {
         vec![
             pb::RangeFacetField {
                 column: "value".into(),
-                typed_edges: typed
+                edges: typed
                     .into_iter()
                     .map(|value| pb::FilterBound {
                         value: Some(value),
@@ -86,13 +86,15 @@ fn fields() -> (Vec<pb::RangeFacetField>, Vec<Vec<i128>>) {
             },
             pb::RangeFacetField {
                 column: "value".into(),
-                edges: vec![
+                edges: [
                     -9_223_372_036_854_775_808.0,
                     0.0,
                     9_007_199_254_740_992.0,
                     9_223_372_036_854_775_808.0,
                     18_446_744_073_709_551_616.0,
-                ],
+                ]
+                .map(pb::FilterBound::num)
+                .to_vec(),
                 ..Default::default()
             },
         ],
@@ -181,11 +183,8 @@ async fn verify(addresses: Vec<String>) {
                         "stream={stream} text={text} filter={filter} field={index}"
                     );
                     for (i, bucket) in counts.buckets.iter().enumerate() {
-                        assert_eq!(bucket.typed_from, fields[index].typed_edges.get(i).cloned());
-                        assert_eq!(
-                            bucket.typed_to,
-                            fields[index].typed_edges.get(i + 1).cloned()
-                        );
+                        assert_eq!(bucket.from, fields[index].edges.get(i).copied());
+                        assert_eq!(bucket.to, fields[index].edges.get(i + 1).copied());
                     }
                 }
             }
@@ -254,7 +253,7 @@ async fn typed_ranges_match_numeric_oracle_through_nested_relays_and_storage_lif
             .unwrap();
         // Direct empty shards must reject malformed edges before reading a store.
         let mut bad = fields().0[0].clone();
-        bad.typed_edges[0].exclusive = true;
+        bad.edges[0].exclusive = true;
         assert_eq!(
             client
                 .bm25_query(pb::Bm25QueryRequest {
@@ -361,10 +360,9 @@ fn relay_refuses_forged_bucket_edges_even_with_one_child() {
             column: field.column,
             known: true,
             buckets: vec![pb::RangeBucket {
-                from: 0.0,
-                to: 1.0,
+                from: Some(pb::FilterBound::num(0.0)),
+                to: Some(pb::FilterBound::num(1.0)),
                 count: 9,
-                ..Default::default()
             }],
             ..Default::default()
         }],

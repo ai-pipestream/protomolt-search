@@ -32,36 +32,26 @@ impl Bm25Shard {
                         .collect::<Result<_, _>>()?,
                 ),
                 Expr::Not(child) => ResolvedFilter::Not(Box::new(self.resolve_filter(child)?)),
-                Expr::StringRange(p) | Expr::MapStringRange(p) => ResolvedFilter::Leaf(
-                    self.resolve_string_predicate(
-                        &p.column,
-                        (matches!(expr.expr, Some(Expr::MapStringRange(_))) || !p.key.is_empty())
-                            .then_some(p.key.as_str()),
-                        p.min.as_ref().map(|b| (b.value.as_str(), b.exclusive)),
-                        p.max.as_ref().map(|b| (b.value.as_str(), b.exclusive)),
-                        None,
-                    )?,
-                ),
-                Expr::StringPrefix(p) | Expr::MapStringPrefix(p) => ResolvedFilter::Leaf(
-                    self.resolve_string_predicate(
-                        &p.column,
-                        (matches!(expr.expr, Some(Expr::MapStringPrefix(_))) || !p.key.is_empty())
-                            .then_some(p.key.as_str()),
-                        None,
-                        None,
-                        Some(p.prefix.as_str()),
-                    )?,
-                ),
+                Expr::StringRange(p) => ResolvedFilter::Leaf(self.resolve_string_predicate(
+                    &p.column,
+                    p.map_key.as_deref(),
+                    p.min.as_ref().map(|b| (b.value.as_str(), b.exclusive)),
+                    p.max.as_ref().map(|b| (b.value.as_str(), b.exclusive)),
+                    None,
+                )?),
+                Expr::StringPrefix(p) => ResolvedFilter::Leaf(self.resolve_string_predicate(
+                    &p.column,
+                    p.map_key.as_deref(),
+                    None,
+                    None,
+                    Some(p.prefix.as_str()),
+                )?),
                 Expr::Facet(p) => ResolvedFilter::Leaf(self.resolve_facet_leaf(p)),
                 Expr::Number(p) => ResolvedFilter::Leaf(self.resolve_number_leaf(p)),
                 Expr::MapFacet(p) => ResolvedFilter::Leaf(self.resolve_map_facet_leaf(p)),
-                Expr::MapNumber(p) | Expr::TypedMapNumber(p) => {
-                    let typed = matches!(expr.expr, Some(Expr::TypedMapNumber(_)));
-                    ResolvedFilter::Leaf(self.resolve_map_number_leaf(p, typed))
-                }
-                Expr::MapHasKey(p) | Expr::TypedMapHasKey(p) => {
-                    let typed = matches!(expr.expr, Some(Expr::TypedMapHasKey(_)));
-                    ResolvedFilter::Leaf(ResolvedLeaf::MapHasKey(self.map_key_ref(p, typed)))
+                Expr::MapNumber(p) => ResolvedFilter::Leaf(self.resolve_map_number_leaf(p)),
+                Expr::MapHasKey(p) => {
+                    ResolvedFilter::Leaf(ResolvedLeaf::MapHasKey(self.map_key_ref(p)))
                 }
                 Expr::Has(p) => ResolvedFilter::Leaf(ResolvedLeaf::Has {
                     facet: self.facet_index(&p.column),
@@ -127,18 +117,14 @@ impl Bm25Shard {
         ResolvedLeaf::MapFacet { target, ords }
     }
 
-    fn resolve_map_number_leaf(
-        &self,
-        p: &crate::pb::MapNumberPredicate,
-        typed: bool,
-    ) -> ResolvedLeaf {
+    fn resolve_map_number_leaf(&self, p: &crate::pb::MapNumberPredicate) -> ResolvedLeaf {
         let lo = p.min.as_ref().and_then(crate::filter::edge_of);
         let hi = p.max.as_ref().and_then(crate::filter::edge_of);
-        if let Some(ci) = self.map_integer_index(&p.column).filter(|_| typed) {
+        if let Some(ci) = self.map_integer_index(&p.column) {
             let target = self.map_integer_key_ord(ci, &p.key).map(|key| (ci, key));
             let (lo, hi) = crate::filter::int_range(&lo, &hi);
             ResolvedLeaf::MapIntRange { target, lo, hi }
-        } else if let Some(ci) = self.map_unsigned_integer_index(&p.column).filter(|_| typed) {
+        } else if let Some(ci) = self.map_unsigned_integer_index(&p.column) {
             let target = self
                 .map_unsigned_integer_key_ord(ci, &p.key)
                 .map(|key| (ci, key));
@@ -152,9 +138,9 @@ impl Bm25Shard {
         }
     }
 
-    /// Map-facet first, then map-numeric: the one order, shared with
-    /// `filter_columns_known`.
-    fn map_key_ref(&self, p: &crate::pb::MapKeyPredicate, typed: bool) -> MapKeyRef {
+    /// Map-facet, map-numeric, map-integer, then map-unsigned: the one
+    /// order, shared with `filter_columns_known`.
+    fn map_key_ref(&self, p: &crate::pb::MapKeyPredicate) -> MapKeyRef {
         if let Some(ci) = self.map_facet_index(&p.column) {
             MapKeyRef::Facet {
                 column: ci,
@@ -165,12 +151,12 @@ impl Bm25Shard {
                 column: ci,
                 key_ord: self.map_numeric_key_ord(ci, &p.key),
             }
-        } else if let Some(ci) = self.map_integer_index(&p.column).filter(|_| typed) {
+        } else if let Some(ci) = self.map_integer_index(&p.column) {
             MapKeyRef::Integer {
                 column: ci,
                 key_ord: self.map_integer_key_ord(ci, &p.key),
             }
-        } else if let Some(ci) = self.map_unsigned_integer_index(&p.column).filter(|_| typed) {
+        } else if let Some(ci) = self.map_unsigned_integer_index(&p.column) {
             MapKeyRef::UnsignedInteger {
                 column: ci,
                 key_ord: self.map_unsigned_integer_key_ord(ci, &p.key),

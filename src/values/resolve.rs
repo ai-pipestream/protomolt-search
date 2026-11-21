@@ -25,9 +25,7 @@ pub fn resolve(
         .ok_or_else(|| refuse("empty ValueExpr node"))?
     {
         V::Column(name) => resolve_column(name, cols),
-        V::Map(read) | V::TypedMap(read) => {
-            resolve_map(read, matches!(expr.expr, Some(V::TypedMap(_))), cols)
-        }
+        V::Map(read) => resolve_map(read, cols),
 
         V::IntLiteral(v) => Ok((ResolvedValue::ConstInt(*v), ValueType::Int)),
         V::UintLiteral(v) => Ok((ResolvedValue::ConstUint(*v), ValueType::Uint)),
@@ -107,15 +105,12 @@ fn resolve_column(
 /// keeps the column's static type when the key is missing.
 fn resolve_map(
     read: &pb::MapRead,
-    typed: bool,
     cols: &dyn ColumnLookup,
 ) -> Result<(ResolvedValue, ValueType), ValuesError> {
     let num = cols.map_numeric_index(&read.column);
     let facet = cols.map_facet_index(&read.column);
-    let int = cols.map_integer_index(&read.column).filter(|_| typed);
-    let uint = cols
-        .map_unsigned_integer_index(&read.column)
-        .filter(|_| typed);
+    let int = cols.map_integer_index(&read.column);
+    let uint = cols.map_unsigned_integer_index(&read.column);
     if [num, facet, int, uint]
         .iter()
         .filter(|c| c.is_some())
@@ -153,14 +148,7 @@ fn resolve_map(
                 },
                 ValueType::Double,
             )),
-            None => Ok((
-                ResolvedValue::Absent,
-                if typed {
-                    ValueType::Double
-                } else {
-                    ValueType::Unknown
-                },
-            )),
+            None => Ok((ResolvedValue::Absent, ValueType::Double)),
         }
     } else if let Some(ci) = facet {
         match cols.map_facet_key_ord(ci, &read.key) {
@@ -171,14 +159,7 @@ fn resolve_map(
                 },
                 ValueType::Str,
             )),
-            None => Ok((
-                ResolvedValue::Absent,
-                if typed {
-                    ValueType::Str
-                } else {
-                    ValueType::Unknown
-                },
-            )),
+            None => Ok((ResolvedValue::Absent, ValueType::Str)),
         }
     } else {
         Ok((ResolvedValue::Absent, ValueType::Unknown))

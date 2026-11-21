@@ -97,7 +97,6 @@ pub(super) fn query_stream_revision(
         content_fingerprint,
         scoring_fingerprint,
         identity_state: identity_state as i32,
-        content_fingerprint_version: 2,
     }
 }
 

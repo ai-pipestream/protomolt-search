@@ -248,9 +248,7 @@ pub(crate) fn stored_query() -> QueryRequest {
                 source: Some(ScoreSignal {
                     source: Some(score_signal::Source::BoundedValue(ScoreStage {
                         column: "boost".into(),
-                        operation: Some(pipestream_search::pb::score_stage::Operation::Op(
-                            ScoreOp::AddLinear as i32,
-                        )),
+                        op: ScoreOp::AddLinear as i32,
                         weight: 1.,
                         ..Default::default()
                     })),

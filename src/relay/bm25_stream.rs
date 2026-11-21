@@ -324,10 +324,6 @@ async fn on_child(
             progress.remaining -= 1;
             Ok(())
         }
-        Some(Up::Done(_)) => Err(Status::failed_precondition(format!(
-            "relay child {shard} ({addr}): BM25 stream used the obsolete uncertified \
-             terminal response"
-        ))),
         None => Ok(()),
     }
 }

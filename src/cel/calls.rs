@@ -11,7 +11,7 @@ use crate::pb;
 /// and `column in [v, ...]` (membership).
 pub(super) fn compile_in(lhs: Side, rhs: Side) -> Result<pb::FilterExpr, CelError> {
     match (lhs, rhs) {
-        (Side::Str(key), Side::Column(column)) => Ok(wrap(pb::filter_expr::Expr::TypedMapHasKey(
+        (Side::Str(key), Side::Column(column)) => Ok(wrap(pb::filter_expr::Expr::MapHasKey(
             pb::MapKeyPredicate { column, key },
         ))),
         (Side::Column(_) | Side::MapAccess(..), Side::Column(name)) => Err(refuse(format!(
@@ -196,9 +196,9 @@ fn compile_starts_with(args: &[Ast]) -> Result<pb::FilterExpr, CelError> {
             "startsWith() takes a column receiver and one string",
         ));
     }
-    let (column, key, is_map) = match side_of(&args[0])? {
-        Side::Column(name) => (name, String::new(), false),
-        Side::MapAccess(name, key) => (name, key, true),
+    let (column, map_key) = match side_of(&args[0])? {
+        Side::Column(name) => (name, None),
+        Side::MapAccess(name, key) => (name, Some(key)),
         _ => {
             return Err(refuse(
                 "startsWith() reads a facet column or a map entry; the receiver \
@@ -215,17 +215,13 @@ fn compile_starts_with(args: &[Ast]) -> Result<pb::FilterExpr, CelError> {
             "startsWith(\"\") matches every value; presence is has(column)",
         ));
     }
-    let explicit_map = is_map && key.is_empty();
-    let predicate = pb::StringPrefixPredicate {
-        column,
-        key,
-        prefix,
-    };
-    Ok(wrap(if explicit_map {
-        pb::filter_expr::Expr::MapStringPrefix(predicate)
-    } else {
-        pb::filter_expr::Expr::StringPrefix(predicate)
-    }))
+    Ok(wrap(pb::filter_expr::Expr::StringPrefix(
+        pb::StringPrefixPredicate {
+            column,
+            map_key,
+            prefix,
+        },
+    )))
 }
 
 /// Geo function arguments: a column identifier plus `n` numeric

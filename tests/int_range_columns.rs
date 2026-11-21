@@ -13,8 +13,8 @@ use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
-    AddDocumentsRequest, Bm25Hit, Bm25SearchRequest, IntegerValue, RangeFacetField, ScoreOp,
-    ScoreStage, TimestampValue,
+    filter_bound::Value as BoundValue, AddDocumentsRequest, Bm25Hit, Bm25SearchRequest,
+    FilterBound, IntegerValue, RangeFacetField, ScoreOp, ScoreStage, TimestampValue,
 };
 use pipestream_search::postings::{
     AnalyzedDoc, Bm25Reader, Bm25Store, ColumnKind::*, SpillBuilder,
@@ -146,16 +146,22 @@ async fn start_integer_shards(
 fn range_field(column: &str, edges: &[f64]) -> RangeFacetField {
     RangeFacetField {
         column: column.to_string(),
-        key: String::new(),
-        edges: edges.to_vec(),
-        ..Default::default()
+        map_key: None,
+        edges: edges.iter().copied().map(FilterBound::num).collect(),
     }
 }
 
 /// A range facet's buckets as `(from, to, count)`, for hand-computed
 /// comparisons.
 fn buckets_of(rf: &pipestream_search::pb::RangeFacetCounts) -> Vec<(f64, f64, u64)> {
-    rf.buckets.iter().map(|b| (b.from, b.to, b.count)).collect()
+    let edge = |b: &Option<FilterBound>| match b.as_ref().and_then(|x| x.value) {
+        Some(BoundValue::Num(v)) => v,
+        other => panic!("double edge expected, got {other:?}"),
+    };
+    rf.buckets
+        .iter()
+        .map(|b| (edge(&b.from), edge(&b.to), b.count))
+        .collect()
 }
 
 fn hit_signature(hits: &[Bm25Hit]) -> Vec<(u64, u32)> {

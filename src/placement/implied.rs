@@ -70,13 +70,9 @@ fn implied_walk(
         }
         Some(Expr::StringRange(_))
         | Some(Expr::StringPrefix(_))
-        | Some(Expr::MapStringRange(_))
-        | Some(Expr::MapStringPrefix(_))
         | Some(Expr::MapFacet(_))
         | Some(Expr::MapNumber(_))
-        | Some(Expr::TypedMapNumber(_))
         | Some(Expr::MapHasKey(_))
-        | Some(Expr::TypedMapHasKey(_))
         | Some(Expr::Geo(_)) => {
             *next += 1;
         }

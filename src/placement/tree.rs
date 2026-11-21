@@ -133,12 +133,12 @@ impl Placement {
                             LeafRef::Facet(p) => &p.column,
                             LeafRef::Number(p) => &p.column,
                             LeafRef::MapFacet(p) => &p.column,
-                            LeafRef::MapNumber(p) | LeafRef::TypedMapNumber(p) => &p.column,
-                            LeafRef::MapHasKey(p) | LeafRef::TypedMapHasKey(p) => &p.column,
+                            LeafRef::MapNumber(p) => &p.column,
+                            LeafRef::MapHasKey(p) => &p.column,
                             LeafRef::Has(p) => &p.column,
                             LeafRef::Geo(p) => &p.column,
-                            LeafRef::StringRange(p) | LeafRef::MapStringRange(p) => &p.column,
-                            LeafRef::StringPrefix(p) | LeafRef::MapStringPrefix(p) => &p.column,
+                            LeafRef::StringRange(p) => &p.column,
+                            LeafRef::StringPrefix(p) => &p.column,
                         };
                         out.insert(column.clone());
                     });

@@ -23,30 +23,28 @@ fn compare(a: NumBound, b: NumBound) -> Ordering {
     }
 }
 
-fn display(value: NumBound) -> f64 {
-    match value {
-        NumBound::I(v) => v as f64,
-        NumBound::U(v) => v as f64,
-        NumBound::F(v) => v,
+impl crate::pb::FilterBound {
+    /// Inclusive double bound for test construction.
+    #[doc(hidden)]
+    pub fn num(value: f64) -> Self {
+        Self::inclusive(Value::Num(value))
     }
-}
-
-impl RangeFacetField {
-    /// Literal map key; presence distinguishes an empty key from a plain column.
-    pub(crate) fn map_key(&self) -> Option<&str> {
-        self.typed_map
-            .as_ref()
-            .or(self.map.as_ref())
-            .map(|map| map.key.as_str())
-            .or_else(|| (!self.key.is_empty()).then_some(self.key.as_str()))
+    /// Inclusive unsigned integer bound for test construction.
+    #[doc(hidden)]
+    pub fn uint(value: u64) -> Self {
+        Self::inclusive(Value::Uint(value))
+    }
+    fn inclusive(value: Value) -> Self {
+        Self {
+            value: Some(value),
+            exclusive: false,
+        }
     }
 }
 
 pub(crate) struct Intervals<'a> {
     request: &'a RangeFacetField,
     edges: Vec<NumBound>,
-    key: Option<&'a str>,
-    typed_edges: &'a [crate::pb::FilterBound],
 }
 impl<'a> Intervals<'a> {
     pub(crate) fn new(request: &'a RangeFacetField) -> Result<Self, Status> {
@@ -54,57 +52,29 @@ impl<'a> Intervals<'a> {
             Status::invalid_argument(format!(
                 "range facet {:?}[{:?}]: {why}",
                 request.column,
-                request.map_key().unwrap_or_default()
+                request.map_key.as_deref()
             ))
         };
         if request.column.is_empty() {
             return Err(invalid("a request names the column it buckets"));
         }
-        let key = request.map_key();
-        if request.map.is_some() && request.typed_map.is_some() {
-            return Err(invalid("supply either map or typed_map, never both"));
-        }
-        let (raw_edges, typed_edges) = match request.typed_map.as_ref().or(request.map.as_ref()) {
-            Some(map) => {
-                if !request.key.is_empty()
-                    || !request.edges.is_empty()
-                    || !request.typed_edges.is_empty()
-                {
+        let edges = request
+            .edges
+            .iter()
+            .map(|edge| {
+                if edge.exclusive {
                     return Err(invalid(
-                        "map input carries its own key and edges; leave legacy fields empty",
+                        "edges must have exclusive=false; buckets are half-open",
                     ));
                 }
-                (&map.edges, &map.typed_edges)
-            }
-            None => (&request.edges, &request.typed_edges),
-        };
-        if !raw_edges.is_empty() && !typed_edges.is_empty() {
-            return Err(invalid("supply either edges or typed_edges, never both"));
-        }
-        let edges = if typed_edges.is_empty() {
-            raw_edges
-                .iter()
-                .copied()
-                .map(NumBound::F)
-                .collect::<Vec<_>>()
-        } else {
-            typed_edges
-                .iter()
-                .map(|edge| {
-                    if edge.exclusive {
-                        return Err(invalid(
-                            "typed_edges must have exclusive=false; buckets are half-open",
-                        ));
-                    }
-                    match edge.value {
-                        Some(Value::Int(v)) => Ok(NumBound::I(v)),
-                        Some(Value::Uint(v)) => Ok(NumBound::U(v)),
-                        Some(Value::Num(v)) => Ok(NumBound::F(v)),
-                        None => Err(invalid("every typed edge must set a value")),
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?
-        };
+                match edge.value {
+                    Some(Value::Int(v)) => Ok(NumBound::I(v)),
+                    Some(Value::Uint(v)) => Ok(NumBound::U(v)),
+                    Some(Value::Num(v)) => Ok(NumBound::F(v)),
+                    None => Err(invalid("every edge must set a value")),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         if edges.len() < 2 {
             return Err(invalid("edges must hold at least 2 values (one bucket)"));
         }
@@ -120,12 +90,7 @@ impl<'a> Intervals<'a> {
         {
             return Err(invalid("edges must be strictly ascending"));
         }
-        Ok(Self {
-            request,
-            edges,
-            key,
-            typed_edges,
-        })
+        Ok(Self { request, edges })
     }
     pub(crate) fn len(&self) -> usize {
         self.edges.len() - 1
@@ -138,21 +103,19 @@ impl<'a> Intervals<'a> {
     }
     pub(crate) fn response(&self, counts: Vec<u64>, known: bool) -> RangeFacetCounts {
         debug_assert_eq!(counts.len(), self.len());
+        let edges = &self.request.edges;
         RangeFacetCounts {
             column: self.request.column.clone(),
-            key: self.key.unwrap_or_default().to_owned(),
-            map_key: self.key.map(str::to_owned),
+            map_key: self.request.map_key.clone(),
             known,
             buckets: if known {
                 counts
                     .into_iter()
                     .enumerate()
                     .map(|(i, count)| RangeBucket {
-                        from: display(self.edges[i]),
-                        to: display(self.edges[i + 1]),
                         count,
-                        typed_from: self.typed_edges.get(i).cloned(),
-                        typed_to: self.typed_edges.get(i + 1).cloned(),
+                        from: Some(edges[i]),
+                        to: Some(edges[i + 1]),
                     })
                     .collect()
             } else {
@@ -165,18 +128,10 @@ impl<'a> Intervals<'a> {
             Status::failed_precondition(format!(
                 "range facet {:?}[{:?}]: child response does not match requested intervals",
                 self.request.column,
-                self.key.unwrap_or_default()
+                self.request.map_key.as_deref()
             ))
         };
-        if response.column != self.request.column || response.key != self.key.unwrap_or_default() {
-            return Err(malformed());
-        }
-        let legacy_nonempty_map = self.request.map.is_none()
-            && self.request.typed_map.is_none()
-            && self.key.is_some_and(|key| !key.is_empty());
-        if response.map_key.as_deref() != self.key
-            && !(legacy_nonempty_map && response.map_key.is_none())
-        {
+        if response.column != self.request.column || response.map_key != self.request.map_key {
             return Err(malformed());
         }
         if !response.known {
@@ -191,11 +146,7 @@ impl<'a> Intervals<'a> {
         }
         let expected = self.response(vec![0; self.len()], true);
         for (actual, expected) in response.buckets.iter().zip(expected.buckets) {
-            if actual.from != expected.from
-                || actual.to != expected.to
-                || actual.typed_from != expected.typed_from
-                || actual.typed_to != expected.typed_to
-            {
+            if actual.from != expected.from || actual.to != expected.to {
                 return Err(malformed());
             }
         }
@@ -228,8 +179,9 @@ pub(crate) fn merge(
             for (sum, bucket) in sums[i].iter_mut().zip(&response.buckets) {
                 *sum = sum.checked_add(bucket.count).ok_or_else(|| {
                     Status::out_of_range(format!(
-                        "range facet {:?}: bucket count overflows u64",
-                        requested[i].column
+                        "range facet {:?}[{:?}]: bucket count overflows u64",
+                        requested[i].column,
+                        requested[i].map_key.as_deref()
                     ))
                 })?;
             }
@@ -242,9 +194,10 @@ pub(crate) fn merge(
         .map(|((plan, counts), known)| {
             if require_known && !known {
                 return Err(Status::invalid_argument(format!(
-                "no shard has range-facet column {:?}[{:?}]; check --numeric-fields / --integer-fields / --unsigned-integer-fields / --map-numeric-fields / --map-integer-fields / --map-unsigned-integer-fields",
-                plan.request.column, plan.key.unwrap_or_default()
-            )));
+                    "no shard has range-facet column {:?}[{:?}]; check --numeric-fields / --integer-fields / --unsigned-integer-fields / --map-numeric-fields / --map-integer-fields / --map-unsigned-integer-fields",
+                    plan.request.column,
+                    plan.request.map_key.as_deref()
+                )));
             }
             Ok(plan.response(counts, known))
         })
@@ -258,7 +211,7 @@ mod tests {
     fn typed(values: Vec<Value>) -> RangeFacetField {
         RangeFacetField {
             column: "value".into(),
-            typed_edges: values
+            edges: values
                 .into_iter()
                 .map(|value| FilterBound {
                     value: Some(value),
@@ -324,17 +277,13 @@ mod tests {
         }
         assert_eq!(plan.bucket(NumBound::F(0.5)), Some(3));
         assert_eq!(plan.bucket(NumBound::F(18_446_744_073_709_551_616.0)), None);
-        // Legacy double bounds still require exact integer comparisons.
-        let legacy = RangeFacetField {
-            column: "value".into(),
-            edges: vec![
-                0.0,
-                9_223_372_036_854_775_808.0,
-                18_446_744_073_709_551_616.0,
-            ],
-            ..Default::default()
-        };
-        let plan = Intervals::new(&legacy).unwrap();
+        // Double bounds still require exact integer comparisons.
+        let doubles = typed(vec![
+            Num(0.0),
+            Num(9_223_372_036_854_775_808.0),
+            Num(18_446_744_073_709_551_616.0),
+        ]);
+        let plan = Intervals::new(&doubles).unwrap();
         assert_eq!(plan.bucket(NumBound::I(i64::MAX)), Some(0));
         assert_eq!(plan.bucket(NumBound::U(u64::MAX)), Some(1));
     }
@@ -359,13 +308,10 @@ mod tests {
         }
         let base = typed(vec![Uint(0), Uint(1)]);
         let mut bad = base.clone();
-        bad.typed_edges[0].value = None;
-        assert!(Intervals::new(&bad).is_err());
-        let mut bad = base.clone();
-        bad.typed_edges[1].exclusive = true;
+        bad.edges[0].value = None;
         assert!(Intervals::new(&bad).is_err());
         let mut bad = base;
-        bad.edges = vec![0.0, 1.0];
+        bad.edges[1].exclusive = true;
         assert!(Intervals::new(&bad).is_err());
     }
     #[test]
@@ -373,7 +319,6 @@ mod tests {
         let req = typed(vec![Value::Uint(u64::MAX - 1), Value::Uint(u64::MAX)]);
         let plan = Intervals::new(&req).unwrap();
         let good = plan.response(vec![3], true);
-        assert_eq!(good.buckets[0].from, good.buckets[0].to); // display is insufficient
         let absent = plan.response(vec![0], false);
         let nested = merge(
             std::slice::from_ref(&req),
@@ -397,7 +342,7 @@ mod tests {
         child.column = "wrong".into();
         bad.push(child);
         let mut child = good.clone();
-        child.key = "wrong".into();
+        child.map_key = Some(String::new());
         bad.push(child);
         let mut child = good.clone();
         child.known = false;
@@ -406,13 +351,13 @@ mod tests {
         child.buckets.clear();
         bad.push(child);
         let mut child = good.clone();
-        child.buckets[0].typed_from = None;
+        child.buckets[0].from = None;
         bad.push(child);
         let mut child = good.clone();
-        child.buckets[0].typed_to.as_mut().unwrap().value = Some(Value::Uint(u64::MAX - 1));
+        child.buckets[0].to.as_mut().unwrap().value = Some(Value::Uint(u64::MAX - 1));
         bad.push(child);
         let mut child = good.clone();
-        child.buckets[0].to = f64::NAN;
+        child.buckets[0].to.as_mut().unwrap().exclusive = true;
         bad.push(child);
         for child in bad {
             for require in [false, true] {
@@ -431,5 +376,26 @@ mod tests {
                 .code(),
             tonic::Code::OutOfRange
         );
+    }
+
+    #[test]
+    fn refusal_messages_distinguish_plain_column_from_empty_map_key() {
+        let plain = RangeFacetField {
+            column: "col".into(),
+            map_key: None,
+            edges: vec![FilterBound::num(1.0)],
+        };
+        let empty_key = RangeFacetField {
+            map_key: Some(String::new()),
+            ..plain.clone()
+        };
+        let plain_msg = Intervals::new(&plain).err().unwrap().message().to_string();
+        let empty_msg = Intervals::new(&empty_key)
+            .err()
+            .unwrap()
+            .message()
+            .to_string();
+        assert!(plain_msg.contains(r#""col"[None]"#), "{plain_msg}");
+        assert!(empty_msg.contains(r#""col"[Some("")]"#), "{empty_msg}");
     }
 }

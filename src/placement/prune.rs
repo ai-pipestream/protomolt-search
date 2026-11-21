@@ -66,25 +66,27 @@ fn impossible_walk(
         Some(Expr::StringRange(p)) => {
             let index = *next;
             *next += 1;
-            none_admitted(bounds, p.key.is_empty().then_some(&p.column), index, |v| {
-                string_in_range(v, p.min.as_ref(), p.max.as_ref())
-            })
+            none_admitted(
+                bounds,
+                p.map_key.is_none().then_some(&p.column),
+                index,
+                |v| string_in_range(v, p.min.as_ref(), p.max.as_ref()),
+            )
         }
         Some(Expr::StringPrefix(p)) => {
             let index = *next;
             *next += 1;
-            none_admitted(bounds, p.key.is_empty().then_some(&p.column), index, |v| {
-                v.as_bytes().starts_with(p.prefix.as_bytes())
-            })
+            none_admitted(
+                bounds,
+                p.map_key.is_none().then_some(&p.column),
+                index,
+                |v| v.as_bytes().starts_with(p.prefix.as_bytes()),
+            )
         }
 
-        Some(Expr::MapStringRange(_))
-        | Some(Expr::MapStringPrefix(_))
-        | Some(Expr::MapFacet(_))
+        Some(Expr::MapFacet(_))
         | Some(Expr::MapNumber(_))
-        | Some(Expr::TypedMapNumber(_))
         | Some(Expr::MapHasKey(_))
-        | Some(Expr::TypedMapHasKey(_))
         | Some(Expr::Has(_))
         | Some(Expr::Geo(_)) => {
             *next += 1;

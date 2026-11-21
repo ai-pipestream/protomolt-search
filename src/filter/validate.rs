@@ -95,14 +95,14 @@ fn validate_leaf(leaf: &crate::pb::filter_expr::Expr) -> Result<(), FilterError>
             }
             Ok(())
         }
-        Expr::MapNumber(p) | Expr::TypedMapNumber(p) => validate_map_number(p),
-        Expr::MapHasKey(p) | Expr::TypedMapHasKey(p) => named(&p.column, "map-key"),
+        Expr::MapNumber(p) => validate_map_number(p),
+        Expr::MapHasKey(p) => named(&p.column, "map-key"),
         Expr::Has(p) => named(&p.column, "has"),
         Expr::Geo(g) => crate::node::validate_geo_filter(g)
             .map(|_| ())
             .map_err(|err| FilterError::invalid_argument(err.message())),
-        Expr::StringRange(p) | Expr::MapStringRange(p) => validate_string_range(p),
-        Expr::StringPrefix(p) | Expr::MapStringPrefix(p) => validate_string_prefix(p),
+        Expr::StringRange(p) => validate_string_range(p),
+        Expr::StringPrefix(p) => validate_string_prefix(p),
     }
 }
 

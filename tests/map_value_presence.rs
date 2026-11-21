@@ -106,12 +106,8 @@ async fn verify(addresses: Vec<String>, removed: &[u32], map_key: &str) {
                     analysis: Some(body_spec()),
                     range_facet_fields: vec![pb::RangeFacetField {
                         column: "metrics".into(),
-                        map: Some(pb::MapRangeFacet {
-                            key: map_key.into(),
-                            edges: vec![-1.0, 0.0, 3.0, 6.0],
-                            ..Default::default()
-                        }),
-                        ..Default::default()
+                        map_key: Some(map_key.into()),
+                        edges: [-1.0, 0.0, 3.0, 6.0].map(pb::FilterBound::num).to_vec(),
                     }],
                     projections: vec![
                         pb::NamedProjection {

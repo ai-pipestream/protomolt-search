@@ -96,10 +96,6 @@ fn merge_fetch_shares(
     let mut identities = Vec::new();
     let mut checker = IdentityCheck::new(req, ranges);
     for (shard, share) in shares {
-        crate::values::validate_map_fetch_contract(
-            &req.projections,
-            share.typed_map_contract_version,
-        )?;
         checker.check(shard, &share)?;
         merge_known(
             "stage-column",
@@ -123,7 +119,6 @@ fn merge_fetch_shares(
         identities.extend(share.identities);
     }
     let response = crate::pb::FetchValuesResponse {
-        typed_map_contract_version: crate::values::TYPED_MAP_FETCH_VERSION,
         rows: in_caller_order(&req.candidate_ids, rows, |r| r.doc_id),
         identities,
         identities_included: req.include_identities,

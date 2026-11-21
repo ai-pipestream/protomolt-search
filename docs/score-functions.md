@@ -7,15 +7,16 @@ has.
 
 ## Signed and unsigned map scoring (2026-09-07)
 
-`ScoreStage.typed_map_op` at tag 10 accepts f64, i64 and u64 map entries.
-It uses the existing `MapScoreOperation { op, key }` message and stage
-parameters. The key is literal and may be empty. `map_op` and the legacy
-nonempty `key` selector retain their f64-only meaning.
+`ScoreStage` carries `op` (tag 1), `column` (tag 2), and `optional string map_key`
+(tag 11). When `map_key` is present, the stage reads that literal key (including
+empty) from an f64, i64 or u64 map column; when `map_key` is absent, it reads a
+plain f64, i64 or u64 column (or a geo column for geo transforms).
 
 ```textproto
 score_stages {
+  op: SCORE_OP_ADD_LINEAR
   column: "counts"
-  typed_map_op { op: SCORE_OP_ADD_LINEAR key: "" }
+  map_key: ""
   weight: 0.25
 }
 ```
@@ -29,14 +30,11 @@ absence nor zero is inferred from a numeric sentinel.
 
 The selector is used by lexical score chains, candidate rescores, Boolean
 lexical leaves, FetchValues and bounded-value scorer dimensions. Explain echoes
-the literal key and the converted input. USE permits scoring; DISCLOSE is also
-required to expose the field's explanatory input or stored dimension details.
-Geo operations, unknown operations, incompatible parameters and conflicting
-legacy keys are refused before an empty-node shortcut.
-
-Older nodes discard the new oneof member and refuse the missing operation.
-The independent old-wire fixture verifies that behavior on empty FetchValues,
-BM25 query and rescore routes. There is no new route or storage format.
+the literal key in `ScoreStageExplain.map_key` and the converted input. USE
+permits scoring; DISCLOSE is also required to expose the field's explanatory
+input or stored dimension details. Geo operations with `map_key`, unknown
+operations, and incompatible parameters are refused before an empty-node
+shortcut.
 
 `tests/integer_map_scoring.rs` checks integer extrema, zero, absence, empty and
 quoted keys, mutable and persisted reads, key-ordinal changes, compaction and
@@ -47,74 +45,43 @@ and independently checks converted values and each transform's arithmetic.
 `tests/field_grants.rs` checks admission before statistics, USE-only scoring,
 and the extra disclosure permission required for Explain.
 
-Validation on `b6c1017` plus this increment passed 508 library tests, 772
-integration tests across 136 targets, 12 embedded tests and two IVF tests:
-1,294 passed, none failed, with one existing live OpenNLP test ignored. All
-five mobile Rust targets, test/example compilation, formatting and vendored
-protos passed. Descriptor comparison permits only the new stage selector.
-The final schema-description and grant-isolation fixture edits were followed
-by passing reruns of all 21 field-grant and eight schema-report tests.
-Every validation process ran under an 8 GiB cgroup limit with swap disabled.
-This is local validation; the feature branch has not been merged or deployed.
-
 ## Explicit map input (2026-09-06)
 
-`ScoreStage.operation` is a protobuf oneof. Its `op` member retains tag 1 and
-the existing semantics: an empty legacy `key` selects a plain column, and a
-nonempty key selects a numeric map entry. The `map_op` member at tag 9 contains
-`MapScoreOperation { op, key }`, where the key is literal, including empty.
-Column, weight, origin and scale remain on the containing stage.
+`ScoreStage.op` retains tag 1, `column` tag 2, and `optional string map_key`
+tag 11: absence of `map_key` selects a plain column, and presence of `map_key`
+selects a numeric map entry under that literal key, including empty. Weight,
+origin and scale sit on the stage.
 
 ```textproto
 score_stages {
+  op: SCORE_OP_ADD_LINEAR
   column: "metrics"
-  map_op { op: SCORE_OP_ADD_LINEAR key: "" }
+  map_key: ""
   weight: 2
 }
 ```
 
-Map operations admit the same numeric transforms and parameter checks as plain
-numeric inputs. Geo transforms, unspecified or unknown operations, non-finite
-parameters and a nonempty legacy key alongside `map_op` refuse before reading.
+Map stages admit the same numeric transforms and parameter checks as plain
+numeric inputs. Geo transforms with `map_key`, unspecified or unknown
+operations, and non-finite parameters refuse before reading.
 A missing entry remains absent; a present zero contributes zero to ADD_LINEAR
 and a present value to the other transforms. The map key's extrema drive bounds.
 Column knowledge uses the same resolution as scoring, including requests for
 zero hits. A spilling bulk builder refuses score queries before reading bounds
 that are only available after Flush.
 
-`ScoreStageExplain.map_key` at tag 8 has explicit presence for the new map
-operation. It is present even for the empty key; the legacy key is also echoed.
-Rendered explanations quote map keys so an empty key cannot appear to be a
-plain column. Field-use checks still require access to the containing column,
+`ScoreStageExplain.map_key` (optional string, tag 8) carries explicit presence
+for map stages, including the empty key; plain-column explanations leave it
+absent. Rendered explanations quote map keys so an empty key cannot appear to
+be a plain column. Field-use checks require access to the containing column,
 and candidate-scoped FetchValues signals use the same input resolution.
 
-Valid legacy stage encodings remain byte-identical, including field order used
-by the floor-sharing scoring fingerprint. An older decoder discards `map_op`
-and sees an unspecified operation, which its existing parser rejects. New map
-operations therefore require an updated server; they cannot silently fall back
-to a plain column. Rust callers must regenerate their protobuf bindings and set
-`operation: Some(score_stage::Operation::Op(...))` for a legacy operation or
-`Operation::MapOp(...)` for an explicit map operation. Textproto/JSON retain
-`op` for the legacy case.
-
-`tests/map_score_input.rs` covers legacy byte identity, old-decoder refusal,
-ambiguous selectors, invalid map transforms, absence versus zero, heap and
-mapped reads, and direct and two-level relay scoring. Positive and negative
-linear boosts, log boosts, decay and a chain agree bit for bit with a full-row
-calculation; explanations and candidate-scoped signals retain the map input.
-The subsequent [map count contract](map-columns.md#explicit-map-counts-and-ingestion-2026-09-06)
+`tests/map_score_input.rs` covers invalid map transforms, absence versus zero,
+heap and mapped reads, and direct and two-level relay scoring. Positive and
+negative linear boosts, log boosts, decay and a chain agree bit for bit with a
+full-row calculation; explanations and candidate-scoped signals retain the map
+input. The subsequent [map count contract](map-columns.md#explicit-map-counts-and-ingestion-2026-09-06)
 enables ordinary empty-key ingestion. Storage formats are unchanged.
-
-Validation against main `41ca93c` passed 507 library tests, 728 integration
-tests across 125 targets, 12 embedded tests and two IVF tests (1,249 total;
-one existing live OpenNLP test ignored). All five mobile Rust target checks,
-test/example compilation, formatting and vendored-proto checks passed. The
-wire comparison allows only the operation oneof with its new map member,
-`MapScoreOperation`, and the optional explanation key; all other declarations
-remain unchanged. This is local validation with two build jobs and four test
-threads, not device execution or a fleet rollout. Main `b65be06` was then
-incorporated with a benchmark document update. All tested source files retain
-the same hashes.
 
 ## The two-language split
 
@@ -234,7 +201,7 @@ validated against a full scan at open.
 
 ## Unsigned inputs (2026-09-05, feature branch)
 
-Scalar score stages now resolve f64, i64 or u64 columns when `key` is empty.
+Scalar score stages resolve f64, i64 or u64 columns when `map_key` is absent.
 Unsigned columns use the same `ScoreStage` contract as signed columns:
 `ADD_LINEAR`, `MULT_LOG` and `MULT_EXP_DECAY` run in double precision. The
 conversion happens at the scoring read, including `Stage.input` and

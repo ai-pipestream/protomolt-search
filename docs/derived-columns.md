@@ -135,7 +135,7 @@ naming the difference, and a manifest from before either is adopted.
 ## Compatibility with the parallel integer-map branch
 
 The combined contract keeps `AddDocumentsRequest.map_integers` at tag 27,
-`map_unsigned_integers` at 28, and `ValueExpr.typed_map` at 16. It allocates
+`map_unsigned_integers` at 28, and `ValueExpr.map` at 16. It allocates
 `derived_fingerprint` at 29 and `stable_key_hash` at 17. These two fields
 therefore differ from the short-lived main contract at `cea2c63`; update
 clients and servers together. No package or RPC name changes.

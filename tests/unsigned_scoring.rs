@@ -63,10 +63,9 @@ fn ops() -> Vec<StageOp> {
     ]
 }
 fn stage_proto(op: pb::ScoreOp, weight: f64, origin: f64, scale: f64) -> pb::ScoreStage {
-    let operation = Some(pb::score_stage::Operation::Op(op as i32));
     pb::ScoreStage {
         column: "counter".into(),
-        operation,
+        op: op as i32,
         weight,
         origin,
         scale,
@@ -86,10 +85,7 @@ fn input(value: u64) -> f64 {
 }
 fn contribution(stage: &pb::ScoreStage, value: u64) -> f64 {
     let x = input(value);
-    let Some(pb::score_stage::Operation::Op(op)) = stage.operation else {
-        panic!("expected scalar operation")
-    };
-    match pb::ScoreOp::try_from(op).unwrap() {
+    match pb::ScoreOp::try_from(stage.op).unwrap() {
         pb::ScoreOp::AddLinear => stage.weight * x,
         pb::ScoreOp::MultLog => 1.0 + stage.weight * (1.0 + x.max(0.0)).ln(),
         pb::ScoreOp::MultExpDecay => (-((x - stage.origin).abs()) / stage.scale).exp(),
@@ -245,10 +241,7 @@ fn check(hits: &[pb::Bm25Hit], stages: &[pb::ScoreStage]) -> Vec<(i64, u32)> {
                 } else {
                     assert_eq!(actual.contribution.to_bits(), effect.to_bits());
                 }
-                score = if stage.operation
-                    == Some(pb::score_stage::Operation::Op(
-                        pb::ScoreOp::AddLinear as i32,
-                    )) {
+                score = if stage.op == pb::ScoreOp::AddLinear as i32 {
                     score + effect
                 } else {
                     score * effect

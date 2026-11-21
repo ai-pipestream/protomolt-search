@@ -79,11 +79,7 @@ pub(super) fn eval_ingest_inner(
             .stable_key
             .as_deref()
             .map(|key| IngestVal::Uint(fnv1a64_bytes(key)))),
-        V::Map(read) => Ok(env
-            .map_numerics
-            .get(&(read.column.clone(), read.key.clone()))
-            .map(|v| IngestVal::Double(*v))),
-        V::TypedMap(read) => {
+        V::Map(read) => {
             let key = (read.column.clone(), read.key.clone());
             Ok(env
                 .map_integers

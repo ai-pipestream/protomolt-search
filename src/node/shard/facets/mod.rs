@@ -150,7 +150,6 @@ impl Bm25Shard {
                 field: name.to_owned(),
                 known: false,
                 counts: Vec::new(),
-                key: String::new(),
                 map_key: None,
             };
         };
@@ -159,7 +158,6 @@ impl Bm25Shard {
             field: name.to_owned(),
             known: true,
             counts: to_wire(counts, &|ord| self.facet_value(fi, ord).to_string()),
-            key: String::new(),
             map_key: None,
         }
     }
@@ -180,7 +178,6 @@ impl Bm25Shard {
                 field: req.column.clone(),
                 known: false,
                 counts: Vec::new(),
-                key: req.key.clone(),
                 map_key: Some(req.key.clone()),
             };
         };
@@ -192,7 +189,6 @@ impl Bm25Shard {
             field: req.column.clone(),
             known: true,
             counts: to_wire(counts, &|ord| self.map_facet_value(ci, ord).to_string()),
-            key: req.key.clone(),
             map_key: Some(req.key.clone()),
         }
     }
@@ -211,7 +207,7 @@ impl Bm25Shard {
     ) -> crate::pb::RangeFacetCounts {
         let intervals =
             crate::rangefacet::Intervals::new(req).expect("range facets validated before counting");
-        let source = self.resolve_range_column(&req.column, req.map_key(), req.typed_map.is_some());
+        let source = self.resolve_range_column(&req.column, req.map_key.as_deref());
         let mut counts = vec![0u64; intervals.len()];
         if let Some(source) = source {
             for doc in set.docs() {
@@ -232,7 +228,7 @@ impl Bm25Shard {
     /// makes mean = sum / count honest.
     fn column_stats(&self, name: &str, set: &MatchSet) -> Result<crate::pb::ColumnStats, Status> {
         use crate::pb::ScalarValueType as Type;
-        let source = self.resolve_range_column(name, None, false);
+        let source = self.resolve_range_column(name, None);
         let ty = match source {
             Some(RangeSource::Numeric(_)) => Type::Number,
             Some(RangeSource::Integer(_)) => Type::Integer,
@@ -282,15 +278,13 @@ impl Bm25Shard {
 
     /// Resolve a range facet's column against THIS shard's tables:
     /// with no key the f64, i64 and u64 tables (one name space
-    /// across kinds, so at most one answers), with a key the
-    /// map-numeric column and its key ordinal; typed map requests also resolve
-    /// i64/u64 map tables. `None` = this shard
+    /// across kinds, so at most one answers), with a key the f64, i64
+    /// or u64 map column and its key ordinal. `None` = this shard
     /// cannot resolve it, which answers `known: false`.
     pub(in crate::node) fn resolve_range_column(
         &self,
         column: &str,
         key: Option<&str>,
-        typed_map: bool,
     ) -> Option<RangeSource> {
         if key.is_none() {
             if let Some(ni) = self.numeric_index(column) {
@@ -305,23 +299,21 @@ impl Bm25Shard {
                 });
         }
         let key = key?;
-        if typed_map {
-            if let Some(ci) = self.map_integer_index(column) {
-                return self
-                    .map_integer_key_ord(ci, key)
-                    .map(|key_ord| RangeSource::MapInteger {
-                        column: ci,
-                        key_ord,
-                    });
-            }
-            if let Some(ci) = self.map_unsigned_integer_index(column) {
-                return self.map_unsigned_integer_key_ord(ci, key).map(|key_ord| {
-                    RangeSource::MapUnsigned {
-                        column: ci,
-                        key_ord,
-                    }
+        if let Some(ci) = self.map_integer_index(column) {
+            return self
+                .map_integer_key_ord(ci, key)
+                .map(|key_ord| RangeSource::MapInteger {
+                    column: ci,
+                    key_ord,
                 });
-            }
+        }
+        if let Some(ci) = self.map_unsigned_integer_index(column) {
+            return self.map_unsigned_integer_key_ord(ci, key).map(|key_ord| {
+                RangeSource::MapUnsigned {
+                    column: ci,
+                    key_ord,
+                }
+            });
         }
         let ci = self.map_numeric_index(column)?;
         let key_ord = self.map_numeric_key_ord(ci, key)?;

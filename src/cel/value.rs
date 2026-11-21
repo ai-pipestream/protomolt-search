@@ -64,7 +64,7 @@ pub(super) fn compile_value_ast(
             _ => Ok((value_of(V::Column(name.clone())), None)),
         },
         Ast::MapAccess(col, key) => Ok((
-            value_of(V::TypedMap(pb::MapRead {
+            value_of(V::Map(pb::MapRead {
                 column: col.clone(),
                 key: key.clone(),
             })),

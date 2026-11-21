@@ -109,7 +109,7 @@ fn number(column: &str, key: Option<&str>, op: Op, value: V) -> FilterExpr {
         Op::Lte => (None, bound(false)),
     };
     let expr = match key {
-        Some(key) => E::TypedMapNumber(pb::MapNumberPredicate {
+        Some(key) => E::MapNumber(pb::MapNumberPredicate {
             column: column.to_owned(),
             key: key.to_owned(),
             min,
@@ -198,7 +198,7 @@ fn key_filter(f: &StructuredFilterPlan, c: &NlpColumnSpec) -> (Option<FilterExpr
     if column.is_empty() || key.is_empty() {
         return (None, 1.0);
     }
-    let expr = E::TypedMapHasKey(pb::MapKeyPredicate {
+    let expr = E::MapHasKey(pb::MapKeyPredicate {
         column: column.clone(),
         key,
     });
@@ -257,12 +257,12 @@ fn diagnostic_cel(expr: &FilterExpr) -> String {
             format!("({})", children.join(" && "))
         }
         E::Number(n) => diagnostic_number(&n.column, &n.min, &n.max),
-        E::TypedMapNumber(n) => diagnostic_number(
+        E::MapNumber(n) => diagnostic_number(
             &format!("{}[{}]", n.column, escape_cel_string(&n.key)),
             &n.min,
             &n.max,
         ),
-        E::TypedMapHasKey(k) => format!("{} in {}", escape_cel_string(&k.key), k.column),
+        E::MapHasKey(k) => format!("{} in {}", escape_cel_string(&k.key), k.column),
         _ => unreachable!("constructed structured filter"),
     }
 }

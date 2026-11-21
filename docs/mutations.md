@@ -191,11 +191,13 @@ for inspection after a rollback and refused by name until removed.
   until the closing flush retires them (the WAL generation stays until
   archived).
 - The write-lock window includes the live WAL fence, the shadow WAL fsync,
-  the marker, three or four renames, and the state swap. No records or analysis run under that
-  lock, so `locked_tail_records` is zero. Earlier measurements of 13–39 ms
-  with 18–90 records applied under the lock describe the retired algorithm;
-  it could stall when analysis and a blocked ingest shared a runtime.
-  The concurrent-write fixture still refuses lock holds above 500 ms.
+  the marker, three or four renames, and the state swap. No records or analysis
+  run under that lock; all post-cutoff records are applied during unlocked tail
+  preparation and reported in `tail_records_applied`, with lock duration in
+  `write_lock_ms`. Earlier measurements of 13–39 ms with 18–90 records applied
+  under the lock describe the retired algorithm; it could stall when analysis
+  and a blocked ingest shared a runtime. The concurrent-write fixture still
+  refuses lock holds above 500 ms.
 - The closing flush costs what any flush on the layout costs: a segmented
   flush seals the tail rows into one small segment and rewrites the
   whole-shard FP32 sidecar. It is reported apart from the lock hold.

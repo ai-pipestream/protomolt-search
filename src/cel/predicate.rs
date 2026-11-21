@@ -187,9 +187,9 @@ fn compile_string_relation(col: &Side, op: RelOp, value: &str) -> Result<pb::Fil
         }
         _ => unreachable!("callers pass a column side"),
     };
-    let (column, key) = match col {
-        Side::Column(name) => (name.clone(), String::new()),
-        Side::MapAccess(name, key) => (name.clone(), key.clone()),
+    let (column, map_key) = match col {
+        Side::Column(name) => (name.clone(), None),
+        Side::MapAccess(name, key) => (name.clone(), Some(key.clone())),
         _ => unreachable!("callers pass a column side"),
     };
     // String ordering compiles to a dictionary ordinal range:
@@ -202,21 +202,14 @@ fn compile_string_relation(col: &Side, op: RelOp, value: &str) -> Result<pb::Fil
         })
     };
     let range = |min: Option<pb::StringBound>, max: Option<pb::StringBound>| {
-        let predicate = pb::StringRangePredicate {
-            column: column.clone(),
-            key: key.clone(),
-            min,
-            max,
-        };
-        // Preserve the legacy encoding where it is unambiguous. An empty
-        // map key needs its own oneof variant so older readers refuse it.
-        wrap(
-            if matches!(col, Side::MapAccess(_, key) if key.is_empty()) {
-                pb::filter_expr::Expr::MapStringRange(predicate)
-            } else {
-                pb::filter_expr::Expr::StringRange(predicate)
+        wrap(pb::filter_expr::Expr::StringRange(
+            pb::StringRangePredicate {
+                column: column.clone(),
+                map_key: map_key.clone(),
+                min,
+                max,
             },
-        )
+        ))
     };
     match op {
         RelOp::Eq => Ok(eq),
@@ -248,14 +241,14 @@ pub(super) fn compile_number_relation(
             min,
             max,
         })),
-        Side::MapAccess(name, key) => wrap(pb::filter_expr::Expr::TypedMapNumber(
-            pb::MapNumberPredicate {
+        Side::MapAccess(name, key) => {
+            wrap(pb::filter_expr::Expr::MapNumber(pb::MapNumberPredicate {
                 column: name.clone(),
                 key: key.clone(),
                 min,
                 max,
-            },
-        )),
+            }))
+        }
         _ => unreachable!("callers pass a column side"),
     };
     Ok(if op == RelOp::Ne { not_of(leaf) } else { leaf })

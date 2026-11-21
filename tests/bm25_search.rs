@@ -791,9 +791,6 @@ async fn bm25_stream_candidates_end_in_a_scoring_certificate() {
                 }
             }
             Some(bm25_query_stream_response::Payload::Completion(done)) => break done,
-            Some(bm25_query_stream_response::Payload::Done(_)) => {
-                panic!("server emitted obsolete uncertified Done")
-            }
             _ => {}
         }
     };

@@ -177,7 +177,7 @@ impl<'a> RoundMerge<'a> {
             .iter()
             .zip(&self.stage_known)
             .filter(|(_, known)| !**known)
-            .map(|(stage, _)| match stage.map_key() {
+            .map(|(stage, _)| match stage.map_key.as_deref() {
                 None => format!("{:?}", stage.column),
                 Some(key) => format!("{:?}[{:?}]", stage.column, key),
             })
@@ -188,7 +188,7 @@ impl<'a> RoundMerge<'a> {
         let any_geo = stages.iter().zip(&self.stage_known).any(|(stage, known)| {
             !known
                 && matches!(
-                    crate::pb::ScoreOp::try_from(stage.operation_code()),
+                    crate::pb::ScoreOp::try_from(stage.op),
                     Ok(crate::pb::ScoreOp::MultGeoDecayHaversine
                         | crate::pb::ScoreOp::MultGeoDecayManhattan)
                 )

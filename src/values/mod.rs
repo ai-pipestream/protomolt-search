@@ -36,10 +36,7 @@ mod resolve_call;
 mod resolve_compare;
 mod types;
 
-pub use contract::{
-    merge_projection_types, projected_type, validate_map_fetch_contract, validate_projection_row,
-    TYPED_MAP_FETCH_VERSION,
-};
+pub use contract::{merge_projection_types, projected_type, validate_projection_row};
 pub use eval::eval;
 pub use functions::{civil_of_micros, fn_signature, fnv1a64_bytes, FnSignature};
 pub use ingest::{eval_ingest, eval_ingest_derived};
