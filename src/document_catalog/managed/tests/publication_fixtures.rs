@@ -84,7 +84,6 @@ pub(super) fn target_named(dir: &Directory, key: &[u8], path: &str) -> ManagedTa
             ..Default::default()
         },
         None,
-        false,
     )
     .unwrap();
     ManagedTarget {
