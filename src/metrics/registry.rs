@@ -182,7 +182,7 @@ pub(super) const SCAN_COUNTERS: [(&str, &str, &AtomicU64); 10] = [
     ),
     (
         "turbovec_dense_policy_drift_total",
-        "AUTO dense queries that fell back to exhaustive execution due to live policy or hardware drift.",
+        "Dense AUTO queries that fell back due to policy identity or capability drift",
         &DENSE_POLICY_DRIFT,
     ),
 ];

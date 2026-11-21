@@ -45,7 +45,7 @@ pub fn merge_vector_backend(
                     name(shard)
                 ))
             })?;
-        fold_child_mutation_state(&mut state_hash, shard, report);
+        fold_child_mutation_state(&mut state_hash, shard, name(shard), report)?;
     }
     let mut merged_descriptor = first_desc.clone();
     merged_descriptor.capabilities = intersect_capabilities(first_desc, reports);
@@ -139,8 +139,14 @@ fn intersect_capabilities(
 fn fold_child_mutation_state(
     hasher: &mut turbo_sha256::Sha256,
     shard: usize,
+    child_name: &str,
     report: &crate::pb::GetVectorBackendResponse,
-) {
+) -> Result<(), Status> {
+    if report.stats_incarnation.is_empty() {
+        return Err(Status::failed_precondition(format!(
+            "relay: child {shard} ({child_name}) reported an empty stats_incarnation"
+        )));
+    }
     hasher.update(&(shard as u64).to_le_bytes());
     hasher.update(&report.num_vectors.to_le_bytes());
     hasher.update(&report.deleted_docs.to_le_bytes());
@@ -149,6 +155,7 @@ fn fold_child_mutation_state(
     hasher.update(&report.stats_epoch.to_le_bytes());
     hasher.update(&(report.stats_incarnation.len() as u64).to_le_bytes());
     hasher.update(&report.stats_incarnation);
+    Ok(())
 }
 
 impl RelayService {
@@ -315,6 +322,12 @@ mod tests {
         }
 
         let missing_completion = child_report(2_048, &["batch_query"]);
-        assert!(merge_vector_backend(&children, &[staged, missing_completion]).is_err());
+        assert!(merge_vector_backend(&children, &[staged.clone(), missing_completion]).is_err());
+
+        let mut missing_incarnation = staged.clone();
+        missing_incarnation.stats_incarnation.clear();
+        let err = merge_vector_backend(&children, &[staged, missing_incarnation]).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("stats_incarnation"), "{err}");
     }
 }

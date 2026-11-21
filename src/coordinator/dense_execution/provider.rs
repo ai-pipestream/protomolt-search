@@ -118,7 +118,18 @@ impl ShardFactsFold {
         }
     }
 
-    fn absorb_state(&mut self, shard: usize, backend: &crate::pb::GetVectorBackendResponse) {
+    fn absorb_state(
+        &mut self,
+        shard: usize,
+        addr: &str,
+        backend: &crate::pb::GetVectorBackendResponse,
+    ) -> Result<(), Status> {
+        if backend.stats_incarnation.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "dense execution preflight: shard {shard} ({addr}) reported an empty \
+                 stats_incarnation"
+            )));
+        }
         self.corpus_hash.update(&(shard as u64).to_le_bytes());
         self.corpus_hash.update(&backend.num_vectors.to_le_bytes());
         self.corpus_hash.update(&backend.deleted_docs.to_le_bytes());
@@ -130,6 +141,7 @@ impl ShardFactsFold {
         self.corpus_hash
             .update(&(backend.stats_incarnation.len() as u64).to_le_bytes());
         self.corpus_hash.update(&backend.stats_incarnation);
+        Ok(())
     }
 
     fn absorb(
@@ -295,7 +307,7 @@ impl CoordinatorServiceImpl {
                 .ok_or_else(|| {
                     Status::internal("dense execution preflight deleted_docs overflow")
                 })?;
-            fold.absorb_state(shard_idx, &backend);
+            fold.absorb_state(shard_idx, &addr, &backend)?;
             let descriptor = backend.descriptor.ok_or_else(|| {
                 Status::failed_precondition(
                     "dense execution preflight found an unconfigured vector shard",
@@ -309,5 +321,29 @@ impl CoordinatorServiceImpl {
             fold.absorb(descriptor, shard_quality)?;
         }
         Ok(fold.finish(self.topology_generation))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ShardFactsFold;
+    use crate::pb::GetVectorBackendResponse;
+
+    #[test]
+    fn absorb_state_refuses_empty_stats_incarnation() {
+        let mut fold = ShardFactsFold::new();
+        let empty = GetVectorBackendResponse::default();
+        let err = fold
+            .absorb_state(0, "http://127.0.0.1:50051", &empty)
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("stats_incarnation"), "{err}");
+
+        let populated = GetVectorBackendResponse {
+            stats_incarnation: vec![7; 32],
+            ..Default::default()
+        };
+        fold.absorb_state(0, "http://127.0.0.1:50051", &populated)
+            .unwrap();
     }
 }

@@ -65,6 +65,19 @@ fn round_trips_through_bytes_and_fingerprints_them() {
     let loaded = DenseExecutionPolicy::load(&path).unwrap();
     assert_eq!(loaded.document(), &doc);
     assert_eq!(loaded.fingerprint(), policy.fingerprint());
+
+    let next_seq = SAVE_SEQ.load(Ordering::Relaxed);
+    let collision = dir.join(format!(
+        ".policy.binpb.tmp.{}.{next_seq}",
+        std::process::id()
+    ));
+    std::fs::write(&collision, b"keep-leftover").unwrap();
+    assert!(policy.save(&path).is_err());
+    assert_eq!(std::fs::read(&collision).unwrap(), b"keep-leftover");
+    std::fs::remove_file(&collision).unwrap();
+    assert!(policy
+        .save(&dir.join("missing-parent").join("policy.binpb"))
+        .is_err());
     std::fs::remove_dir_all(dir).unwrap();
 }
 

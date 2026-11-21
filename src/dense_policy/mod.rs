@@ -98,7 +98,10 @@ impl DenseExecutionPolicy {
             path.with_file_name(format!(".{file_name}.tmp.{}.{seq}", std::process::id()));
         let write = || -> std::io::Result<()> {
             use std::io::Write;
-            let mut file = std::fs::File::create(&temporary)?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
             if let Err(err) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
                 let _ = std::fs::remove_file(&temporary);
                 return Err(err);
@@ -108,11 +111,11 @@ impl DenseExecutionPolicy {
                 let _ = std::fs::remove_file(&temporary);
                 return Err(err);
             }
-            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                if let Ok(dir) = std::fs::File::open(parent) {
-                    let _ = dir.sync_all();
-                }
-            }
+            let parent = match path.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => Path::new("."),
+            };
+            std::fs::File::open(parent)?.sync_all()?;
             Ok(())
         };
         write().map_err(|error| format!("write dense execution policy {}: {error}", path.display()))
