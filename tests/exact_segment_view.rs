@@ -172,7 +172,6 @@ async fn a_same_sized_stale_sidecar_cannot_replace_sealed_vector_values() {
     assert_eq!(fixture.scores(&reopened).await.hits, response.hits);
     let _ = &fixture.directory;
 }
-
 #[test]
 fn held_views_share_images_across_retirements_and_keep_gaps_during_appends() {
     use pipestream_search::segments::SegmentRowRetirement;
@@ -251,7 +250,6 @@ fn held_views_share_images_across_retirements_and_keep_gaps_during_appends() {
         fixture.expected(&present)
     );
 }
-
 #[tokio::test]
 async fn sparse_flush_export_install_and_reopen_keep_exact_scores() {
     let fixture = Fixture::new(true);
@@ -296,7 +294,6 @@ async fn sparse_flush_export_install_and_reopen_keep_exact_scores() {
     assert_eq!(fixture.scores(&reopened).await.hits, before.hits);
     assert!(!exact_vector_sidecar_path(&installed_path).exists());
 }
-
 #[test]
 fn mismatched_exact_dimensions_cannot_enter_a_catalog() {
     let fixture = Fixture::new(false);
@@ -380,7 +377,6 @@ async fn sealed_retirements_remain_hidden_on_reopen_and_snapshot_install() {
         .unwrap();
     assert_eq!(fixture.scores(&receiver).await.hits, scores.hits);
 }
-
 #[tokio::test]
 async fn an_empty_configured_catalog_does_not_reuse_retired_sidecar_rows() {
     let fixture = Fixture::new(false);
@@ -415,10 +411,9 @@ async fn an_empty_configured_catalog_does_not_reuse_retired_sidecar_rows() {
     node.export_snapshot_blocking(&path).unwrap();
     assert!(!path.join("vectors.f32").exists());
 }
-
 #[test]
 fn publication_switches_sealed_rows_and_read_version_together() {
-    use pipestream_search::segments::{OpenedSegmentSet, SegmentRowRetirement};
+    use pipestream_search::segments::OpenedSegmentSet;
     use pipestream_search::stats_identity::StatsClaim;
     let fixture = Fixture::new(true);
     let node = NodeServiceImpl::open(fixture.config(), None).unwrap();
@@ -431,44 +426,10 @@ fn publication_switches_sealed_rows_and_read_version_together() {
     let claim = StatsClaim::required(before.stats_epoch, &before.stats_incarnation).unwrap();
     let root = segments_root(&fixture.index);
     let held = OpenedSegmentSet::open(&root).unwrap();
-    let stage = fixture.directory.join("stage-0");
-    let next = node
-        .publish_segment_rows_blocking(
-            claim,
-            held.epoch(),
-            &[SegmentRowRetirement {
-                segment_id: "part-0".into(),
-                rows: vec![0],
-            }],
-            vec![SegmentSource {
-                multi_res_path: None,
-                segment_id: "replacement",
-                generation: held.epoch() + 1,
-                base_label: 6,
-                backend_kind: EMBEDDED_TURBOVEC,
-                vector_path: Some(&stage.join("vector.index")),
-                exact_vector_path: Some(&stage.join("vectors.f32")),
-                bm25_path: &stage.join("documents.bm25"),
-                live_docs_path: &stage.join("live.bin"),
-                partition_column: None,
-                parents_colocated: false,
-            }],
-        )
-        .unwrap();
+    let next = publish_replacement(&node, &fixture, claim, held.epoch());
     assert_eq!(next.epoch, claim.epoch + 1);
     assert_eq!(next.incarnation(), claim.incarnation());
-    let scores = runtime
-        .block_on(
-            node.exact_vector_rescore(Request::new(ExactVectorRescoreRequest {
-                vector: fixture.vectors[..DIM].to_vec(),
-                candidate_ids: (0..8).collect(),
-                expected_stats_epoch: next.epoch,
-                expected_stats_incarnation: next.incarnation(),
-                ..Default::default()
-            })),
-        )
-        .unwrap()
-        .into_inner();
+    let scores = rescore(&runtime, &node, &fixture, (0..8).collect(), Some(&next)).unwrap();
     assert_eq!(
         scores.hits.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
         [1, 4, 5, 6, 7]
@@ -488,32 +449,69 @@ fn publication_switches_sealed_rows_and_read_version_together() {
         .into_inner();
     assert_eq!(lexical.doc_ids, [1, 2, 3, 4, 5, 6, 7]);
     assert!(!held.live_docs(0).is_deleted(0));
-    let stale = runtime
-        .block_on(
-            node.exact_vector_rescore(Request::new(ExactVectorRescoreRequest {
-                vector: fixture.vectors[..DIM].to_vec(),
-                candidate_ids: vec![0, 6],
-                expected_stats_epoch: claim.epoch,
-                expected_stats_incarnation: claim.incarnation(),
-                ..Default::default()
-            })),
-        )
-        .unwrap_err();
+    let stale = rescore(&runtime, &node, &fixture, vec![0, 6], Some(&claim)).unwrap_err();
     assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
     assert!(node
         .publish_segment_rows_blocking(claim, held.epoch(), &[], vec![])
         .is_err());
     drop(node);
     let reopened = NodeServiceImpl::open(fixture.config(), None).unwrap();
-    let restored = runtime
+    let restored = rescore(&runtime, &reopened, &fixture, (0..8).collect(), None).unwrap();
+    assert_eq!(restored.hits, scores.hits);
+}
+
+/// Exact-vector rescore of `candidates` against the fixture's first
+/// vector, optionally fenced to `claim`.
+fn rescore(
+    runtime: &tokio::runtime::Runtime,
+    node: &NodeServiceImpl,
+    fixture: &Fixture,
+    candidates: Vec<u64>,
+    claim: Option<&pipestream_search::stats_identity::StatsClaim>,
+) -> Result<ExactVectorRescoreResponse, tonic::Status> {
+    let (epoch, incarnation) = claim.map_or((0, Vec::new()), |c| (c.epoch, c.incarnation()));
+    runtime
         .block_on(
-            reopened.exact_vector_rescore(Request::new(ExactVectorRescoreRequest {
+            node.exact_vector_rescore(Request::new(ExactVectorRescoreRequest {
                 vector: fixture.vectors[..DIM].to_vec(),
-                candidate_ids: (0..8).collect(),
+                candidate_ids: candidates,
+                expected_stats_epoch: epoch,
+                expected_stats_incarnation: incarnation,
                 ..Default::default()
             })),
         )
-        .unwrap()
-        .into_inner();
-    assert_eq!(restored.hits, scores.hits);
+        .map(|response| response.into_inner())
+}
+
+/// Publish the staged replacement segment retiring row 0 of part-0.
+fn publish_replacement(
+    node: &NodeServiceImpl,
+    fixture: &Fixture,
+    claim: pipestream_search::stats_identity::StatsClaim,
+    catalog_epoch: u64,
+) -> pipestream_search::stats_identity::StatsClaim {
+    use pipestream_search::segments::SegmentRowRetirement;
+    let stage = fixture.directory.join("stage-0");
+    node.publish_segment_rows_blocking(
+        claim,
+        catalog_epoch,
+        &[SegmentRowRetirement {
+            segment_id: "part-0".into(),
+            rows: vec![0],
+        }],
+        vec![SegmentSource {
+            multi_res_path: None,
+            segment_id: "replacement",
+            generation: catalog_epoch + 1,
+            base_label: 6,
+            backend_kind: EMBEDDED_TURBOVEC,
+            vector_path: Some(&stage.join("vector.index")),
+            exact_vector_path: Some(&stage.join("vectors.f32")),
+            bm25_path: &stage.join("documents.bm25"),
+            live_docs_path: &stage.join("live.bin"),
+            partition_column: None,
+            parents_colocated: false,
+        }],
+    )
+    .unwrap()
 }

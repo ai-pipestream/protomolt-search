@@ -249,45 +249,13 @@ fn unsigned_presence_metadata_and_truncation_are_checked() {
 
 #[test]
 fn unsigned_values_survive_sealing_publication_and_reopen() {
-    use pipestream_search::live_docs::LiveDocs;
     use pipestream_search::segmented::SegmentedShard;
-    use pipestream_search::segments::SegmentSource;
 
-    fn tail() -> Bm25Store {
-        Bm25Store::new().with_columns(UnsignedInteger, &["unsigned", "missing"])
-    }
-    fn append(shard: &mut SegmentedShard, values: &[Option<u64>]) {
-        for value in values {
-            let local = shard.tail().next_doc_id();
-            shard
-                .tail_mut()
-                .add_document(local, "word".into(), analyzed(false));
-            if let Some(value) = value {
-                shard.tail_mut().set_unsigned_integer(0, local, *value);
-            }
-        }
-        shard.sync_tail();
-    }
-    fn verify(shard: &SegmentedShard, expected: &[Option<u64>]) {
-        assert_eq!(shard.unsigned_integer_count(), 2);
-        assert_eq!(shard.unsigned_integer_name(0), "unsigned");
-        assert_eq!(shard.unsigned_integer_index("unsigned"), Some(0));
-        assert_eq!(shard.integer_index("unsigned"), None);
-        for (row, value) in expected.iter().enumerate() {
-            assert_eq!(shard.unsigned_integer_value(0, row as u32), *value);
-            assert_eq!(shard.unsigned_integer_value(1, row as u32), None);
-        }
-        assert_eq!(shard.unsigned_integer_value(0, expected.len() as u32), None);
-        let min = expected.iter().flatten().copied().min().unwrap_or(u64::MAX);
-        let max = expected.iter().flatten().copied().max().unwrap_or(0);
-        assert_eq!(shard.unsigned_integer_min_max(0), (min, max));
-        assert_eq!(shard.unsigned_integer_min_max(1), (u64::MAX, 0));
-    }
     let dir = directory("segments");
     let root = dir.join("catalog");
-    let mut shard = SegmentedShard::open(&root, tail()).unwrap();
+    let mut shard = SegmentedShard::open(&root, unsigned_tail()).unwrap();
     let mut expected = Vec::new();
-    verify(&shard, &expected);
+    verify_unsigned(&shard, &expected);
     for (index, batch) in [
         [Some(u64::MAX), None, Some((1u64 << 63) + 1)],
         [Some((1u64 << 53) + 1), Some(0), None],
@@ -296,15 +264,15 @@ fn unsigned_values_survive_sealing_publication_and_reopen() {
     .into_iter()
     .enumerate()
     {
-        append(&mut shard, &batch);
+        append_unsigned(&mut shard, &batch);
         expected.extend(batch);
-        verify(&shard, &expected);
+        verify_unsigned(&shard, &expected);
         // Refusal leaves the existing schema and values untouched.
         for wrong in [
             Bm25Store::new(),
             Bm25Store::new().with_columns(UnsignedInteger, &["missing", "unsigned"]),
             Bm25Store::new().with_columns(Integer, &["unsigned", "missing"]),
-            tail().with_columns(Facet, &["extra"]),
+            unsigned_tail().with_columns(Facet, &["extra"]),
         ] {
             let rows = shard.tail().next_doc_id();
             assert!(shard
@@ -313,67 +281,22 @@ fn unsigned_values_survive_sealing_publication_and_reopen() {
                 .unwrap()
                 .contains("tables"));
             assert!(shard.frozen().is_none());
-            verify(&shard, &expected);
+            verify_unsigned(&shard, &expected);
         }
         let rows = shard.tail().next_doc_id();
-        let frozen = shard.freeze_tail(tail(), rows).unwrap();
-        let base = shard.frozen().unwrap().0;
-        verify(&shard, &expected);
+        let frozen = shard.freeze_tail(unsigned_tail(), rows).unwrap();
+        verify_unsigned(&shard, &expected);
         // Ingest continues while the frozen rows await publication.
         let probe = [None, Some(u64::MAX - index as u64)];
-        append(&mut shard, &probe);
+        append_unsigned(&mut shard, &probe);
         expected.extend(probe);
-        verify(&shard, &expected);
-        let bm25 = dir.join(format!("{index}.bm25"));
-        let live = dir.join(format!("{index}.live"));
-        frozen.save(&bm25).unwrap();
-        LiveDocs::default().write(&live, u64::from(rows)).unwrap();
-        let published = shard
-            .catalog()
-            .append(SegmentSource {
-                multi_res_path: None,
-                segment_id: &format!("seg-{index}"),
-                generation: index as u64 + 1,
-                base_label: u64::from(base),
-                backend_kind: "",
-                vector_path: None,
-                exact_vector_path: None,
-                bm25_path: &bm25,
-                live_docs_path: &live,
-                partition_column: None,
-                parents_colocated: false,
-            })
-            .unwrap();
-        let summary = published.metadata(index).summary.as_ref().unwrap();
-        let stored = &expected[base as usize..(base + rows) as usize];
-        assert_eq!(summary.uint_columns.len(), 2);
-        let range = &summary.uint_columns[0];
-        assert_eq!(range.name, "unsigned");
-        assert_eq!(
-            range.min,
-            stored.iter().flatten().copied().min().unwrap_or(u64::MAX)
-        );
-        assert_eq!(
-            range.max,
-            stored.iter().flatten().copied().max().unwrap_or(0)
-        );
-        assert_eq!(range.present, stored.iter().flatten().count() as u64);
-        assert_eq!(summary.uint_columns[1].present, 0);
-        assert_eq!(summary.uint_columns[1].min, u64::MAX);
-        assert_eq!(summary.uint_columns[1].max, 0);
-        let encoded = serde_json::to_vec(summary).unwrap();
-        let decoded: pipestream_search::segments::SegmentSummary =
-            serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(&decoded, summary);
-        shard.republish(published).unwrap();
-        assert!(shard.frozen().is_none());
-        assert_eq!(shard.sealed_parts(), index + 1);
-        verify(&shard, &expected);
+        verify_unsigned(&shard, &expected);
+        publish_unsigned_batch(&mut shard, &dir, index, &frozen, &expected, rows);
     }
     let sealed_rows = shard.tail_base() as usize;
     drop(shard);
-    let reopened = SegmentedShard::open(&root, tail()).unwrap();
-    verify(&reopened, &expected[..sealed_rows]);
+    let reopened = SegmentedShard::open(&root, unsigned_tail()).unwrap();
+    verify_unsigned(&reopened, &expected[..sealed_rows]);
     for wrong in [
         Bm25Store::new(),
         Bm25Store::new().with_columns(UnsignedInteger, &["unsigned"]),
@@ -397,4 +320,97 @@ fn older_segment_summaries_have_no_unsigned_pruning_information() {
     assert!(!serde_json::to_string(&summary)
         .unwrap()
         .contains("uint_columns"));
+}
+
+fn unsigned_tail() -> Bm25Store {
+    Bm25Store::new().with_columns(UnsignedInteger, &["unsigned", "missing"])
+}
+fn append_unsigned(
+    shard: &mut pipestream_search::segmented::SegmentedShard,
+    values: &[Option<u64>],
+) {
+    for value in values {
+        let local = shard.tail().next_doc_id();
+        shard
+            .tail_mut()
+            .add_document(local, "word".into(), analyzed(false));
+        if let Some(value) = value {
+            shard.tail_mut().set_unsigned_integer(0, local, *value);
+        }
+    }
+    shard.sync_tail();
+}
+fn verify_unsigned(shard: &pipestream_search::segmented::SegmentedShard, expected: &[Option<u64>]) {
+    assert_eq!(shard.unsigned_integer_count(), 2);
+    assert_eq!(shard.unsigned_integer_name(0), "unsigned");
+    assert_eq!(shard.unsigned_integer_index("unsigned"), Some(0));
+    assert_eq!(shard.integer_index("unsigned"), None);
+    for (row, value) in expected.iter().enumerate() {
+        assert_eq!(shard.unsigned_integer_value(0, row as u32), *value);
+        assert_eq!(shard.unsigned_integer_value(1, row as u32), None);
+    }
+    assert_eq!(shard.unsigned_integer_value(0, expected.len() as u32), None);
+    let min = expected.iter().flatten().copied().min().unwrap_or(u64::MAX);
+    let max = expected.iter().flatten().copied().max().unwrap_or(0);
+    assert_eq!(shard.unsigned_integer_min_max(0), (min, max));
+    assert_eq!(shard.unsigned_integer_min_max(1), (u64::MAX, 0));
+}
+
+/// Save the frozen part, append it, assert its summary, and republish.
+fn publish_unsigned_batch(
+    shard: &mut pipestream_search::segmented::SegmentedShard,
+    dir: &std::path::Path,
+    index: usize,
+    frozen: &std::sync::Arc<Bm25Store>,
+    expected: &[Option<u64>],
+    rows: u32,
+) {
+    use pipestream_search::live_docs::LiveDocs;
+    use pipestream_search::segments::SegmentSource;
+    let base = shard.frozen().unwrap().0;
+    let bm25 = dir.join(format!("{index}.bm25"));
+    let live = dir.join(format!("{index}.live"));
+    frozen.save(&bm25).unwrap();
+    LiveDocs::default().write(&live, u64::from(rows)).unwrap();
+    let published = shard
+        .catalog()
+        .append(SegmentSource {
+            multi_res_path: None,
+            segment_id: &format!("seg-{index}"),
+            generation: index as u64 + 1,
+            base_label: u64::from(base),
+            backend_kind: "",
+            vector_path: None,
+            exact_vector_path: None,
+            bm25_path: &bm25,
+            live_docs_path: &live,
+            partition_column: None,
+            parents_colocated: false,
+        })
+        .unwrap();
+    let summary = published.metadata(index).summary.as_ref().unwrap();
+    let stored = &expected[base as usize..(base + rows) as usize];
+    assert_eq!(summary.uint_columns.len(), 2);
+    let range = &summary.uint_columns[0];
+    assert_eq!(range.name, "unsigned");
+    assert_eq!(
+        range.min,
+        stored.iter().flatten().copied().min().unwrap_or(u64::MAX)
+    );
+    assert_eq!(
+        range.max,
+        stored.iter().flatten().copied().max().unwrap_or(0)
+    );
+    assert_eq!(range.present, stored.iter().flatten().count() as u64);
+    assert_eq!(summary.uint_columns[1].present, 0);
+    assert_eq!(summary.uint_columns[1].min, u64::MAX);
+    assert_eq!(summary.uint_columns[1].max, 0);
+    let encoded = serde_json::to_vec(summary).unwrap();
+    let decoded: pipestream_search::segments::SegmentSummary =
+        serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(&decoded, summary);
+    shard.republish(published).unwrap();
+    assert!(shard.frozen().is_none());
+    assert_eq!(shard.sealed_parts(), index + 1);
+    verify_unsigned(shard, expected);
 }

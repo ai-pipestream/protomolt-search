@@ -35,71 +35,8 @@ async fn document_only_segment_is_a_gap_in_bitmap_and_boolean_membership() {
     std::fs::create_dir_all(&root).unwrap();
     let vectors = unit_vectors(8, 16, 731);
     let (shift, scale) = fit_calibration(16, 4, &vectors);
-    let catalog = SegmentCatalog::open(root.join("catalog")).unwrap();
-    for part in 0..3 {
-        let stage = root.join(format!("stage-{part}"));
-        std::fs::create_dir_all(&stage).unwrap();
-        let bm25 = stage.join("documents.bm25");
-        let live = stage.join("live.bin");
-        let image = stage.join("vector.index");
-        let exact = stage.join("vectors.f32");
-        documents().save(&bm25).unwrap();
-        LiveDocs::default().write(&live, 2).unwrap();
-        if part != 1 {
-            let mut index = seeded_index(16, 4, &shift, &scale);
-            index.add(&vectors[part * 32..(part + 1) * 32], 16).unwrap();
-            index.prepare().unwrap();
-            index.write(&image).unwrap();
-            pipestream_search::exact_vectors::ExactVectorStore::from_values(
-                16,
-                vectors[part * 32..(part + 1) * 32].to_vec(),
-            )
-            .unwrap()
-            .write(&exact)
-            .unwrap();
-        }
-        catalog
-            .append(SegmentSource {
-                multi_res_path: None,
-                segment_id: &format!("part-{part}"),
-                generation: part as u64 + 1,
-                base_label: (part * 2) as u64,
-                backend_kind: if part == 1 { "" } else { EMBEDDED_TURBOVEC },
-                vector_path: (part != 1).then_some(image.as_path()),
-                exact_vector_path: (part != 1).then_some(exact.as_path()),
-                bm25_path: &bm25,
-                live_docs_path: &live,
-                partition_column: None,
-                parents_colocated: false,
-            })
-            .unwrap();
-    }
-    let set = std::sync::Arc::new(OpenedSegmentSet::open(root.join("catalog")).unwrap());
-    let provider = SegmentedProvider::open(set, seeded_index(16, 4, &shift, &scale)).unwrap();
-    let mut index = VectorIndex::from_provider(provider);
-    index.add(&vectors[96..], 16).unwrap();
-    index.prepare().unwrap();
-    assert_eq!(index.len(), 8);
-    assert_eq!(index.vector_rows(), vec![(0, 2), (4, 2), (6, 2)]);
-    let mut bm25 =
-        SegmentedShard::open(root.join("catalog"), Bm25Store::with_text_fields(&["body"])).unwrap();
-    for slot in 6..8 {
-        bm25.add_document(
-            slot,
-            "word".into(),
-            analyze_document_native("word", Some(&body_spec())).unwrap(),
-            None,
-        )
-        .unwrap();
-    }
-    let node = NodeServiceImpl::new(
-        Some(index),
-        NodeConfig {
-            slot_offset: 100,
-            ..Default::default()
-        },
-    )
-    .with_bm25(Some(Bm25Shard::Segmented(bm25)));
+    stage_three_part_catalog(&root, &vectors, &shift, &scale);
+    let node = build_gapped_node(&root, &vectors, &shift, &scale);
     let bitmap = node
         .resolve_vector_bitmap(Request::new(VectorBitmapRequest::default()))
         .await
@@ -197,6 +134,85 @@ async fn document_only_segment_is_a_gap_in_bitmap_and_boolean_membership() {
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert!(error.message().contains("exact-vector sidecar"));
     drop(node);
-    drop(catalog);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Stage three 2-row parts into the catalog; the middle part carries no
+/// vector or exact artifact.
+fn stage_three_part_catalog(root: &std::path::Path, vectors: &[f32], shift: &[f32], scale: &[f32]) {
+    let catalog = SegmentCatalog::open(root.join("catalog")).unwrap();
+    for part in 0..3 {
+        let stage = root.join(format!("stage-{part}"));
+        std::fs::create_dir_all(&stage).unwrap();
+        let bm25 = stage.join("documents.bm25");
+        let live = stage.join("live.bin");
+        let image = stage.join("vector.index");
+        let exact = stage.join("vectors.f32");
+        documents().save(&bm25).unwrap();
+        LiveDocs::default().write(&live, 2).unwrap();
+        if part != 1 {
+            let mut index = seeded_index(16, 4, shift, scale);
+            index.add(&vectors[part * 32..(part + 1) * 32], 16).unwrap();
+            index.prepare().unwrap();
+            index.write(&image).unwrap();
+            pipestream_search::exact_vectors::ExactVectorStore::from_values(
+                16,
+                vectors[part * 32..(part + 1) * 32].to_vec(),
+            )
+            .unwrap()
+            .write(&exact)
+            .unwrap();
+        }
+        catalog
+            .append(SegmentSource {
+                multi_res_path: None,
+                segment_id: &format!("part-{part}"),
+                generation: part as u64 + 1,
+                base_label: (part * 2) as u64,
+                backend_kind: if part == 1 { "" } else { EMBEDDED_TURBOVEC },
+                vector_path: (part != 1).then_some(image.as_path()),
+                exact_vector_path: (part != 1).then_some(exact.as_path()),
+                bm25_path: &bm25,
+                live_docs_path: &live,
+                partition_column: None,
+                parents_colocated: false,
+            })
+            .unwrap();
+    }
+}
+
+/// Open the catalog as a served node: provider index with a 2-row tail
+/// over a segmented BM25 holding the same tail documents.
+fn build_gapped_node(
+    root: &std::path::Path,
+    vectors: &[f32],
+    shift: &[f32],
+    scale: &[f32],
+) -> NodeServiceImpl {
+    let set = std::sync::Arc::new(OpenedSegmentSet::open(root.join("catalog")).unwrap());
+    let provider = SegmentedProvider::open(set, seeded_index(16, 4, shift, scale)).unwrap();
+    let mut index = VectorIndex::from_provider(provider);
+    index.add(&vectors[96..], 16).unwrap();
+    index.prepare().unwrap();
+    assert_eq!(index.len(), 8);
+    assert_eq!(index.vector_rows(), vec![(0, 2), (4, 2), (6, 2)]);
+    let mut bm25 =
+        SegmentedShard::open(root.join("catalog"), Bm25Store::with_text_fields(&["body"])).unwrap();
+    for slot in 6..8 {
+        bm25.add_document(
+            slot,
+            "word".into(),
+            analyze_document_native("word", Some(&body_spec())).unwrap(),
+            None,
+        )
+        .unwrap();
+    }
+    NodeServiceImpl::new(
+        Some(index),
+        NodeConfig {
+            slot_offset: 100,
+            ..Default::default()
+        },
+    )
+    .with_bm25(Some(Bm25Shard::Segmented(bm25)))
 }
