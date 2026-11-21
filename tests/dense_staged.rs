@@ -7,6 +7,7 @@
 mod common;
 
 use common::{fit_calibration, start_node, unit_vectors};
+use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
 use pipestream_search::coordinator::CoordinatorServiceImpl;
 use pipestream_search::dense_policy::{DenseExecutionPolicy, LiveIdentity};
 use pipestream_search::harness::{fake_ann, seeded_index};
@@ -15,10 +16,12 @@ use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
-    search_query, selection_query, AddVectorsRequest, DenseCoverage, DenseExecutionMode as Mode,
-    DenseExecutionPolicyDocument, DenseExecutionShape, DenseFilterStrategy, DensePolicyPoint,
+    search_query, search_shard_request, selection_query, AddDocumentsRequest, AddVectorsRequest,
+    CollapseSpec, DenseCoverage, DenseExecutionMode as Mode, DenseExecutionPolicyDocument,
+    DenseExecutionShape, DenseFilterStrategy, DensePolicyPoint,
     DensePrecisionRequest as PrecisionRequest, DenseQuery, DenseScorePrecision, DenseTechnique,
-    QueryRequest, SearchQuery, SelectionQuery,
+    DocLineage, QueryRequest, SearchQuery, SearchRequest, SearchShardRequest, SelectionQuery,
+    StartShardSearch,
 };
 use tonic::Request;
 
@@ -317,4 +320,97 @@ async fn auto_serves_staged_policy_over_real_embedded_turbovec_40k() {
             assert!(dense_policy_drift_total() > before);
         }
     }
+}
+
+async fn start_parented_staged_node(
+    corpus: &[f32],
+) -> (
+    String,
+    NodeServiceClient<tonic::transport::Channel>,
+    tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+) {
+    let (shift, scale) = fit_calibration(DIM, 4, corpus);
+    let index = fake_ann::fake_staged_index(seeded_index(DIM, 4, &shift, &scale));
+    let cfg = NodeConfig {
+        analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
+        ..Default::default()
+    };
+    let (addr, handle) = start_node(index, cfg).await;
+    let mut node_client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+    let docs = (0..64u64).map(|i| AddDocumentsRequest {
+        text: format!("chunk {i} about vector staging"),
+        analysis: Some(body_spec()),
+        lineage: Some(DocLineage {
+            parent_id: i / 4,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    node_client
+        .add_documents(tokio_stream::iter(docs))
+        .await
+        .unwrap();
+    ingest_vectors(&addr, corpus).await;
+    (addr, node_client, handle)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collapse_parents_and_staged_selection_are_rejected_while_query_collapse_serves_staged() {
+    let corpus = unit_vectors(64, DIM, 0x57A6_3001);
+    let (addr, mut node_client, _handle) = start_parented_staged_node(&corpus).await;
+    let qvec = unit_vectors(1, DIM, 0x57A6_3002);
+    let coordinator = CoordinatorServiceImpl::new(vec![addr]);
+
+    let search_err = coordinator
+        .search(Request::new(SearchRequest {
+            k: 4,
+            vector: qvec.clone(),
+            collapse_parents: true,
+            staged_selection: true,
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(search_err.code(), tonic::Code::InvalidArgument);
+    assert!(search_err
+        .message()
+        .contains("collapse_parents and staged_selection are mutually exclusive"));
+
+    let mut shard_stream = node_client
+        .search_shard(tokio_stream::iter([SearchShardRequest {
+            payload: Some(search_shard_request::Payload::Start(StartShardSearch {
+                k: 4,
+                vector: qvec.clone(),
+                collapse_parents: true,
+                staged_selection: true,
+                ..Default::default()
+            })),
+        }]))
+        .await
+        .unwrap()
+        .into_inner();
+    let shard_err = shard_stream.message().await.unwrap_err();
+    assert_eq!(shard_err.code(), tonic::Code::InvalidArgument);
+    assert!(shard_err
+        .message()
+        .contains("collapse_parents and staged_selection are mutually exclusive"));
+
+    let mut collapsed_query = balanced(&qvec, 4);
+    collapsed_query.collapse = Some(CollapseSpec {
+        map: None,
+        column: "parent_id".into(),
+        inner_hits: 1,
+    });
+    let collapsed = coordinator
+        .query(Request::new(collapsed_query))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(collapsed.hits.len(), 4);
+    let out = collapsed.dense_execution.unwrap();
+    assert_eq!(out.resolved_mode, Mode::Balanced as i32);
+    assert_eq!(
+        out.techniques[0].technique,
+        DenseTechnique::BitplaneStaged as i32
+    );
 }

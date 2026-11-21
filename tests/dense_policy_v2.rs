@@ -407,6 +407,8 @@ async fn tombstone_replacement_and_append_fail_auto_closed_to_exhaustive() {
     assert_auto_fails_closed(&after_append, &query_vector, "corpus_fingerprint").await;
 }
 
+#[path = "dense_policy_v2/composite_shapes.rs"]
+mod composite_shapes;
 #[path = "dense_policy_v2/selectivity_bitmaps.rs"]
 mod selectivity_bitmaps;
 #[path = "dense_policy_v2/staged_drift.rs"]

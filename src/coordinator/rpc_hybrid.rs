@@ -32,7 +32,9 @@ impl CoordinatorServiceImpl {
             legs.fusion_mode,
             FusionMode::Cascade | FusionMode::Unspecified
         ) || legs.vector_weight != 0.0;
-        let rows = self.check_hybrid_raw_controls(&req, runs_vector).await?;
+        let rows = self
+            .check_hybrid_raw_controls(&req, legs.fusion_mode, runs_vector)
+            .await?;
         let (mut hits, mut cascade_hits, mut debug, mut exec) = match legs.fusion_mode {
             FusionMode::Cascade | FusionMode::Unspecified => {
                 let query = CascadeQuery::from_request(
@@ -85,11 +87,14 @@ impl CoordinatorServiceImpl {
     async fn check_hybrid_raw_controls(
         &self,
         req: &HybridSearchRequest,
+        fusion_mode: FusionMode,
         runs_vector: bool,
     ) -> Result<u64, Status> {
         let raw = raw_hybrid_controls(req);
         if runs_vector {
-            self.validate_raw_dense_controls(&raw).await
+            let decomposed = fusion_mode == FusionMode::Decomposed;
+            self.validate_hybrid_raw_dense_controls(&raw, decomposed)
+                .await
         } else {
             crate::dense_execution::validate_raw_controls(&raw, None).map_err(dense_status)?;
             Ok(0)
@@ -135,6 +140,7 @@ impl CoordinatorServiceImpl {
 
 fn raw_hybrid_controls(req: &HybridSearchRequest) -> crate::dense_execution::RawDenseControls {
     crate::dense_execution::RawDenseControls {
+        collapse_parents: false,
         filter_strategy: req.filter_strategy,
         enumerate_all: req.enumerate_all,
         staged_selection: req.staged_selection,

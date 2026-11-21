@@ -323,6 +323,7 @@ fn stream_search_response(
 
 fn raw_search_controls(req: &SearchRequest) -> crate::dense_execution::RawDenseControls {
     crate::dense_execution::RawDenseControls {
+        collapse_parents: req.collapse_parents,
         filter_strategy: req.filter_strategy,
         enumerate_all: req.enumerate_all,
         staged_selection: req.staged_selection,

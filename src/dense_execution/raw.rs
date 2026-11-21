@@ -7,6 +7,7 @@ use crate::pb::DenseFilterStrategy as Strategy;
 /// `HybridSearch` requests.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct RawDenseControls {
+    pub(crate) collapse_parents: bool,
     pub(crate) filter_strategy: i32,
     pub(crate) enumerate_all: bool,
     pub(crate) staged_selection: bool,
@@ -60,6 +61,11 @@ pub(crate) fn validate_raw_controls(
             "floor_greediness_ppm and floor_clamp_min require floor_prune = true".to_string(),
         ));
     }
+    if raw.collapse_parents && raw.staged_selection {
+        return Err(DenseExecutionError::InvalidRequest(
+            "collapse_parents and staged_selection are mutually exclusive".to_string(),
+        ));
+    }
     let approx_controls = strategy != Strategy::Default
         || raw.enumerate_max_rows.is_some()
         || raw.patience_saturation_ppm.is_some()
@@ -76,16 +82,7 @@ pub(crate) fn validate_raw_controls(
                 .to_string(),
         ));
     }
-    if raw.staged_selection
-        && (strategy != Strategy::Default
-            || raw.enumerate_max_rows.is_some()
-            || raw.patience_saturation_ppm.is_some()
-            || raw.finish_settle_us.is_some()
-            || raw.finish_deadline_us.is_some()
-            || raw.floor_prune == Some(true)
-            || raw.floor_greediness_ppm.is_some()
-            || raw.floor_clamp_min.is_some())
-    {
+    if raw.staged_selection && approx_controls {
         return Err(DenseExecutionError::InvalidRequest(
             "staged_selection is unary bit-plane selection and cannot be combined with \
              filter_strategy, enumerate_max_rows, patience, floor pruning, or early-finish controls"

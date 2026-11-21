@@ -7,9 +7,10 @@ use crate::dense_execution::{DenseRequest, ProviderCaps, RawDenseControls, Resol
 use crate::dense_policy::{DenseExecutionPolicy, Qualification, Qualified};
 
 impl DenseProviderFacts {
-    /// The executable capabilities the fleet proved. Staged selection is a
-    /// unary technique, so a streaming coordinator does not offer it.
-    pub(super) fn caps(&self, streaming: bool) -> ProviderCaps {
+    /// The executable capabilities the fleet proved for a route shape. Staged
+    /// selection is unary-only, and settle/deadline finish windows are driven
+    /// only on single-leaf streams.
+    pub(super) fn caps(&self, streaming: bool, finish_windows: bool) -> ProviderCaps {
         ProviderCaps {
             provider: self.provider.clone(),
             native: if self.bits_per_dimension == 32 {
@@ -25,7 +26,7 @@ impl DenseProviderFacts {
             staged: self.staged && !streaming,
             patience: self.supports_patience,
             floor_pruning: self.supports_floor_pruning,
-            candidate_stream: self.supports_stream,
+            candidate_stream: self.supports_stream && finish_windows,
             rows: self.rows,
         }
     }
@@ -86,8 +87,8 @@ impl CoordinatorServiceImpl {
                 facts.dimensions
             )));
         }
-        let streaming = self.request_streams(key.filters);
-        let caps = facts.caps(streaming);
+        let (streaming, finish_windows) = self.route_transport(key);
+        let caps = facts.caps(streaming, finish_windows);
         let decision = match (&self.dense_execution_policy, request.mode) {
             (Some(policy), crate::pb::DenseExecutionMode::Auto) => {
                 self.decide_auto(policy, request, &facts, &caps, key, streaming)
@@ -129,11 +130,36 @@ impl CoordinatorServiceImpl {
         Ok(exact_rows > 0)
     }
 
-    /// Validate raw dense controls on direct `Search` / `HybridSearch` calls
-    /// and check peer capabilities before dispatching to shards.
+    /// Validate raw dense controls on a direct `Search` call and check peer
+    /// capabilities before dispatching to shards.
     pub(in crate::coordinator) async fn validate_raw_dense_controls(
         &self,
         raw: &RawDenseControls,
+    ) -> Result<u64, Status> {
+        let streaming = self.stream_search
+            || raw.finish_settle_us.is_some()
+            || raw.finish_deadline_us.is_some();
+        self.validate_raw_controls_for_route(raw, streaming, true)
+            .await
+    }
+
+    /// Validate raw dense controls on a direct `HybridSearch` call, classifying
+    /// transport from the fusion mode (`Decomposed` streams; other modes run
+    /// unary leg rounds; none drive finish windows).
+    pub(in crate::coordinator) async fn validate_hybrid_raw_dense_controls(
+        &self,
+        raw: &RawDenseControls,
+        decomposed: bool,
+    ) -> Result<u64, Status> {
+        self.validate_raw_controls_for_route(raw, decomposed, false)
+            .await
+    }
+
+    async fn validate_raw_controls_for_route(
+        &self,
+        raw: &RawDenseControls,
+        streaming: bool,
+        finish_windows: bool,
     ) -> Result<u64, Status> {
         crate::dense_execution::validate_raw_controls(raw, None).map_err(dense_status)?;
         if !raw.has_any() {
@@ -143,11 +169,8 @@ impl CoordinatorServiceImpl {
             Some(identity) => DenseProviderFacts::clustered(identity, false),
             None => self.shard_dense_facts().await?,
         };
-        let streaming = self.stream_search
-            || raw.finish_settle_us.is_some()
-            || raw.finish_deadline_us.is_some();
-        crate::dense_execution::validate_raw_controls(raw, Some(&facts.caps(streaming)))
-            .map_err(dense_status)?;
+        let caps = facts.caps(streaming, finish_windows);
+        crate::dense_execution::validate_raw_controls(raw, Some(&caps)).map_err(dense_status)?;
         Ok(facts.rows)
     }
 
@@ -158,6 +181,14 @@ impl CoordinatorServiceImpl {
             None => self.shard_dense_facts().await?,
         };
         Ok(facts.live_identity())
+    }
+
+    fn route_transport(&self, key: DenseRequestKey<'_>) -> (bool, bool) {
+        match key.route_mode {
+            DenseRouteMode::SingleLeaf => (self.request_streams(key.filters), true),
+            DenseRouteMode::CompositeUnary => (false, false),
+            DenseRouteMode::CompositeDecomposed => (true, false),
+        }
     }
 
     fn request_streams(&self, filters: Option<&RequestFilters>) -> bool {
@@ -262,7 +293,9 @@ fn stamp_provenance(
 
 #[cfg(test)]
 mod tests {
-    use crate::coordinator::{CoordinatorServiceImpl, RequestFilters};
+    use crate::coordinator::{
+        CoordinatorServiceImpl, DenseRequestKey, DenseRouteMode, RequestFilters,
+    };
 
     #[test]
     fn request_streams_tracks_stream_search_and_finish_windows() {
@@ -284,5 +317,41 @@ mod tests {
 
         let streaming = unary.with_stream_search(true);
         assert!(streaming.request_streams(None));
+    }
+
+    #[test]
+    fn route_transport_distinguishes_single_leaf_unary_and_decomposed_composites() {
+        let unary = CoordinatorServiceImpl::new(Vec::new());
+        let streaming = unary.clone().with_stream_search(true);
+        let key = |route_mode| DenseRequestKey {
+            k: 10,
+            candidate_depth: 0,
+            route_mode,
+            filters: None,
+        };
+        assert_eq!(
+            unary.route_transport(key(DenseRouteMode::SingleLeaf)),
+            (false, true)
+        );
+        assert_eq!(
+            streaming.route_transport(key(DenseRouteMode::SingleLeaf)),
+            (true, true)
+        );
+        assert_eq!(
+            unary.route_transport(key(DenseRouteMode::CompositeUnary)),
+            (false, false)
+        );
+        assert_eq!(
+            streaming.route_transport(key(DenseRouteMode::CompositeUnary)),
+            (false, false)
+        );
+        assert_eq!(
+            unary.route_transport(key(DenseRouteMode::CompositeDecomposed)),
+            (true, false)
+        );
+        assert_eq!(
+            streaming.route_transport(key(DenseRouteMode::CompositeDecomposed)),
+            (true, false)
+        );
     }
 }
