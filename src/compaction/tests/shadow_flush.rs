@@ -95,14 +95,16 @@ impl CutoverFixture {
         self.node
             .apply_document_locked(
                 &mut guard,
-                AddDocumentsRequest {
-                    text: TEXTS[i].into(),
-                    analysis: Some(self.spec.clone()),
-                    ..Default::default()
+                crate::node::MaterializedDocument {
+                    doc: AddDocumentsRequest {
+                        text: TEXTS[i].into(),
+                        analysis: Some(self.spec.clone()),
+                        ..Default::default()
+                    },
+                    analyzed: self.analyzed[i].clone(),
+                    vector: Some(self.sample[..64].to_vec()),
+                    stable_routing_key: None,
                 },
-                self.analyzed[i].clone(),
-                Some(self.sample[..64].to_vec()),
-                None,
                 &mut 0,
                 &mut 0,
             )

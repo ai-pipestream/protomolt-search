@@ -228,7 +228,7 @@ impl Batch<'_> {
                         hash.update(&pos.to_le_bytes());
                     }
                 }
-                // Absence means unit arcs, including legacy segments merged
+                // Absence means unit arcs, including segments without lattices merged
                 // with lattice-bearing rows in the same destination field.
                 if let Some(positions) = field.posting_positions(term, row as u32) {
                     let lengths = field

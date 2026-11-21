@@ -54,16 +54,13 @@ pub use rewrite_proof::{
     MAX_BATCH_ROWS as MAX_PROOF_BATCH_ROWS,
 };
 pub use row_update::SegmentRowRetirement;
+pub(crate) use row_update::SourceGeneration;
 use stage::{cleanup_staged, stage_segment, verify_retry_source};
 pub use stage::{remove_segment_dirs, stage_segments, write_manifest_file};
 pub(crate) use summary::summarize_columns;
 use validate::{validate_manifest, validate_relative_file, validate_segment_id};
 
-const BASE_SET_FORMAT: u32 = 1;
-const SET_FORMAT: u32 = 2;
-const SOURCE_SET_FORMAT: u32 = 3;
-const DECLARED_SET_FORMAT: u32 = 4;
-const RETAINED_SET_FORMAT: u32 = 5;
+const SET_FORMAT: u32 = 5;
 const SET_FILE: &str = "segments.json";
 const SEGMENT_META_FILE: &str = "segment.json";
 

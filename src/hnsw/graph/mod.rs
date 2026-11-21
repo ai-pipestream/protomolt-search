@@ -51,7 +51,7 @@ pub(in crate::hnsw) use beam::LayerSearch;
 pub(super) use build::LinkBuilder;
 pub(in crate::hnsw) use enumerate::EnumerateQuery;
 pub use hooks::{FloorHook, Hook, NoHook};
-pub use policy::{Filter, FloorPrune, Patience, Route, Walk};
+pub use policy::{Filter, FloorPrune, Patience, Route, Steering, Walk};
 pub use scratch::{with_scratch, Scratch};
 pub use store::{level_for, GraphLinks, Store};
 pub use view::{Locks, View};

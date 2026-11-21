@@ -54,14 +54,16 @@ impl Fixture {
         self.node
             .apply_document_locked(
                 &mut guard,
-                AddDocumentsRequest {
-                    text: text.into(),
-                    analysis: Some(body_spec()),
-                    ..Default::default()
+                crate::node::MaterializedDocument {
+                    doc: AddDocumentsRequest {
+                        text: text.into(),
+                        analysis: Some(body_spec()),
+                        ..Default::default()
+                    },
+                    analyzed,
+                    vector,
+                    stable_routing_key: None,
                 },
-                analyzed,
-                vector,
-                None,
                 &mut 0,
                 &mut 0,
             )

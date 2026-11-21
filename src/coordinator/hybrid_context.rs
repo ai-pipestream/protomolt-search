@@ -64,8 +64,9 @@ impl<'a> HybridInput<'a> {
     }
 }
 
+/// A validated hybrid search: input, fusion legs and debug flag.
 #[derive(Clone, Copy)]
-pub(crate) struct HybridQuery<'a> {
+pub struct HybridQuery<'a> {
     input: HybridInput<'a>,
     legs: HybridLegs,
     debug: bool,
@@ -79,7 +80,7 @@ impl<'a> HybridQuery<'a> {
         validate_legs(legs)?;
         Ok(Self { input, legs, debug })
     }
-    pub(crate) fn from_request(
+    pub fn from_request(
         request_id: &'a str,
         request: &'a HybridSearchRequest,
         k: u32,
@@ -108,8 +109,9 @@ impl<'a> HybridQuery<'a> {
     }
 }
 
+/// A validated cascade search: input, vector floor and debug flag.
 #[derive(Clone, Copy)]
-pub(crate) struct CascadeQuery<'a> {
+pub struct CascadeQuery<'a> {
     input: HybridInput<'a>,
     min_vector_score: f32,
     debug: bool,
@@ -127,7 +129,7 @@ impl<'a> CascadeQuery<'a> {
             debug,
         })
     }
-    pub(crate) fn from_request(
+    pub fn from_request(
         request_id: &'a str,
         request: &'a HybridSearchRequest,
         k: u32,

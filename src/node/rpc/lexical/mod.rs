@@ -126,25 +126,26 @@ impl NodeServiceImpl {
             }
             let service = self.clone();
             tokio::task::spawn_blocking(move || {
-                let mut legs = service.compute_legs(
-                    &req.vector,
-                    &req.terms,
-                    req.analysis_fingerprint,
-                    req.global_doc_count,
-                    req.global_total_doc_length,
-                    &req.global_doc_frequencies,
-                    params_from(req.k1, req.b)?,
-                    req.k as usize,
-                    req.expected_stats_epoch,
-                    &req.expected_stats_incarnation,
-                    &LegFilters {
-                        geo: &req.geo_filters,
-                        regions: geo_regions,
-                        tree: req.filter.as_ref(),
-                    },
-                    req.read_context.as_ref(),
-                    req.include_rerank_candidate,
-                )?;
+                let query = crate::node::lexical::LegQuery {
+                    vector: &req.vector,
+                    terms: &req.terms,
+                    analysis_fingerprint: req.analysis_fingerprint,
+                    global_doc_count: req.global_doc_count,
+                    global_total_doc_length: req.global_total_doc_length,
+                    global_doc_frequencies: &req.global_doc_frequencies,
+                    params: params_from(req.k1, req.b)?,
+                    k: req.k as usize,
+                    expected_stats_epoch: req.expected_stats_epoch,
+                    expected_stats_incarnation: &req.expected_stats_incarnation,
+                    read_context: req.read_context.as_ref(),
+                    include_rerank_candidate: req.include_rerank_candidate,
+                };
+                let filters = LegFilters {
+                    geo: &req.geo_filters,
+                    regions: geo_regions,
+                    tree: req.filter.as_ref(),
+                };
+                let mut legs = service.compute_legs(query, &filters)?;
                 Ok(ShardLegsResponse {
                     vector_hits: legs
                         .vector

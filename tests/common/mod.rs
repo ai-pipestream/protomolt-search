@@ -10,6 +10,7 @@
 #![allow(dead_code, unused_imports)]
 
 pub mod catalog;
+pub mod fanout;
 pub mod files;
 pub mod mock;
 

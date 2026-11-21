@@ -229,9 +229,7 @@ fn traced_walk<L: LinkCells + ?Sized>(
         view.walk(
             q,
             ef,
-            filter,
-            Patience::OFF,
-            FloorPrune::OFF,
+            super::super::graph::Steering::filtered(filter),
             scratch,
             &mut trace,
         )

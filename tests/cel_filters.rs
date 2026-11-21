@@ -771,11 +771,11 @@ impl NumericRead for ReaderCols<'_> {
 
 fn build_cel_pruned_corpus(n: u32, path: &std::path::Path) -> CorpusStats {
     let tf_a = |d: u32| 1 + (u64::from(d) * 2654435761 % 7) as u32;
-    let mut store = Bm25Store::with_fields(&["body"])
-        .with_facets(&["court"])
-        .with_integers(&["year"])
-        .with_numerics(&["score"])
-        .with_map_facets(&["tags"]);
+    let mut store = Bm25Store::with_text_fields(&["body"])
+        .with_columns(pipestream_search::postings::ColumnKind::Facet, &["court"])
+        .with_columns(pipestream_search::postings::ColumnKind::Integer, &["year"])
+        .with_columns(pipestream_search::postings::ColumnKind::Numeric, &["score"])
+        .with_columns(pipestream_search::postings::ColumnKind::MapFacet, &["tags"]);
     let courts = ["scotus", "ca5", "ca9", "dcc"];
     for doc in 0..n {
         let mut terms = vec![("a".to_string(), tf_a(doc), Vec::new())];

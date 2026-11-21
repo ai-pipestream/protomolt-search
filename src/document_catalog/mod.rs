@@ -101,6 +101,20 @@ fn decode_header(bytes: &[u8]) -> Result<DocumentCatalogHeader, Status> {
     Ok(header)
 }
 
+/// The catalog header stored in `meta`, required to be a served format.
+fn current_header(
+    meta: &impl ReadableTable<&'static str, &'static [u8]>,
+) -> Result<DocumentCatalogHeader, Status> {
+    let header = decode_header(
+        meta.get("header")
+            .map_err(storage)?
+            .ok_or_else(|| Status::data_loss("catalog header missing"))?
+            .value(),
+    )?;
+    validate_current_header(&header)?;
+    Ok(header)
+}
+
 fn valid_history_id(id: &[u8]) -> bool {
     id.len() == 16 && id.iter().any(|byte| *byte != 0)
 }
@@ -191,13 +205,7 @@ impl DocumentCatalog {
     pub fn collection(&self) -> Result<String, Status> {
         let transaction = self.database.begin_read().map_err(storage)?;
         let meta = transaction.open_table(META).map_err(storage)?;
-        let header: DocumentCatalogHeader = decode_header(
-            meta.get("header")
-                .map_err(storage)?
-                .ok_or_else(|| Status::data_loss("catalog header missing"))?
-                .value(),
-        )?;
-        validate_current_header(&header)?;
+        let header = current_header(&meta)?;
         Ok(header.collection)
     }
 }

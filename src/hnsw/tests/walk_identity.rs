@@ -5,7 +5,8 @@
 
 use super::super::distance::{kernel_dot_slack_per_norm, Kernel};
 use super::super::graph::{
-    with_scratch, Filter, FloorPrune, Hook, LinkCells, Patience, Route, Scratch, Store, View, Walk,
+    with_scratch, Filter, FloorPrune, Hook, LinkCells, Patience, Route, Scratch, Steering, Store,
+    View, Walk,
 };
 use super::*;
 use crate::vector::Mask;
@@ -336,7 +337,7 @@ fn regime_digest(fx: &Pinned, regime: &Regime, ends: &mut Vec<Walk>) -> u64 {
     };
     for q in fx.queries.chunks_exact(fx.dim) {
         let floor = regime.floor_rank.map(|rank| ranked_score(&view, q, rank));
-        let prune = FloorPrune {
+        let floor_prune = FloorPrune {
             enabled: floor.is_some(),
             gate: 8,
             slack_per_norm: kernel_dot_slack_per_norm(fx.dim, q),
@@ -344,10 +345,13 @@ fn regime_digest(fx: &Pinned, regime: &Regime, ends: &mut Vec<Walk>) -> u64 {
         for &ef in regime.efs {
             tape.floor = floor.unwrap_or(f32::NEG_INFINITY);
             tape.hops_left = regime.stop_after;
-            let filter = fx.filter(regime.gate);
+            let steering = Steering {
+                filter: fx.filter(regime.gate),
+                patience: regime.patience,
+                floor_prune,
+            };
             with_scratch(|scratch| {
-                let (hits, stats, walk) =
-                    view.walk(q, ef, filter, regime.patience, prune, scratch, &mut tape);
+                let (hits, stats, walk) = view.walk(q, ef, steering, scratch, &mut tape);
                 ends.push(walk);
                 for count in [walk as u64, stats.hops, stats.scored] {
                     tape.digest.word(count);

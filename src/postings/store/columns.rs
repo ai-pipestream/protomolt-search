@@ -5,11 +5,6 @@ use crate::postings::columns::ColumnKind;
 use std::io;
 
 impl Bm25Store {
-    /// Declare the facet field table, in facet-id order.
-    pub fn with_facets(self, names: &[&str]) -> Self {
-        self.with_columns(ColumnKind::Facet, names)
-    }
-
     /// Number of fields in the field table.
     pub fn field_count(&self) -> usize {
         self.fields.len()
@@ -75,11 +70,6 @@ impl Bm25Store {
         self.columns.set_facet(fi, doc_id, value);
     }
 
-    /// Declare the numeric field table, in numeric-id order.
-    pub fn with_numerics(self, names: &[&str]) -> Self {
-        self.with_columns(ColumnKind::Numeric, names)
-    }
-
     /// Number of numeric fields in the numeric table.
     pub fn numeric_count(&self) -> usize {
         self.column_count(ColumnKind::Numeric)
@@ -108,11 +98,6 @@ impl Bm25Store {
     /// Record `doc_id`'s finite value for numeric field `ni`.
     pub fn set_numeric(&mut self, ni: usize, doc_id: u32, value: f64) {
         self.columns.set_numeric(ni, doc_id, value);
-    }
-
-    /// Declare the `i64` field table, in integer-id order.
-    pub fn with_integers(self, names: &[&str]) -> Self {
-        self.with_columns(ColumnKind::Integer, names)
     }
 
     /// Number of `i64` fields in the integer table.
@@ -145,11 +130,6 @@ impl Bm25Store {
         self.columns.set_integer(ii, doc_id, value);
     }
 
-    /// Declare the unsigned `u64` column table before adding documents.
-    pub fn with_unsigned_integers(self, names: &[&str]) -> Self {
-        self.with_columns(ColumnKind::UnsignedInteger, names)
-    }
-
     /// Number of `u64` fields in the unsigned integer table.
     pub fn unsigned_integer_count(&self) -> usize {
         self.column_count(ColumnKind::UnsignedInteger)
@@ -178,11 +158,6 @@ impl Bm25Store {
     /// Record `doc_id`'s value for unsigned integer field `ii`.
     pub fn set_unsigned_integer(&mut self, ii: usize, doc_id: u32, value: u64) {
         self.columns.set_unsigned_integer(ii, doc_id, value);
-    }
-
-    /// Declare the geo-point column table, in geo-id order.
-    pub fn with_geos(self, names: &[&str]) -> Self {
-        self.with_columns(ColumnKind::Geo, names)
     }
 
     /// Number of geo fields in the geo table.
@@ -215,16 +190,6 @@ impl Bm25Store {
         self.columns.set_geo(gi, doc_id, lat, lon);
     }
 
-    /// Declare the `map<string, string>` column table.
-    pub fn with_map_facets(self, names: &[&str]) -> Self {
-        self.with_columns(ColumnKind::MapFacet, names)
-    }
-
-    /// Declare the `map<string, f64>` column table.
-    pub fn with_map_numerics(self, names: &[&str]) -> Self {
-        self.with_columns(ColumnKind::MapNumeric, names)
-    }
-
     /// Number of `map<string, string>` columns.
     pub fn map_facet_count(&self) -> usize {
         self.column_count(ColumnKind::MapFacet)
@@ -233,11 +198,6 @@ impl Bm25Store {
     /// The name of map-facet column `ci`. Panics when out of range.
     pub fn map_facet_name(&self, ci: usize) -> &str {
         self.column_name(ColumnKind::MapFacet, ci)
-    }
-
-    /// Configure exact `i64` map columns before adding documents.
-    pub fn with_map_integers(self, names: &[&str]) -> Self {
-        self.with_columns(ColumnKind::MapInteger, names)
     }
 
     /// Set an exact value in an existing document slot. Duplicate keys return an error.
@@ -250,21 +210,6 @@ impl Bm25Store {
     ) -> io::Result<()> {
         self.columns
             .set_map_integer(self.texts.len(), ci, doc_id, key, value)
-    }
-
-    /// Number of exact `i64` map columns.
-    pub fn map_integer_count(&self) -> usize {
-        self.column_count(ColumnKind::MapInteger)
-    }
-
-    /// Column name at `ci`; panics for an invalid column index.
-    pub fn map_integer_name(&self, ci: usize) -> &str {
-        self.column_name(ColumnKind::MapInteger, ci)
-    }
-
-    /// Look up an exact `i64` map column by name.
-    pub fn map_integer_index(&self, name: &str) -> Option<usize> {
-        self.column_index(ColumnKind::MapInteger, name)
     }
 
     /// Map keys in this store's ordinal order.
@@ -287,11 +232,6 @@ impl Bm25Store {
         self.columns.map_integers[ci].value(key, row)
     }
 
-    /// Configure exact `u64` map columns before adding documents.
-    pub fn with_map_unsigned_integers(self, names: &[&str]) -> Self {
-        self.with_columns(ColumnKind::MapUnsignedInteger, names)
-    }
-
     /// Set an exact value in an existing document slot. Duplicate keys return an error.
     pub fn set_map_unsigned_integer(
         &mut self,
@@ -302,21 +242,6 @@ impl Bm25Store {
     ) -> io::Result<()> {
         self.columns
             .set_map_unsigned_integer(self.texts.len(), ci, doc_id, key, value)
-    }
-
-    /// Number of exact `u64` map columns.
-    pub fn map_unsigned_integer_count(&self) -> usize {
-        self.column_count(ColumnKind::MapUnsignedInteger)
-    }
-
-    /// Column name at `ci`; panics for an invalid column index.
-    pub fn map_unsigned_integer_name(&self, ci: usize) -> &str {
-        self.column_name(ColumnKind::MapUnsignedInteger, ci)
-    }
-
-    /// Look up an exact `u64` map column by name.
-    pub fn map_unsigned_integer_index(&self, name: &str) -> Option<usize> {
-        self.column_index(ColumnKind::MapUnsignedInteger, name)
     }
 
     /// Map keys in this store's ordinal order.
@@ -417,5 +342,35 @@ impl Bm25Store {
     /// Record `doc_id`'s finite map-numeric entry.
     pub fn set_map_numeric(&mut self, ci: usize, doc_id: u32, key: &str, value: f64) {
         self.columns.set_map_numeric(ci, doc_id, key, value);
+    }
+
+    /// Number of exact `i64` map columns.
+    pub fn map_integer_count(&self) -> usize {
+        self.column_count(ColumnKind::MapInteger)
+    }
+
+    /// Column name at `ci`; panics for an invalid column index.
+    pub fn map_integer_name(&self, ci: usize) -> &str {
+        self.column_name(ColumnKind::MapInteger, ci)
+    }
+
+    /// Look up an exact `i64` map column by name.
+    pub fn map_integer_index(&self, name: &str) -> Option<usize> {
+        self.column_index(ColumnKind::MapInteger, name)
+    }
+
+    /// Number of exact `u64` map columns.
+    pub fn map_unsigned_integer_count(&self) -> usize {
+        self.column_count(ColumnKind::MapUnsignedInteger)
+    }
+
+    /// Column name at `ci`; panics for an invalid column index.
+    pub fn map_unsigned_integer_name(&self, ci: usize) -> &str {
+        self.column_name(ColumnKind::MapUnsignedInteger, ci)
+    }
+
+    /// Look up an exact `u64` map column by name.
+    pub fn map_unsigned_integer_index(&self, name: &str) -> Option<usize> {
+        self.column_index(ColumnKind::MapUnsignedInteger, name)
     }
 }

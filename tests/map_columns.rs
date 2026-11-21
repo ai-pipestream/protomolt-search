@@ -15,7 +15,9 @@ use pipestream_search::pb::{
     AddDocumentsRequest, Bm25Hit, Bm25SearchRequest, MapFacetEntry, MapFacetField, MapNumericEntry,
     ScoreOp, ScoreStage,
 };
-use pipestream_search::postings::{AnalyzedDoc, Bm25Reader, Bm25Store, SpillBuilder};
+use pipestream_search::postings::{
+    AnalyzedDoc, Bm25Reader, Bm25Store, ColumnKind::*, SpillBuilder,
+};
 use pipestream_search::scorefn::{ColumnRef, NumericRead, ScoreChain, Stage, StageOp};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -192,9 +194,9 @@ fn map_columns_roundtrip_and_dual_writers_agree() {
     const NUM_SETS: [(u32, &str, f64); 3] =
         [(0, "boost", 2.5), (2, "boost", -1.0), (2, "rank", 7.0)];
 
-    let mut store = Bm25Store::with_fields(&["body"])
-        .with_map_facets(&["meta"])
-        .with_map_numerics(&["attrs"]);
+    let mut store = Bm25Store::with_text_fields(&["body"])
+        .with_columns(MapFacet, &["meta"])
+        .with_columns(MapNumeric, &["attrs"]);
     for (i, terms) in [
         &[("rust", 1u32), ("search", 1)][..],
         &[("vector", 1)][..],
@@ -220,10 +222,10 @@ fn map_columns_roundtrip_and_dual_writers_agree() {
         "map columns opt into the v7-shaped v8 payload"
     );
 
-    let mut builder = SpillBuilder::create_with_fields(&dir.join("spill.build"), &["body"])
+    let mut builder = SpillBuilder::create_with_text_fields(&dir.join("spill.build"), &["body"])
         .unwrap()
-        .with_map_facet_fields(&["meta"])
-        .with_map_numeric_fields(&["attrs"])
+        .with_columns(MapFacet, &["meta"])
+        .with_columns(MapNumeric, &["attrs"])
         .with_buffer_bytes(32);
     for (i, terms) in [
         &[("rust", 1u32), ("search", 1)][..],
@@ -321,9 +323,8 @@ async fn map_facet_counts_are_exact_with_key_level_typo_rules() {
 
     // "rust" matches d0, d1, d2, d4. meta[color]: red (d0, d2), blue
     // (d1); meta[lang]: en (d0), de (d2) — value-ascending on the tie.
-    let want = vec![map_field("meta", "color"), map_field("meta", "lang")];
-    let (hits, facets, _) = coordinator
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &want, &[], &[], &[], None)
+    let want = [map_field("meta", "color"), map_field("meta", "lang")];
+    let (hits, facets, _) = common::fanout::bm25_map_facets(&coordinator, "rust", 6, &want, None)
         .await
         .unwrap();
     assert_eq!(hits.len(), 4);
@@ -341,10 +342,10 @@ async fn map_facet_counts_are_exact_with_key_level_typo_rules() {
     assert_eq!(counts_of(&facets[1]), vec![("de", 1), ("en", 1)]);
 
     // Counts cover the whole match set at k = 1 too.
-    let (hits_k1, facets_k1, _) = coordinator
-        .fanout_bm25_faceted("rust", 1, None, 0.0, &[], &want, &[], &[], &[], None)
-        .await
-        .unwrap();
+    let (hits_k1, facets_k1, _) =
+        common::fanout::bm25_map_facets(&coordinator, "rust", 1, &want, None)
+            .await
+            .unwrap();
     assert_eq!(hits_k1.len(), 1);
     assert_eq!(counts_of(&facets_k1[0]), vec![("red", 2), ("blue", 1)]);
 
@@ -382,21 +383,15 @@ async fn map_facet_counts_are_exact_with_key_level_typo_rules() {
     assert_eq!(counts_of(&resp.facets[0]), vec![("blue", 1)]);
 
     // A key NO shard knows is a typo, not an empty drill-down.
-    let err = coordinator
-        .fanout_bm25_faceted(
-            "rust",
-            6,
-            None,
-            0.0,
-            &[],
-            &[map_field("meta", "colour")],
-            &[],
-            &[],
-            &[],
-            None,
-        )
-        .await
-        .unwrap_err();
+    let err = common::fanout::bm25_map_facets(
+        &coordinator,
+        "rust",
+        6,
+        &[map_field("meta", "colour")],
+        None,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     assert!(
         err.message().contains("colour") && err.message().contains("--map-facet-fields"),
@@ -505,7 +500,7 @@ fn map_keyed_chain_pruned_matches_exhaustive_bitwise() {
 fn build_map_chain_store(path: &std::path::Path) -> CorpusStats {
     let n = 3000u32;
     let mut total = 0u64;
-    let mut store = Bm25Store::with_fields(&["body"]).with_map_numerics(&["attrs"]);
+    let mut store = Bm25Store::with_text_fields(&["body"]).with_columns(MapNumeric, &["attrs"]);
     for doc in 0..n {
         let tf_a = 1 + (u64::from(doc) * 2654435761 % 7) as u32;
         let mut terms = vec![("a".to_string(), tf_a, Vec::new())];
@@ -551,7 +546,7 @@ async fn distributed_map_stages_and_ingest_refusals() {
     let monolithic = CoordinatorServiceImpl::new(vec![mono_addr])
         .with_bm25(Some(analysis.clone()), Default::default());
 
-    let stages = vec![ScoreStage {
+    let stages = [ScoreStage {
         operation: Some(pipestream_search::pb::score_stage::Operation::Op(
             ScoreOp::MultLog as i32,
         )),
@@ -564,12 +559,10 @@ async fn distributed_map_stages_and_ingest_refusals() {
         origin_lon: 0.0,
     }];
     for text in ["rust", "vector"] {
-        let (got, _, _) = distributed
-            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &[], &stages, &[], None)
+        let (got, _, _) = common::fanout::bm25_stages(&distributed, text, 6, &stages, None)
             .await
             .unwrap();
-        let (want, _, _) = monolithic
-            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &[], &stages, &[], None)
+        let (want, _, _) = common::fanout::bm25_stages(&monolithic, text, 6, &stages, None)
             .await
             .unwrap();
         assert_eq!(hit_signature(&got), hit_signature(&want), "query {text:?}");
@@ -577,8 +570,7 @@ async fn distributed_map_stages_and_ingest_refusals() {
     // The chain reorders and absent entries are identity: d2 has no
     // attrs entries, so its score is bitwise the unchained one.
     let unchained = distributed.fanout_bm25("rust", 6, None).await.unwrap();
-    let (chained, _, _) = distributed
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &stages, &[], None)
+    let (chained, _, _) = common::fanout::bm25_stages(&distributed, "rust", 6, &stages, None)
         .await
         .unwrap();
     assert_ne!(hit_signature(&unchained), hit_signature(&chained));
@@ -590,12 +582,11 @@ async fn distributed_map_stages_and_ingest_refusals() {
     );
 
     // A key no shard knows refuses, naming column[key] and the knob.
-    let typo = vec![ScoreStage {
+    let typo = [ScoreStage {
         key: "bost".to_string(),
         ..stages[0].clone()
     }];
-    let err = distributed
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &typo, &[], None)
+    let err = common::fanout::bm25_stages(&distributed, "rust", 6, &typo, None)
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);

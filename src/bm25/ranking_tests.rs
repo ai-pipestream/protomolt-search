@@ -43,7 +43,10 @@ impl Fixture {
         let directory = Directory::new();
         let rows = scores.len() as u32;
         let base = bm25::idf(u64::from(rows), rows);
-        let mut store = Bm25Store::new().with_numerics(&["cancel_base", "score"]);
+        let mut store = Bm25Store::new().with_columns(
+            crate::postings::ColumnKind::Numeric,
+            &["cancel_base", "score"],
+        );
         for (doc, &score) in scores.iter().enumerate() {
             let doc = doc as u32;
             let analyzed = AnalyzedDoc::body(vec![("x".into(), 1, vec![(0, 1)])], 1);

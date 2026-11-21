@@ -72,13 +72,7 @@ impl DocumentCatalog {
                 .map(|t| t.name().to_owned())
                 .collect::<Vec<_>>();
             let mut meta = tx.open_table(META).map_err(storage)?;
-            let header: DocumentCatalogHeader = decode_header(
-                meta.get("header")
-                    .map_err(storage)?
-                    .ok_or_else(|| Status::data_loss("catalog header missing"))?
-                    .value(),
-            )?;
-            validate_current_header(&header)?;
+            let header = current_header(&meta)?;
             let encoded = meta
                 .get(JOURNAL)
                 .map_err(storage)?

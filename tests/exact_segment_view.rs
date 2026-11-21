@@ -41,7 +41,7 @@ impl Fixture {
             let live = stage.join("live.bin");
             let image = stage.join("vector.index");
             let exact = stage.join("vectors.f32");
-            let mut documents = Bm25Store::with_fields(&["body"]);
+            let mut documents = Bm25Store::with_text_fields(&["body"]);
             for row in 0..2 {
                 documents.add_document(
                     row,

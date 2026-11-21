@@ -98,7 +98,10 @@ fn contribution(stage: &pb::ScoreStage, value: u64) -> f64 {
 }
 fn build_unsigned_pruning_store(path: &std::path::Path) -> CorpusStats {
     let (n, mut total) = (3000u32, 0u64);
-    let mut store = Bm25Store::with_fields(&["body"]).with_unsigned_integers(&["counter", "empty"]);
+    let mut store = Bm25Store::with_text_fields(&["body"]).with_columns(
+        pipestream_search::postings::ColumnKind::UnsignedInteger,
+        &["counter", "empty"],
+    );
     for doc in 0..n {
         let mut terms = vec![("a".into(), 1 + doc % 7, vec![])];
         for (m, t) in [(3, "b"), (61, "c")] {

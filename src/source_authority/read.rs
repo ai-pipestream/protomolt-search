@@ -13,21 +13,7 @@ impl SourceAuthorityStore {
         contract::principal(principal)?;
         self.guarded(|| {
             let tx = self.inner.database().begin_read().map_err(storage)?;
-            let meta = tx.open_table(META).map_err(storage)?;
-            let header: SourceAuthorityHeader = contract::decode(
-                meta.get("header")
-                    .map_err(storage)?
-                    .ok_or_else(|| missing("header"))?
-                    .value(),
-            )?;
-            recovery::header(&header, &self.inner.identity)?;
-            let policy: AccessPolicy = contract::decode(
-                meta.get("policy")
-                    .map_err(storage)?
-                    .ok_or_else(|| missing("policy"))?
-                    .value(),
-            )?;
-            contract::policy(&policy).map_err(corrupt)?;
+            let policy = self.committed_policy(&tx)?;
             crate::authorization::authorize_policy_snapshot(&policy, principal, collection, action)
         })
     }

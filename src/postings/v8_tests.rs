@@ -12,9 +12,9 @@ use super::*;
 fn v8_store(columns: bool) -> Bm25Store {
     let mut store = if columns {
         Bm25Store::new()
-            .with_facets(&["court"])
-            .with_integers(&["cited"])
-            .with_geos(&["place"])
+            .with_columns(crate::postings::ColumnKind::Facet, &["court"])
+            .with_columns(crate::postings::ColumnKind::Integer, &["cited"])
+            .with_columns(crate::postings::ColumnKind::Geo, &["place"])
     } else {
         Bm25Store::new()
     };

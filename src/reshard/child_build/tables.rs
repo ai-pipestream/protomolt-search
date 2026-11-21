@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 
 use crate::pb::{AddDocumentsRequest, MappedAnalysisContract};
 
+use super::columns::ColumnSlots;
 use super::{ChildSchema, ColumnTables};
 
 /// Every table one child's BM25 store is built with.
@@ -12,6 +13,8 @@ pub(super) struct ChildTables {
     /// Text fields, body first.
     pub(super) fields: Vec<String>,
     pub(super) columns: ColumnTables,
+    /// `columns` indexed by name, for per-row slot lookup.
+    pub(super) slots: ColumnSlots,
     /// Fields that keep token positions.
     pub(super) positions: Vec<String>,
     /// Fields that keep sentence spans.
@@ -42,6 +45,7 @@ impl ChildTables {
         })?;
         Ok(Self {
             fields,
+            slots: ColumnSlots::new(&columns)?,
             columns,
             positions,
             sentences,
@@ -145,4 +149,44 @@ fn layer_table(
         }
     }
     Ok(table.into_iter().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derive_refuses_duplicate_column_names_within_a_family() {
+        let columns = ColumnTables {
+            facets: vec!["court".into(), "court".into()],
+            ..Default::default()
+        };
+        let schema = ChildSchema {
+            columns: Some(&columns),
+            ..Default::default()
+        };
+        let err = ChildTables::derive(&[], &schema, &MappedAnalysisContract::default())
+            .err()
+            .expect("duplicate facet column must fail closed");
+        assert!(
+            err.contains("duplicate facet column \"court\""),
+            "unexpected error: {err}"
+        );
+
+        let int_columns = ColumnTables {
+            integers: vec!["year".into(), "cited".into(), "year".into()],
+            ..Default::default()
+        };
+        let int_schema = ChildSchema {
+            columns: Some(&int_columns),
+            ..Default::default()
+        };
+        let int_err = ChildTables::derive(&[], &int_schema, &MappedAnalysisContract::default())
+            .err()
+            .expect("duplicate integer column must fail closed");
+        assert!(
+            int_err.contains("duplicate integer column \"year\""),
+            "unexpected error: {int_err}"
+        );
+    }
 }

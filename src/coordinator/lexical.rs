@@ -20,38 +20,15 @@ impl CoordinatorServiceImpl {
         spec: Option<&crate::pb::AnalysisSpec>,
         min_score: f32,
     ) -> Result<Vec<Bm25Hit>, Status> {
-        self.fanout_bm25_faceted(text, k, spec, min_score, &[], &[], &[], &[], &[], None)
-            .await
-            .map(|(hits, _, _)| hits)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn fanout_bm25_faceted(
-        &self,
-        text: &str,
-        k: u32,
-        spec: Option<&crate::pb::AnalysisSpec>,
-        min_score: f32,
-        facet_fields: &[String],
-        map_facet_fields: &[crate::pb::MapFacetField],
-        range_facet_fields: &[crate::pb::RangeFacetField],
-        score_stages: &[crate::pb::ScoreStage],
-        geo_filters: &[crate::pb::GeoFilter],
-        filter: Option<&crate::pb::FilterExpr>,
-    ) -> Result<FacetedHits, Status> {
         let request = Bm25SearchRequest {
             text: text.into(),
             analysis: spec.cloned(),
             min_score,
-            facet_fields: facet_fields.to_vec(),
-            map_facet_fields: map_facet_fields.to_vec(),
-            range_facet_fields: range_facet_fields.to_vec(),
-            score_stages: score_stages.to_vec(),
-            geo_filters: geo_filters.to_vec(),
             ..Default::default()
         };
-        self.fanout_bm25_context(FlatLexicalQuery::new(&request, k, &[], filter)?)
+        self.fanout_bm25_context(FlatLexicalQuery::new(&request, k, &[], None)?)
             .await
+            .map(|(hits, _, _)| hits)
     }
 
     pub(super) async fn fanout_bm25_aggregated(
@@ -147,7 +124,7 @@ impl CoordinatorServiceImpl {
         Ok(terms)
     }
 
-    pub(crate) async fn fanout_bm25_context(
+    pub async fn fanout_bm25_context(
         &self,
         query: FlatLexicalQuery<'_>,
     ) -> Result<FacetedHits, Status> {

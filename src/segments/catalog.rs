@@ -201,7 +201,6 @@ impl SegmentCatalog {
             .ok_or("segment catalog epoch overflow")?;
         manifest.segments.push(metadata.clone());
         manifest.segments.sort_by_key(|segment| segment.base_label);
-        manifest.update_retained_format();
         let published = self.publish(manifest);
         if published.is_err() {
             cleanup_staged(&self.root, std::slice::from_ref(&metadata));

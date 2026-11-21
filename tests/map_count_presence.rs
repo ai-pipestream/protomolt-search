@@ -116,9 +116,9 @@ async fn explicit_map_ranges_preserve_typed_edges_and_refuse_lost_context() {
     use pipestream_search::{
         node::{Bm25Shard, NodeConfig, NodeServiceImpl},
         pb::node_service_server::NodeService,
-        postings::{AnalyzedDoc, Bm25Store},
+        postings::{AnalyzedDoc, Bm25Store, ColumnKind::MapNumeric},
     };
-    let mut data = Bm25Store::new().with_map_numerics(&["metrics"]);
+    let mut data = Bm25Store::new().with_columns(MapNumeric, &["metrics"]);
     for (row, value) in [Some(-1.0), Some(0.0), Some(2.0), Some(3.0), Some(6.0), None]
         .into_iter()
         .enumerate()

@@ -2,6 +2,23 @@
 
 use super::*;
 
+async fn run_scoped_hybrid(
+    reader: &CoordinatorServiceImpl,
+    query_id: &str,
+    k: u32,
+    legs: HybridLegs,
+) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
+    let req = crate::pb::HybridSearchRequest {
+        text: "word".into(),
+        vector: vec![0.25; 16],
+        analysis: Some(crate::analyzer::body_spec()),
+        ..Default::default()
+    };
+    let filters = RequestFilters::default();
+    let query = crate::coordinator::HybridQuery::from_request(query_id, &req, k, legs, &filters)?;
+    reader.fanout_hybrid_context(query).await
+}
+
 #[tokio::test]
 async fn fused_legs_admit_empty_shards_and_apply_the_document_view_to_both_lists() {
     let mut decision = access("semantic", FieldAction::Use);
@@ -26,27 +43,22 @@ async fn fused_legs_admit_empty_shards_and_apply_the_document_view_to_both_lists
                 .unwrap()
                 .for_vector_field("semantic")
                 .unwrap();
-            let result = reader
-                .fanout_hybrid(
-                    "scoped-legs",
-                    "word",
-                    &[0.25; 16],
-                    4,
-                    Some(&crate::analyzer::body_spec()),
-                    HybridLegs {
-                        leg_k: 4,
-                        vector_weight: 1.0,
-                        bm25_weight: 1.0,
-                        rrf_k: 60.0,
-                        fusion_mode: mode,
-                        normalization: fusion::Normalization::MinMax,
-                        combination: fusion::Combination::Arithmetic,
-                        min_vector_score: 0.0,
-                    },
-                    false,
-                    &RequestFilters::default(),
-                )
-                .await;
+            let result = run_scoped_hybrid(
+                &reader,
+                "scoped-legs",
+                4,
+                HybridLegs {
+                    leg_k: 4,
+                    vector_weight: 1.0,
+                    bm25_weight: 1.0,
+                    rrf_k: 60.0,
+                    fusion_mode: mode,
+                    normalization: fusion::Normalization::MinMax,
+                    combination: fusion::Combination::Arithmetic,
+                    min_vector_score: 0.0,
+                },
+            )
+            .await;
             if empty_incompatible {
                 let error = result.unwrap_err();
                 assert_eq!(error.code(), tonic::Code::FailedPrecondition);
@@ -108,31 +120,11 @@ async fn decomposed_lexical_admission_matches_a_physically_restricted_corpus() {
         combination: fusion::Combination::Arithmetic,
         min_vector_score: 0.0,
     };
-    let expected = reference
-        .fanout_hybrid(
-            "restricted",
-            "word",
-            &[0.25; 16],
-            1,
-            Some(&crate::analyzer::body_spec()),
-            legs,
-            false,
-            &RequestFilters::default(),
-        )
+    let expected = run_scoped_hybrid(&reference, "restricted", 1, legs)
         .await
         .unwrap()
         .0;
-    let actual = scoped
-        .fanout_hybrid(
-            "scoped",
-            "word",
-            &[0.25; 16],
-            1,
-            Some(&crate::analyzer::body_spec()),
-            legs,
-            false,
-            &RequestFilters::default(),
-        )
+    let actual = run_scoped_hybrid(&scoped, "scoped", 1, legs)
         .await
         .unwrap()
         .0;

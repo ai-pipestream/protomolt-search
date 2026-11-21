@@ -14,7 +14,9 @@ use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     AddDocumentsRequest, Bm25Hit, Bm25SearchRequest, NumericValue, QueryField, ScoreOp, ScoreStage,
 };
-use pipestream_search::postings::{AnalyzedDoc, Bm25Reader, Bm25Store, SpillBuilder};
+use pipestream_search::postings::{
+    AnalyzedDoc, Bm25Reader, Bm25Store, ColumnKind::*, SpillBuilder,
+};
 use pipestream_search::scorefn::{ColumnRef, NumericRead, ScoreChain, Stage, StageOp};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -175,9 +177,9 @@ fn numeric_columns_roundtrip_and_dual_writers_agree() {
     ];
 
     // A store with BOTH column kinds, to pin the kinded table.
-    let mut store = Bm25Store::with_fields(&["body"])
-        .with_facets(&["court"])
-        .with_numerics(&["date"]);
+    let mut store = Bm25Store::with_text_fields(&["body"])
+        .with_columns(Facet, &["court"])
+        .with_columns(Numeric, &["date"]);
     for (i, (text, terms, date)) in docs.iter().enumerate() {
         store.add_document(i as u32, text.to_string(), analyzed(terms));
         if let Some(d) = date {
@@ -190,10 +192,10 @@ fn numeric_columns_roundtrip_and_dual_writers_agree() {
     let bytes = std::fs::read(&heap_path).unwrap();
     assert_eq!(&bytes[..8], b"TVBM2508");
 
-    let mut builder = SpillBuilder::create_with_fields(&dir.join("spill.build"), &["body"])
+    let mut builder = SpillBuilder::create_with_text_fields(&dir.join("spill.build"), &["body"])
         .unwrap()
-        .with_facet_fields(&["court"])
-        .with_numeric_fields(&["date"])
+        .with_columns(Facet, &["court"])
+        .with_columns(Numeric, &["date"])
         .with_buffer_bytes(32);
     for (i, (text, terms, date)) in docs.iter().enumerate() {
         builder
@@ -229,7 +231,7 @@ fn numeric_columns_roundtrip_and_dual_writers_agree() {
     assert_eq!(loaded.numeric_min_max(0), (-3.0, 150.5));
 
     // Numerics alone still opt the shard into v7.
-    let mut only_numeric = Bm25Store::with_fields(&["body"]).with_numerics(&["date"]);
+    let mut only_numeric = Bm25Store::with_text_fields(&["body"]).with_columns(Numeric, &["date"]);
     only_numeric.add_document(0, "rust".to_string(), analyzed(&[("rust", 1)]));
     only_numeric.set_numeric(0, 0, 7.0);
     let numeric_path = dir.join("numeric.bm25");
@@ -340,7 +342,7 @@ fn chained_pruned_matches_chained_exhaustive_bitwise() {
 fn build_numeric_chain_store(path: &std::path::Path) -> CorpusStats {
     let n = 3000u32;
     let mut total = 0u64;
-    let mut store = Bm25Store::with_fields(&["body"]).with_numerics(&["date"]);
+    let mut store = Bm25Store::with_text_fields(&["body"]).with_columns(Numeric, &["date"]);
     for doc in 0..n {
         let tf_a = 1 + (u64::from(doc) * 2654435761 % 7) as u32;
         let mut terms = vec![("a".to_string(), tf_a, Vec::new())];
@@ -388,12 +390,10 @@ async fn distributed_chain_matches_monolith_and_reorders() {
 
     let stages = vec![decay_stage(300.0, 100.0)];
     for text in ["rust", "search rust", "vector"] {
-        let (got, _, _) = distributed
-            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &[], &stages, &[], None)
+        let (got, _, _) = common::fanout::bm25_stages(&distributed, text, 6, &stages, None)
             .await
             .unwrap();
-        let (want, _, _) = monolithic
-            .fanout_bm25_faceted(text, 6, None, 0.0, &[], &[], &[], &stages, &[], None)
+        let (want, _, _) = common::fanout::bm25_stages(&monolithic, text, 6, &stages, None)
             .await
             .unwrap();
         assert_eq!(
@@ -406,8 +406,7 @@ async fn distributed_chain_matches_monolith_and_reorders() {
     // The chain reorders: unchained, d0 (tf=2) outranks d2 on "rust";
     // decayed toward date=300, d2 (factor 1) climbs above d0 (e^-2).
     let unchained = distributed.fanout_bm25("rust", 6, None).await.unwrap();
-    let (chained, _, _) = distributed
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &stages, &[], None)
+    let (chained, _, _) = common::fanout::bm25_stages(&distributed, "rust", 6, &stages, None)
         .await
         .unwrap();
     assert_eq!(unchained.len(), chained.len(), "same match set");
@@ -482,12 +481,11 @@ async fn stage_and_ingest_refusals_are_loud() {
         .with_bm25(Some(analysis.clone()), Default::default());
 
     // A typo'd column would be an identity chain everywhere: refused.
-    let typo = vec![ScoreStage {
+    let typo = [ScoreStage {
         column: "dat".to_string(),
         ..decay_stage(300.0, 100.0)
     }];
-    let err = coordinator
-        .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &typo, &[], None)
+    let err = common::fanout::bm25_stages(&coordinator, "rust", 6, &typo, None)
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -537,8 +535,7 @@ async fn stage_and_ingest_refusals_are_loud() {
             "unknown op",
         ),
     ] {
-        let err = coordinator
-            .fanout_bm25_faceted("rust", 6, None, 0.0, &[], &[], &[], &[bad], &[], None)
+        let err = common::fanout::bm25_stages(&coordinator, "rust", 6, &[bad], None)
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument, "{needle}");

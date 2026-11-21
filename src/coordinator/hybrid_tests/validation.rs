@@ -153,47 +153,52 @@ fn borrowed_request_constructors_preserve_preanalysis_and_normalized_options() {
 }
 
 #[tokio::test]
-async fn legacy_empty_searches_keep_their_early_return_after_validation() {
+async fn empty_searches_keep_their_early_return_after_validation() {
     let coordinator = CoordinatorServiceImpl::new(Vec::new());
     let filters = RequestFilters::default();
     assert!(coordinator
-        .fanout_hybrid("id", "", &[], 0, None, default_legs(), false, &filters)
+        .fanout_hybrid_context(
+            crate::coordinator::HybridQuery::from_request(
+                "id",
+                &crate::pb::HybridSearchRequest::default(),
+                0,
+                default_legs(),
+                &filters
+            )
+            .unwrap()
+        )
         .await
         .unwrap()
         .0
         .is_empty());
     assert!(coordinator
-        .fanout_cascade("id", "", &[], 0, None, 0.0, false, &filters)
+        .fanout_cascade_context(
+            crate::coordinator::CascadeQuery::from_request(
+                "id",
+                &crate::pb::HybridSearchRequest::default(),
+                0,
+                0.0,
+                &filters
+            )
+            .unwrap()
+        )
         .await
         .unwrap()
         .0
         .is_empty());
+    let request = crate::pb::HybridSearchRequest::default();
+    let nan_rrf = HybridLegs {
+        rrf_k: f64::NAN,
+        ..default_legs()
+    };
+    let refused = HybridQuery::from_request("id", &request, 0, nan_rrf, &filters).err();
     assert_eq!(
-        coordinator
-            .fanout_hybrid(
-                "id",
-                "",
-                &[],
-                0,
-                None,
-                HybridLegs {
-                    rrf_k: f64::NAN,
-                    ..default_legs()
-                },
-                false,
-                &filters
-            )
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::InvalidArgument
+        refused.map(|status| status.code()),
+        Some(tonic::Code::InvalidArgument)
     );
+    let refused = CascadeQuery::from_request("id", &request, 0, f32::NAN, &filters).err();
     assert_eq!(
-        coordinator
-            .fanout_cascade("id", "", &[], 0, None, f32::NAN, false, &filters)
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::InvalidArgument
+        refused.map(|status| status.code()),
+        Some(tonic::Code::InvalidArgument)
     );
 }

@@ -837,12 +837,12 @@ fn section(reader: &Bm25Reader, name: &str) -> u64 {
 fn positions_and_bigrams_are_priced_exactly() {
     let dir = tempdir("cost");
     let corpus = synthetic_corpus(2000);
-    let mut plain = Bm25Store::with_fields(&["body"]);
-    let mut positional = Bm25Store::with_fields(&["body"]).with_positions(&["body"]);
-    let mut bigrams = Bm25Store::with_fields(&["body", "body.bigrams"]);
+    let mut plain = Bm25Store::with_text_fields(&["body"]);
+    let mut positional = Bm25Store::with_text_fields(&["body"]).with_positions(&["body"]);
+    let mut bigrams = Bm25Store::with_text_fields(&["body", "body.bigrams"]);
     // The bigram column alone, as an ordinary single-field store: the
     // oracle for "a bigram is a term with no extra payload".
-    let mut bigrams_alone = Bm25Store::with_fields(&["body"]);
+    let mut bigrams_alone = Bm25Store::with_text_fields(&["body"]);
     let mut occurrences = 0u64;
     let mut bigram_postings = 0u64;
     for (i, text) in corpus.iter().enumerate() {

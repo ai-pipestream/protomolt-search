@@ -54,9 +54,11 @@ pub(super) fn shard_authority(
             guard.bm25.as_ref(),
             deleted.clone(),
             n,
-            &[],
-            &[],
-            view.filter.as_ref(),
+            ShardFilterInputs {
+                geo: &[],
+                regions: &[],
+                tree: view.filter.as_ref(),
+            },
             prune_enabled,
             None,
         )?;

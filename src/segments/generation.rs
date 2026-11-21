@@ -295,7 +295,8 @@ mod tests {
 
     fn declaration() -> IndexGenerationDeclaration {
         from_store(
-            &Bm25Store::with_fields(&["body"]).with_unsigned_integers(&["empty"]),
+            &Bm25Store::with_text_fields(&["body"])
+                .with_columns(crate::postings::ColumnKind::UnsignedInteger, &["empty"]),
             None,
         )
         .unwrap()
@@ -388,10 +389,11 @@ mod tests {
     fn empty_tail_restores_analysis_without_losing_empty_columns() {
         let mut persisted = declaration();
         persisted.text_fields[0].analysis_fingerprint = Some(17);
-        let mut tail = Bm25Store::with_fields(&["body"]).with_unsigned_integers(&["empty"]);
+        let mut tail = Bm25Store::with_text_fields(&["body"])
+            .with_columns(crate::postings::ColumnKind::UnsignedInteger, &["empty"]);
         restore_tail(&persisted, &mut tail).unwrap();
         assert_eq!(from_store(&tail, None).unwrap(), persisted);
-        let mut wrong = Bm25Store::with_fields(&["body"]);
+        let mut wrong = Bm25Store::with_text_fields(&["body"]);
         assert!(restore_tail(&persisted, &mut wrong).is_err());
         let mut changed = persisted.clone();
         changed.text_fields[0].analysis_fingerprint = Some(18);

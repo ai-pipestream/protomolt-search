@@ -27,12 +27,20 @@ fn full_signed_domain_and_missing_values_survive_both_writers_and_readers() {
                 _ => Some((1i64 << 53) + 1),
             })
             .collect();
-        let mut heap = Bm25Store::with_fields(&["body"]).with_integers(&["value", "absent"]);
-        let mut spill =
-            SpillBuilder::create_with_fields(&dir.join(format!("spill-{slots}.build")), &["body"])
-                .unwrap()
-                .with_integer_fields(&["value", "absent"])
-                .with_buffer_bytes(32);
+        let mut heap = Bm25Store::with_text_fields(&["body"]).with_columns(
+            pipestream_search::postings::ColumnKind::Integer,
+            &["value", "absent"],
+        );
+        let mut spill = SpillBuilder::create_with_text_fields(
+            &dir.join(format!("spill-{slots}.build")),
+            &["body"],
+        )
+        .unwrap()
+        .with_columns(
+            pipestream_search::postings::ColumnKind::Integer,
+            &["value", "absent"],
+        )
+        .with_buffer_bytes(32);
         for (row, value) in expected.iter().enumerate() {
             heap.add_document(row as u32, "word".into(), analyzed());
             spill
@@ -261,7 +269,8 @@ async fn mapped_numeric_presence_survives_reopen_and_compaction_replay() {
 #[test]
 fn malformed_presence_and_value_bytes_refuse_before_serving() {
     let dir = directory("corrupt");
-    let mut store = Bm25Store::with_fields(&["body"]).with_integers(&["value"]);
+    let mut store = Bm25Store::with_text_fields(&["body"])
+        .with_columns(pipestream_search::postings::ColumnKind::Integer, &["value"]);
     for row in 0..9 {
         store.add_document(row, "word".into(), analyzed());
         if row != 1 {

@@ -37,7 +37,7 @@ impl Drop for Scratch {
 }
 
 fn store(texts: &[&str]) -> Bm25Store {
-    let mut store = Bm25Store::with_fields(&["body"]);
+    let mut store = Bm25Store::with_text_fields(&["body"]);
     store
         .set_analysis_fingerprint(0, analysis_fingerprint(Some(&body_spec())))
         .unwrap();
@@ -329,7 +329,10 @@ async fn relay_is_one_configured_shard_for_lexical_ties() {
 }
 
 fn negative_image(path: &Path, adjustment: f64) {
-    let mut store = Bm25Store::with_fields(&["body"]).with_numerics(&["adjustment"]);
+    let mut store = Bm25Store::with_text_fields(&["body"]).with_columns(
+        pipestream_search::postings::ColumnKind::Numeric,
+        &["adjustment"],
+    );
     store
         .set_analysis_fingerprint(0, analysis_fingerprint(Some(&body_spec())))
         .unwrap();

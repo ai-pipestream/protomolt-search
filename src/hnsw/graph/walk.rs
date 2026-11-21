@@ -4,8 +4,7 @@
 use super::beam::LayerSearch;
 use super::search_layer::AwareSearch;
 use super::{
-    Filter, FloorPrune, Hook, LinkCells, Patience, Route, Scored, Scratch, SearchStats, View, Walk,
-    NO_NODE,
+    Filter, Hook, LinkCells, Route, Scored, Scratch, SearchStats, Steering, View, Walk, NO_NODE,
 };
 use crate::vector::Mask;
 
@@ -22,17 +21,19 @@ impl<L: LinkCells + ?Sized> View<'_, L> {
     /// Paper Algorithm 5: descend greedily from the entry to layer 1, then
     /// a beam of `ef` at layer 0, steered by `filter`, `patience`, and
     /// `floor_prune`. Results best first.
-    #[allow(clippy::too_many_arguments)]
     pub fn walk<H: Hook>(
         &self,
         q: &[f32],
         ef: usize,
-        filter: Filter<'_>,
-        patience: Patience,
-        floor_prune: FloorPrune,
+        steering: Steering<'_>,
         scratch: &mut Scratch,
         hook: &mut H,
     ) -> (Vec<Scored>, SearchStats, Walk) {
+        let Steering {
+            filter,
+            patience,
+            floor_prune,
+        } = steering;
         let mut stats = SearchStats::default();
         if self.entry == NO_NODE {
             return (Vec::new(), stats, Walk::Completed);

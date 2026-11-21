@@ -24,19 +24,10 @@ impl SourceAuthorityStore {
                     .value(),
             )?;
             let topologies = tx.open_table(TOPOLOGIES).map_err(storage)?;
-            let topology: ControlTopology = contract::decode(
-                topologies
-                    .get(
-                        ControlTopologyKey {
-                            key: Some(key.clone()),
-                            generation: state.topology_generation,
-                        }
-                        .encode_to_vec()
-                        .as_slice(),
-                    )
-                    .map_err(storage)?
-                    .ok_or_else(|| corrupt("current topology row is missing"))?
-                    .value(),
+            let topology = crate::source_authority::capacity::current_topology(
+                &topologies,
+                key,
+                state.topology_generation,
             )?;
             let prefix = resource_prefix(key);
             let end = prefix_end(&prefix).ok_or_else(|| corrupt("resource prefix overflow"))?;

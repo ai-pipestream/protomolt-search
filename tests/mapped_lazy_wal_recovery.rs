@@ -8,7 +8,7 @@ use pipestream_search::node::{NodeConfig, NodeServiceImpl};
 use pipestream_search::pb::ingest_mapped_request::Payload;
 use pipestream_search::pb::*;
 use pipestream_search::reshard::{self, SplitRequest};
-use pipestream_search::vector::{legacy_calibration_config, VectorIndex, EMBEDDED_TURBOVEC};
+use pipestream_search::vector::{embedded_turbovec_calibration, VectorIndex, EMBEDDED_TURBOVEC};
 use pipestream_search::{
     harness::unit_vectors, hnsw::HNSW, link::NodeLink, mapping::derive_plan, wal,
 };
@@ -97,7 +97,7 @@ fn assert_locked_manifest_and_split(gen_dir: &Path, split_out: &Path, backend: &
     assert_eq!(locked_cfg.backend_kind, backend);
     VectorIndex::from_backend_config(DIM, &locked_cfg).expect("locked config builds index");
     if backend == EMBEDDED_TURBOVEC {
-        let cal = legacy_calibration_config(&locked_cfg).unwrap().unwrap();
+        let cal = embedded_turbovec_calibration(&locked_cfg).unwrap().unwrap();
         assert_eq!(cal.bits_per_dimension, 4);
         return;
     }

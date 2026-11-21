@@ -183,8 +183,8 @@ fn the_mask_from_the_columns_is_the_row_by_row_mask_across_every_part() {
     let root = dir.join("catalog");
     let tail = || {
         Bm25Store::new()
-            .with_facets(&["court"])
-            .with_integers(&["year"])
+            .with_columns(pipestream_search::postings::ColumnKind::Facet, &["court"])
+            .with_columns(pipestream_search::postings::ColumnKind::Integer, &["year"])
     };
     let document = || AnalyzedDoc::body(vec![("opinion".into(), 1, vec![(0, 7)])], 1);
     let mut shard = SegmentedShard::open(&root, tail()).unwrap();
@@ -259,8 +259,8 @@ fn measure_the_mask_from_the_columns() {
     let root = dir.join("catalog");
     let tail = || {
         Bm25Store::new()
-            .with_facets(&["court"])
-            .with_integers(&["year"])
+            .with_columns(pipestream_search::postings::ColumnKind::Facet, &["court"])
+            .with_columns(pipestream_search::postings::ColumnKind::Integer, &["year"])
     };
     let document = || AnalyzedDoc::body(vec![("opinion".into(), 1, vec![(0, 7)])], 1);
     // 50%, 10%, 1% and 0.1% of the rows, and a long tail of rare values.

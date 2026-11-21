@@ -3,20 +3,32 @@
 
 use super::*;
 
+/// The host-owned state a transport listener serves: the Raft handle, the
+/// lease hold, snapshot staging and rejections, and the read-barrier bound.
+pub(crate) struct ListenerHost {
+    pub(crate) raft: Raft<ControlRaft>,
+    pub(crate) hold: LeaseHold,
+    pub(crate) staging: Arc<SnapshotStaging>,
+    pub(crate) rejections: Arc<SnapshotRejections>,
+    pub(crate) read_timeout: Duration,
+}
+
 impl RaftTransportService {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        raft: Raft<ControlRaft>,
+        host: ListenerHost,
         node_id: NodeId,
         directory: Arc<PeerDirectory>,
         isolation: Isolation,
         timing: String,
-        hold: LeaseHold,
-        staging: Arc<SnapshotStaging>,
-        rejections: Arc<SnapshotRejections>,
         limits: &TransportLimits,
-        read_timeout: Duration,
     ) -> Self {
+        let ListenerHost {
+            raft,
+            hold,
+            staging,
+            rejections,
+            read_timeout,
+        } = host;
         Self {
             raft,
             node_id,

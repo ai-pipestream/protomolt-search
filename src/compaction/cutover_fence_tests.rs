@@ -63,14 +63,16 @@ impl Fixture {
         self.node
             .apply_document_locked(
                 &mut guard,
-                AddDocumentsRequest {
-                    text: ["seed document", "replayed tail"][row].into(),
-                    analysis: Some(body_spec()),
-                    ..Default::default()
+                crate::node::MaterializedDocument {
+                    doc: AddDocumentsRequest {
+                        text: ["seed document", "replayed tail"][row].into(),
+                        analysis: Some(body_spec()),
+                        ..Default::default()
+                    },
+                    analyzed: self.analyzed[row].clone(),
+                    vector: Some(self.vector.clone()),
+                    stable_routing_key: None,
                 },
-                self.analyzed[row].clone(),
-                Some(self.vector.clone()),
-                None,
                 &mut 0,
                 &mut 0,
             )

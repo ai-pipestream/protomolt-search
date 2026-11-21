@@ -11,7 +11,7 @@ pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
 pub enum Tokenizer {
     /// Split on the Unicode `White_Space` property.
     Whitespace,
-    /// Unicode Standard Annex #29 word boundaries with OpenNLP-compatible
+    /// Unicode Standard Annex 29 (UAX-29) word boundaries with OpenNLP-compatible
     /// filtering of punctuation-only segments.
     Uax29,
 }
@@ -148,7 +148,7 @@ pub struct GlossaryMatch {
     pub id: String,
     pub registered_term: String,
     pub span: Span,
-    /// Number of UAX #29 tokens in the registered surface form.
+    /// Number of UAX-29 tokens in the registered surface form.
     pub token_count: u32,
 }
 

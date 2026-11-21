@@ -25,8 +25,8 @@ mod rows;
 mod validation;
 
 pub(super) use audit::validate;
+pub(super) use committed::{current_topology, load_committed, Committed};
 use committed::{derive, node_records};
-pub(super) use committed::{load_committed, Committed};
 use rows::{load_rows, rebuild, Rows};
 pub(super) use validation::observation_key;
 use validation::{observation_from_proto, validate_configuration, validate_stored_configure};

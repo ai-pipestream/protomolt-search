@@ -94,13 +94,15 @@ async fn cutover(
             })
             .collect();
         node.publish_document_maintenance_blocking(
-            &source,
-            b"books-index",
-            expected,
-            before.epoch(),
-            sources,
-            &scratch,
-            1,
+            pipestream_search::node::DocumentMaintenanceRequest {
+                source: &source,
+                index_key: b"books-index",
+                expected,
+                catalog_epoch: before.epoch(),
+                sources,
+                proof_scratch: &scratch,
+                proof_batch_rows: 1,
+            },
         )
     })
     .await

@@ -17,13 +17,7 @@ impl DocumentCatalog {
         catalog.with_durable_snapshot(|snapshot| {
             let tx = self.database.begin_read().map_err(storage)?;
             let meta = tx.open_table(META).map_err(storage)?;
-            let header: DocumentCatalogHeader = decode_header(
-                meta.get("header")
-                    .map_err(storage)?
-                    .ok_or_else(|| Status::data_loss("catalog header missing"))?
-                    .value(),
-            )?;
-            validate_current_header(&header)?;
+            let header = current_header(&meta)?;
             let states = tx.open_table(STATES).map_err(storage)?;
             let Some(bytes) = states.get(key).map_err(storage)? else {
                 return Ok(None);
@@ -80,13 +74,7 @@ impl DocumentCatalog {
         };
         let intent: MaintenanceIntent = decode(bytes.value())?;
         let meta = tx.open_table(META).map_err(storage)?;
-        let header: DocumentCatalogHeader = decode_header(
-            meta.get("header")
-                .map_err(storage)?
-                .ok_or_else(|| Status::data_loss("catalog header missing"))?
-                .value(),
-        )?;
-        validate_current_header(&header)?;
+        let header = current_header(&meta)?;
         validate_maintenance(&intent, key, &header.history_id, &header.collection)?;
         if intent.after_epoch != after_epoch || intent.encode_to_vec() != bytes.value() {
             return Err(Status::data_loss(
@@ -143,8 +131,7 @@ impl DocumentCatalog {
             let result;
             {
                 let meta = tx.open_table(META).map_err(storage)?;
-                let header: DocumentCatalogHeader = decode_header(meta.get("header").map_err(storage)?.ok_or_else(|| Status::data_loss("catalog header missing"))?.value())?;
-                validate_current_header(&header)?;
+                let header = current_header(&meta)?;
                 let mut states = tx.open_table(STATES).map_err(storage)?;
                 let mut state: ProjectionJournalState = decode(states.get(key).map_err(storage)?.ok_or_else(|| Status::not_found("maintenance index is not registered"))?.value())?;
                 validate_state(&state, key, &header.history_id)?;

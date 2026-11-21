@@ -64,7 +64,9 @@ fn slices_and_words_keep_the_slots() {
         let part = bits.slice(start, end);
         let end = end.min(300);
         assert_eq!(
-            part.to_bools(),
+            (0..part.len())
+                .map(|slot| part.test(slot))
+                .collect::<Vec<_>>(),
             bools[start.min(end)..end],
             "{start}..{end}"
         );

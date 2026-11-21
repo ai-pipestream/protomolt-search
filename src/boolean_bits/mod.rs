@@ -280,11 +280,6 @@ impl Bits {
         out
     }
 
-    /// A per-slot admission list, the shape the vector kernel masks with.
-    pub fn to_bools(&self) -> Vec<bool> {
-        (0..self.len).map(|slot| self.test(slot)).collect()
-    }
-
     /// The slots where at least `minimum` of `sets` hold the bit.
     /// `minimum == 0` is every slot below `len`; a minimum past the
     /// number of sets is no slot.

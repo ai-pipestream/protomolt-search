@@ -23,7 +23,10 @@ async fn leaf(offset: u64, different_binding: bool, empty: bool) -> NodeServiceI
     if different_binding {
         binding.plan_fingerprint = "b".repeat(64);
     }
-    let mut store = Bm25Store::new().with_facets(&["audience"]);
+    let mut store = Bm25Store::new().with_columns(
+        pipestream_search::postings::ColumnKind::Facet,
+        &["audience"],
+    );
     store.set_binding(Some(StoredBinding {
         plan_fingerprint: binding.plan_fingerprint.clone(),
         body_path: "body".into(),

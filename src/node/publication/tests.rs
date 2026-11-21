@@ -10,7 +10,7 @@ fn fixture(label: &str) -> (PathBuf, NodeConfig, Arc<OpenedSegmentSet>) {
     let path = root.join("index");
     let bm25_path = root.join("documents.bm25");
     let live_path = root.join("live.bin");
-    let mut store = crate::postings::Bm25Store::with_fields(&["body"]);
+    let mut store = crate::postings::Bm25Store::with_text_fields(&["body"]);
     for row in 0..2 {
         store.add_document(
             row,

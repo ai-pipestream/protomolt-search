@@ -152,3 +152,22 @@ pub enum Walk {
     /// name the allowed rows already scored.
     Budget,
 }
+
+/// Everything that steers one layer-0 beam besides its width.
+#[derive(Clone, Copy)]
+pub struct Steering<'a> {
+    pub filter: Filter<'a>,
+    pub patience: Patience,
+    pub floor_prune: FloorPrune,
+}
+
+impl<'a> Steering<'a> {
+    /// `filter` with patience and floor pruning off.
+    pub const fn filtered(filter: Filter<'a>) -> Self {
+        Self {
+            filter,
+            patience: Patience::OFF,
+            floor_prune: FloorPrune::OFF,
+        }
+    }
+}

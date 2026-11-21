@@ -141,7 +141,7 @@ fn random_two_field_corpus(
 }
 
 fn build_store(corpus: &[(u32, String, AnalyzedDoc)]) -> Bm25Store {
-    let mut store = Bm25Store::with_fields(&["body", "name"]);
+    let mut store = Bm25Store::with_text_fields(&["body", "name"]);
     for (id, text, doc) in corpus {
         store.add_document(*id, text.clone(), doc.clone());
     }
@@ -393,7 +393,7 @@ fn check_identical_doc_ties(dir: &std::path::Path) {
     let body_terms = vec!["court".to_string()];
     let name_terms = vec!["smith".to_string()];
     let name_params = Bm25Params { k1: 0.5, b: 0.0 };
-    let mut store = Bm25Store::with_fields(&["body", "name"]);
+    let mut store = Bm25Store::with_text_fields(&["body", "name"]);
     for i in 0..400u32 {
         let f0 = AnalyzedField {
             terms: vec![("court".to_string(), 2, vec![(0, 4), (10, 14)])],
@@ -457,7 +457,7 @@ fn check_cross_block_ties(dir: &std::path::Path) {
     let body_terms = vec!["court".to_string()];
     let name_terms = vec!["smith".to_string()];
     let name_params = Bm25Params { k1: 0.5, b: 0.0 };
-    let mut store = Bm25Store::with_fields(&["body", "name"]);
+    let mut store = Bm25Store::with_text_fields(&["body", "name"]);
     for i in 0..300u32 {
         let mut fields = vec![AnalyzedField {
             terms: vec![("court".to_string(), 1, vec![(0, 4)])],
@@ -525,7 +525,7 @@ fn fused_ties_at_floor_and_kth_slot() {
 }
 
 fn build_skip_store(path: &std::path::Path) -> Bm25Store {
-    let mut store = Bm25Store::with_fields(&["body", "name"]);
+    let mut store = Bm25Store::with_text_fields(&["body", "name"]);
     for i in 0..3000u32 {
         let f0 = AnalyzedField {
             terms: vec![

@@ -396,9 +396,11 @@ async fn stale_catalog_cannot_republish_over_equal_row_snapshot() {
     copy_tail(&pinned, &tail);
     let validation = SegmentCatalog::open(dir.0.join("validation")).unwrap();
     stale_append(&validation, &tail, 0).expect("copied tail must be a valid segment");
-    let mut old_view =
-        SegmentedShard::open_catalog(stale.clone(), Bm25Store::new().with_facets(&["tag"]))
-            .unwrap();
+    let mut old_view = SegmentedShard::open_catalog(
+        stale.clone(),
+        Bm25Store::new().with_columns(pipestream_search::postings::ColumnKind::Facet, &["tag"]),
+    )
+    .unwrap();
     let old_text = old_view.text(0);
     let repository = dir.0.join("repository");
     export_snapshot(&source.addr, &repository).await.unwrap();

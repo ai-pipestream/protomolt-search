@@ -86,17 +86,29 @@ fn open_builder(path: &Path, tables: &ChildTables) -> Result<SpillBuilder, Strin
     spill_dir.push(".build");
     let spill_dir = PathBuf::from(spill_dir);
     let c = &tables.columns;
-    let builder = SpillBuilder::create_with_fields(&spill_dir, &names(&tables.fields))
+    let builder = SpillBuilder::create_with_text_fields(&spill_dir, &names(&tables.fields))
         .map_err(|e| format!("spill dir {}: {e}", spill_dir.display()))?
-        .with_facet_fields(&names(&c.facets))
-        .with_numeric_fields(&names(&c.numerics))
-        .with_map_facet_fields(&names(&c.map_facets))
-        .with_map_numeric_fields(&names(&c.map_numerics))
-        .with_map_integer_fields(&names(&c.map_integers))
-        .with_map_unsigned_integer_fields(&names(&c.map_unsigned_integers))
-        .with_integer_fields(&names(&c.integers))
-        .with_unsigned_integer_fields(&names(&c.unsigned_integers))
-        .with_geo_fields(&names(&c.geo))
+        .with_columns(crate::postings::ColumnKind::Facet, &names(&c.facets))
+        .with_columns(crate::postings::ColumnKind::Numeric, &names(&c.numerics))
+        .with_columns(crate::postings::ColumnKind::MapFacet, &names(&c.map_facets))
+        .with_columns(
+            crate::postings::ColumnKind::MapNumeric,
+            &names(&c.map_numerics),
+        )
+        .with_columns(
+            crate::postings::ColumnKind::MapInteger,
+            &names(&c.map_integers),
+        )
+        .with_columns(
+            crate::postings::ColumnKind::MapUnsignedInteger,
+            &names(&c.map_unsigned_integers),
+        )
+        .with_columns(crate::postings::ColumnKind::Integer, &names(&c.integers))
+        .with_columns(
+            crate::postings::ColumnKind::UnsignedInteger,
+            &names(&c.unsigned_integers),
+        )
+        .with_columns(crate::postings::ColumnKind::Geo, &names(&c.geo))
         .with_position_fields(&names(&tables.positions))
         .with_sentence_fields(&names(&tables.sentences));
     Ok(builder)
@@ -211,7 +223,7 @@ fn add_row(
     let fields = document::assemble_fields(&tables.fields, local, doc, source)?;
     document::set_fingerprints(builder, &tables.fields, doc)?;
     document::add_document(builder, local, doc, fields)?;
-    super::columns::set_columns(builder, &tables.columns, local, doc)
+    super::columns::set_columns(builder, &tables.slots, local, doc)
 }
 
 /// Rewrite rows `[lo, hi)` of an already-built child store as a standalone

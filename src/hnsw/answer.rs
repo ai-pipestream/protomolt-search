@@ -117,16 +117,12 @@ impl HnswIndex {
         } else {
             0.0
         });
-        let filter = plan.filter();
-        with_view!(self, |view| view.walk(
-            query,
-            ef,
-            filter,
+        let steering = graph::Steering {
+            filter: plan.filter(),
             patience,
             floor_prune,
-            scratch,
-            hook
-        ))
+        };
+        with_view!(self, |view| view.walk(query, ef, steering, scratch, hook))
     }
 
     /// One query under a plan: up to `k` `(row, score)` best first, and

@@ -141,7 +141,6 @@ impl Inputs<'_> {
 /// Mark the catalog as the owned, declared generation a rewrite requires.
 fn declare_owned_generation(catalog: &SegmentCatalog, root: &Path, backend: VectorBackendConfig) {
     let mut manifest = catalog.snapshot().published_manifest();
-    manifest.format = 4;
     manifest.source_owner = Some(
         SegmentSourceOwner::encode(&crate::pb::storage::SourceIndexOwner {
             format_version: 1,

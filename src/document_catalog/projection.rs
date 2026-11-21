@@ -43,13 +43,7 @@ impl DocumentCatalog {
     ) -> Result<PreparedDocumentProjection, Status> {
         let transaction = self.database.begin_read().map_err(storage)?;
         let meta = transaction.open_table(META).map_err(storage)?;
-        let header: DocumentCatalogHeader = decode_header(
-            meta.get("header")
-                .map_err(storage)?
-                .ok_or_else(|| Status::data_loss("catalog header missing"))?
-                .value(),
-        )?;
-        validate_current_header(&header)?;
+        let header = current_header(&meta)?;
         if header.history_id != request.history_id {
             return Err(Status::failed_precondition(
                 "projection belongs to another catalog history",

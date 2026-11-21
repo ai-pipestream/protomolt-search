@@ -9,7 +9,7 @@ use tonic::Code;
 
 #[test]
 fn accepted_receipt_survives_process_exit_without_drop() {
-    const ENV: &str = "PROTOMOLT_REPLAY_JOURNAL_EXIT_TEST";
+    const ENV: &str = "PIPESTREAM_SEARCH_REPLAY_JOURNAL_EXIT_TEST";
     if let Some(path) = std::env::var_os(ENV) {
         let journal = ReplayJournal::create(std::path::Path::new(&path), binding()).unwrap();
         let receipt = accept(&journal, &first("exit")).unwrap();

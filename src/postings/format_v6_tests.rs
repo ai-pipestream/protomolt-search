@@ -158,7 +158,7 @@ pub(super) fn two_field_corpus() -> Vec<(u32, String, AnalyzedDoc, Option<DocLin
 }
 
 fn two_field_store() -> Bm25Store {
-    let mut store = Bm25Store::with_fields(&["body", "case_name"]);
+    let mut store = Bm25Store::with_text_fields(&["body", "case_name"]);
     for (id, text, doc, lineage) in two_field_corpus() {
         store.add_document_with_lineage(id, text, doc, lineage);
     }

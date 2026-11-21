@@ -170,13 +170,18 @@ fn copy_rechecks_mutations_after_acquiring_the_seal_fence_with_or_without_wal() 
         service
             .apply_document_locked(
                 &mut write_shard(&service.state),
-                AddDocumentsRequest {
-                    text: "word".into(),
-                    ..Default::default()
+                crate::node::MaterializedDocument {
+                    doc: AddDocumentsRequest {
+                        text: "word".into(),
+                        ..Default::default()
+                    },
+                    analyzed: crate::postings::AnalyzedDoc::body(
+                        vec![("word".into(), 1, vec![(0, 4)])],
+                        1,
+                    ),
+                    vector: None,
+                    stable_routing_key: None,
                 },
-                crate::postings::AnalyzedDoc::body(vec![("word".into(), 1, vec![(0, 4)])], 1),
-                None,
-                None,
                 &mut 0,
                 &mut 0,
             )

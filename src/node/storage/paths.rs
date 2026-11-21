@@ -51,16 +51,22 @@ pub(crate) fn heap_store(config: &NodeConfig) -> Result<Bm25Store, String> {
     let geos: Vec<&str> = config.geo_fields.iter().map(String::as_str).collect();
     let positions: Vec<&str> = config.position_fields.iter().map(String::as_str).collect();
     let sentences: Vec<&str> = config.sentence_fields.iter().map(String::as_str).collect();
-    let mut store = Bm25Store::with_fields(&names)
-        .with_facets(&facets)
-        .with_numerics(&numerics)
-        .with_map_facets(&map_facets)
-        .with_map_numerics(&map_numerics)
-        .with_map_integers(&map_integers)
-        .with_map_unsigned_integers(&map_unsigned_integers)
-        .with_integers(&integers)
-        .with_unsigned_integers(&unsigned_integers)
-        .with_geos(&geos)
+    let mut store = Bm25Store::with_text_fields(&names)
+        .with_columns(crate::postings::ColumnKind::Facet, &facets)
+        .with_columns(crate::postings::ColumnKind::Numeric, &numerics)
+        .with_columns(crate::postings::ColumnKind::MapFacet, &map_facets)
+        .with_columns(crate::postings::ColumnKind::MapNumeric, &map_numerics)
+        .with_columns(crate::postings::ColumnKind::MapInteger, &map_integers)
+        .with_columns(
+            crate::postings::ColumnKind::MapUnsignedInteger,
+            &map_unsigned_integers,
+        )
+        .with_columns(crate::postings::ColumnKind::Integer, &integers)
+        .with_columns(
+            crate::postings::ColumnKind::UnsignedInteger,
+            &unsigned_integers,
+        )
+        .with_columns(crate::postings::ColumnKind::Geo, &geos)
         .with_positions(&positions)
         .with_sentences(&sentences);
     store.set_derived(stored_derived(config));

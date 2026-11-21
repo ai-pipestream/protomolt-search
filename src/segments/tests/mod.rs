@@ -158,7 +158,7 @@ fn source_owner_metadata_rejects_downgrade_corruption_and_noncanonical_protobuf(
     assert!(unknown.decode().is_err());
     let root = std::env::temp_dir().join(format!("source-owner-format-{}", std::process::id()));
     let valid_manifest = SegmentSetManifest {
-        format: 3,
+        format: 5,
         source_owner: Some(valid),
         ..Default::default()
     };
@@ -168,8 +168,8 @@ fn source_owner_metadata_rejects_downgrade_corruption_and_noncanonical_protobuf(
         let mut invalid = valid_manifest.clone();
         match case {
             0 => invalid.format = 1,
-            1 => invalid.format = 2,
-            2 => invalid.source_owner = None,
+            1 => invalid.format = 4,
+            2 => invalid.format = 6,
             _ => invalid.source_owner = Some(corrupted.clone()),
         }
         assert!(

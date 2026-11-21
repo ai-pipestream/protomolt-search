@@ -137,25 +137,24 @@ async fn verify(addresses: Vec<String>) {
                     } else {
                         pipestream_search::cel::compile_filter(filter).unwrap()
                     };
-                    let (_, _, fused) = coord
-                        .fanout_bm25_fused_faceted(
-                            text,
-                            1,
-                            &[pb::QueryField {
-                                field: "body".into(),
-                                analysis: Some(body_spec()),
-                                weight: 1.0,
-                                ..Default::default()
-                            }],
-                            0.0,
-                            &[],
-                            &[],
-                            &fields,
-                            &[],
-                            filter_expr.as_ref(),
-                        )
-                        .await
-                        .unwrap();
+                    let req = pb::Bm25SearchRequest {
+                        text: text.into(),
+                        fields: vec![pb::QueryField {
+                            field: "body".into(),
+                            analysis: Some(body_spec()),
+                            weight: 1.0,
+                            ..Default::default()
+                        }],
+                        range_facet_fields: fields.to_vec(),
+                        ..Default::default()
+                    };
+                    let fquery = pipestream_search::coordinator::FusedLexicalQuery::new(
+                        &req,
+                        1,
+                        filter_expr.as_ref(),
+                    )
+                    .unwrap();
+                    let (_, _, fused) = coord.fanout_bm25_fused_context(fquery).await.unwrap();
                     assert_eq!(fused, result.range_facets);
                 }
                 assert!(result.hits.len() <= 1);

@@ -24,6 +24,7 @@ pub(crate) struct ModuleSummary {
     pub(crate) dead_code_allows: Vec<String>,
     pub(crate) doc_breadcrumbs: Vec<String>,
     pub(crate) slop_comments: Vec<String>,
+    pub(crate) issue_breadcrumbs: Vec<String>,
 }
 
 pub(crate) struct WorkspaceScan {
@@ -76,6 +77,10 @@ fn fold_file_into_module(rel: &str, report: FileReport, sum: &mut ModuleSummary)
     }
     for (line, phrase) in report.comments.slop_phrases {
         sum.slop_comments.push(format!("{rel}:{line} ({phrase:?})"));
+    }
+    for (line, issue) in report.comments.issue_breadcrumbs {
+        sum.issue_breadcrumbs
+            .push(format!("{rel}:{line} ({issue})"));
     }
 }
 

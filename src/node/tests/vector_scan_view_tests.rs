@@ -35,7 +35,8 @@ fn scan_job(
 
 #[test]
 fn one_coalesced_pass_keeps_each_jobs_authority_and_rejects_only_the_bad_job() {
-    let mut store = crate::postings::Bm25Store::new().with_facets(&["audience"]);
+    let mut store = crate::postings::Bm25Store::new()
+        .with_columns(crate::postings::ColumnKind::Facet, &["audience"]);
     for (row, audience) in ["public", "private"].into_iter().enumerate() {
         store.add_document(
             row as u32,

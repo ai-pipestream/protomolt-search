@@ -57,16 +57,22 @@ impl<'a> ColumnTables<'a> {
     }
 
     fn heap_builder(&self, config: &NodeConfig) -> Bm25Shard {
-        let mut store = Bm25Store::with_fields(&self.names)
-            .with_facets(&self.facets)
-            .with_numerics(&self.numerics)
-            .with_map_facets(&self.map_facets)
-            .with_map_numerics(&self.map_numerics)
-            .with_map_integers(&self.map_integers)
-            .with_map_unsigned_integers(&self.map_unsigned_integers)
-            .with_integers(&self.integers)
-            .with_unsigned_integers(&self.unsigned_integers)
-            .with_geos(&self.geos)
+        let mut store = Bm25Store::with_text_fields(&self.names)
+            .with_columns(crate::postings::ColumnKind::Facet, &self.facets)
+            .with_columns(crate::postings::ColumnKind::Numeric, &self.numerics)
+            .with_columns(crate::postings::ColumnKind::MapFacet, &self.map_facets)
+            .with_columns(crate::postings::ColumnKind::MapNumeric, &self.map_numerics)
+            .with_columns(crate::postings::ColumnKind::MapInteger, &self.map_integers)
+            .with_columns(
+                crate::postings::ColumnKind::MapUnsignedInteger,
+                &self.map_unsigned_integers,
+            )
+            .with_columns(crate::postings::ColumnKind::Integer, &self.integers)
+            .with_columns(
+                crate::postings::ColumnKind::UnsignedInteger,
+                &self.unsigned_integers,
+            )
+            .with_columns(crate::postings::ColumnKind::Geo, &self.geos)
             .with_positions(&self.positions)
             .with_sentences(&self.sentences);
         store.set_derived(stored_derived(config));

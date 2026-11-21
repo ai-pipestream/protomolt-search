@@ -20,24 +20,8 @@ struct CascadeTiming {
 }
 
 impl CoordinatorServiceImpl {
-    #[allow(clippy::too_many_arguments)]
-    pub async fn fanout_cascade(
-        &self,
-        request_id: &str,
-        text: &str,
-        vector: &[f32],
-        k: u32,
-        spec: Option<&crate::pb::AnalysisSpec>,
-        min_vector_score: f32,
-        debug: bool,
-        filters: &RequestFilters,
-    ) -> Result<(Vec<CascadeHit>, Option<HybridDebug>), Status> {
-        let input = HybridInput::new(request_id, text, vector, k, spec, filters)?;
-        self.fanout_cascade_context(CascadeQuery::new(input, min_vector_score, debug)?)
-            .await
-    }
-
-    pub(crate) async fn fanout_cascade_context(
+    /// Vector candidates rescored by the lexical leg; see [`CascadeQuery`].
+    pub async fn fanout_cascade_context(
         &self,
         query: CascadeQuery<'_>,
     ) -> Result<(Vec<CascadeHit>, Option<HybridDebug>), Status> {

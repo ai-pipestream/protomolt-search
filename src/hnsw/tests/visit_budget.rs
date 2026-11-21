@@ -124,14 +124,12 @@ fn zero_budget_descent_scored<L: LinkCells + ?Sized>(
         view.walk(
             query,
             16,
-            Filter::Aware {
+            super::super::graph::Steering::filtered(Filter::Aware {
                 allow: Mask::Bools(&dummy),
                 allowed: 0,
                 route: None,
                 budget: Some(0),
-            },
-            super::super::graph::Patience::OFF,
-            super::super::graph::FloorPrune::OFF,
+            }),
             scratch,
             &mut NoHook,
         )

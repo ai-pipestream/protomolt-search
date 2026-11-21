@@ -15,10 +15,11 @@ fn empty_map_values_remain_present_in_both_writers_and_readers() {
     let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("map-value-storage-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
-    let mut heap = Bm25Store::new().with_map_facets(&["meta"]);
+    let mut heap =
+        Bm25Store::new().with_columns(pipestream_search::postings::ColumnKind::MapFacet, &["meta"]);
     let mut spill = SpillBuilder::create(&root.join("spill"))
         .unwrap()
-        .with_map_facet_fields(&["meta"]);
+        .with_columns(pipestream_search::postings::ColumnKind::MapFacet, &["meta"]);
     for row in 0..3 {
         let analyzed = AnalyzedDoc::body(vec![("word".into(), 1, vec![(0, 4)])], 1);
         heap.add_document(row, "word".into(), analyzed.clone());

@@ -18,25 +18,7 @@ impl CoordinatorServiceImpl {
     ///    global ranks, or normalize-and-combine over global scores);
     ///    TWO_LEVEL lets each shard RRF-fuse locally and RRF-merges the
     ///    shard lists (the fallback for incomparable scores).
-    #[allow(clippy::too_many_arguments)]
-    pub async fn fanout_hybrid(
-        &self,
-        request_id: &str,
-        text: &str,
-        vector: &[f32],
-        k: u32,
-        spec: Option<&crate::pb::AnalysisSpec>,
-        legs: HybridLegs,
-        debug: bool,
-        filters: &RequestFilters,
-    ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
-        let input = HybridInput::new(request_id, text, vector, k, spec, filters)?;
-        self.fanout_hybrid_context(HybridQuery::new(input, legs, debug)?)
-            .await
-    }
-
-    /// Run hybrid search using grouped query inputs.
-    pub(crate) async fn fanout_hybrid_context(
+    pub async fn fanout_hybrid_context(
         &self,
         query: HybridQuery<'_>,
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {

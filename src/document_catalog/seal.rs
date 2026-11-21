@@ -80,13 +80,7 @@ pub(super) fn header_from(
     tx: &redb::WriteTransaction,
 ) -> Result<DocumentCatalogHeader, Status> {
     let meta = tx.open_table(META).map_err(storage)?;
-    let header = decode_header(
-        meta.get("header")
-            .map_err(storage)?
-            .ok_or_else(|| Status::data_loss("catalog header missing"))?
-            .value(),
-    )?;
-    validate_current_header(&header)?;
+    let header = current_header(&meta)?;
     catalog.validate_resource_binding(&header)?;
     // A managed source writes only through a handle activated under the
     // committed fence the file records; `validate_resource_binding` above
@@ -144,13 +138,7 @@ impl DocumentCatalog {
     pub fn retirement_intent(&self) -> Result<Option<SourceRetirementIntent>, Status> {
         let read = self.database.begin_read().map_err(storage)?;
         let meta = read.open_table(META).map_err(storage)?;
-        let header: DocumentCatalogHeader = decode_header(
-            meta.get("header")
-                .map_err(storage)?
-                .ok_or_else(|| Status::data_loss("catalog header missing"))?
-                .value(),
-        )?;
-        validate_current_header(&header)?;
+        let header = current_header(&meta)?;
         self.validate_resource_binding(&header)?;
         Ok(header.retirement_intent)
     }
@@ -225,13 +213,7 @@ impl DocumentCatalog {
     pub fn history_seal(&self) -> Result<Option<SourceHistorySeal>, Status> {
         let read = self.database.begin_read().map_err(storage)?;
         let meta = read.open_table(META).map_err(storage)?;
-        let header: DocumentCatalogHeader = decode_header(
-            meta.get("header")
-                .map_err(storage)?
-                .ok_or_else(|| Status::data_loss("catalog header missing"))?
-                .value(),
-        )?;
-        validate_current_header(&header)?;
+        let header = current_header(&meta)?;
         self.validate_resource_binding(&header)?;
         Ok(header.history_seal)
     }

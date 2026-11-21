@@ -22,24 +22,43 @@ pub(in crate::node) struct LegResults {
     pub(in crate::node) rerank_candidates: HashMap<u64, crate::pb::RerankCandidatePayload>,
 }
 
+/// One shard's leg request: the query, the coordinator's global BM25
+/// statistics and the stats fence they were computed under.
+pub(in crate::node) struct LegQuery<'a> {
+    pub(in crate::node) vector: &'a [f32],
+    pub(in crate::node) terms: &'a [String],
+    pub(in crate::node) analysis_fingerprint: u64,
+    pub(in crate::node) global_doc_count: u64,
+    pub(in crate::node) global_total_doc_length: u64,
+    pub(in crate::node) global_doc_frequencies: &'a [u32],
+    pub(in crate::node) params: Bm25Params,
+    pub(in crate::node) k: usize,
+    pub(in crate::node) expected_stats_epoch: u64,
+    pub(in crate::node) expected_stats_incarnation: &'a [u8],
+    pub(in crate::node) read_context: Option<&'a crate::pb::VectorReadContext>,
+    pub(in crate::node) include_rerank_candidate: bool,
+}
+
 impl NodeServiceImpl {
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::node) fn compute_legs(
         &self,
-        vector: &[f32],
-        terms: &[String],
-        analysis_fingerprint: u64,
-        global_doc_count: u64,
-        global_total_doc_length: u64,
-        global_doc_frequencies: &[u32],
-        params: Bm25Params,
-        k: usize,
-        expected_stats_epoch: u64,
-        expected_stats_incarnation: &[u8],
+        query: LegQuery<'_>,
         filters: &LegFilters<'_>,
-        read_context: Option<&crate::pb::VectorReadContext>,
-        include_rerank_candidate: bool,
     ) -> Result<LegResults, Status> {
+        let LegQuery {
+            vector,
+            terms,
+            analysis_fingerprint,
+            global_doc_count,
+            global_total_doc_length,
+            global_doc_frequencies,
+            params,
+            k,
+            expected_stats_epoch,
+            expected_stats_incarnation,
+            read_context,
+            include_rerank_candidate,
+        } = query;
         let guard = read_shard(&self.state);
         if !terms.is_empty() {
             guard.check_query_analysis("body", analysis_fingerprint)?;
@@ -216,25 +235,26 @@ impl NodeServiceImpl {
         if let Some(f) = req.filter.as_ref() {
             crate::filter::validate_filter(f)?;
         }
-        let mut legs = self.compute_legs(
-            &req.vector,
-            &req.terms,
-            req.analysis_fingerprint,
-            req.global_doc_count,
-            req.global_total_doc_length,
-            &req.global_doc_frequencies,
-            params_from(req.k1, req.b)?,
+        let query = LegQuery {
+            vector: &req.vector,
+            terms: &req.terms,
+            analysis_fingerprint: req.analysis_fingerprint,
+            global_doc_count: req.global_doc_count,
+            global_total_doc_length: req.global_total_doc_length,
+            global_doc_frequencies: &req.global_doc_frequencies,
+            params: params_from(req.k1, req.b)?,
             k,
-            req.expected_stats_epoch,
-            &req.expected_stats_incarnation,
-            &LegFilters {
-                geo: &req.geo_filters,
-                regions: geo_regions,
-                tree: req.filter.as_ref(),
-            },
-            req.read_context.as_ref(),
-            req.include_rerank_candidate,
-        )?;
+            expected_stats_epoch: req.expected_stats_epoch,
+            expected_stats_incarnation: &req.expected_stats_incarnation,
+            read_context: req.read_context.as_ref(),
+            include_rerank_candidate: req.include_rerank_candidate,
+        };
+        let filters = LegFilters {
+            geo: &req.geo_filters,
+            regions: geo_regions,
+            tree: req.filter.as_ref(),
+        };
+        let mut legs = self.compute_legs(query, &filters)?;
         let geo_columns_known = legs.geo_columns_known;
         let filter_columns_known = legs.filter_columns_known;
 

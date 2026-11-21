@@ -10,6 +10,7 @@ use crate::document_catalog::{DocumentCatalog, ProjectionRecovery};
 use crate::pb::{storage::ProjectionIntent, DocumentProjectionActivation};
 use crate::segments::{OpenedSegmentSet, SegmentRowRetirement, SegmentSource};
 use crate::stats_identity::StatsClaim;
+pub use maintenance::DocumentMaintenanceRequest;
 #[cfg(test)]
 pub(crate) use maintenance::{AFTER_MAINTENANCE_VERIFIED, INTERRUPT_MAINTENANCE};
 #[cfg(feature = "net")]

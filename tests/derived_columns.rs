@@ -11,22 +11,22 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use common::start_empty_node;
-use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
-use pipestream_search::coordinator::CoordinatorServiceImpl;
-use pipestream_search::derived::Declaration;
-use pipestream_search::node::{NodeConfig, NodeServiceImpl};
-use pipestream_search::pb::node_service_client::NodeServiceClient;
-use pipestream_search::pb::search_service_server::SearchService;
-use pipestream_search::pb::{
-    projected_value, AddDocumentsRequest, Bm25SearchRequest, DerivedColumn, DerivedColumns,
-    DerivedDisclosure, FacetValue, FlushRequest, IntegerValue, MaterializeKind, MaterializeSpec,
-    MaterializedColumn, NamedProjection,
+use pipestream_search::{
+    analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND},
+    coordinator::CoordinatorServiceImpl,
+    derived::Declaration,
+    node::{NodeConfig, NodeServiceImpl},
+    pb::{
+        node_service_client::NodeServiceClient, projected_value,
+        search_service_server::SearchService, AddDocumentsRequest, Bm25SearchRequest,
+        DerivedColumn, DerivedColumns, DerivedDisclosure, FacetValue, FlushRequest, IntegerValue,
+        MaterializeKind, MaterializeSpec, MaterializedColumn, NamedProjection,
+    },
+    placement::{PinnedLeaf, Placement, PlacementNodeConfig, PlacementTreeConfig},
+    postings::{Bm25Store, ColumnKind::*},
+    reshard,
+    values::fnv1a64_bytes,
 };
-use pipestream_search::placement::{
-    PinnedLeaf, Placement, PlacementNodeConfig, PlacementTreeConfig,
-};
-use pipestream_search::reshard;
-use pipestream_search::values::fnv1a64_bytes;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
@@ -887,10 +887,10 @@ fn an_empty_store_keeps_its_declaration_through_save_and_no_catalog_admits_it() 
     let declaration = declaration();
     // A zero-row store written under the declaration: the kind-15
     // entry and the complete tables, no rows.
-    let mut store = pipestream_search::postings::Bm25Store::with_fields(&["body"])
-        .with_facets(&["court"])
-        .with_integers(&["decided", "placement", "year_d", "scotus"])
-        .with_unsigned_integers(&["court_hash"]);
+    let mut store = Bm25Store::with_text_fields(&["body"])
+        .with_columns(Facet, &["court"])
+        .with_columns(Integer, &["decided", "placement", "year_d", "scotus"])
+        .with_columns(UnsignedInteger, &["court_hash"]);
     store.set_derived(Some(pipestream_search::postings::StoredDerived::of(
         &declaration,
     )));

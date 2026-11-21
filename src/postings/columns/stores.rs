@@ -368,10 +368,9 @@ pub(in crate::postings) fn dictionary_lookup(
     }
 }
 
-/// [`sorted_dictionary`], or the identity order (first-seen ordinals, the
-/// layout every file before 2026-09-02 has) for the legacy oracle
-/// writer the tests use to prove old files still open and refuse string
-/// ordering by name.
+/// [`sorted_dictionary`], or the identity order (first-seen ordinals) for
+/// the oracle writer the tests use to prove first-seen files still open
+/// and refuse string ordering by name.
 pub(super) fn dictionary_order(dict: &[String], byte_order: bool) -> (Vec<u32>, Vec<u32>) {
     if byte_order {
         sorted_dictionary(dict)

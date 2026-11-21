@@ -31,9 +31,11 @@ impl NodeServiceImpl {
                 guard.bm25.as_ref(),
                 guard.live_docs.words(),
                 label_count,
-                &req.geo_filters,
-                &geo_regions,
-                filter.as_ref(),
+                ShardFilterInputs {
+                    geo: &req.geo_filters,
+                    regions: &geo_regions,
+                    tree: filter.as_ref(),
+                },
                 self.knobs.segment_pruning(),
                 None,
             )?;
@@ -72,9 +74,11 @@ impl NodeServiceImpl {
             guard.bm25.as_ref(),
             guard.live_docs.words(),
             label_count,
-            &[],
-            &[],
-            Some(filter),
+            ShardFilterInputs {
+                geo: &[],
+                regions: &[],
+                tree: Some(filter),
+            },
             self.knobs.segment_pruning(),
             None,
         )?

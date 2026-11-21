@@ -236,7 +236,7 @@ impl SegmentCatalog {
     ) -> Result<Arc<OpenedSegmentSet>, String> {
         self.check_source_owner(owner)?;
         if opened.manifest().source_owner != owner.map(SegmentSourceOwner::encode).transpose()? {
-            return Err("source-managed index owner cannot be added, changed or removed by a legacy publication".into());
+            return Err("source-managed index owner cannot be added, changed or removed by an unowned publication".into());
         }
         let manifest = opened.manifest();
         let mut pending = self

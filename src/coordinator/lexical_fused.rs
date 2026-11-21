@@ -12,36 +12,15 @@ impl CoordinatorServiceImpl {
         fields: &[crate::pb::QueryField],
         min_score: f32,
     ) -> Result<Vec<Bm25Hit>, Status> {
-        self.fanout_bm25_fused_faceted(text, k, fields, min_score, &[], &[], &[], &[], None)
-            .await
-            .map(|(hits, _, _)| hits)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn fanout_bm25_fused_faceted(
-        &self,
-        text: &str,
-        k: u32,
-        fields: &[crate::pb::QueryField],
-        min_score: f32,
-        facet_fields: &[String],
-        map_facet_fields: &[crate::pb::MapFacetField],
-        range_facet_fields: &[crate::pb::RangeFacetField],
-        geo_filters: &[crate::pb::GeoFilter],
-        filter: Option<&crate::pb::FilterExpr>,
-    ) -> Result<FacetedHits, Status> {
         let request = Bm25SearchRequest {
             text: text.into(),
             fields: fields.to_vec(),
             min_score,
-            facet_fields: facet_fields.to_vec(),
-            map_facet_fields: map_facet_fields.to_vec(),
-            range_facet_fields: range_facet_fields.to_vec(),
-            geo_filters: geo_filters.to_vec(),
             ..Default::default()
         };
-        self.fanout_bm25_fused_context(FusedLexicalQuery::new(&request, k, filter)?)
+        self.fanout_bm25_fused_context(FusedLexicalQuery::new(&request, k, None)?)
             .await
+            .map(|(hits, _, _)| hits)
     }
 
     pub(super) async fn fanout_bm25_fused_routed(
@@ -110,7 +89,7 @@ impl CoordinatorServiceImpl {
         }
     }
 
-    pub(crate) async fn fanout_bm25_fused_context(
+    pub async fn fanout_bm25_fused_context(
         &self,
         query: FusedLexicalQuery<'_>,
     ) -> Result<FacetedHits, Status> {

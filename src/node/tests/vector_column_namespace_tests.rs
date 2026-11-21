@@ -5,14 +5,14 @@ use super::*;
 fn active_store_columns_are_checked_even_if_the_config_does_not_declare_them() {
     let node = NodeServiceImpl::new(None, NodeConfig::default());
     let stores = [
-        Bm25Store::with_fields(&["body", "embedding"]),
-        Bm25Store::new().with_facets(&["embedding"]),
-        Bm25Store::new().with_numerics(&["embedding"]),
-        Bm25Store::new().with_integers(&["embedding"]),
-        Bm25Store::new().with_unsigned_integers(&["embedding"]),
-        Bm25Store::new().with_map_facets(&["embedding"]),
-        Bm25Store::new().with_map_numerics(&["embedding"]),
-        Bm25Store::new().with_geos(&["embedding"]),
+        Bm25Store::with_text_fields(&["body", "embedding"]),
+        Bm25Store::new().with_columns(crate::postings::ColumnKind::Facet, &["embedding"]),
+        Bm25Store::new().with_columns(crate::postings::ColumnKind::Numeric, &["embedding"]),
+        Bm25Store::new().with_columns(crate::postings::ColumnKind::Integer, &["embedding"]),
+        Bm25Store::new().with_columns(crate::postings::ColumnKind::UnsignedInteger, &["embedding"]),
+        Bm25Store::new().with_columns(crate::postings::ColumnKind::MapFacet, &["embedding"]),
+        Bm25Store::new().with_columns(crate::postings::ColumnKind::MapNumeric, &["embedding"]),
+        Bm25Store::new().with_columns(crate::postings::ColumnKind::Geo, &["embedding"]),
     ];
     for store in stores {
         let store = Bm25Shard::Building(store);

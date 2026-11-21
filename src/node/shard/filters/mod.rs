@@ -199,21 +199,31 @@ pub(in crate::node) type ResolvedShardFilters = (
     crate::segment_prune::PruneStats,
 );
 
+/// A request's validated geo filters, their regions, and its filter tree.
+#[derive(Clone, Copy)]
+pub(in crate::node) struct ShardFilterInputs<'a> {
+    pub(in crate::node) geo: &'a [crate::pb::GeoFilter],
+    pub(in crate::node) regions: &'a [crate::geo::GeoRegion],
+    pub(in crate::node) tree: Option<&'a crate::pb::FilterExpr>,
+}
+
 /// Resolve a request's filters for one shard into its lexical predicate and
 /// vector slot allowlist. With `prune` set on a segmented shard, sealed
 /// segments ruled out by their summaries are skipped before per-row evaluation;
 /// with `domain` set, only domain slots are evaluated.
-#[allow(clippy::too_many_arguments)]
 pub(in crate::node) fn resolve_shard_filters(
     bm25: Option<&Bm25Shard>,
     deleted: Option<Arc<Vec<u64>>>,
     n: usize,
-    geo_filters: &[crate::pb::GeoFilter],
-    geo_regions: &[crate::geo::GeoRegion],
-    filter: Option<&crate::pb::FilterExpr>,
+    inputs: ShardFilterInputs<'_>,
     prune: bool,
     domain: Option<&crate::boolean_bits::Bits>,
 ) -> Result<ResolvedShardFilters, Status> {
+    let ShardFilterInputs {
+        geo: geo_filters,
+        regions: geo_regions,
+        tree: filter,
+    } = inputs;
     let total = |bm25: Option<&Bm25Shard>| crate::segment_prune::PruneStats {
         segments_total: match bm25 {
             Some(Bm25Shard::Segmented(shard)) => shard.sealed_parts() as u32,

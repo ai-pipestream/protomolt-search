@@ -87,9 +87,8 @@ pub struct SegmentMetadata {
     pub multi_res: Option<SegmentArtifact>,
     pub bm25: SegmentArtifact,
     pub live_docs: SegmentArtifact,
-    /// Absent on segments sealed before summaries existed; such a
-    /// segment is never pruned.
-    #[serde(default)]
+    /// Optional per-segment column summary used as a pruning accelerator;
+    /// segments with `None` remain unpruned and are always scanned.
     pub summary: Option<SegmentSummary>,
 }
 
@@ -225,7 +224,7 @@ pub struct SegmentSetManifest {
 impl Default for SegmentSetManifest {
     fn default() -> Self {
         Self {
-            format: BASE_SET_FORMAT,
+            format: SET_FORMAT,
             binding: None,
             source_owner: None,
             generation_declaration: None,
@@ -237,32 +236,8 @@ impl Default for SegmentSetManifest {
 }
 
 impl SegmentSetManifest {
-    /// Promote only after the final artifact inventory is assembled. Source
-    /// publication establishes its binding before it appends staged segments.
-    pub(super) fn update_retained_format(&mut self) {
-        if self
-            .segments
-            .iter()
-            .any(|segment| segment.multi_res.is_some())
-        {
-            self.format = RETAINED_SET_FORMAT;
-        }
-    }
-
     pub fn with_binding(mut self, binding: Option<&StoredBinding>) -> Result<Self, String> {
         self.binding = binding.map(SegmentBinding::encode).transpose()?;
-        self.format = if self.format == RETAINED_SET_FORMAT {
-            RETAINED_SET_FORMAT
-        } else if self.generation_declaration.is_some() {
-            DECLARED_SET_FORMAT
-        } else if self.source_owner.is_some() {
-            SOURCE_SET_FORMAT
-        } else if self.binding.is_some() {
-            SET_FORMAT
-        } else {
-            BASE_SET_FORMAT
-        };
-        self.update_retained_format();
         Ok(self)
     }
 }

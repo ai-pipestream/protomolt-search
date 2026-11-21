@@ -67,7 +67,7 @@ const READ_PER_RUN_ROW: usize = 4;
 /// A range over one part's column. `sorted` is the part's column in value
 /// order, `None` for a part that keeps none (a tail still being written);
 /// `read` gives a part-local row's value. The range is `from_below` and
-/// `from_above`, as [`NumberRows::run`] takes them.
+/// `from_above`, as `NumberRows::run` takes them.
 pub struct PartRange<'a, T> {
     pub sorted: Option<&'a NumberRows<T>>,
     pub read: &'a dyn Fn(u32) -> Option<T>,

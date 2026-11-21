@@ -15,7 +15,7 @@ pub(in crate::node) fn declare_placement_column(config: &mut NodeConfig) {
 /// The index's SOURCE column tables: the configured lists without the
 /// derived names, which is what a derived expression or a request's
 /// own materialize spec may read (outputs are not inputs).
-pub(in crate::node) fn source_tables(config: &NodeConfig) -> SourceTables {
+pub(in crate::node) fn source_tables(config: &NodeConfig) -> crate::reshard::ColumnTables {
     let without = |names: &[String]| -> Vec<String> {
         names
             .iter()
@@ -28,39 +28,16 @@ pub(in crate::node) fn source_tables(config: &NodeConfig) -> SourceTables {
             .cloned()
             .collect()
     };
-    SourceTables {
+    crate::reshard::ColumnTables {
+        facets: config.facet_fields.clone(),
         numerics: without(&config.numeric_fields),
-        integers: without(&config.integer_fields),
-        unsigned_integers: without(&config.unsigned_integer_fields),
+        map_facets: config.map_facet_fields.clone(),
         map_numerics: config.map_numeric_fields.clone(),
         map_integers: config.map_integer_fields.clone(),
         map_unsigned_integers: config.map_unsigned_integer_fields.clone(),
-        facets: config.facet_fields.clone(),
-    }
-}
-
-/// Owned form of [`crate::values::NumericTypes`].
-pub(in crate::node) struct SourceTables {
-    pub(in crate::node) numerics: Vec<String>,
-    pub(in crate::node) integers: Vec<String>,
-    pub(in crate::node) unsigned_integers: Vec<String>,
-    pub(in crate::node) map_numerics: Vec<String>,
-    pub(in crate::node) map_integers: Vec<String>,
-    pub(in crate::node) map_unsigned_integers: Vec<String>,
-    pub(in crate::node) facets: Vec<String>,
-}
-
-impl SourceTables {
-    pub(in crate::node) fn types(&self) -> crate::values::NumericTypes<'_> {
-        crate::values::NumericTypes {
-            numerics: &self.numerics,
-            integers: &self.integers,
-            unsigned_integers: &self.unsigned_integers,
-            map_numerics: &self.map_numerics,
-            map_integers: &self.map_integers,
-            map_unsigned_integers: &self.map_unsigned_integers,
-            facets: &self.facets,
-        }
+        integers: without(&config.integer_fields),
+        unsigned_integers: without(&config.unsigned_integer_fields),
+        geo: config.geo_fields.clone(),
     }
 }
 
@@ -95,7 +72,7 @@ pub(in crate::node) fn declare_derived_columns(config: &mut NodeConfig) -> Resul
     }
     let sources = source_tables(config);
     declaration
-        .check_tables(&sources.types())
+        .check_tables(&sources.numeric_types())
         .map_err(|e| format!("derived columns: {e}"))?;
     for (kind, table) in [
         (crate::pb::MaterializeKind::F64, &mut config.numeric_fields),

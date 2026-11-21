@@ -34,12 +34,6 @@ impl SpillBuilder {
         self.columns.index(kind, name)
     }
 
-    /// Declare the facet field table, in facet-id order; same contract as
-    /// [`Bm25Store::with_facets`].
-    pub fn with_facet_fields(self, names: &[&str]) -> Self {
-        self.with_columns(ColumnKind::Facet, names)
-    }
-
     /// Declare which fields keep token positions; same contract as
     /// [`Bm25Store::with_positions`].
     pub fn with_position_fields(mut self, names: &[&str]) -> Self {
@@ -106,11 +100,6 @@ impl SpillBuilder {
         self.columns.set_facet(fi, doc_id, value);
     }
 
-    /// Declare the numeric field table; same contract as [`Bm25Store::with_numerics`].
-    pub fn with_numeric_fields(self, names: &[&str]) -> Self {
-        self.with_columns(ColumnKind::Numeric, names)
-    }
-
     /// Number of numeric fields in the numeric table.
     pub fn numeric_count(&self) -> usize {
         self.column_count(ColumnKind::Numeric)
@@ -129,11 +118,6 @@ impl SpillBuilder {
     /// Record `doc_id`'s finite value for numeric field `ni`.
     pub fn set_numeric(&mut self, ni: usize, doc_id: u32, value: f64) {
         self.columns.set_numeric(ni, doc_id, value);
-    }
-
-    /// Declare the `i64` field table; same contract as [`Bm25Store::with_integers`].
-    pub fn with_integer_fields(self, names: &[&str]) -> Self {
-        self.with_columns(ColumnKind::Integer, names)
     }
 
     /// Number of `i64` fields in the integer table.
@@ -156,11 +140,6 @@ impl SpillBuilder {
         self.columns.set_integer(ii, doc_id, value);
     }
 
-    /// Declare the `u64` field table; same contract as [`Bm25Store::with_unsigned_integers`].
-    pub fn with_unsigned_integer_fields(self, names: &[&str]) -> Self {
-        self.with_columns(ColumnKind::UnsignedInteger, names)
-    }
-
     /// Number of `u64` fields in the unsigned integer table.
     pub fn unsigned_integer_count(&self) -> usize {
         self.column_count(ColumnKind::UnsignedInteger)
@@ -179,11 +158,6 @@ impl SpillBuilder {
     /// Record `doc_id`'s value for unsigned integer field `ii`.
     pub fn set_unsigned_integer(&mut self, ii: usize, doc_id: u32, value: u64) {
         self.columns.set_unsigned_integer(ii, doc_id, value);
-    }
-
-    /// Declare the geo-point column table; same contract as [`Bm25Store::with_geos`].
-    pub fn with_geo_fields(self, names: &[&str]) -> Self {
-        self.with_columns(ColumnKind::Geo, names)
     }
 
     /// Number of geo fields in the geo table.
@@ -206,23 +180,6 @@ impl SpillBuilder {
         self.columns.set_geo(gi, doc_id, lat, lon);
     }
 
-    /// Declare the `map<string, string>` column table; same contract as
-    /// [`Bm25Store::with_map_facets`].
-    pub fn with_map_facet_fields(self, names: &[&str]) -> Self {
-        self.with_columns(ColumnKind::MapFacet, names)
-    }
-
-    /// Declare the `map<string, f64>` column table; same contract as
-    /// [`Bm25Store::with_map_numerics`].
-    pub fn with_map_numeric_fields(self, names: &[&str]) -> Self {
-        self.with_columns(ColumnKind::MapNumeric, names)
-    }
-
-    /// Configure exact `i64` map columns before adding documents.
-    pub fn with_map_integer_fields(self, names: &[&str]) -> Self {
-        self.with_columns(ColumnKind::MapInteger, names)
-    }
-
     /// Set an exact value in an existing document slot. Duplicate keys return an error.
     pub fn set_map_integer(
         &mut self,
@@ -233,21 +190,6 @@ impl SpillBuilder {
     ) -> io::Result<()> {
         self.columns
             .set_map_integer(self.fields[0].doc_lengths.len(), ci, doc_id, key, value)
-    }
-
-    /// Number of exact `i64` map columns.
-    pub fn map_integer_count(&self) -> usize {
-        self.column_count(ColumnKind::MapInteger)
-    }
-
-    /// Column name at `ci`; panics for an invalid column index.
-    pub fn map_integer_name(&self, ci: usize) -> &str {
-        self.column_name(ColumnKind::MapInteger, ci)
-    }
-
-    /// Look up an exact `i64` map column by name.
-    pub fn map_integer_index(&self, name: &str) -> Option<usize> {
-        self.column_index(ColumnKind::MapInteger, name)
     }
 
     /// Map keys in this builder's ordinal order.
@@ -270,11 +212,6 @@ impl SpillBuilder {
         self.columns.map_integers[ci].value(key, row)
     }
 
-    /// Configure exact `u64` map columns before adding documents.
-    pub fn with_map_unsigned_integer_fields(self, names: &[&str]) -> Self {
-        self.with_columns(ColumnKind::MapUnsignedInteger, names)
-    }
-
     /// Set an exact value in an existing document slot. Duplicate keys return an error.
     pub fn set_map_unsigned_integer(
         &mut self,
@@ -290,21 +227,6 @@ impl SpillBuilder {
             key,
             value,
         )
-    }
-
-    /// Number of exact `u64` map columns.
-    pub fn map_unsigned_integer_count(&self) -> usize {
-        self.column_count(ColumnKind::MapUnsignedInteger)
-    }
-
-    /// Column name at `ci`; panics for an invalid column index.
-    pub fn map_unsigned_integer_name(&self, ci: usize) -> &str {
-        self.column_name(ColumnKind::MapUnsignedInteger, ci)
-    }
-
-    /// Look up an exact `u64` map column by name.
-    pub fn map_unsigned_integer_index(&self, name: &str) -> Option<usize> {
-        self.column_index(ColumnKind::MapUnsignedInteger, name)
     }
 
     /// Map keys in this builder's ordinal order.
@@ -345,5 +267,35 @@ impl SpillBuilder {
     /// Record `doc_id`'s finite map-numeric entry.
     pub fn set_map_numeric(&mut self, ci: usize, doc_id: u32, key: &str, value: f64) {
         self.columns.set_map_numeric(ci, doc_id, key, value);
+    }
+
+    /// Number of exact `i64` map columns.
+    pub fn map_integer_count(&self) -> usize {
+        self.column_count(ColumnKind::MapInteger)
+    }
+
+    /// Column name at `ci`; panics for an invalid column index.
+    pub fn map_integer_name(&self, ci: usize) -> &str {
+        self.column_name(ColumnKind::MapInteger, ci)
+    }
+
+    /// Look up an exact `i64` map column by name.
+    pub fn map_integer_index(&self, name: &str) -> Option<usize> {
+        self.column_index(ColumnKind::MapInteger, name)
+    }
+
+    /// Number of exact `u64` map columns.
+    pub fn map_unsigned_integer_count(&self) -> usize {
+        self.column_count(ColumnKind::MapUnsignedInteger)
+    }
+
+    /// Column name at `ci`; panics for an invalid column index.
+    pub fn map_unsigned_integer_name(&self, ci: usize) -> &str {
+        self.column_name(ColumnKind::MapUnsignedInteger, ci)
+    }
+
+    /// Look up an exact `u64` map column by name.
+    pub fn map_unsigned_integer_index(&self, name: &str) -> Option<usize> {
+        self.column_index(ColumnKind::MapUnsignedInteger, name)
     }
 }

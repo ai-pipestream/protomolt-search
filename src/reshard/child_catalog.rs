@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::live_docs::LiveDocs;
-use crate::postings::{Bm25Reader, Bm25Store};
+use crate::postings::{Bm25Reader, Bm25Store, ColumnKind};
 use crate::segments::{SegmentCatalog, SegmentSource};
 
 use super::{ChildImage, ReshardOutput};
@@ -284,16 +284,22 @@ fn empty_store(
          tables to declare"
             .to_string()
     })?;
-    let mut store = Bm25Store::with_fields(&names(&table.fields))
-        .with_facets(&names(&table.facets))
-        .with_numerics(&names(&table.numerics))
-        .with_map_facets(&names(&table.map_facets))
-        .with_map_numerics(&names(&table.map_numerics))
-        .with_map_integers(&names(&table.map_integers))
-        .with_map_unsigned_integers(&names(&table.map_unsigned_integers))
-        .with_integers(&names(&table.integers))
-        .with_unsigned_integers(&names(&table.unsigned_integers))
-        .with_geos(&names(&table.geo))
+    let mut store = Bm25Store::with_text_fields(&names(&table.fields))
+        .with_columns(ColumnKind::Facet, &names(&table.facets))
+        .with_columns(ColumnKind::Numeric, &names(&table.numerics))
+        .with_columns(ColumnKind::MapFacet, &names(&table.map_facets))
+        .with_columns(ColumnKind::MapNumeric, &names(&table.map_numerics))
+        .with_columns(ColumnKind::MapInteger, &names(&table.map_integers))
+        .with_columns(
+            ColumnKind::MapUnsignedInteger,
+            &names(&table.map_unsigned_integers),
+        )
+        .with_columns(ColumnKind::Integer, &names(&table.integers))
+        .with_columns(
+            ColumnKind::UnsignedInteger,
+            &names(&table.unsigned_integers),
+        )
+        .with_columns(ColumnKind::Geo, &names(&table.geo))
         .with_positions(&names(&layers.positions))
         .with_sentences(&names(&layers.sentences));
     store.set_derived(super::child_build::manifest_derived(manifest)?);

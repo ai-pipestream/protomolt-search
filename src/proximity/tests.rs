@@ -62,7 +62,7 @@ fn bigrams_repeat_within_a_document() {
 }
 
 fn store_with(docs: &[&[(&str, &[u32])]]) -> Bm25Store {
-    let mut store = Bm25Store::with_fields(&["body"]).with_positions(&["body"]);
+    let mut store = Bm25Store::with_text_fields(&["body"]).with_positions(&["body"]);
     for (i, doc) in docs.iter().enumerate() {
         let terms: DocTerms = doc
             .iter()
@@ -127,7 +127,7 @@ fn window_is_ordered_and_exact_at_every_slop() {
 
 #[test]
 fn window_refuses_a_field_without_positions_instead_of_guessing() {
-    let mut store = Bm25Store::with_fields(&["body"]);
+    let mut store = Bm25Store::with_text_fields(&["body"]);
     store.add_document(
         0,
         "new york".into(),
