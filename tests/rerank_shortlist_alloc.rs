@@ -149,6 +149,11 @@ fn dense_query(q_vec: &[f32], fp32_rerank: bool, reranked: bool) -> QueryRequest
                     } else {
                         0
                     },
+                    query_text: if reranked {
+                        "constitutional appellate jurisdiction maritime appeals".into()
+                    } else {
+                        String::new()
+                    },
                     ..Default::default()
                 })),
             })),
@@ -189,6 +194,11 @@ fn composite_query(q_vec: &[f32], highlight: bool) -> QueryRequest {
                             id: "vec".into(),
                             query: Some(search_query::Query::Dense(DenseQuery {
                                 vector: q_vec.to_vec(),
+                                query_text: if highlight {
+                                    "constitutional appellate jurisdiction maritime appeals".into()
+                                } else {
+                                    String::new()
+                                },
                                 ..Default::default()
                             })),
                         })),
@@ -232,8 +242,6 @@ fn calibrated_spec(shortlist_size: usize) -> RerankSpec {
     spec.highlight_top_k = 4;
     spec.max_snippets_per_candidate = 2;
     spec.compose_parent_lineage_offsets = true;
-    spec.query_text_override =
-        Some("constitutional appellate jurisdiction maritime appeals".into());
     spec
 }
 

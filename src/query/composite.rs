@@ -98,7 +98,12 @@ pub(super) async fn execute_composite(mut run: Run<'_>, legs: Legs<'_>) -> Resul
         explain_hits(&mut hits, &response, &legs, &fusion, legacy.as_ref())?;
     }
     let sources = rerank_sources(base.coordinator.rerank_spec(), &hits, &response);
-    if turbo_rerank(&base, &legs.lexical.text, &sources, &mut hits).await? {
+    let rerank_text = if legs.dense.query_text.trim().is_empty() {
+        legs.lexical.text.as_str()
+    } else {
+        legs.dense.query_text.as_str()
+    };
+    if turbo_rerank(&base, rerank_text, &sources, &mut hits).await? {
         route = "hybrid_search:turbo_rerank";
     }
     let mut answer = match answer_pool(&mut run, hits, route, response.request_id).await? {

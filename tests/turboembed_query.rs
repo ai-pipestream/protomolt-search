@@ -284,13 +284,12 @@ async fn one_pass_analyze_query_binds_structured_filters_across_lexical_dense_an
         vec![0]
     );
 
-    // 3. Pure Dense shape with `RerankSpec::query_text_override`: binds inline `$5000 25 kg in 2024`
+    // 3. Pure Dense shape with per-request `DenseQuery.query_text`: binds inline `$5000 25 kg in 2024`
     //    before vector scan so Doc 3 (exact vector match!) and Docs 1..2 are filtered out!
-    let mut rerank_spec = RerankSpec::new(RerankBackend::DeterministicCalibrated {
+    let rerank_spec = RerankSpec::new(RerankBackend::DeterministicCalibrated {
         platt_slope: 2.0,
         platt_intercept: -0.5,
     });
-    rerank_spec.query_text_override = Some("lithium batteries $5000 25 kg in 2024".into());
     let dense_coord = coord.with_rerank_spec(rerank_spec);
     let dense_resp = SearchService::query(
         &dense_coord,
@@ -302,6 +301,7 @@ async fn one_pass_analyze_query_binds_structured_filters_across_lexical_dense_an
                     id: "vec".into(),
                     query: Some(search_query::Query::Dense(DenseQuery {
                         vector: doc3_vec,
+                        query_text: "lithium batteries $5000 25 kg in 2024".into(),
                         ..Default::default()
                     })),
                 })),

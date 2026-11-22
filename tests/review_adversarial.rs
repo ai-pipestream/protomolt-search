@@ -372,12 +372,10 @@ async fn single_pass_dense_and_hybrid_rerank_emit_snippets_with_zero_get_documen
         platt_intercept: -0.5,
     });
     rerank_spec.compose_parent_lineage_offsets = true;
-    rerank_spec.query_text_override = Some("lithium battery energy density".to_string());
-
+    let q_text = "lithium battery energy density";
     let coord = CoordinatorServiceImpl::new(vec![addr])
         .with_bm25(Some(TURBO_ANALYSIS_BACKEND.to_string()), Default::default())
         .with_rerank_spec(rerank_spec);
-
     let before_get_docs = get_documents_rpc_count();
 
     // 1. Pure DenseQuery over TCP: inline RerankCandidatePayload produces calibrated scores + snippets
@@ -390,6 +388,7 @@ async fn single_pass_dense_and_hybrid_rerank_emit_snippets_with_zero_get_documen
                     id: "v".to_string(),
                     query: Some(search_query::Query::Dense(DenseQuery {
                         vector: vecs[0..DIM].to_vec(),
+                        query_text: q_text.into(),
                         ..Default::default()
                     })),
                 })),
@@ -471,6 +470,7 @@ async fn single_pass_dense_and_hybrid_rerank_emit_snippets_with_zero_get_documen
                 id: "v".to_string(),
                 query: Some(search_query::Query::Dense(DenseQuery {
                     vector: vecs[0..DIM].to_vec(),
+                    query_text: q_text.into(),
                     ..Default::default()
                 })),
             })),
@@ -581,12 +581,10 @@ async fn matryoshka_active_tier_indexes_compact_prefix_and_rescores_higher_tier_
     full_query[8] = 0.8660254;
     let rescored = coord
         .rescore_matryoshka_shortlist(&[(0, 0.5), (1, 0.4)], &full_query, 16)
+        .await
         .unwrap();
     assert_eq!(rescored.len(), 2);
-    assert_eq!(
-        rescored[0].0, 1,
-        "higher Matryoshka tier (dim=16) must promote doc 1 above doc 0: {rescored:?}"
-    );
+    assert_eq!(rescored[0].0, 1, "dim=16 must promote doc 1: {rescored:?}");
 }
 
 #[tokio::test]

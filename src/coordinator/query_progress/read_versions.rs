@@ -141,4 +141,32 @@ impl CoordinatorServiceImpl {
         }
         Ok(())
     }
+
+    /// Probe fresh shard `StatsClaim` versions across all configured shards and
+    /// return a coordinator clone pinned to those physical read versions.
+    pub async fn with_pinned_read_versions(&self) -> Result<Self, Status> {
+        let coordinator = self.request_snapshot().unwrap_or_else(|| self.clone());
+        coordinator
+            .pin_read_versions()
+            .await
+            .map(|(pinned, _)| pinned)
+    }
+
+    /// Bind an explicit per-shard `StatsClaim` vector onto a coordinator clone.
+    pub fn with_read_claims(&self, claims: Vec<StatsClaim>) -> Result<Self, Status> {
+        let mut pinned = self.request_snapshot().unwrap_or_else(|| self.clone());
+        if claims.len() != pinned.node_addrs.len() {
+            return Err(Status::invalid_argument(format!(
+                "read claims len {} does not match coordinator shard count {}",
+                claims.len(),
+                pinned.node_addrs.len()
+            )));
+        }
+        for claim in &claims {
+            StatsClaim::required(claim.epoch, &claim.incarnation())?;
+        }
+        pinned.replica_addrs.clear();
+        pinned.query_read_versions = Some(Arc::new(claims));
+        Ok(pinned)
+    }
 }

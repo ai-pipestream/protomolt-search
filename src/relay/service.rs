@@ -304,4 +304,11 @@ impl NodeService for RelayService {
     ) -> Result<Response<crate::pb::ScoreSpladeResponse>, Status> {
         self.handle_score_splade(request).await
     }
+
+    async fn rescore_matryoshka(
+        &self,
+        request: Request<crate::pb::RescoreMatryoshkaRequest>,
+    ) -> Result<Response<crate::pb::RescoreMatryoshkaResponse>, Status> {
+        self.handle_rescore_matryoshka(request).await
+    }
 }

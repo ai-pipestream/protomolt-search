@@ -86,7 +86,7 @@ impl CoordinatorServiceImpl {
                     self.stats_cache.invalidate_all();
                     fresh = true;
                 }
-                other => return other.map(|(hits, _)| hits),
+                other => return other.map(|((hits, _), _)| hits),
             }
         }
     }

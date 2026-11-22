@@ -34,6 +34,10 @@ independently of physical order and segment boundaries.
 
 SPLADE requests above the configured `--max-k` are refused before field or
 query-term shortcuts, both by the coordinator and by `NodeService.ScoreSplade`.
+Coordinator SPLADE scoring fans out concurrently across all unmasked local and
+remote shards, enforces pinned `expected_stats_epoch` and
+`expected_stats_incarnation` read claims when present, and aborts in-flight
+shard RPCs on drop.
 The coordinator retains its live `max_k` knob; a node's startup `NodeConfig.max_k`
 is exposed as the fixed `score_splade_max_k` diagnostic. Other node RPC limits
 are unchanged. SPLADE `k=0` still returns no hits. The low-level reader bounds
@@ -86,8 +90,11 @@ Missing declared files, mismatched hashes, out-of-range rows, and absent
 configured tiers refuse recovery or installation before replacing serving
 state. A generation written before retention cannot recover a discarded full
 vector from its active prefix; rebuild it from full-resolution input. Explicit
-tier queries report unavailable retained data rather than silently omitting a
-live vector candidate. Document-only positions remain valid gaps.
+tier queries (`NodeService.RescoreMatryoshka` and
+`CoordinatorServiceImpl::rescore_matryoshka_shortlist`) fan out concurrently
+across local and remote shards and report unavailable retained data rather than
+silently omitting a live vector candidate. Document-only positions remain valid
+gaps.
 
 `AddVectorsRequest.materialized_rows` (tag 3) carries optional retention records
 parallel to its active vectors. Admission checks their cardinality and exact

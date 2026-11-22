@@ -51,6 +51,7 @@ pub(super) async fn prepare<'a>(
     let selection_k = selection_depth(req, &dense)?;
     let boosts = parse_boosts(&req.boosts, &plan.shape, scorer.is_some())?;
     check_explain(req, &plan.shape)?;
+    check_dense_highlight(req, &plan.shape)?;
     let uses = PoolUse {
         scorer: scorer.is_some(),
         aggregate: pool_aggregate.is_some(),
@@ -91,9 +92,7 @@ fn bind_filter(
         Shape::Lexical { query, .. } | Shape::Composite { lexical: query, .. } => {
             Some(query.text.as_str())
         }
-        Shape::Dense { .. } => coordinator
-            .rerank_spec()
-            .and_then(|s| s.query_text_override.as_deref()),
+        Shape::Dense { query, .. } => Some(query.query_text.as_str()),
         Shape::Browse => None,
     };
     let Some(q_text) = raw_q.filter(|s| !s.trim().is_empty()) else {
@@ -257,6 +256,20 @@ fn check_explain(req: &QueryRequest, shape: &Shape<'_>) -> Result<(), Status> {
         return Err(refuse(
             "explain is served on relevance-ordered results: a column sort over a                  lexical leaf walks its exact membership and computes no score to explain",
         ));
+    }
+    Ok(())
+}
+
+fn check_dense_highlight(req: &QueryRequest, shape: &Shape<'_>) -> Result<(), Status> {
+    if req.highlight.is_some() {
+        if let Shape::Dense { query, .. } = shape {
+            if query.query_text.trim().is_empty() {
+                return Err(refuse(
+                    "highlight on a pure dense selection requires non-empty \
+                     DenseQuery.query_text so Stage-2 reranking can attribute snippets",
+                ));
+            }
+        }
     }
     Ok(())
 }

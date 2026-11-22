@@ -59,8 +59,13 @@ pub(super) async fn execute_dense(
         }
         "search"
     };
-    let sources = rerank_sources(base.coordinator.rerank_spec(), &hits, &response);
-    if turbo_rerank(&base, &base.req.request_id, &sources, &mut hits).await? {
+    let will_rerank = !query.query_text.trim().is_empty();
+    let sources = if will_rerank {
+        rerank_sources(base.coordinator.rerank_spec(), &hits, &response)
+    } else {
+        RerankSources::disabled()
+    };
+    if turbo_rerank(&base, &query.query_text, &sources, &mut hits).await? {
         route = "search:turbo_rerank";
     }
     let mut answer = match answer_pool(&mut run, hits, route, response.request_id).await? {
@@ -73,6 +78,8 @@ pub(super) async fn execute_dense(
 
 fn search_request(run: &mut Run<'_>, query: &DenseQuery) -> SearchRequest {
     let knobs = run.dense.knobs;
+    let include_rerank_candidate =
+        run.base.coordinator.rerank_spec().is_some() && !query.query_text.trim().is_empty();
     SearchRequest {
         request_id: run.base.req.request_id.clone(),
         k: run.depths.fetch_k,
@@ -86,7 +93,7 @@ fn search_request(run: &mut Run<'_>, query: &DenseQuery) -> SearchRequest {
         floor_prune: knobs.floor_prune,
         floor_greediness_ppm: knobs.floor_greediness_ppm,
         floor_clamp_min: knobs.floor_clamp_min,
-        include_rerank_candidate: run.base.coordinator.rerank_spec().is_some(),
+        include_rerank_candidate,
         ..Default::default()
     }
 }

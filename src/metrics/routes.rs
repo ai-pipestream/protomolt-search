@@ -93,12 +93,14 @@ pub enum Route {
     VerifyPublishedImage,
     /// `NodeService.ScoreSplade`.
     ScoreSplade,
+    /// `NodeService.RescoreMatryoshka`.
+    RescoreMatryoshka,
 }
 
 /// Route names as they appear in the `rpc` label, parallel to the
 /// counter tables, with whether the route answers with a response
 /// stream (and so reports two latency phases).
-pub(super) const REQUEST_ROUTES: [(Route, &str, bool); 74] = [
+pub(super) const REQUEST_ROUTES: [(Route, &str, bool); 75] = [
     (Route::SearchShard, "search_shard", true),
     (Route::StreamSearch, "stream_search", true),
     (Route::BrowseShard, "browse_shard", false),
@@ -189,6 +191,7 @@ pub(super) const REQUEST_ROUTES: [(Route, &str, bool); 74] = [
     (Route::RemoveMember, "remove_member", false),
     (Route::VerifyPublishedImage, "verify_published_image", false),
     (Route::ScoreSplade, "score_splade", false),
+    (Route::RescoreMatryoshka, "rescore_matryoshka", false),
 ];
 
 pub(super) const N_ROUTES: usize = REQUEST_ROUTES.len();
