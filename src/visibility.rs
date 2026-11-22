@@ -248,5 +248,6 @@ scoped_read_responses!(
     QuantileCountsResponse,
     ResolveParentsResponse,
     FetchValuesResponse,
-    ScoreSpladeResponse
+    ScoreSpladeResponse,
+    RescoreMatryoshkaResponse
 );

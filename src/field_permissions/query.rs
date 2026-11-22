@@ -197,8 +197,12 @@ impl FieldScope {
                 quality: _,
                 execution_mode: _,
                 field,
+                query_text,
             })) => {
                 self.vector(field)?;
+                if !query_text.trim().is_empty() {
+                    self.require_use("body")?;
+                }
                 if explain {
                     self.require_disclose(field)?;
                 }
@@ -228,6 +232,11 @@ impl QueryDisclosure {
             if !self.fields.disclose_identity {
                 hit.identity = None;
             }
+            hit.snippets.retain(|snippet| {
+                let keep = self.fields.can_disclose(&snippet.field);
+                redacted |= !keep;
+                keep
+            });
             hit.dimensions
                 .retain(|dimension| !self.hidden_dimensions.contains(&dimension.id));
         }

@@ -100,9 +100,6 @@ pub struct RerankSpec {
     /// highlight UTF-8 byte offsets so chunk hits project directly onto their
     /// parent document's coordinate space.
     pub compose_parent_lineage_offsets: bool,
-    /// Optional explicit query string used when reranking a pure `VectorQuery`
-    /// selection that carries only float coordinates on the wire.
-    pub query_text_override: Option<String>,
     /// Underlying remote, local-bundle, or deterministic calibrated backend.
     pub backend: RerankBackend,
 }
@@ -118,7 +115,6 @@ impl RerankSpec {
             field: "body".to_string(),
             language: "eng".to_string(),
             compose_parent_lineage_offsets: false,
-            query_text_override: None,
             backend,
         }
     }
@@ -166,8 +162,20 @@ pub async fn rerank_and_highlight_shortlist(
     if candidates.is_empty() || spec.shortlist_size == 0 {
         return Ok(Vec::new());
     }
+    let query_text = query_text.trim();
+    if query_text.is_empty() {
+        return Err(Status::invalid_argument(
+            "Stage-2 reranking requires non-empty query_text",
+        ));
+    }
     let limit = candidates.len().min(spec.shortlist_size);
     let shortlist = &candidates[..limit];
+    if let Some(missing) = shortlist.iter().find(|cand| cand.text.is_empty()) {
+        return Err(Status::failed_precondition(format!(
+            "rerank candidate {} has no stored document text",
+            missing.doc_id
+        )));
+    }
     let _timeout = remaining_deadline_duration(finish_deadline_us)?;
 
     match &spec.backend {

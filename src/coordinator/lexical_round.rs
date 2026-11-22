@@ -27,7 +27,7 @@ impl CoordinatorServiceImpl {
     pub(super) async fn bm25_query_round(
         &self,
         round: FlatRound<'_>,
-    ) -> Result<AggregatedHits, Status> {
+    ) -> Result<(AggregatedHits, HashMap<u64, usize>), Status> {
         let FlatRound {
             query,
             terms,
@@ -98,7 +98,13 @@ impl CoordinatorServiceImpl {
     pub(super) async fn bm25_fused_round(
         &self,
         round: FusedRound<'_>,
-    ) -> Result<(FacetedHits, crate::segment_prune::PruneStats), Status> {
+    ) -> Result<
+        (
+            (FacetedHits, crate::segment_prune::PruneStats),
+            HashMap<u64, usize>,
+        ),
+        Status,
+    > {
         let legs = self.build_fused_legs(&round);
         let FusedRound {
             query,
@@ -133,7 +139,7 @@ impl CoordinatorServiceImpl {
             fields: legs,
             ..query.request()
         };
-        let result = self
+        let (result, owners) = self
             .execute_bm25_round(PreparedRound {
                 request,
                 claims,
@@ -146,9 +152,12 @@ impl CoordinatorServiceImpl {
                 }),
             })
             .await?;
-        Ok(((result.0, result.1, result.2), result.5))
+        Ok((((result.0, result.1, result.2), result.5), owners))
     }
-    async fn execute_bm25_round(&self, round: PreparedRound<'_>) -> Result<AggregatedHits, Status> {
+    async fn execute_bm25_round(
+        &self,
+        round: PreparedRound<'_>,
+    ) -> Result<(AggregatedHits, HashMap<u64, usize>), Status> {
         let stream_enabled = self.bm25_stream && round.phrase.is_none();
         let relay = stream_enabled
             .then(|| {
@@ -188,15 +197,19 @@ impl CoordinatorServiceImpl {
             merged.trace_shards();
         }
         let prune = merged.prune();
-        let hits = finish_bm25_hits(merged.into_hits(), stream_heap, round.request.k)?;
+        let (hits, owners) =
+            finish_bm25_hits_owned(merged.into_hits(), stream_heap, round.request.k)?;
         trace_fused_timing(round.timing, t_query);
         Ok((
-            hits,
-            summaries.0,
-            summaries.1,
-            summaries.2,
-            summaries.3,
-            prune,
+            (
+                hits,
+                summaries.0,
+                summaries.1,
+                summaries.2,
+                summaries.3,
+                prune,
+            ),
+            owners,
         ))
     }
 
@@ -313,11 +326,20 @@ fn trace_fused_timing(timing: Option<FusedTiming>, query_elapsed: Option<Duratio
     }
 }
 
+#[cfg(test)]
 pub(super) fn finish_bm25_hits(
-    mut all: Vec<(u32, Bm25Hit)>,
+    all: Vec<(u32, Bm25Hit)>,
     stream_heap: Option<Arc<Mutex<Bm25StreamHeap>>>,
     k: u32,
 ) -> Result<Vec<Bm25Hit>, Status> {
+    finish_bm25_hits_owned(all, stream_heap, k).map(|(hits, _)| hits)
+}
+
+pub(super) fn finish_bm25_hits_owned(
+    mut all: Vec<(u32, Bm25Hit)>,
+    stream_heap: Option<Arc<Mutex<Bm25StreamHeap>>>,
+    k: u32,
+) -> Result<(Vec<Bm25Hit>, HashMap<u64, usize>), Status> {
     if let Some(stream_heap) = stream_heap {
         let winners: Vec<MergedHit> = {
             let state = stream_heap.lock().expect("BM25 stream heap poisoned");
@@ -361,5 +383,13 @@ pub(super) fn finish_bm25_hits(
         });
         all.truncate(k as usize);
     }
-    Ok(all.into_iter().map(|(_, hit)| hit).collect())
+    let mut owners = HashMap::with_capacity(all.len());
+    let hits = all
+        .into_iter()
+        .map(|(shard, hit)| {
+            owners.entry(hit.doc_id).or_insert(shard as usize);
+            hit
+        })
+        .collect();
+    Ok((hits, owners))
 }

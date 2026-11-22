@@ -360,9 +360,12 @@ impl AnalysisService for MockAnalysis {
         if let Some(lanes) = &self.lanes {
             lanes.run(Lane::of(req.metadata())).await;
         }
-        Ok(Response::new(rerank::rerank_and_highlight(
-            req.into_inner(),
-        )))
+        let inner = req.into_inner();
+        self.rerank_log.lock().unwrap().push((
+            inner.query.clone(),
+            inner.candidates.iter().map(|c| c.text.clone()).collect(),
+        ));
+        Ok(Response::new(rerank::rerank_and_highlight(inner)))
     }
 
     async fn round_trip_rerank_and_highlight(

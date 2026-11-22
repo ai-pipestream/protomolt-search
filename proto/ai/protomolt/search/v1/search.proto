@@ -403,6 +403,11 @@ service NodeService {
   // using 128-doc Block-Max WAND pruning under this shard's live-row overlay
   // and compiled filter predicate (#104).
   rpc ScoreSplade(ScoreSpladeRequest) returns (ScoreSpladeResponse);
+
+  // Rescores `candidate_ids` owned by this shard against the retained
+  // Matryoshka `target_dim` tier (prefix or full) using normalized dot-product
+  // similarity. Live candidates missing the requested tier fail closed.
+  rpc RescoreMatryoshka(RescoreMatryoshkaRequest) returns (RescoreMatryoshkaResponse);
 }
 
 // SearchService is the client-facing API served by the coordinator.
@@ -5735,6 +5740,11 @@ message DenseQuery {
   // and compatible read receipts from every product shard. Empty preserves
   // legacy unrestricted selection; it cannot satisfy a field-restricted grant.
   string field = 5;
+  // Optional natural-language query text paired with `vector` for Stage-2
+  // cross-encoder reranking, snippet attribution, and one-pass query
+  // analysis. When empty on a pure dense selection, Stage-2 text reranking
+  // and one-pass text analysis are skipped.
+  string query_text = 8;
 }
 
 // A request for a measured candidate depth. Recall is expressed in parts per
@@ -8341,4 +8351,27 @@ message ScoreSpladeResponse {
   bytes stats_incarnation = 9;
   bytes visibility_fingerprint = 10;
   repeated bool visibility_columns_known = 11;
+}
+
+// Candidate-scoped retained Matryoshka tier rescoring request.
+message RescoreMatryoshkaRequest {
+  // Full or tier-sliced query vector; length must be at least `target_dim`.
+  repeated float query = 1;
+  // Target Matryoshka tier dimension (> 0).
+  uint32 target_dim = 2;
+  // Global candidate document or vector ids to rescore on this shard.
+  repeated uint64 candidate_ids = 3;
+  // Trusted-planner document visibility predicate when configured.
+  DocumentVisibility visibility = 4;
+  uint64 expected_stats_epoch = 5;
+  bytes expected_stats_incarnation = 6;
+}
+
+// Shard-side retained Matryoshka tier rescoring response.
+message RescoreMatryoshkaResponse {
+  repeated RawLegHit hits = 1;
+  uint64 stats_epoch = 2;
+  bytes stats_incarnation = 3;
+  bytes visibility_fingerprint = 4;
+  repeated bool visibility_columns_known = 5;
 }

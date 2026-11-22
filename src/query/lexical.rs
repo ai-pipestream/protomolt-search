@@ -1,12 +1,13 @@
 //! The single lexical leaf, in relevance order: the `Bm25Search` route.
 
+use std::collections::HashMap;
+
 use tonic::{Request, Status};
 
 use super::pool::{answer_pool, Answer, Routed};
 use super::rerank::{turbo_rerank, RerankSources};
 use super::response::{leaf_signal, matched, ms, scored_hit};
 use super::run::Run;
-use crate::pb::search_service_server::SearchService;
 use crate::pb::{Bm25SearchRequest, Bm25SearchResponse, LexicalQuery, QueryHit};
 
 pub(super) async fn execute_lexical(
@@ -17,11 +18,10 @@ pub(super) async fn execute_lexical(
     let base = run.base;
     let t_sel = std::time::Instant::now();
     let request = bm25_request(&mut run, query);
-    let response = base
+    let (response, shard_owners) = base
         .coordinator
-        .bm25_search(crate::metrics::nested(Request::new(request)))
-        .await?
-        .into_inner();
+        .bm25_search_routed(crate::metrics::nested(Request::new(request)))
+        .await?;
     if let Some(p) = run.prof.as_mut() {
         p.selection_ms = ms(t_sel);
         p.segments_total = response.segments_total;
@@ -32,7 +32,8 @@ pub(super) async fn execute_lexical(
         synonym_expansions.extend(bound.synonym_expansions.iter().cloned());
     }
     let mut hits = lexical_hits(&run, id, &response)?;
-    let reranked = turbo_rerank(&base, &query.text, &RerankSources::disabled(), &mut hits).await?;
+    let sources = rerank_sources(base.coordinator.rerank_spec(), &hits, &shard_owners);
+    let reranked = turbo_rerank(&base, &query.text, &sources, &mut hits).await?;
     let route = if reranked {
         "bm25_search:turbo_rerank"
     } else {
@@ -98,4 +99,21 @@ fn lexical_hits(
         }
     }
     Ok(hits)
+}
+
+fn rerank_sources(
+    spec: Option<&crate::turbo_bridge::rerank::RerankSpec>,
+    hits: &[QueryHit],
+    shard_owners: &HashMap<u64, usize>,
+) -> RerankSources {
+    let mut sources = RerankSources::for_shortlist(spec, hits);
+    if !sources.is_enabled() {
+        return sources;
+    }
+    for hit in hits {
+        if let Some(&shard) = shard_owners.get(&hit.doc_id) {
+            sources.note_owner(hit.doc_id, shard);
+        }
+    }
+    sources
 }

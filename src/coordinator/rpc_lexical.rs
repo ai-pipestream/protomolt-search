@@ -7,14 +7,21 @@ impl CoordinatorServiceImpl {
         &self,
         request: Request<Bm25SearchRequest>,
     ) -> Result<Response<Bm25SearchResponse>, Status> {
+        self.bm25_search_routed(request)
+            .await
+            .map(|(response, _)| Response::new(response))
+    }
+
+    pub(crate) async fn bm25_search_routed(
+        &self,
+        request: Request<Bm25SearchRequest>,
+    ) -> Result<(Bm25SearchResponse, HashMap<u64, usize>), Status> {
         crate::metrics::timed(Route::Bm25Search, request, |request| async move {
             self.admit(&request.get_ref().collection)?;
             if let Some(snapshot) = self.request_snapshot() {
-                return Box::pin(SearchService::bm25_search(
-                    &snapshot,
-                    crate::metrics::nested(request),
-                ))
-                .await;
+                return Box::pin(snapshot.bm25_search_routed(crate::metrics::nested(request)))
+                    .await
+                    .map(Response::new);
             }
             let req = request.into_inner();
             let k = self.resolve_k(req.k)?;
@@ -34,15 +41,16 @@ impl CoordinatorServiceImpl {
                 fields.bm25(&req, user_filter.as_ref(), &projections)?;
             }
             let filter = self.visible_filter(user_filter)?;
-            let mut response = self
+            let (mut response, owners) = self
                 .execute_bm25_rpc(&req, k, &projections, filter.as_ref())
                 .await?;
             if let Some(fields) = &self.field_permissions {
                 fields.disclose(&mut response)?;
             }
-            Ok(Response::new(response))
+            Ok(Response::new((response, owners)))
         })
         .await
+        .map(Response::into_inner)
     }
 
     async fn execute_bm25_rpc(
@@ -51,16 +59,16 @@ impl CoordinatorServiceImpl {
         k: u32,
         projections: &[crate::pb::CompiledProjection],
         filter: Option<&crate::pb::FilterExpr>,
-    ) -> Result<Bm25SearchResponse, Status> {
+    ) -> Result<(Bm25SearchResponse, HashMap<u64, usize>), Status> {
         let mut prefix_expansions = Vec::new();
         let mut synonym_expansions = Vec::new();
         let expansions = LexicalExpansions {
             prefixes: &mut prefix_expansions,
             synonyms: &mut synonym_expansions,
         };
-        let ((hits, facets, range_facets, stats, cardinality, prune), phrase_routing) = self
-            .bm25_rpc_route(req, k, projections, filter, expansions)
-            .await?;
+        let ((hits, facets, range_facets, stats, cardinality, prune), phrase_routing, owners) =
+            self.bm25_rpc_route(req, k, projections, filter, expansions)
+                .await?;
         // The merged k-th best: one f32 ULP below the last hit's score
         // when k hits were returned (see `bm25::floor_seed` — a later
         // seed can never exceed the true k-th best), 0 otherwise.
@@ -94,7 +102,7 @@ impl CoordinatorServiceImpl {
             prefix_expansions,
             synonym_expansions,
         };
-        Ok(response)
+        Ok((response, owners))
     }
 
     async fn bm25_rpc_route(
@@ -104,13 +112,18 @@ impl CoordinatorServiceImpl {
         projections: &[crate::pb::CompiledProjection],
         filter: Option<&crate::pb::FilterExpr>,
         expansions: LexicalExpansions<'_>,
-    ) -> Result<(AggregatedHits, Vec<crate::pb::PhraseRouting>), Status> {
+    ) -> Result<
+        (
+            AggregatedHits,
+            Vec<crate::pb::PhraseRouting>,
+            HashMap<u64, usize>,
+        ),
+        Status,
+    > {
         if req.fields.is_empty() && req.phrase.is_none() {
             let query = FlatLexicalQuery::new(req, k, projections, filter)?;
-            return Ok((
-                self.fanout_bm25_aggregated(query, expansions).await?,
-                Vec::new(),
-            ));
+            let (hits, owners) = self.fanout_bm25_aggregated_owned(query, expansions).await?;
+            return Ok((hits, Vec::new(), owners));
         }
         let query = if req.fields.is_empty() {
             validate_bm25_phrase_route(req)?;
@@ -119,11 +132,13 @@ impl CoordinatorServiceImpl {
             validate_bm25_fused_route(req)?;
             FusedLexicalQuery::new(req, k, filter)?
         };
-        let (((hits, facets, ranges), prune), routing) =
-            self.fanout_bm25_fused_routed(query, expansions).await?;
+        let (((hits, facets, ranges), prune), routing, owners) = self
+            .fanout_bm25_fused_routed_owned(query, expansions)
+            .await?;
         Ok((
             (hits, facets, ranges, Vec::new(), Vec::new(), prune),
             routing,
+            owners,
         ))
     }
 }

@@ -107,7 +107,6 @@ fn reranking(nodes: Vec<Arc<NodeServiceImpl>>, addr: &str) -> CoordinatorService
     });
     spec.shortlist_size = 4;
     spec.highlight_top_k = 4;
-    spec.query_text_override = Some("appellate jurisdiction".into());
     CoordinatorServiceImpl::with_local_nodes(nodes)
         .with_bm25(Some(addr.to_string()), Default::default())
         .with_rerank_spec(spec)
@@ -127,6 +126,7 @@ async fn reranked_query(coordinator: &CoordinatorServiceImpl, vector: &[f32]) ->
                     id: "vec".into(),
                     query: Some(search_query::Query::Dense(DenseQuery {
                         vector: vector.to_vec(),
+                        query_text: "appellate jurisdiction".into(),
                         ..Default::default()
                     })),
                 })),

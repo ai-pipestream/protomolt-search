@@ -277,6 +277,7 @@ impl NodeLink {
         evaluate_boolean: BooleanShardRequest => BooleanShardResponse,
         apply_wal_binding: ApplyWalBindingRequest => ApplyWalBindingResponse,
         score_splade: ScoreSpladeRequest => ScoreSpladeResponse,
+        rescore_matryoshka: RescoreMatryoshkaRequest => RescoreMatryoshkaResponse,
         health: HealthRequest => HealthResponse,
     }
 

@@ -185,6 +185,70 @@ impl RelayService {
         .await
     }
 
+    pub(super) async fn handle_rescore_matryoshka(
+        &self,
+        request: Request<crate::pb::RescoreMatryoshkaRequest>,
+    ) -> Result<Response<crate::pb::RescoreMatryoshkaResponse>, Status> {
+        crate::metrics::timed(Route::RescoreMatryoshka, request, |request| async move {
+            let timeout = grpc_timeout(request.metadata());
+            let req = request.into_inner();
+            let claim = (
+                req.expected_stats_epoch,
+                &req.expected_stats_incarnation[..],
+            );
+            let visibility = req.visibility.as_ref();
+            let Routed { opened, by_child } = self
+                .open_routed(
+                    "RescoreMatryoshka",
+                    visibility,
+                    claim,
+                    timeout,
+                    &req.candidate_ids,
+                )
+                .await?;
+            let requests = by_child
+                .into_iter()
+                .zip(&opened.claims)
+                .map(|(candidate_ids, claim)| {
+                    Some(crate::pb::RescoreMatryoshkaRequest {
+                        query: req.query.clone(),
+                        target_dim: req.target_dim,
+                        candidate_ids,
+                        visibility: req.visibility.clone(),
+                        expected_stats_epoch: claim.epoch,
+                        expected_stats_incarnation: claim.incarnation(),
+                    })
+                })
+                .collect();
+            let shares = fan_out(
+                &opened.frozen,
+                &opened.children,
+                requests,
+                timeout,
+                "rescore matryoshka",
+                |mut link, request| async move { link.rescore_matryoshka(request).await },
+            )
+            .await?;
+            let mut receipts = Vec::with_capacity(shares.len());
+            let mut hits = Vec::new();
+            for share in shares_only(shares) {
+                receipts.push(read_metadata(&share));
+                hits.extend(share.hits);
+            }
+            hits.sort_by(|a, b| by_score_then_id((a.score, a.doc_id), (b.score, b.doc_id)));
+            self.still_current(&opened.pinned, "RescoreMatryoshka")?;
+            let receipt = self.routed_receipt(&opened, visibility, &receipts)?;
+            Ok(Response::new(crate::pb::RescoreMatryoshkaResponse {
+                hits,
+                stats_epoch: receipt.stats_epoch,
+                stats_incarnation: receipt.stats_incarnation,
+                visibility_fingerprint: receipt.visibility_fingerprint,
+                visibility_columns_known: receipt.visibility_columns_known,
+            }))
+        })
+        .await
+    }
+
     pub(super) async fn handle_bm25_rescore(
         &self,
         request: Request<Bm25RescoreRequest>,

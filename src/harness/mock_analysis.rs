@@ -112,6 +112,8 @@ pub struct MockAnalysis {
     /// Optional accelerator slot every streamed document and every rerank
     /// call takes one unit of, in the lane its `x-turbo-priority` names.
     pub lanes: Option<Arc<PriorityLanes>>,
+    /// Recorded `(query_text, candidate_texts)` pairs received by `RerankAndHighlight`.
+    pub rerank_log: Arc<std::sync::Mutex<Vec<(String, Vec<String>)>>>,
 }
 
 impl Default for MockAnalysis {
@@ -127,6 +129,7 @@ impl Default for MockAnalysis {
             unary_delay: None,
             stream_end_gate: None,
             lanes: None,
+            rerank_log: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 }
@@ -271,6 +274,21 @@ pub async fn start_mock_analysis_without_dual_identity() -> (
     })
     .await;
     (address, handle, calls)
+}
+
+/// Start a mock recording `(query_text, candidate_texts)` on every `RerankAndHighlight` RPC.
+pub async fn start_mock_analysis_recording_rerank() -> (
+    String,
+    JoinHandle<Result<(), TransportError>>,
+    Arc<std::sync::Mutex<Vec<(String, Vec<String>)>>>,
+) {
+    let rerank_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (address, handle) = start_mock(MockAnalysis {
+        rerank_log: rerank_log.clone(),
+        ..Default::default()
+    })
+    .await;
+    (address, handle, rerank_log)
 }
 
 async fn start_mock(mock: MockAnalysis) -> (String, JoinHandle<Result<(), TransportError>>) {

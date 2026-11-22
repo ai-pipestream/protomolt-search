@@ -66,12 +66,12 @@ impl RerankSources {
             .is_some_and(|ids| ids.contains(&doc_id))
     }
 
-    /// Keep the first inline payload seen for a shortlisted doc.
+    /// Keep the first non-empty inline payload seen for a shortlisted doc.
     pub(super) fn note_candidate(&mut self, doc_id: u64, payload: Option<&RerankCandidatePayload>) {
         if !self.accepts(doc_id) {
             return;
         }
-        if let Some(payload) = payload {
+        if let Some(payload) = payload.filter(|p| !p.text.is_empty()) {
             self.inline.entry(doc_id).or_insert_with(|| payload.clone());
         }
     }
@@ -85,20 +85,22 @@ impl RerankSources {
     }
 }
 
-/// Run the coordinator's reranker, when one is configured, over the
-/// pool's shortlist. The query text is the spec's override, else
-/// `fallback_text`. Returns whether a reranker is configured, which is
-/// what the `executed` echo reports.
+/// Run the coordinator's reranker, when one is configured and `query_text`
+/// is non-empty, over the pool's shortlist. Returns whether Stage-2 reranking
+/// executed, which is what the `executed` echo reports.
 pub(super) async fn turbo_rerank(
     base: &Base<'_>,
-    fallback_text: &str,
+    query_text: &str,
     sources: &RerankSources,
     hits: &mut Vec<QueryHit>,
 ) -> Result<bool, Status> {
     let Some(spec) = base.coordinator.rerank_spec() else {
         return Ok(false);
     };
-    let query_text = spec.query_text_override.as_deref().unwrap_or(fallback_text);
+    let query_text = query_text.trim();
+    if query_text.is_empty() {
+        return Ok(false);
+    }
     apply_turbo_rerank(base, spec, query_text, sources, hits).await?;
     Ok(true)
 }
@@ -121,7 +123,7 @@ async fn apply_turbo_rerank(
         .map(|h| (h.doc_id, f64::from(h.score)))
         .collect();
     let fallback = fetch_missing(base, sources, &hits[..limit], &shortlist_pairs).await?;
-    let candidates = shortlist_candidates(&shortlist_pairs, &sources.inline, &fallback);
+    let candidates = shortlist_candidates(&shortlist_pairs, &sources.inline, &fallback)?;
     let reranked = crate::turbo_bridge::rerank::rerank_and_highlight_shortlist(
         spec,
         query_text,
@@ -185,15 +187,19 @@ fn resolve_owners(
 }
 
 /// One reranker input per shortlist hit, in shortlist order: the inline
-/// payload, else the fetched candidate, else an empty text.
+/// payload, else the fetched candidate; refuses when any shortlisted hit
+/// lacks stored document text.
 fn shortlist_candidates(
     shortlist_pairs: &[(u64, f64)],
     inline_candidates: &HashMap<u64, RerankCandidatePayload>,
     fallback: &HashMap<u64, RerankCandidate>,
-) -> Vec<RerankCandidate> {
+) -> Result<Vec<RerankCandidate>, Status> {
     let mut candidates = Vec::with_capacity(shortlist_pairs.len());
     for &(doc_id, prior_score) in shortlist_pairs {
-        if let Some(inline) = inline_candidates.get(&doc_id) {
+        if let Some(inline) = inline_candidates
+            .get(&doc_id)
+            .filter(|p| !p.text.is_empty())
+        {
             candidates.push(RerankCandidate {
                 doc_id,
                 prior_score,
@@ -205,19 +211,15 @@ fn shortlist_candidates(
                     .collect(),
                 lineage_span_start: inline.lineage.as_ref().map_or(0, |l| l.span_start),
             });
-        } else if let Some(fetched) = fallback.get(&doc_id) {
+        } else if let Some(fetched) = fallback.get(&doc_id).filter(|c| !c.text.is_empty()) {
             candidates.push(fetched.clone());
         } else {
-            candidates.push(RerankCandidate {
-                doc_id,
-                prior_score,
-                text: String::new(),
-                sentence_spans: Vec::new(),
-                lineage_span_start: 0,
-            });
+            return Err(Status::failed_precondition(format!(
+                "rerank candidate {doc_id} has no stored document text"
+            )));
         }
     }
-    candidates
+    Ok(candidates)
 }
 
 /// Put the reranked shortlist first, in the reranker's order with its

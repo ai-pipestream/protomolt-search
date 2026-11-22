@@ -182,11 +182,16 @@ pins both.
 - No stored text for non-body fields; that is a separate cost decision.
 - Without Stage-2 `RerankAndHighlight` (`with_rerank_spec`), sentence-level
   snippets for pure dense hits are not served because Stage-1 vector search
-  holds one vector per document. When `RerankSpec` (`#105` / `turboembed`
-  `#2342`) is configured on the coordinator, top-`C` dense and hybrid hits
+  holds one vector per document. When `RerankSpec` is configured on the
+  coordinator and `DenseQuery.query_text` is populated on the request (or a
+  composite/lexical selection supplies its own query text), top-`C` hits
   receive calibrated `[0, 1]` relevance probabilities and source-projected
   (`ViewId::SOURCE`) semantic snippets, with optional `DocLineage.span_start`
-  parent-document offset composition (`compose_parent_lineage_offsets`).
+  parent-document offset composition (`compose_parent_lineage_offsets`). Pure
+  dense selections with empty `DenseQuery.query_text` skip Stage-2 text
+  reranking (and refuse an explicit `QueryRequest.highlight` with
+  `INVALID_ARGUMENT`), and shortlisted candidates lacking stored document text
+  fail closed rather than scoring empty passages.
 
 ## Tests
 

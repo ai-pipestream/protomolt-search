@@ -36,6 +36,16 @@ impl CoordinatorServiceImpl {
         query: FlatLexicalQuery<'_>,
         expansions: LexicalExpansions<'_>,
     ) -> Result<AggregatedHits, Status> {
+        self.fanout_bm25_aggregated_owned(query, expansions)
+            .await
+            .map(|(hits, _)| hits)
+    }
+
+    pub(super) async fn fanout_bm25_aggregated_owned(
+        &self,
+        query: FlatLexicalQuery<'_>,
+        expansions: LexicalExpansions<'_>,
+    ) -> Result<(AggregatedHits, HashMap<u64, usize>), Status> {
         let terms = self.flat_query_terms(query, expansions).await?;
         let k = if terms.is_empty() {
             0
@@ -48,12 +58,15 @@ impl CoordinatorServiceImpl {
                 self.body_stats(&[], false).await?;
             }
             return Ok((
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Default::default(),
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Default::default(),
+                ),
+                HashMap::new(),
             ));
         }
         let analysis_fingerprint =

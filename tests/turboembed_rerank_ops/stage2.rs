@@ -144,8 +144,6 @@ async fn stage2_rerank_and_highlight_reorders_dense_and_composite_and_composes_l
         spec.highlight_top_k = 4;
         spec.max_snippets_per_candidate = 2;
         spec.compose_parent_lineage_offsets = true;
-        spec.query_text_override =
-            Some("constitutional appellate jurisdiction maritime appeals".into());
 
         let rerank_coord = base_coord.clone().with_rerank_spec(spec);
 
@@ -164,6 +162,8 @@ async fn stage2_rerank_and_highlight_reorders_dense_and_composite_and_composes_l
                         id: "vec".into(),
                         query: Some(search_query::Query::Dense(DenseQuery {
                             vector: q_vec.clone(),
+                            query_text: "constitutional appellate jurisdiction maritime appeals"
+                                .into(),
                             ..Default::default()
                         })),
                     })),
@@ -226,6 +226,9 @@ async fn stage2_rerank_and_highlight_reorders_dense_and_composite_and_composes_l
                                     id: "vec".into(),
                                     query: Some(search_query::Query::Dense(DenseQuery {
                                         vector: q_vec.clone(),
+                                        query_text:
+                                            "constitutional appellate jurisdiction maritime appeals"
+                                                .into(),
                                         ..Default::default()
                                     })),
                                 })),

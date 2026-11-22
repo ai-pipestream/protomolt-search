@@ -34,6 +34,23 @@ impl CoordinatorServiceImpl {
         ),
         Status,
     > {
+        self.fanout_bm25_fused_routed_owned(query, expansions)
+            .await
+            .map(|(hits, routing, _)| (hits, routing))
+    }
+
+    pub(super) async fn fanout_bm25_fused_routed_owned(
+        &self,
+        query: FusedLexicalQuery<'_>,
+        expansions: LexicalExpansions<'_>,
+    ) -> Result<
+        (
+            (FacetedHits, crate::segment_prune::PruneStats),
+            Vec<crate::pb::PhraseRouting>,
+            HashMap<u64, usize>,
+        ),
+        Status,
+    > {
         let trace = std::env::var_os("PIPESTREAM_SEARCH_TRACE_BM25").is_some();
         let started = std::time::Instant::now();
         let analyzed = self.analyze_fused_query(&query, expansions).await?;
@@ -50,6 +67,7 @@ impl CoordinatorServiceImpl {
             return Ok((
                 ((Vec::new(), Vec::new(), Vec::new()), Default::default()),
                 Vec::new(),
+                HashMap::new(),
             ));
         }
         let probe = FusedProbe::new(self, &query, analyzed);
@@ -84,7 +102,7 @@ impl CoordinatorServiceImpl {
                     self.stats_cache.invalidate_all();
                     fresh = true;
                 }
-                other => return other.map(|hits| (hits, resolved.routing)),
+                other => return other.map(|(hits, owners)| (hits, resolved.routing, owners)),
             }
         }
     }

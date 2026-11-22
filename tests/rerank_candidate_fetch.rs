@@ -44,7 +44,7 @@ async fn remote_fallback_preserves_local_sentences_lineage_order_and_tombstones(
     let local = CoordinatorServiceImpl::with_local_nodes(vec![Arc::clone(&node)]);
     let (address, server) = pipestream_search::harness::serve_node((*node).clone()).await;
     let remote = CoordinatorServiceImpl::new(vec![address]);
-    let shortlist = [(101, 3.0), (100, 2.0), (101, 1.0), (999, 0.0)];
+    let shortlist = [(101, 3.0), (100, 2.0), (101, 1.0)];
     let expected = local.fetch_rerank_candidates(&shortlist).await.unwrap();
     let actual = remote.fetch_rerank_candidates(&shortlist).await.unwrap();
     for (i, (left, right)) in expected.iter().zip(&actual).enumerate() {
@@ -53,22 +53,25 @@ async fn remote_fallback_preserves_local_sentences_lineage_order_and_tombstones(
         assert_eq!(left.text, right.text);
         assert_eq!(left.sentence_spans, right.sentence_spans);
         assert_eq!(left.lineage_span_start, right.lineage_span_start);
-        if i < 3 {
-            assert_eq!(right.lineage_span_start, 1000);
-            assert_eq!(right.sentence_spans.len(), 2);
-            for &(start, end) in &right.sentence_spans {
-                assert!(!right
-                    .text
-                    .get(start as usize..end as usize)
-                    .unwrap()
-                    .is_empty());
-            }
-        } else {
-            assert!(right.text.is_empty());
-            assert!(right.sentence_spans.is_empty());
+        assert_eq!(right.lineage_span_start, 1000);
+        assert_eq!(right.sentence_spans.len(), 2);
+        for &(start, end) in &right.sentence_spans {
+            assert!(!right
+                .text
+                .get(start as usize..end as usize)
+                .unwrap()
+                .is_empty());
         }
     }
     assert_eq!(actual[0].sentence_spans, actual[2].sentence_spans);
+    for coord in [&local, &remote] {
+        let missing = coord
+            .fetch_rerank_candidates(&[(101, 3.0), (999, 0.0)])
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), Code::FailedPrecondition);
+        assert!(missing.message().contains("999"));
+    }
     link.delete_documents(DeleteDocumentsRequest {
         doc_ids: vec![100],
         ..Default::default()
@@ -76,10 +79,12 @@ async fn remote_fallback_preserves_local_sentences_lineage_order_and_tombstones(
     .await
     .unwrap();
     for coord in [&local, &remote] {
-        let rows = coord.fetch_rerank_candidates(&[(100, 1.0)]).await.unwrap();
-        assert!(rows[0].text.is_empty());
-        assert!(rows[0].sentence_spans.is_empty());
-        assert_eq!(rows[0].lineage_span_start, 0);
+        let deleted = coord
+            .fetch_rerank_candidates(&[(100, 1.0)])
+            .await
+            .unwrap_err();
+        assert_eq!(deleted.code(), Code::FailedPrecondition);
+        assert!(deleted.message().contains("100"));
     }
     server.abort();
     let _ = server.await;
@@ -257,20 +262,25 @@ async fn unrouted_fallback_merges_candidates_across_multiple_remote_shards() {
     let (addr1, srv1) = pipestream_search::harness::serve_node((*shard1).clone()).await;
     let coordinator = CoordinatorServiceImpl::new(vec![addr0, addr1]);
 
-    let shortlist = [(200, 4.0), (100, 2.0), (404, 1.0)];
+    let shortlist = [(200, 4.0), (100, 2.0)];
     let rows = coordinator
         .fetch_rerank_candidates(&shortlist)
         .await
         .unwrap();
-    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].doc_id, 200);
     assert_eq!(rows[0].lineage_span_start, 20);
     assert_eq!(rows[0].sentence_spans.len(), 2);
     assert_eq!(rows[1].doc_id, 100);
     assert_eq!(rows[1].lineage_span_start, 10);
     assert_eq!(rows[1].sentence_spans.len(), 2);
-    assert!(rows[2].text.is_empty());
-    assert!(rows[2].sentence_spans.is_empty());
+
+    let missing = coordinator
+        .fetch_rerank_candidates(&[(200, 4.0), (404, 1.0)])
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), Code::FailedPrecondition);
+    assert!(missing.message().contains("404"));
 
     srv0.abort();
     srv1.abort();

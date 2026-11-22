@@ -102,7 +102,7 @@ impl CoordinatorServiceImpl {
             responses.insert(shard, response?);
         }
 
-        Ok(assemble_rerank_candidates(hit_scores, responses))
+        assemble_rerank_candidates(hit_scores, responses)
     }
 }
 
@@ -137,7 +137,7 @@ fn rerank_fetch_plan(
 fn assemble_rerank_candidates(
     hit_scores: &[(u64, f64)],
     responses: BTreeMap<usize, Vec<crate::pb::StoredDocument>>,
-) -> Vec<RerankCandidate> {
+) -> Result<Vec<RerankCandidate>, Status> {
     let mut docs_by_id = HashMap::with_capacity(hit_scores.len());
     for (_shard, documents) in responses {
         for doc in documents {
@@ -147,21 +147,25 @@ fn assemble_rerank_candidates(
     hit_scores
         .iter()
         .map(|&(doc_id, prior_score)| {
-            let doc = docs_by_id.get(&doc_id);
-            RerankCandidate {
+            let doc = docs_by_id
+                .get(&doc_id)
+                .filter(|doc| !doc.text.is_empty())
+                .ok_or_else(|| {
+                    Status::failed_precondition(format!(
+                        "rerank candidate {doc_id} has no stored document text"
+                    ))
+                })?;
+            Ok(RerankCandidate {
                 doc_id,
                 prior_score,
-                text: doc.map_or_else(String::new, |doc| doc.text.clone()),
-                sentence_spans: doc.map_or_else(Vec::new, |doc| {
-                    doc.sentence_spans
-                        .iter()
-                        .map(|span| (span.start, span.end))
-                        .collect()
-                }),
-                lineage_span_start: doc
-                    .and_then(|doc| doc.lineage.as_ref())
-                    .map_or(0, |l| l.span_start),
-            }
+                text: doc.text.clone(),
+                sentence_spans: doc
+                    .sentence_spans
+                    .iter()
+                    .map(|span| (span.start, span.end))
+                    .collect(),
+                lineage_span_start: doc.lineage.as_ref().map_or(0, |l| l.span_start),
+            })
         })
         .collect()
 }
