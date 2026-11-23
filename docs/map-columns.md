@@ -226,12 +226,13 @@ regenerated gRPC/JSON clients must switch to the single-form `search.proto`
 schema together. `StringRangePredicate` and `StringPrefixPredicate` carry map
 context on `optional string map_key` (tags `5` and `4`, with retired tag `2`
 reserved), and lexical stream completion (`Bm25StreamCompletion`, with
-`Bm25QueryStreamResponse` tag `2` reserved) plus `FetchValuesResponse` map-type
-validation (tag `11` reserved) assume matching builds; mixed-fleet peers would
-silently misread a map-context string range or prefix predicate as a plain
-facet-column predicate without an error. Under proto3 JSON (`WIRE_JSON`),
-`FilterExpr.mapNumber`/`mapHasKey` and `ValueExpr.map` bind to the unified
-all-plane map variants (tags `15`, `16`, and `16`).
+`Bm25QueryStreamResponse` tag `2` reserved), `FetchValuesResponse` map-type
+validation (tag `11` reserved) and the query stream's content fingerprint
+(`QueryStreamRevision` tag `7` reserved) assume matching builds; mixed-fleet
+peers would silently misread a map-context string range or prefix predicate as
+a plain facet-column predicate without an error. Under proto3 JSON
+(`WIRE_JSON`), `FilterExpr.mapNumber`/`mapHasKey` and `ValueExpr.map` bind to
+the unified all-plane map variants (tags `15`, `16`, and `16`).
 
 ### Remaining map work
 
