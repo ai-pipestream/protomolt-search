@@ -8,31 +8,19 @@ with explicit double conversion and [exact range facets](range-facets.md#integer
 Column statistics remain unfinished. See
 [map projection](map-projection.md) and [storage](integer-map-storage.md).
 
-## Protobuf operators and older nodes
+## Protobuf operators
 
-FilterExpr has `typed_map_number` at tag 15 and `typed_map_has_key` at tag 16.
-ValueExpr has `typed_map` at tag 16. The numeric predicate reuses
-MapNumberPredicate and its typed FilterBound values; the value read reuses
-MapRead. Column names and literal string keys identify entries, including the
+`FilterExpr` carries `map_number` at tag 15 and `map_has_key` at tag 16.
+`ValueExpr` carries `map` at tag 16. The numeric predicate uses
+`MapNumberPredicate` and its typed `FilterBound` values; the value read uses
+`MapRead`. Column names and literal string keys identify entries, including the
 empty key. Integer-keyed source maps use their canonical string keys.
 
-These operators include signed and unsigned map planes. The original
-FilterExpr `map_number` continues to resolve only floating maps; `map_has_key`
-continues to resolve string and floating maps. The original ValueExpr `map`
-retains its string/float scope. Existing protobuf field and enum numbers are
-unchanged.
-
-New CEL compilation emits the typed operators for numeric map comparisons,
-map-key presence and map value reads, including string/float reads. An older
-protobuf decoder sees an unset expression, which query validation rejects.
-This prevents a mixed cluster from treating an integer-map column on an older
-node as unknown and silently omitting its rows while another node answers.
-Map queries emitted by the new compiler therefore require updated node and
-relay decoders; legacy protobuf operators remain usable for their original
-families. Candidate fetches also require the typed-map response acknowledgement
-described in [map order](integer-map-order.md#exact-ordering-and-composition),
-including from empty nodes that previously skipped expression validation.
-These checks use request/response contracts, not health probes.
+`FilterExpr.map_number` resolves across f64, i64 and u64 map planes;
+`FilterExpr.map_has_key` and `ValueExpr.map` resolve across string, f64, i64
+and u64 map planes. Retired tags 7, 8 and 2 are `reserved`, so CEL compilation
+emits one canonical operator per concept, and empty nodes validate configured
+map column families during `FetchValues` and `Collapse` reads.
 
 ## Exact values and missing entries
 

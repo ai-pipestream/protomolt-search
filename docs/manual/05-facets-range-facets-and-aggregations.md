@@ -8,9 +8,9 @@ over one shared match bitmap:
 - `facet_fields`: plain facet columns.
 - `map_facet_fields`: `{column, key}` pairs. The shape is structured instead
   of a `"column[key]"` string, so keys need no escaping. These come back
-  after the plain entries, with `key` set.
-- `range_facet_fields`: a column, optional map key, and `edges` or
-  `typed_edges`, returned positionally.
+  after the plain entries, with `map_key` set.
+- `range_facet_fields`: a column, optional `map_key`, and exact `FilterBound`
+  `edges`, returned positionally.
 
 The counts are count-then-rank: every document matching at least one query term
 **and** passing every filter enters the count, whatever `k` and `min_score` are. A
@@ -41,17 +41,16 @@ value on an interior edge goes in the upper bucket. There are no
 implicit underflow or overflow buckets: a value below the first edge or at or
 above the last falls in no bucket. If you want the tails, ask for them.
 
-On the unsigned-numeric feature branch, `typed_edges` accepts exact signed,
-unsigned and finite double values through `FilterBound`. Set one value per
-edge, keep `exclusive=false`, and omit legacy `edges`. Values from i64/u64
-columns compare exactly even against double bounds. For example, uint(0)
-through num(18446744073709551616) covers the full u64 domain.
+`RangeFacetField.edges` accepts exact signed, unsigned and finite double values
+through `FilterBound`. Set one value per edge and keep `exclusive=false`.
+Values from i64/u64 columns compare exactly even against double bounds. For
+example, `uint(0)` through `num(18446744073709551616)` covers the full u64
+domain.
 
-Typed requests return `typed_from` and `typed_to` in each bucket. Use those
-exact bounds; the legacy display doubles can round adjacent integer edges to
-the same value. Roots and relays check the returned intervals and refuse count
-overflow. This requires matching client and server builds. See
-[the complete interval contract](../range-facets.md#typed-edges-2026-09-05-feature-branch).
+Each `RangeBucket` returns exact `FilterBound` `from` and `to` bounds matching
+the request. Roots and relays check the returned intervals and refuse count
+overflow. See
+[the complete interval contract](../range-facets.md#typed-edges).
 
 ## The Aggregate route
 

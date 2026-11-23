@@ -102,19 +102,19 @@ number, which is the whole point of the kinded table.
   counts retain it. No NaN sentinel exists in map pairs; non-finite numeric
   values are refused at ingest.
 - Empty keys are literal keys in ordinary `AddDocuments` map entries.
-  Dedicated map predicates, explicit map score/range inputs and `MapRead`
-  distinguish them from plain columns. Legacy selectors retain their meaning;
-  use the explicit map forms to select an empty key.
+  Optional `map_key` fields on string predicates, score stages and range
+  facets, together with `MapRead`, distinguish empty map keys from plain
+  columns.
 - **Counting**: `MapFacetField { column, key }` entries ride the same
   count-then-rank pass as plain facets — resolve (column, key) to a
   shard-local key ordinal once, then one binary search per matched
   document. Counts are additive; roots and relays validate each response's
   column and key before merging, then sort count-desc, value-asc. Map entries
   follow plain entries in `facets`, with `FacetFieldCounts.map_key` present
-  even for an empty key. The legacy `key` also echoes the key.
-- **Scoring**: `ScoreStage.map_op` selects a map-numeric entry, including an
-  empty key; bounds use that key's min/max. Legacy operations with a nonempty
-  `ScoreStage.key` still select a map entry. See [score input](score-functions.md).
+  even for an empty key.
+- **Scoring**: `ScoreStage.map_key` selects a map-numeric entry, including an
+  empty key; bounds use that key's min/max. Omitting `map_key` selects a plain
+  column. See [score input](score-functions.md).
 - **The typo rule goes down to the key.** A shard lacking the column or
   the key answers known=false and contributes nothing (its documents
   genuinely hold no entries — exact, not degraded). A (column, key)
@@ -164,78 +164,52 @@ Descriptor comparison confirms byte-identical protobuf wire declarations to
 
 ### Explicit map string selectors (2026-09-06)
 
-`FilterExpr.map_string_range` (tag 13) and `map_string_prefix` (tag 14)
-carry explicit map context. Their key is literal, including the empty string.
-The node resolves an optional key: no key selects a plain column; a present
-empty key selects the map dictionary's empty key. CEL emits these variants
-for empty-key ordering and prefixes. Existing scalar and nonempty map CEL
-predicates retain their previous wire encoding; callers may also use the new
-variants for nonempty map keys.
-
-Before this change, `meta[''] >= 'm'` and `meta[''].startsWith('m')` lost
-map context in CEL compilation. Node and placement evaluation then read a plain
-column named `meta`. A regression with opposite scalar and map values reproduced
-the incorrect placement decision. Evaluation now reads the map, and placement
-cannot exclude or remove these leaves using same-named scalar bounds. Leaf order
-for knowledge checks and field-use authorization includes both new variants.
-
-An older protobuf filter schema sees an unknown oneof variant. Its required
-expression validation must reject the unset node, including inside a connective,
-so the compiled filter cannot silently acquire scalar semantics. The public CEL
-text endpoint needs an updated server to compile this meaning correctly; the new
-wire contract does not change an older server's compiler. These variants also
-work through current relays without a special translation.
+`FilterExpr.string_range` (tag 11) and `FilterExpr.string_prefix` (tag 12) carry
+an optional `map_key` on `StringRangePredicate` (tag 5) and
+`StringPrefixPredicate` (tag 4). An absent `map_key` selects a plain facet
+column; a present `map_key`, including the empty string, selects that literal
+key in the map dictionary. CEL emits `map_key` for map ordering and prefixes
+such as `meta[''] >= 'm'` and `meta[''].startsWith('m')`. Evaluation reads the
+map column, and placement cannot exclude or remove these leaves using
+same-named scalar bounds. Leaf order for knowledge checks and field-use
+authorization covers both plain and map forms.
 
 Tests cover heap and mapped dictionaries, absent keys and empty values, Kleene
 negation, direct and two-level relay queries over gRPC, placement evaluation and
-pruning, field-use denial before statistics, and decoding against the preceding
-12-variant filter descriptor. The descriptor comparison permits only these two
-additive fields. Empty-key ingestion was gated at that checkpoint; the count
-contract below completes the ordinary ingestion path.
-
-Combined validation against main `66094fc` passed 507 library tests, 723
-integration tests across 124 targets, 12 embedded tests and two IVF tests
-(1,244 total; one existing live OpenNLP test ignored). All five mobile Rust
-checks, test/example compilation, formatting and vendored-proto checks passed.
-Descriptor comparison confirms exactly the two additive filter variants, with
-all preceding wire declarations unchanged. This is local validation with two
-build jobs and four test threads; no fleet rollout was performed.
+pruning, and field-use denial before statistics.
 
 ### Explicit map score input (2026-09-06)
 
-Score stages now use a protobuf operation oneof with an explicit map operation
-that preserves a literal empty key. Scoring, bounds, column knowledge, fetched
-signals and explanations carry that distinction through current relays.
+`ScoreStage.map_key` (optional string, tag 11) preserves a literal map key,
+including empty. Scoring, bounds, column knowledge, fetched signals and
+explanations carry that distinction through relays.
 [Score input](score-functions.md#explicit-map-input-2026-09-06) describes the
-contract, generated-client migration and old-peer refusal. Existing operation
-wire encodings remain identical. The subsequent count contract below enables
-empty-key ingestion through the ordinary column API.
+contract. The count contract below enables empty-key ingestion through the
+ordinary column API.
 
 ### Explicit map counts and ingestion (2026-09-06)
 
-Ordinary `AddDocuments` now accepts empty map keys for strings and finite
+Ordinary `AddDocuments` accepts empty map keys for strings and finite
 numbers. A present empty string or numeric zero remains distinct from an
 omitted entry. Duplicate keys, unknown columns and non-finite values still
-refuse before mutation. The subsequent [descriptor projection](map-projection.md)
+refuse before mutation. The [descriptor projection](map-projection.md)
 increment connects supported protobuf map values to these columns.
 
-`RangeFacetField.map` carries `MapRangeFacet { key, edges, typed_edges }` with
-a literal key, including empty. Keep the outer legacy key and edge lists
-empty; mixed forms refuse. The same half-open, exact typed-edge rules apply
-inside the map input. An older decoder drops this new field and leaves an
-invalid empty edge list, so it cannot reinterpret the request as a plain range.
+`RangeFacetField` carries `optional string map_key` (tag 7) and
+`repeated FilterBound edges` (tag 8), selecting a literal map key (including
+empty) when `map_key` is present and a plain column when `map_key` is absent.
+The same half-open, exact typed-edge rules apply.
 See [range facets](range-facets.md#explicit-map-input-2026-09-06).
 
 `FacetFieldCounts.map_key` and `RangeFacetCounts.map_key` retain map context
 with protobuf presence. Nodes echo them on known and unknown map responses;
 plain responses omit them. Roots and relays reject a different column/key,
-missing context for empty-key counts, unknown responses carrying counts, and
-count overflow. Explicit map ranges require this context for every key;
-legacy nonempty-key requests can still accept an older response's key echo.
-Range merges also validate every interval edge before adding counts.
+missing context for map counts, unknown responses carrying counts, and
+count overflow. Range merges also validate every interval edge before adding
+counts.
 
-`tests/map_count_presence.rs` covers typed intervals and boundaries, old-decoder
-refusal, ambiguous inputs, forged response identity and overflow.
+`tests/map_count_presence.rs` covers typed intervals and boundaries, forged
+response identity and overflow.
 `tests/map_value_presence.rs` covers named and empty keys, missing entries,
 string and numeric projections, facet and range counts, and Aggregate count,
 sum and mean through direct and two-level relay gRPC queries. It exercises
@@ -245,17 +219,20 @@ The WAL check uses the explicit reshard replay path after the flush persistence
 barrier; the rebuild reads log records independently of the source images.
 Automatic WAL replay on node open is not implemented: an interrupted bulk
 build refuses to open. This remains a durability/recovery integration gap.
-Storage encodings are unchanged. Deploy matching servers for empty-key queries;
-older ingestion servers may still refuse empty keys.
+Storage encodings are unchanged.
 
-Validation against main `46099c7` passed 507 library tests, 732 integration
-tests across 126 targets, 12 embedded tests and two IVF tests (1,253 total;
-one existing live OpenNLP test ignored). All five Android/iOS Rust target
-checks, test/example compilation, formatting and vendored-proto checks passed.
-Descriptor comparison permits only `RangeFacetField.map`, `MapRangeFacet`,
-and the optional `map_key` fields on the two count responses; preceding wire
-declarations are unchanged. This is local validation with two build jobs and
-four test threads. No fleet deployment was performed.
+**Simultaneous rollout requirement.** Coordinators, relays, nodes and
+regenerated gRPC/JSON clients must switch to the single-form `search.proto`
+schema together. `StringRangePredicate` and `StringPrefixPredicate` carry map
+context on `optional string map_key` (tags `5` and `4`, with retired tag `2`
+reserved), and lexical stream completion (`Bm25StreamCompletion`, with
+`Bm25QueryStreamResponse` tag `2` reserved), `FetchValuesResponse` map-type
+validation (tag `11` reserved) and the query stream's content fingerprint
+(`QueryStreamRevision` tag `7` reserved) assume matching builds; mixed-fleet
+peers would silently misread a map-context string range or prefix predicate as
+a plain facet-column predicate without an error. Under proto3 JSON
+(`WIRE_JSON`), `FilterExpr.mapNumber`/`mapHasKey` and `ValueExpr.map` bind to
+the unified all-plane map variants (tags `15`, `16`, and `16`).
 
 ### Remaining map work
 

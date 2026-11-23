@@ -196,7 +196,6 @@ async fn every_query_shape_and_collapse_carries_imported_identity() {
             let events = streamed_query(&coordinator, Some(request), 0).await;
             let (revisions, completion) = stream_parts(&events);
             for revision in revisions {
-                assert_eq!(revision.content_fingerprint_version, 2);
                 if revision.hits.is_empty() {
                     continue;
                 }

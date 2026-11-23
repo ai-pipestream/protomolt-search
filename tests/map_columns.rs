@@ -330,13 +330,13 @@ async fn map_facet_counts_are_exact_with_key_level_typo_rules() {
     assert_eq!(hits.len(), 4);
     assert_eq!(facets.len(), 2);
     assert_eq!(
-        (facets[0].field.as_str(), facets[0].key.as_str()),
+        (facets[0].field.as_str(), facets[0].map_key()),
         ("meta", "color")
     );
     assert!(facets[0].known);
     assert_eq!(counts_of(&facets[0]), vec![("red", 2), ("blue", 1)]);
     assert_eq!(
-        (facets[1].field.as_str(), facets[1].key.as_str()),
+        (facets[1].field.as_str(), facets[1].map_key()),
         ("meta", "lang")
     );
     assert_eq!(counts_of(&facets[1]), vec![("de", 1), ("en", 1)]);
@@ -547,11 +547,9 @@ async fn distributed_map_stages_and_ingest_refusals() {
         .with_bm25(Some(analysis.clone()), Default::default());
 
     let stages = [ScoreStage {
-        operation: Some(pipestream_search::pb::score_stage::Operation::Op(
-            ScoreOp::MultLog as i32,
-        )),
+        op: ScoreOp::MultLog as i32,
         column: "attrs".to_string(),
-        key: "boost".to_string(),
+        map_key: Some("boost".to_string()),
         weight: 1.0,
         origin: 0.0,
         scale: 0.0,
@@ -583,7 +581,7 @@ async fn distributed_map_stages_and_ingest_refusals() {
 
     // A key no shard knows refuses, naming column[key] and the knob.
     let typo = [ScoreStage {
-        key: "bost".to_string(),
+        map_key: Some("bost".to_string()),
         ..stages[0].clone()
     }];
     let err = common::fanout::bm25_stages(&distributed, "rust", 6, &typo, None)

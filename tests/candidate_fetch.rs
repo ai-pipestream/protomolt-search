@@ -389,7 +389,7 @@ where
 }
 
 #[tokio::test]
-async fn coordinator_refuses_old_or_inconsistent_fetch_peers_before_publishing_values() {
+async fn coordinator_refuses_incomplete_or_inconsistent_fetch_peers_before_publishing_values() {
     let good = FetchValuesResponse {
         rows: vec![FetchedRow {
             doc_id: 0,
@@ -412,6 +412,17 @@ async fn coordinator_refuses_old_or_inconsistent_fetch_peers_before_publishing_v
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
     );
     let coordinator = CoordinatorServiceImpl::new(vec![address]);
+    assert_value_and_stage_refusals(&coordinator, &response, &good).await;
+    assert_identity_refusals(&coordinator, &response).await;
+    server.abort();
+    let _ = server.await;
+}
+
+async fn assert_value_and_stage_refusals(
+    coordinator: &CoordinatorServiceImpl,
+    response: &std::sync::Mutex<FetchValuesResponse>,
+    good: &FetchValuesResponse,
+) {
     let projections = vec![projection("7")];
     assert_eq!(
         coordinator
@@ -429,9 +440,7 @@ async fn coordinator_refuses_old_or_inconsistent_fetch_peers_before_publishing_v
                 invalid.stats_epoch = 0;
                 invalid.stats_incarnation.clear();
             }
-            1 => {
-                invalid.stats_incarnation.pop();
-            }
+            1 => drop(invalid.stats_incarnation.pop()),
             2 => invalid.visibility_fingerprint = vec![3; 32],
             3 => invalid.visibility_columns_known = vec![true],
             4 => invalid.rows[0].doc_id = 1,
@@ -458,9 +467,7 @@ async fn coordinator_refuses_old_or_inconsistent_fetch_peers_before_publishing_v
     *response.lock().unwrap() = malformed_stage;
     let stages = vec![ScoreStage {
         column: "boost".into(),
-        operation: Some(pipestream_search::pb::score_stage::Operation::Op(
-            ScoreOp::AddLinear as i32,
-        )),
+        op: ScoreOp::AddLinear as i32,
         weight: 1.0,
         ..Default::default()
     }];
@@ -468,12 +475,18 @@ async fn coordinator_refuses_old_or_inconsistent_fetch_peers_before_publishing_v
         .fetch_values(&[0], &projections, &stages)
         .await
         .is_err());
-    *response.lock().unwrap() = good;
+    *response.lock().unwrap() = good.clone();
     let expected = StatsClaim::required(1, &[9; 32]).unwrap();
     assert!(coordinator
         .fetch_values_at(&[0], &projections, &[], &[expected])
         .await
         .is_err());
+}
+
+async fn assert_identity_refusals(
+    coordinator: &CoordinatorServiceImpl,
+    response: &std::sync::Mutex<FetchValuesResponse>,
+) {
     let expected = StatsClaim::required(1, &[2; 32]).unwrap();
     let identity_good = FetchValuesResponse {
         stats_epoch: 1,
@@ -506,19 +519,14 @@ async fn coordinator_refuses_old_or_inconsistent_fetch_peers_before_publishing_v
             2 => invalid.identities.push(invalid.identities[0].clone()),
             3 => invalid.stats_epoch += 1,
             4 => invalid.stats_incarnation[0] ^= 1,
-            5 => invalid.identities[0]
-                .identity
-                .as_mut()
-                .unwrap()
-                .document_key
-                .clear(),
+            5 => {
+                let id = invalid.identities[0].identity.as_mut().unwrap();
+                id.document_key.clear();
+            }
             6 => invalid.identities[0].identity.as_mut().unwrap().version = 0,
             7 => {
-                invalid.identities[0]
-                    .identity
-                    .as_mut()
-                    .unwrap()
-                    .document_key = vec![1; 16385]
+                let id = invalid.identities[0].identity.as_mut().unwrap();
+                id.document_key = vec![1; 16385];
             }
             _ => unreachable!(),
         }
@@ -547,15 +555,12 @@ async fn coordinator_refuses_old_or_inconsistent_fetch_peers_before_publishing_v
             .unwrap()[&0],
         None
     );
-    server.abort();
-    let _ = server.await;
 }
 
 #[tokio::test]
-async fn typed_map_fetch_requires_empty_peers_to_acknowledge_declared_types() {
+async fn integer_map_fetch_requires_peers_to_agree_on_declared_types() {
     let projections = vec![projection("values['']")];
     let current = FetchValuesResponse {
-        typed_map_contract_version: 1,
         rows: vec![FetchedRow {
             doc_id: 0,
             values: vec![ProjectedValue {
@@ -591,16 +596,6 @@ async fn typed_map_fetch_requires_empty_peers_to_acknowledge_declared_types() {
         responses.push(response);
     }
     let coordinator = CoordinatorServiceImpl::new(addresses);
-    let error = coordinator
-        .fetch_values(&[0], &projections, &[])
-        .await
-        .err()
-        .unwrap();
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert!(error
-        .message()
-        .contains("typed map fetch contract acknowledgement"));
-    responses[1].lock().unwrap().typed_map_contract_version = 1;
     let result = coordinator
         .fetch_values(&[0], &projections, &[])
         .await

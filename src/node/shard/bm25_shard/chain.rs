@@ -19,12 +19,7 @@ impl Bm25Shard {
     }
 
     fn resolve_stage(&self, spec: &ScoreStageSpec) -> Stage {
-        let ScoreStageSpec {
-            op,
-            column,
-            key,
-            typed_map,
-        } = spec;
+        let ScoreStageSpec { op, column, key } = spec;
         // A geo stage reads a geo-point column and nothing
         // else: its op carries the origin, and its bound is
         // identity, so there is no min/max to lift.
@@ -37,7 +32,7 @@ impl Bm25Shard {
         }
         let (column, min_max) = if key.is_none() {
             self.scalar_stage_column(column)
-        } else if *typed_map && self.map_integer_index(column).is_some() {
+        } else if self.map_integer_index(column).is_some() {
             let ci = self.map_integer_index(column).expect("checked signed map");
             let key_ord = self.map_integer_key_ord(ci, key.as_deref().unwrap());
             (
@@ -49,7 +44,7 @@ impl Bm25Shard {
                     .and_then(|k| self.map_integer_key_min_max(ci, k))
                     .map(int_min_max_as_f64),
             )
-        } else if *typed_map && self.map_unsigned_integer_index(column).is_some() {
+        } else if self.map_unsigned_integer_index(column).is_some() {
             let ci = self
                 .map_unsigned_integer_index(column)
                 .expect("checked unsigned map");

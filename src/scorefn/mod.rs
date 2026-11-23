@@ -176,25 +176,3 @@ pub struct Stage {
     /// extent, for the reason [`ScoreChain::bound`] spells out.
     pub min_max: (f64, f64),
 }
-
-impl crate::pb::ScoreStage {
-    /// Wire operation code, including the code inside an explicit map input.
-    pub(crate) fn operation_code(&self) -> i32 {
-        use crate::pb::score_stage::Operation;
-        match &self.operation {
-            Some(Operation::Op(op)) => *op,
-            Some(Operation::MapOp(map) | Operation::TypedMapOp(map)) => map.op,
-            None => 0,
-        }
-    }
-
-    /// A map key has presence independently of its string value. Validation
-    /// rejects conflicting legacy keys before this selector is resolved.
-    pub(crate) fn map_key(&self) -> Option<&str> {
-        use crate::pb::score_stage::Operation;
-        match &self.operation {
-            Some(Operation::MapOp(map) | Operation::TypedMapOp(map)) => Some(&map.key),
-            _ => (!self.key.is_empty()).then_some(self.key.as_str()),
-        }
-    }
-}

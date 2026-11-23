@@ -207,7 +207,6 @@ fn assert_cutover_outcome(
         let response = result.unwrap();
         assert_eq!(calls, 4);
         assert_eq!(response.rows_after, 4);
-        assert_eq!(response.locked_tail_records, 0);
         if matches!(flush_case, ShadowFlushCase::ReadsAvailable) {
             assert_eq!(flush_calls, 2);
         }

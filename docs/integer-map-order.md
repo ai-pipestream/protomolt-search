@@ -64,15 +64,11 @@ Relays advertise version 1 only after checking each child. This prevents older
 nodes from dropping an unknown map selector and contributing a silent omission.
 Legacy scalar sorts do not require the new acknowledgement.
 
-A valid public map selector has an empty legacy `column`. Older public Query
-decoders reject that missing column. Collapse fetches use the typed value
-operator and require `FetchValuesResponse.typed_map_contract_version` at tag 11
-to be at least 1 on every node or relay. Earlier empty nodes could bypass
-expression validation and return unknown types; the acknowledgement rejects
-that shortcut. Empty fetches now resolve against configured families, and
-collapse checks agreed types even without candidate rows. Floating map keys
-refuse as group identities even when no rows qualify. No route number or
-existing field number changes, and the mapped-plan fingerprint is unchanged.
+A valid public map selector has an empty `column`. Collapse fetches use
+`ValueExpr.map` (tag 16) and resolve empty fetches against configured column
+families, checking agreed declared types across every consulted node or relay
+even when no candidate rows qualify. Floating map keys refuse as group
+identities even when no rows qualify. The mapped-plan fingerprint is unchanged.
 
 ## Permissions and lifecycle
 

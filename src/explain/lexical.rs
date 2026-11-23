@@ -139,11 +139,7 @@ fn expansion_source(
 
 /// One score stage applied to the node below it.
 fn stage_node(stage: &ScoreStageExplain, current: Explanation) -> Explanation {
-    let key = stage
-        .map_key
-        .as_deref()
-        .or_else(|| (!stage.key.is_empty()).then_some(stage.key.as_str()));
-    let name = match key {
+    let name = match stage.map_key.as_deref() {
         None => stage.column.clone(),
         Some(key) => format!("{}[{key:?}]", stage.column),
     };

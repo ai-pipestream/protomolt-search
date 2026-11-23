@@ -1442,6 +1442,25 @@ cache as searches touch them; writable tails remain heap-owned. See [Mapped vect
 
 ## TODO
 
+- **2026-11-20 — Canonical `search.proto` request forms (simultaneous
+  upgrade).** Range facets, score stages, map string/number filters and map
+  value reads each collapse to one canonical request/response shape with
+  `optional string map_key` presence and exact `FilterBound` edges/bounds,
+  reserving every retired field tag and name (including
+  `CompactShardResponse.locked_tail_records`). Upgrade coordinators, relays,
+  nodes and regenerated gRPC/JSON clients together: `StringRangePredicate` and
+  `StringPrefixPredicate` move map context to `optional string map_key` (tags
+  `5` and `4`, reserving `key` tag `2`) and the mixed-peer
+  `Bm25QueryStreamResponse.done`, `FetchValuesResponse` tag `11`
+  (`typed_map_contract_version`), and `QueryStreamRevision` tag `7`
+  (`content_fingerprint_version`) guards/version fields are removed, so
+  mixed-fleet peers would silently misread map-context string predicates as
+  plain facet-column predicates without an error. Under proto3 JSON
+  (`WIRE_JSON`), `FilterExpr.mapNumber`/`mapHasKey` and `ValueExpr.map` bind to
+  the unified all-plane map variants (tags `15`, `16`, and `16`), and
+  range-facet edges/bounds take `FilterBound` messages. Stored index formats
+  are unchanged. See [map columns](docs/map-columns.md) and
+  [range facets](docs/range-facets.md).
 - **2026-09-13 — tonic 0.14 and prost 0.14.** The gRPC stack moves as
   one: tonic 0.14 here and in `turbovec-grpc` (with tonic-health and
   tonic-reflection, its main at 4c8827b), prost and prost-types 0.14,

@@ -267,13 +267,11 @@ pub(in crate::node) fn uint_min_max_as_f64((min, max): (u64, u64)) -> (f64, f64)
     }
 }
 
-/// A validated score input. Keep the typed map selector distinct from the
-/// legacy f64-only map operation throughout resolution.
+/// A validated score input: the transform and the column or map entry it reads.
 pub(crate) struct ScoreStageSpec {
     pub(in crate::node) op: crate::scorefn::StageOp,
     pub(in crate::node) column: String,
     pub(in crate::node) key: Option<String>,
-    pub(in crate::node) typed_map: bool,
 }
 
 /// The validated operation of wire stage `i`.
@@ -282,7 +280,7 @@ fn parse_stage_op(
     stage: &crate::pb::ScoreStage,
 ) -> Result<crate::scorefn::StageOp, Status> {
     use crate::scorefn::StageOp;
-    Ok(match crate::pb::ScoreOp::try_from(stage.operation_code()) {
+    Ok(match crate::pb::ScoreOp::try_from(stage.op) {
         Ok(crate::pb::ScoreOp::MultExpDecay) => {
             if !(stage.scale.is_finite() && stage.scale > 0.0) || !stage.origin.is_finite() {
                 return Err(Status::invalid_argument(format!(
@@ -329,10 +327,10 @@ fn parse_stage_op(
                 stage.origin_lat,
                 stage.origin_lon,
             )?;
-            if stage.map_key().is_some() {
+            if stage.map_key.is_some() {
                 return Err(Status::invalid_argument(format!(
                     "score stage {i}: MULT_GEO_DECAY reads a geo-point column, which \
-                     has no keys; use the plain `op` selector with `key` empty"
+                     has no keys; leave map_key absent"
                 )));
             }
             StageOp::MultGeoDecay {
@@ -349,7 +347,7 @@ fn parse_stage_op(
         Ok(crate::pb::ScoreOp::Unspecified) | Err(_) => {
             return Err(Status::invalid_argument(format!(
                 "score stage {i}: unknown op {}",
-                stage.operation_code()
+                stage.op
             )));
         }
     })
@@ -369,21 +367,11 @@ pub(crate) fn parse_score_stages(
                     "score stage {i}: a stage names the numeric column it reads"
                 )));
             }
-            if matches!(
-                stage.operation,
-                Some(crate::pb::score_stage::Operation::MapOp(_) | crate::pb::score_stage::Operation::TypedMapOp(_))
-            ) && !stage.key.is_empty()
-            {
-                return Err(Status::invalid_argument(format!(
-                    "score stage {i}: an explicit map operation carries its own key; leave the legacy key empty"
-                )));
-            }
             let op = parse_stage_op(i, stage)?;
             Ok(ScoreStageSpec {
                 op,
                 column: stage.column.clone(),
-                key: stage.map_key().map(str::to_owned),
-                typed_map: matches!(stage.operation, Some(crate::pb::score_stage::Operation::TypedMapOp(_))),
+                key: stage.map_key.clone(),
             })
         })
         .collect()

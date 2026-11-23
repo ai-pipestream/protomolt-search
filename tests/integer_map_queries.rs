@@ -477,7 +477,7 @@ async fn empty_map_columns_retain_types_across_relay_projection_checks() {
 }
 
 #[tokio::test]
-async fn typed_map_queries_compose_across_children_with_missing_columns() {
+async fn integer_map_queries_compose_across_children_with_missing_columns() {
     let input = materialized_docs();
     let mut addresses = Vec::new();
     let mut servers = Vec::new();

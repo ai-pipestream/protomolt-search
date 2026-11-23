@@ -134,16 +134,14 @@ async fn start_numeric_shards(
 
 fn decay_stage(origin: f64, scale: f64) -> ScoreStage {
     ScoreStage {
-        key: String::new(),
-        operation: Some(pipestream_search::pb::score_stage::Operation::Op(
-            ScoreOp::MultExpDecay as i32,
-        )),
+        op: ScoreOp::MultExpDecay as i32,
         column: "date".to_string(),
         weight: 0.0,
         origin,
         scale,
         origin_lat: 0.0,
         origin_lon: 0.0,
+        map_key: None,
     }
 }
 
@@ -506,31 +504,27 @@ async fn stage_and_ingest_refusals_are_loud() {
         ),
         (
             ScoreStage {
-                key: String::new(),
-                operation: Some(pipestream_search::pb::score_stage::Operation::Op(
-                    ScoreOp::MultLog as i32,
-                )),
+                op: ScoreOp::MultLog as i32,
                 column: "date".to_string(),
                 weight: -1.0,
                 origin: 0.0,
                 scale: 0.0,
                 origin_lat: 0.0,
                 origin_lon: 0.0,
+                map_key: None,
             },
             "weight >= 0",
         ),
         (
             ScoreStage {
-                key: String::new(),
-                operation: Some(pipestream_search::pb::score_stage::Operation::Op(
-                    ScoreOp::Unspecified as i32,
-                )),
+                op: ScoreOp::Unspecified as i32,
                 column: "date".to_string(),
                 weight: 0.0,
                 origin: 0.0,
                 scale: 0.0,
                 origin_lat: 0.0,
                 origin_lon: 0.0,
+                map_key: None,
             },
             "unknown op",
         ),

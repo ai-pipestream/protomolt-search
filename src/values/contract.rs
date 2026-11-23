@@ -1,35 +1,9 @@
-//! The projection contract between shards and the coordinator: fetch
-//! versions, declared types, and row validation.
+//! The projection contract between shards and the coordinator: declared
+//! types and row validation.
 
 use super::ValuesError;
 
-use super::leaves::{column_leaves, ValueLeaf};
 use crate::pb;
-
-/// Typed-map fetches include empty-node validation and declared value types.
-pub const TYPED_MAP_FETCH_VERSION: u32 = 1;
-
-/// Older empty nodes could skip expression validation and type declarations.
-/// Check the response from every node or relay before combining any rows.
-pub fn validate_map_fetch_contract(
-    projections: &[pb::CompiledProjection],
-    version: u32,
-) -> Result<(), ValuesError> {
-    let mut leaves = Vec::new();
-    for projection in projections {
-        if let Some(expr) = &projection.expr {
-            column_leaves(expr, &mut leaves);
-        }
-    }
-    if version < TYPED_MAP_FETCH_VERSION
-        && leaves
-            .iter()
-            .any(|leaf| matches!(leaf, ValueLeaf::TypedMap { .. }))
-    {
-        return Err(ValuesError::failed_precondition("shard omitted the typed map fetch contract acknowledgement; update every node and relay"));
-    }
-    Ok(())
-}
 
 /// The actual projected scalar, with absence represented by UNSPECIFIED.
 pub fn projected_type(value: &pb::ProjectedValue) -> pb::ScalarValueType {

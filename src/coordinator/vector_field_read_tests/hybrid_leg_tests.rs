@@ -217,9 +217,7 @@ async fn assert_stage_column_denied(
                 &HashMap::new(),
                 &[ScoreStage {
                     column: "audience".into(),
-                    operation: Some(crate::pb::score_stage::Operation::Op(
-                        ScoreOp::AddLinear as i32
-                    )),
+                    op: ScoreOp::AddLinear as i32,
                     ..Default::default()
                 },]
             )

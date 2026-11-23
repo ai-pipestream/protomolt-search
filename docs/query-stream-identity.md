@@ -32,10 +32,10 @@ item. Revocation invalidates buffered items and the operation's eventual
 completion. Already delivered provisional results cannot be recalled: clients
 discard them if the request does not end with successful completion.
 
-## Fingerprint version 2
+## Content fingerprint
 
-`content_fingerprint_version` is 2 on new revisions; an omitted value identifies
-the legacy v1 hash. The v2 SHA-256 input is the bytes
+`QueryStreamRevision.content_fingerprint` (tag 4; retired version tag 7 is
+`reserved`) is the SHA-256 over the bytes
 `protomolt-query-revision-v2` followed by a NUL, then:
 
 1. Phase and identity state as little-endian 32-bit values.

@@ -396,7 +396,7 @@ fn push_value_constraints(
         ColumnFamily::try_from(mapped.family),
         Ok(ColumnFamily::MapI64 | ColumnFamily::MapU64)
     ) {
-        constraints.push("Exact numeric map comparisons, key presence, typed value expressions, checked arithmetic, materialization and expression-based aggregates are supported. Statistical folds require explicit double() conversion. Direct map sorting and collapse preserve exact typed keys. Bounded score stages use typed_map_op and convert integer inputs and extrema to double for scoring only. Range facets use typed_map and preserve exact values and typed boundaries. Column statistics are not yet implemented.".into());
+        constraints.push("Exact numeric map comparisons, key presence, typed value expressions, checked arithmetic, materialization and expression-based aggregates are supported. Statistical folds require explicit double() conversion. Direct map sorting and collapse preserve exact typed keys. Bounded score stages on map entries convert integer inputs and extrema to double for scoring only. Range facets on map entries preserve exact values and typed boundaries. Column statistics are not yet implemented.".into());
         if mapped.family == ColumnFamily::MapI64 as i32
             && matches!(descriptor.r#type(), Type::Uint64 | Type::Fixed64)
         {

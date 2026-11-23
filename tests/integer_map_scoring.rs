@@ -6,7 +6,6 @@ use pipestream_search::{
     node::NodeConfig,
     pb::{self, node_service_client::NodeServiceClient, search_service_server::SearchService},
 };
-use prost::Message;
 use tonic::Request;
 
 const SIGNED: [Option<i64>; 8] = [
@@ -30,21 +29,6 @@ const UNSIGNED: [Option<u64>; 8] = [
     Some(1 << 53),
 ];
 const KEY: &str = "zz'\\\"雪";
-// Deliberately independent wire fixture: before support lands the new
-// operation disappears on decode and must be refused, including empty nodes.
-#[derive(Clone, PartialEq, Message)]
-struct WireStage {
-    #[prost(message, optional, tag = "10")]
-    typed_map_op: Option<pb::MapScoreOperation>,
-    #[prost(string, tag = "2")]
-    column: String,
-    #[prost(double, tag = "3")]
-    weight: f64,
-    #[prost(double, tag = "4")]
-    origin: f64,
-    #[prost(double, tag = "5")]
-    scale: f64,
-}
 fn stages(column: &str, key: &str) -> Vec<pb::ScoreStage> {
     [
         pb::ScoreOp::AddLinear,
@@ -52,26 +36,18 @@ fn stages(column: &str, key: &str) -> Vec<pb::ScoreStage> {
         pb::ScoreOp::MultExpDecay,
     ]
     .into_iter()
-    .map(|op| {
-        pb::ScoreStage::decode(
-            WireStage {
-                typed_map_op: Some(pb::MapScoreOperation {
-                    op: op as i32,
-                    key: key.into(),
-                }),
-                column: column.into(),
-                weight: if op == pb::ScoreOp::AddLinear {
-                    -2e-19
-                } else {
-                    0.4
-                },
-                origin: 0.0,
-                scale: 9_223_372_036_854_775_808.0,
-            }
-            .encode_to_vec()
-            .as_slice(),
-        )
-        .unwrap()
+    .map(|op| pb::ScoreStage {
+        op: op as i32,
+        map_key: Some(key.into()),
+        column: column.into(),
+        weight: if op == pb::ScoreOp::AddLinear {
+            -2e-19
+        } else {
+            0.4
+        },
+        origin: 0.0,
+        scale: 9_223_372_036_854_775_808.0,
+        ..Default::default()
     })
     .collect()
 }
@@ -208,45 +184,20 @@ async fn verify(address: String) {
             assert_eq!(hit.dimensions[0].raw, expected);
             assert_eq!(hit.score, expected.unwrap_or(0.0) as f32);
         }
-        let mut legacy = query(column, "");
-        for stage in &mut legacy.score_stages {
-            stage.operation = Some(pb::score_stage::Operation::MapOp(pb::MapScoreOperation {
-                op: pb::ScoreOp::AddLinear as i32,
-                key: "".into(),
-            }));
-        }
-        assert!(
-            coord.bm25_search(Request::new(legacy)).await.is_err(),
-            "legacy f64 map selector must not silently expand its domain"
-        );
         assert!(coord
             .bm25_search(Request::new(query(column, "missing")))
             .await
             .is_err());
     }
 }
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn typed_map_score_values_explain_and_fetch_survive_relay_reopen_and_compaction() {
-    let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 92371));
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("map-score-segments-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let config = NodeConfig {
-        index_path: Some(dir.join("index.tv")),
-        wal: true,
-        wal_buckets: 2,
-        seal_tail_docs: 3,
-        map_integer_fields: vec!["signed".into()],
-        map_unsigned_integer_fields: vec!["unsigned".into()],
-        integer_fields: vec!["row".into()],
-        analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
-        ..Default::default()
-    };
-    let (addr, handle) = common::start_empty_node(config.clone()).await;
-    let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+async fn ingest_map_score_fixture(
+    client: &mut NodeServiceClient<tonic::transport::Channel>,
+    shift: &[f32],
+    scale: &[f32],
+) {
     client
         .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-            8, 4, &shift, &scale,
+            8, 4, shift, scale,
         ))
         .await
         .unwrap();
@@ -300,6 +251,28 @@ async fn typed_map_score_values_explain_and_fetch_survive_relay_reopen_and_compa
             client.flush(pb::FlushRequest {}).await.unwrap();
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn integer_map_score_values_explain_and_fetch_survive_relay_reopen_and_compaction() {
+    let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 92371));
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("map-score-segments-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = NodeConfig {
+        index_path: Some(dir.join("index.tv")),
+        wal: true,
+        wal_buckets: 2,
+        seal_tail_docs: 3,
+        map_integer_fields: vec!["signed".into()],
+        map_unsigned_integer_fields: vec!["unsigned".into()],
+        integer_fields: vec!["row".into()],
+        analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
+        ..Default::default()
+    };
+    let (addr, handle) = common::start_empty_node(config.clone()).await;
+    let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+    ingest_map_score_fixture(&mut client, &shift, &scale).await;
     verify(addr.clone()).await;
     let (empty, empty_h) = common::start_empty_node(NodeConfig {
         slot_offset: 16,
@@ -518,38 +491,21 @@ mod pruning {
     }
 }
 
-#[derive(Clone, PartialEq, Message)]
-struct OldStage {
-    #[prost(int32, optional, tag = "1")]
-    op: Option<i32>,
-    #[prost(message, optional, tag = "9")]
-    map_op: Option<pb::MapScoreOperation>,
-    #[prost(string, tag = "2")]
-    column: String,
-    #[prost(double, tag = "3")]
-    weight: f64,
-}
 #[tokio::test]
 async fn unsupported_and_malformed_map_operations_refuse_on_empty_nodes() {
     let (addr, handle) = common::start_empty_node(NodeConfig::default()).await;
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     let valid = stages("unsigned", "")[0].clone();
-    let old = OldStage::decode(valid.encode_to_vec().as_slice()).unwrap();
-    assert!(old.op.is_none() && old.map_op.is_none());
-    let lost = pb::ScoreStage::decode(old.encode_to_vec().as_slice()).unwrap();
-    let mut duplicate = valid.clone();
-    duplicate.key = "other".into();
+    let mut unspecified = valid.clone();
+    unspecified.op = pb::ScoreOp::Unspecified as i32;
+    let mut unnamed = valid.clone();
+    unnamed.column.clear();
     let mut geo = valid.clone();
-    geo.operation = Some(pb::score_stage::Operation::TypedMapOp(
-        pb::MapScoreOperation {
-            op: pb::ScoreOp::MultGeoDecayHaversine as i32,
-            key: "".into(),
-        },
-    ));
+    geo.op = pb::ScoreOp::MultGeoDecayHaversine as i32;
     geo.scale = 1.;
     let mut bad = valid.clone();
     bad.weight = f64::NAN;
-    for stage in [lost, duplicate, geo, bad] {
+    for stage in [unspecified, unnamed, geo, bad] {
         assert_eq!(
             client
                 .fetch_values(pb::FetchValuesRequest {

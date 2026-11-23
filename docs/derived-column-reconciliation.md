@@ -17,7 +17,7 @@ branch:
 | Allocation | Integer-map branch | Main cea2c63 |
 |---|---|---|
 | AddDocumentsRequest tag 27 | repeated MapIntegerEntry map_integers | string derived_fingerprint |
-| ValueExpr tag 16 | typed_map | stable_key_hash |
+| ValueExpr tag 16 | map (`MapRead`) | stable_key_hash |
 | Column-table kind 15 | exact signed integer map | derived-column declaration |
 
 The feature branch now reconciles these allocations: map document tags 27/28,
@@ -128,32 +128,25 @@ Shared files extend beyond the original note's list: `src/values.rs`,
 reshard metadata, `src/schema_report.rs`, and index-definition reporting.
 FetchValues needs no new protocol for ordinary stored derived columns.
 
-The earlier feature checkpoints already allocate `ValueExpr.typed_map` at tag
-16, `FilterExpr.typed_map_number` at 15 and `typed_map_has_key` at 16, plus
+The feature checkpoints allocate `ValueExpr.map` at tag 16,
+`FilterExpr.map_number` at 15 and `FilterExpr.map_has_key` at 16, plus
 ColumnFamily MAP_I64/MAP_U64 at 9/10 and the corresponding map query
-representations at 9/10. Calendar/hash additions must not reuse those numbers
-even while this feature branch is separate from main.
+representations at 9/10. Calendar/hash additions must not reuse those numbers.
 
 The map-order increment adds `QuerySort.map`, `CollapseSpec.map` and
 `BrowseSort.map` at tag 3, and `BrowseShardResponse.sort_contract_version` at
-16. The empty-node type fix also adds
-`FetchValuesResponse.typed_map_contract_version` at tag 11, checked on every
-child of a typed-map fetch, and resolves empty fetches against configured
-families. Preserve these selectors and per-child checks during reconciliation.
-The route table is unchanged. The existing map operators and column families
-remain under `ai.protomolt.search.v1`.
+16, while empty `FetchValues` calls resolve declared types against configured
+families (`FetchValuesResponse` tag 11 is reserved). Preserve these selectors
+and per-child type checks during reconciliation. The route table is unchanged,
+and the map operators and column families live under `ai.protomolt.search.v1`.
 
 Declaration/persistence can start independently. Reconcile against the current
 feature checkpoint before changing the shared evaluator, and keep the fleet
 proof after the source contract, durability checks and backfill verification.
 
-The following scoring increment allocates `ScoreStage.typed_map_op` at tag 10,
-reusing MapScoreOperation for f64/i64/u64 inputs. Preserve its distinction from
-the legacy f64-only selectors and its double conversion at score evaluation.
-This changes no routes, value-expression tags, storage formats or recovery
-metadata.
-
-The integer-map range increment reserves `RangeFacetField.typed_map` at tag 6,
-reusing MapRangeFacet for exact f64/i64/u64 map bucket counts. It is exclusive
-with the legacy f64-only map selector and key/edge fields. Keep this allocation
-when reconciling the proto; no routes or storage metadata change.
+Map scoring uses `ScoreStage.map_key` (optional string, tag 11; retired tags 6,
+9, 10 reserved) for f64/i64/u64 map entries with double conversion at score
+evaluation. Map range facets use `RangeFacetField.map_key` (tag 7) and
+`RangeFacetField.edges` (tag 8; retired tags 2–6 reserved) for exact f64/i64/u64
+map bucket counts. Neither changes routes, value-expression tags, storage
+formats or recovery metadata.

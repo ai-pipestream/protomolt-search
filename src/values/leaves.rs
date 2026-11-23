@@ -6,11 +6,9 @@ use crate::pb;
 /// One column-read leaf of a value expression.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValueLeaf {
-    /// A map read that includes the exact integer planes.
-    TypedMap { column: String, key: String },
     /// A plain column read.
     Column(String),
-    /// A map entry read.
+    /// A string, f64, i64 or u64 map entry read.
     Map {
         /// Map column name.
         column: String,
@@ -24,9 +22,7 @@ impl ValueLeaf {
     pub fn describe(&self) -> String {
         match self {
             ValueLeaf::Column(name) => name.clone(),
-            ValueLeaf::Map { column, key } | ValueLeaf::TypedMap { column, key } => {
-                format!("{column}[{key:?}]")
-            }
+            ValueLeaf::Map { column, key } => format!("{column}[{key:?}]"),
         }
     }
 }
@@ -37,10 +33,6 @@ pub fn column_leaves(expr: &pb::ValueExpr, out: &mut Vec<ValueLeaf>) {
     use pb::value_expr::Expr as V;
     match expr.expr.as_ref() {
         Some(V::Column(name)) => out.push(ValueLeaf::Column(name.clone())),
-        Some(V::TypedMap(read)) => out.push(ValueLeaf::TypedMap {
-            column: read.column.clone(),
-            key: read.key.clone(),
-        }),
         Some(V::Map(read)) => out.push(ValueLeaf::Map {
             column: read.column.clone(),
             key: read.key.clone(),
@@ -125,7 +117,6 @@ pub fn reads_stable_key(expr: &pb::ValueExpr) -> bool {
         .any(reads_stable_key),
         Some(V::Column(_))
         | Some(V::Map(_))
-        | Some(V::TypedMap(_))
         | Some(V::UintLiteral(_))
         | Some(V::IntLiteral(_))
         | Some(V::FloatLiteral(_))
@@ -146,8 +137,7 @@ pub fn leaf_known(leaf: &ValueLeaf, cols: &dyn ColumnLookup) -> bool {
                 || cols.unsigned_integer_index(name).is_some()
                 || cols.facet_index(name).is_some()
         }
-        ValueLeaf::Map { column, key } | ValueLeaf::TypedMap { column, key } => {
-            let typed = matches!(leaf, ValueLeaf::TypedMap { .. });
+        ValueLeaf::Map { column, key } => {
             let num = cols
                 .map_numeric_index(column)
                 .and_then(|ci| cols.map_numeric_key_ord(ci, key))
@@ -159,12 +149,10 @@ pub fn leaf_known(leaf: &ValueLeaf, cols: &dyn ColumnLookup) -> bool {
             num || facet
                 || cols
                     .map_integer_index(column)
-                    .filter(|_| typed)
                     .and_then(|ci| cols.map_integer_key_ord(ci, key))
                     .is_some()
                 || cols
                     .map_unsigned_integer_index(column)
-                    .filter(|_| typed)
                     .and_then(|ci| cols.map_unsigned_integer_key_ord(ci, key))
                     .is_some()
         }

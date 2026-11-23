@@ -53,9 +53,9 @@ impl Declaration {
             let inputs: BTreeSet<String> = leaves
                 .into_iter()
                 .map(|leaf| match leaf {
-                    values::ValueLeaf::Column(column)
-                    | values::ValueLeaf::Map { column, .. }
-                    | values::ValueLeaf::TypedMap { column, .. } => column,
+                    values::ValueLeaf::Column(column) | values::ValueLeaf::Map { column, .. } => {
+                        column
+                    }
                 })
                 .collect();
             columns.push(CompiledColumn {
@@ -113,8 +113,7 @@ impl Declaration {
                 if !values::leaf_known(leaf, tables) {
                     let what = match leaf {
                         values::ValueLeaf::Column(column) => format!("column {column:?}"),
-                        values::ValueLeaf::Map { column, key }
-                        | values::ValueLeaf::TypedMap { column, key } => {
+                        values::ValueLeaf::Map { column, key } => {
                             format!("map column {column:?} (key {key:?})")
                         }
                     };

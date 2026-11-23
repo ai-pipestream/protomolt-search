@@ -281,9 +281,7 @@ async fn numeric_use_does_not_grant_explanation_or_projection_and_network_bypass
     let mut q = query();
     q.score_stages = vec![ScoreStage {
         column: "boost".into(),
-        operation: Some(pipestream_search::pb::score_stage::Operation::Op(
-            ScoreOp::AddLinear as i32,
-        )),
+        op: ScoreOp::AddLinear as i32,
         weight: 1.,
         ..Default::default()
     }];

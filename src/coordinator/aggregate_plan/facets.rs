@@ -84,10 +84,8 @@ pub(crate) fn merge_facet_counts(
             ));
         }
         for (i, (response, &(field, key))) in share.iter().zip(&targets).enumerate() {
-            let legacy_map = key.is_some_and(|key| !key.is_empty()) && response.map_key.is_none();
             if response.field != field
-                || response.key != key.unwrap_or_default()
-                || (response.map_key.as_deref() != key && !legacy_map)
+                || response.map_key.as_deref() != key
                 || (!response.known && !response.counts.is_empty())
             {
                 return Err(Status::failed_precondition(format!(
@@ -124,7 +122,6 @@ pub(crate) fn merge_facet_counts(
             counts.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value)));
             Ok(crate::pb::FacetFieldCounts {
                 field: field.to_owned(),
-                key: key.unwrap_or_default().to_owned(),
                 map_key: key.map(str::to_owned),
                 known,
                 counts,
