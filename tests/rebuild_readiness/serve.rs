@@ -1,0 +1,150 @@
+//! The `serve` stage's fleet-readiness wait.
+
+use super::rig::Rig;
+
+/// A verifier that reports shard 0 unreachable on every call.
+const NEVER_READY: &str = r#"echo "  ready   TIMED OUT at 0/1 shards after 2s"
+echo "  not ready  shard 0 at 127.0.0.1:1 unreachable: connection refused"
+exit 1"#;
+
+fn serving(name: &str, verifier: &str, budget_s: &str) -> Rig {
+    let mut rig = Rig::new(name);
+    rig.ready_to_serve();
+    rig.stub("verify", verifier);
+    rig.set("READY_TIMEOUT_S", budget_s);
+    rig
+}
+
+#[test]
+fn a_verifier_that_never_confirms_fails_the_stage_with_its_last_report() {
+    let rig = serving("never-ready", NEVER_READY, "1");
+    let run = rig.run("serve");
+    assert!(!run.ok, "{}", run.transcript());
+    assert!(!run.stdout.contains("fleet ready"), "{}", run.transcript());
+    assert!(
+        run.stderr.contains("fleet NOT ready after 1s"),
+        "{}",
+        run.transcript()
+    );
+    assert!(
+        run.stderr
+            .contains("not ready  shard 0 at 127.0.0.1:1 unreachable: connection refused"),
+        "{}",
+        run.transcript()
+    );
+    assert!(
+        !rig.recorded("serve"),
+        "a failed stage left a ledger record"
+    );
+}
+
+#[test]
+fn readiness_is_reported_once_the_verifier_confirms_the_shards() {
+    let ready_on_third_call = r#"if [ "$(wc -l <"$CALLS/verify")" -lt 3 ]; then
+  echo "  ready   TIMED OUT at 0/1 shards after 2s"
+  exit 1
+fi
+echo "  ready   1/1 shards after 0s""#;
+    let rig = serving("eventually-ready", ready_on_third_call, "600");
+    let run = rig.run("serve");
+    assert!(run.ok, "{}", run.transcript());
+    assert!(run.stdout.contains("fleet ready"), "{}", run.transcript());
+    let calls = rig.calls("verify");
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    assert!(
+        calls[0].contains("--shards=1 --ready-only --wait-ready=2"),
+        "{calls:?}"
+    );
+    assert!(rig.recorded("serve"));
+}
+
+#[test]
+fn a_missing_verifier_fails_the_stage_before_anything_starts() {
+    let mut rig = Rig::new("no-verifier");
+    rig.ready_to_serve();
+    let run = rig.run("serve");
+    assert!(!run.ok, "{}", run.transcript());
+    assert!(!run.stdout.contains("fleet ready"), "{}", run.transcript());
+    assert!(
+        run.stderr.contains("no v7_verify at"),
+        "{}",
+        run.transcript()
+    );
+    assert!(rig.calls("bin").is_empty(), "a node or coordinator started");
+}
+
+#[test]
+fn a_verifier_lost_during_the_wait_fails_the_stage() {
+    let rig = serving("verifier-lost", "rm -- \"$0\"\nexit 1", "20");
+    let run = rig.run("serve");
+    assert!(!run.ok, "{}", run.transcript());
+    assert!(!run.stdout.contains("fleet ready"), "{}", run.transcript());
+    assert!(
+        run.stderr.contains("failed (exit 127)"),
+        "{}",
+        run.transcript()
+    );
+    assert_eq!(rig.calls("verify").len(), 1);
+}
+
+#[test]
+fn a_verifier_usage_error_fails_the_stage_at_once() {
+    let usage = "echo '--ready-only needs --wait-ready=<seconds>' >&2\nexit 2";
+    let rig = serving("verifier-usage", usage, "20");
+    let run = rig.run("serve");
+    assert!(!run.ok, "{}", run.transcript());
+    assert!(
+        run.stderr.contains("failed (exit 2)")
+            && run.stderr.contains("--ready-only needs --wait-ready"),
+        "{}",
+        run.transcript()
+    );
+    assert_eq!(rig.calls("verify").len(), 1);
+}
+
+/// The coordinator accepts the verifier's connection and never answers.
+#[test]
+fn a_verifier_left_without_an_answer_fails_the_stage_when_the_budget_ends() {
+    let rig = serving("verifier-hangs", &Rig::stays_up(), "1");
+    let run = rig.run("serve");
+    assert!(!run.ok, "{}", run.transcript());
+    assert!(!run.stdout.contains("fleet ready"), "{}", run.transcript());
+    assert!(
+        run.stderr.contains("fleet NOT ready after 1s")
+            && run.stderr.contains("gave the verifier no answer"),
+        "{}",
+        run.transcript()
+    );
+    assert_eq!(rig.calls("verify").len(), 1);
+}
+
+#[test]
+fn a_coordinator_that_exits_during_the_wait_fails_the_stage() {
+    let rig = serving("coordinator-exits", NEVER_READY, "20");
+    let nodes_stay_up = format!(
+        "case \"$*\" in *--role=coordinator*) exit 3 ;; esac\n{}",
+        Rig::stays_up()
+    );
+    rig.stub("bin", &nodes_stay_up);
+    let run = rig.run("serve");
+    assert!(!run.ok, "{}", run.transcript());
+    assert!(!run.stdout.contains("fleet ready"), "{}", run.transcript());
+    assert!(
+        run.stderr.contains("the coordinator exited"),
+        "{}",
+        run.transcript()
+    );
+}
+
+/// A shard-only host starts no coordinator and waits on nothing, so it
+/// needs no verifier and never claims the fleet is ready.
+#[test]
+fn a_shard_only_host_serves_without_a_verifier_or_a_readiness_claim() {
+    let mut rig = Rig::new("shard-only");
+    rig.ready_to_serve();
+    rig.set("RUN_COORD", "0");
+    let run = rig.run("serve");
+    assert!(run.ok, "{}", run.transcript());
+    assert!(!run.stdout.contains("fleet ready"), "{}", run.transcript());
+    assert_eq!(rig.calls("bin").len(), 1, "one node, no coordinator");
+}

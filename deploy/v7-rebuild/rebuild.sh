@@ -26,7 +26,8 @@
 #
 #   OUT, CHUNKS, EMB, CASE_NAMES, SHARDS, DIM, BLOCK, CHUNK_BLOCKS,
 #   FIELDS, PORT_BASE, COORD_PORT, SIDECAR_PORT, SIDECAR_BIN,
-#   OFFSET_STRIDE, EMBEDDINGS_DIR, BIN, INGEST,
+#   OFFSET_STRIDE, EMBEDDINGS_DIR, BIN, INGEST, PROBE, VERIFY,
+#   READY_TIMEOUT_S, EMBED_TIMEOUT_S (the readiness budgets),
 #   WAVE (shards ingesting at once), DISK_MARGIN_GB, BODY_COLUMNS,
 #   VOCAB / VOCAB_WINDOW_DOCS / VOCAB_TOP_K (vocabulary harvesting, off
 #   unless VOCAB=1; see docs/VOCABULARY-INDEX.md)
@@ -53,7 +54,9 @@
 #                  present to the coordinator (--bearer-token-file)
 #   SIDECAR_ADDR   the analysis sidecar URL every node, driver, and
 #                  coordinator uses (default http://127.0.0.1:$SIDECAR_PORT);
-#                  the sidecar is only started here when it is local
+#                  the sidecar is only started here when it is local, and
+#                  local or remote it must answer an embed probe ($PROBE)
+#                  on every host that runs a stage using it
 #   RUN_COORD      1 (default) to start the coordinator in `serve`; 0 on
 #                  hosts that only serve shards
 #   COORD_HOST     the coordinator's bind address (default 127.0.0.1)
@@ -122,7 +125,8 @@ SIDECAR_PORT=${SIDECAR_PORT:-59202}
 # The pure-Rust turbo-kserve server (`cargo build --release -p turbo-kserve`
 # in `ai-pipestream/turboembed`) serves both `AnalysisService` and KServe v2
 # embeddings. Alternatively set `SIDECAR_ADDR=turbo` for in-process lexical
-# analysis on each node.
+# analysis on each node: a lexical-only deployment, unless TURBO_EMBED_BUNDLE
+# names a bundle for in-process embedding.
 SIDECAR_BIN=${SIDECAR_BIN:-/work/worktrees/turboembed/turboembed/target/release/turbo-kserve}
 # The bundle directory turbo-kserve serves query embeddings from
 # (`TURBO_KSERVE_BUNDLE_DIR`). Ingest does not need it -- vectors come from
@@ -133,6 +137,13 @@ BIN=${BIN:-$REPO/target/release/pipestream-search}
 INGEST=${INGEST:-$REPO/target/release/examples/court_ingest}
 PROBE=${PROBE:-$REPO/target/release/examples/analyze_probe}
 VERIFY=${VERIFY:-$REPO/target/release/examples/v7_verify}
+# How long `serve` waits for every shard to answer health before it fails.
+# The bench fleet budgets the same wait: cold-starting 8x57G shards took
+# more than 750s on krick-1.
+READY_TIMEOUT_S=${READY_TIMEOUT_S:-3600}
+# How long one embed probe may take to answer, and how long a sidecar
+# started here has to load its bundles and pass one.
+EMBED_TIMEOUT_S=${EMBED_TIMEOUT_S:-120}
 
 # Resource cadence for the data plane: shard nodes and the coordinator run
 # niced so an interactive shell and the analysis sidecar stay responsive
@@ -173,6 +184,8 @@ CLIENT_ARG_LIST=("${TLS_ARG_LIST[@]}")
 
 die() { echo "rebuild: $*" >&2; exit 1; }
 say() { echo "== $*"; }
+[[ $READY_TIMEOUT_S =~ ^[0-9]+$ && $EMBED_TIMEOUT_S =~ ^[1-9][0-9]*$ ]] ||
+  die "READY_TIMEOUT_S=$READY_TIMEOUT_S must be whole seconds and EMBED_TIMEOUT_S=$EMBED_TIMEOUT_S a positive number of them"
 
 # --- corpus math ------------------------------------------------------
 #
@@ -317,9 +330,7 @@ INGEST_BLOCK=${INGEST_BLOCK:-}
 # rows it holds and continues from there (a driver that died, a node
 # restarted mid-ingest).
 INGEST_RESUME=${INGEST_RESUME:-}
-# The sidecar is started and probed here only when it lives on this host.
 is_local() { local x; for x in "${LOCAL[@]}"; do [[ $x == "$1" ]] && return 0; done; return 1; }
-sidecar_is_local() { [[ $SIDECAR_ADDR == http://127.0.0.1:* || $SIDECAR_ADDR == http://localhost:* ]]; }
 # Off-loopback plaintext must be asked for by name (docs/security.md);
 # TLS flags in TLS_ARGS replace it.
 PLAINTEXT_ARGS=()
@@ -431,55 +442,6 @@ start_node() {
 }
 
 stage_sidecar() { sidecar_up; }
-
-# Analysis and embedding are separate capabilities of the same process,
-# and a sidecar can hold one without the other: an open port proves
-# neither. Probe embedding specifically, because that is the half ingest
-# never exercises (vectors come from the file), so a sidecar that cannot
-# embed serves a whole rebuild without complaint and then fails the first
-# hybrid query.
-sidecar_can_embed() {
-  "$PROBE" --addr="$SIDECAR_ADDR" --text=probe --embed >/dev/null 2>&1
-}
-
-sidecar_up() {
-  if ! sidecar_is_local; then
-    if [[ -x $PROBE ]] && ! sidecar_can_embed; then
-      die "remote analysis sidecar at $SIDECAR_ADDR does not answer an embed probe"
-    fi
-    say "using the remote analysis sidecar at $SIDECAR_ADDR"
-    return
-  fi
-  if port_open "$SIDECAR_PORT"; then
-    if [[ ! -x $PROBE ]]; then
-      say "analysis sidecar already listening on :$SIDECAR_PORT (no probe binary to check it with)"
-      return
-    fi
-    if sidecar_can_embed; then
-      say "reusing healthy sidecar on :$SIDECAR_PORT"
-      return
-    fi
-    # Most likely the server was started without TURBO_KSERVE_BUNDLE_DIR
-    # pointing at a loaded TASK_EMBED bundle: lexical analysis still
-    # answers, while embedding fails.
-    say "sidecar on :$SIDECAR_PORT answers but CANNOT EMBED; restarting it"
-    if [[ -f $RUN/sidecar.pid ]]; then
-      kill "$(cat "$RUN/sidecar.pid")" 2>/dev/null || true
-      rm -f "$RUN/sidecar.pid"
-    fi
-    for _ in $(seq 1 30); do port_open "$SIDECAR_PORT" || break; sleep 1; done
-    port_open "$SIDECAR_PORT" &&
-      die "sidecar on :$SIDECAR_PORT will not stop; kill it and re-run"
-  fi
-  [[ -x $SIDECAR_BIN ]] || die "no turbo-kserve binary at $SIDECAR_BIN"
-  [[ -d $EMBEDDINGS_DIR ]] || die "no embedding bundle dir at EMBEDDINGS_DIR=$EMBEDDINGS_DIR"
-  mkdir -p "$RUN" "$LOGS"
-  TURBO_KSERVE_LISTEN="127.0.0.1:$SIDECAR_PORT" TURBO_KSERVE_BUNDLE_DIR="$EMBEDDINGS_DIR" \
-    "$SIDECAR_BIN" >>"$LOGS/sidecar.log" 2>&1 &
-  echo $! >"$RUN/sidecar.pid"
-  wait_port "$SIDECAR_PORT" "analysis sidecar"
-  say "analysis sidecar on :$SIDECAR_PORT (pid $(cat "$RUN/sidecar.pid"))"
-}
 
 stage_calibrate() {
   mkdir -p "$OUT" "$LOGS"
@@ -594,6 +556,8 @@ stage_serve() {
     [[ -d $OUT/shard-$i.tv.bm25.build ]] && missing+=("shard-$i: build unfinished")
   done
   ((${#missing[@]} == 0)) || die "not ready to serve: ${missing[*]}"
+  [[ $RUN_COORD != 1 || -x $VERIFY ]] ||
+    die "no v7_verify at $VERIFY, so fleet readiness cannot be verified (cargo build --release --examples, or set VERIFY)"
   sidecar_up
   for i in "${LOCAL[@]}"; do
     start_node "$i"
@@ -617,20 +581,14 @@ stage_serve() {
     "${coord_plain[@]}" "${TLS_ARG_LIST[@]}" "${COORD_EXTRA_ARG_LIST[@]}" \
     ${BEARER_TOKENS:+--bearer-tokens="$BEARER_TOKENS"} \
     >>"$LOGS/coordinator.log" 2>&1 &
-  echo $! >"$RUN/coordinator.pid"
+  local coord_pid=$!
+  echo "$coord_pid" >"$RUN/coordinator.pid"
   wait_port "$COORD_PORT" coordinator
   say "coordinator on $COORD_HOST:$COORD_PORT"
-  # An open port is not readiness: a node binds before it opens its
-  # .bm25, and opening 50 GB of postings reads every document length.
   # Report when the fleet can actually answer, so the next stage does not
   # measure a cluster that is still loading.
-  say "waiting for all $SHARDS shards to answer health (they are still opening their postings)"
-  local waited
-  for waited in $(seq 1 300); do
-    "$VERIFY" --coord="127.0.0.1:$COORD_PORT" --shards="$SHARDS" \
-      --ready-only --wait-ready=2 "${CLIENT_ARG_LIST[@]}" >/dev/null 2>&1 && break
-    sleep 2
-  done
+  say "waiting up to ${READY_TIMEOUT_S}s for all $SHARDS shards to answer health (they are still opening their postings)"
+  wait_fleet_ready "$coord_pid"
   say "fleet ready on :$COORD_PORT"
 }
 
@@ -680,16 +638,8 @@ stage_status() {
   shopt -u nullglob
 }
 
-port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
-
-wait_port() {
-  local port=$1 what=$2
-  for _ in $(seq 1 120); do
-    port_open "$port" && return 0
-    sleep 1
-  done
-  die "$what never opened :$port"
-}
+# shellcheck source=deploy/v7-rebuild/readiness.sh
+source "$(dirname "${BASH_SOURCE[0]}")/readiness.sh"
 
 ENGINE_REV=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)
 

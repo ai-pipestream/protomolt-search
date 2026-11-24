@@ -15,6 +15,7 @@
 //! ```
 
 use pipestream_search::analyzer;
+use pipestream_search::coordinator::FleetReadiness;
 use pipestream_search::pb::search_service_client::SearchServiceClient;
 use pipestream_search::pb::{
     search_variant, AnalysisSpec, Bm25SearchRequest, ClusterHealthRequest, FusionMode,
@@ -114,17 +115,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .await?
                 .into_inner();
-            let up = probe
-                .targets
-                .iter()
-                .filter(|t| !t.is_replica && t.reachable)
-                .count();
-            let want = if expect_shards > 0 {
-                expect_shards
-            } else {
-                probe.targets.iter().filter(|t| !t.is_replica).count()
-            };
-            if want > 0 && up == want {
+            let state = FleetReadiness::of(&probe, expect_shards);
+            let (up, want) = (state.reachable, state.expected);
+            if state.is_ready() {
                 println!(
                     "  ready   {up}/{want} shards after {:.0}s",
                     started.elapsed().as_secs_f64()
@@ -138,6 +131,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Do NOT pass silently: fall through and let the health
                 // check below fail on the record.
                 println!("  ready   TIMED OUT at {up}/{want} shards after {wait_ready}s");
+                for blocker in &state.blockers {
+                    println!("  not ready  {blocker}");
+                }
                 if ready_only {
                     std::process::exit(1);
                 }

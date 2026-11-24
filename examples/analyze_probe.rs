@@ -110,7 +110,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .sqrt();
                 println!("embedding: dim {}, L2 norm {norm:.4}", v.len());
                 if v.iter().any(|x| !x.is_finite()) {
-                    println!("  WARNING: embedding has non-finite coordinates");
+                    println!("embedding: FAILED -- non-finite coordinates");
+                    std::process::exit(1);
                 }
             }
             Err(e) => {
