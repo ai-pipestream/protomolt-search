@@ -192,5 +192,6 @@ fn a_shard_only_host_serves_without_a_verifier_or_a_readiness_claim() {
     let run = rig.run("serve");
     assert!(run.ok, "{}", run.transcript());
     assert!(!run.stdout.contains("fleet ready"), "{}", run.transcript());
-    assert_eq!(rig.calls("bin").len(), 1, "one node, no coordinator");
+    let started = rig.calls_once_recorded("bin", 1);
+    assert_eq!(started.len(), 1, "one node, no coordinator: {started:?}");
 }

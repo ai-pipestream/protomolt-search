@@ -78,6 +78,6 @@ echo "embedding: dim 4, L2 norm 1.0000""#;
         run.transcript()
     );
     assert_eq!(rig.calls("probe").len(), 3);
-    assert_eq!(rig.calls("sidecar").len(), 1);
+    assert_eq!(rig.calls_once_recorded("sidecar", 1).len(), 1);
     assert!(rig.recorded("sidecar"));
 }

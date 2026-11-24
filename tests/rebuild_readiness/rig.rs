@@ -141,6 +141,20 @@ impl Rig {
             .unwrap_or_default()
     }
 
+    /// `name`'s calls once `count` of them are on record. A process the
+    /// script starts in the background records its call after the script
+    /// has moved on, and possibly after the script has exited.
+    pub fn calls_once_recorded(&self, name: &str, count: usize) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let calls = self.calls(name);
+            if calls.len() >= count || Instant::now() >= deadline {
+                return calls;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// Hold an open loopback port for the script to find listening.
     pub fn listening_port(&mut self) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
