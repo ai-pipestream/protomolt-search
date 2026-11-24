@@ -14,6 +14,8 @@ mod scratch;
 #[path = "rebuild_readiness/rig.rs"]
 mod rig;
 
+#[path = "rebuild_readiness/budget.rs"]
+mod budget;
 #[path = "rebuild_readiness/serve.rs"]
 mod serve;
 #[path = "rebuild_readiness/sidecar.rs"]

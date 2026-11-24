@@ -27,7 +27,7 @@
 #   OUT, CHUNKS, EMB, CASE_NAMES, SHARDS, DIM, BLOCK, CHUNK_BLOCKS,
 #   FIELDS, PORT_BASE, COORD_PORT, SIDECAR_PORT, SIDECAR_BIN,
 #   OFFSET_STRIDE, EMBEDDINGS_DIR, BIN, INGEST, PROBE, VERIFY,
-#   READY_TIMEOUT_S, EMBED_TIMEOUT_S (the readiness budgets),
+#   READY_TIMEOUT_S, EMBED_TIMEOUT_S, LEXICAL_ONLY (readiness.sh),
 #   WAVE (shards ingesting at once), DISK_MARGIN_GB, BODY_COLUMNS,
 #   VOCAB / VOCAB_WINDOW_DOCS / VOCAB_TOP_K (vocabulary harvesting, off
 #   unless VOCAB=1; see docs/VOCABULARY-INDEX.md)
@@ -125,8 +125,8 @@ SIDECAR_PORT=${SIDECAR_PORT:-59202}
 # The pure-Rust turbo-kserve server (`cargo build --release -p turbo-kserve`
 # in `ai-pipestream/turboembed`) serves both `AnalysisService` and KServe v2
 # embeddings. Alternatively set `SIDECAR_ADDR=turbo` for in-process lexical
-# analysis on each node: a lexical-only deployment, unless TURBO_EMBED_BUNDLE
-# names a bundle for in-process embedding.
+# analysis on each node, with either TURBO_EMBED_BUNDLE naming a bundle for
+# in-process embedding or LEXICAL_ONLY=1 declaring that no query is embedded.
 SIDECAR_BIN=${SIDECAR_BIN:-/work/worktrees/turboembed/turboembed/target/release/turbo-kserve}
 # The bundle directory turbo-kserve serves query embeddings from
 # (`TURBO_KSERVE_BUNDLE_DIR`). Ingest does not need it -- vectors come from
@@ -137,13 +137,6 @@ BIN=${BIN:-$REPO/target/release/pipestream-search}
 INGEST=${INGEST:-$REPO/target/release/examples/court_ingest}
 PROBE=${PROBE:-$REPO/target/release/examples/analyze_probe}
 VERIFY=${VERIFY:-$REPO/target/release/examples/v7_verify}
-# How long `serve` waits for every shard to answer health before it fails.
-# The bench fleet budgets the same wait: cold-starting 8x57G shards took
-# more than 750s on krick-1.
-READY_TIMEOUT_S=${READY_TIMEOUT_S:-3600}
-# How long one embed probe may take to answer, and how long a sidecar
-# started here has to load its bundles and pass one.
-EMBED_TIMEOUT_S=${EMBED_TIMEOUT_S:-120}
 
 # Resource cadence for the data plane: shard nodes and the coordinator run
 # niced so an interactive shell and the analysis sidecar stay responsive
@@ -184,8 +177,6 @@ CLIENT_ARG_LIST=("${TLS_ARG_LIST[@]}")
 
 die() { echo "rebuild: $*" >&2; exit 1; }
 say() { echo "== $*"; }
-[[ $READY_TIMEOUT_S =~ ^[0-9]+$ && $EMBED_TIMEOUT_S =~ ^[1-9][0-9]*$ ]] ||
-  die "READY_TIMEOUT_S=$READY_TIMEOUT_S must be whole seconds and EMBED_TIMEOUT_S=$EMBED_TIMEOUT_S a positive number of them"
 
 # --- corpus math ------------------------------------------------------
 #

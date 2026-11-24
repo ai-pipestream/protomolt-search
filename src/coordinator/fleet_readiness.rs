@@ -12,8 +12,9 @@ pub struct FleetReadiness {
     /// when the caller expects no particular count.
     pub expected: usize,
     /// One line per obstacle: each unreachable primary with its address
-    /// and probe error, then a listing whose primary count is not the
-    /// expected one. Empty exactly when the fleet is ready.
+    /// and probe error, a listing whose primary count is not the expected
+    /// one, and primaries that do not score in one space. Empty exactly
+    /// when the fleet is ready.
     pub blockers: Vec<String>,
 }
 
@@ -40,6 +41,9 @@ impl FleetReadiness {
         } else if expected == 0 {
             blockers.push("coordinator lists no primary shards".to_string());
         }
+        if !health.provider_mismatch.is_empty() {
+            blockers.push(format!("provider mismatch: {}", health.provider_mismatch));
+        }
         Self {
             reachable: primaries.iter().filter(|t| t.reachable).count(),
             expected,
@@ -47,10 +51,30 @@ impl FleetReadiness {
         }
     }
 
-    /// True when the coordinator lists exactly the expected primaries and
-    /// every one of them answered.
+    /// True when the coordinator lists exactly the expected primaries,
+    /// every one of them answered, and they score in one space.
     pub fn is_ready(&self) -> bool {
         self.blockers.is_empty()
+    }
+
+    /// True when `error`, from connecting to the coordinator or from its
+    /// `ClusterHealth` call, says only that the coordinator is not serving
+    /// yet: the connection was refused, or the call came back
+    /// `Unavailable`. Every other failure (credentials the coordinator
+    /// refuses, a TLS handshake that fails, a malformed request) will
+    /// fail the same way on the next attempt.
+    pub fn coordinator_not_serving_yet(error: &(dyn std::error::Error + 'static)) -> bool {
+        let mut cause = Some(error);
+        while let Some(current) = cause {
+            if let Some(status) = current.downcast_ref::<tonic::Status>() {
+                return status.code() == tonic::Code::Unavailable;
+            }
+            if let Some(io) = current.downcast_ref::<std::io::Error>() {
+                return io.kind() == std::io::ErrorKind::ConnectionRefused;
+            }
+            cause = current.source();
+        }
+        false
     }
 }
 
@@ -150,6 +174,51 @@ mod tests {
                 "coordinator lists 3 primary shards, expected 2",
             ]
         );
+    }
+
+    /// Every primary answers, but they do not score in one space: the
+    /// coordinator refuses Search and Query until that is repaired.
+    #[test]
+    fn a_provider_mismatch_is_not_ready() {
+        let mut answer = health(vec![target(0, false, true), target(1, false, true)]);
+        answer.provider_mismatch = "shard 0 serves hnsw, shard 1 serves flat".to_string();
+        let state = FleetReadiness::of(&answer, 2);
+        assert_eq!((state.reachable, state.expected), (2, 2));
+        assert_eq!(
+            state.blockers,
+            ["provider mismatch: shard 0 serves hnsw, shard 1 serves flat"]
+        );
+        assert!(!state.is_ready());
+    }
+
+    /// A failure with `cause` underneath, the way a transport error
+    /// carries the socket error.
+    #[derive(Debug)]
+    struct Wrapped(Box<dyn std::error::Error + 'static>);
+
+    impl std::fmt::Display for Wrapped {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("transport error")
+        }
+    }
+
+    impl std::error::Error for Wrapped {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self.0.as_ref())
+        }
+    }
+
+    #[test]
+    fn only_a_refused_connection_or_unavailable_call_is_worth_another_attempt() {
+        use std::io::{Error as Io, ErrorKind};
+        let socket = |kind| Wrapped(Box::new(Wrapped(Box::new(Io::new(kind, "socket")))));
+        let not_yet = FleetReadiness::coordinator_not_serving_yet;
+        assert!(not_yet(&socket(ErrorKind::ConnectionRefused)));
+        assert!(not_yet(&tonic::Status::unavailable("starting")));
+        assert!(!not_yet(&socket(ErrorKind::InvalidData)), "a TLS failure");
+        assert!(!not_yet(&tonic::Status::unauthenticated("bad token")));
+        assert!(!not_yet(&tonic::Status::permission_denied("no grant")));
+        assert!(!not_yet(&Wrapped(Box::new(std::fmt::Error))));
     }
 
     #[test]

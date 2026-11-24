@@ -101,22 +101,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // finding out before the cluster is serving rather than from the
     // first hybrid search.
     if std::env::args().any(|a| a == "--embed") {
-        match analyzer::embed_text(&addr, &text).await {
-            Ok(v) => {
-                let norm = v
-                    .iter()
-                    .map(|x| f64::from(*x) * f64::from(*x))
-                    .sum::<f64>()
-                    .sqrt();
-                println!("embedding: dim {}, L2 norm {norm:.4}", v.len());
-                if v.iter().any(|x| !x.is_finite()) {
-                    println!("embedding: FAILED -- non-finite coordinates");
-                    std::process::exit(1);
-                }
-            }
-            Err(e) => {
-                println!("embedding: FAILED -- {e}");
-                println!("  the server analyzes but cannot embed; check TURBO_KSERVE_BUNDLE_DIR");
+        // `--expect-dim=<the index dimension>`: a model of any other
+        // dimension embeds without error and then fails every dense query.
+        let expect_dim: usize = arg("expect-dim", "0").parse()?;
+        let judged = match analyzer::embed_text(&addr, &text).await {
+            Ok(v) => analyzer::judge_query_embedding(&v, expect_dim),
+            Err(e) => Err(format!(
+                "{e}\n  the server analyzes but cannot embed; check TURBO_KSERVE_BUNDLE_DIR"
+            )),
+        };
+        match judged {
+            Ok(summary) => println!("embedding: {summary}"),
+            Err(why) => {
+                println!("embedding: FAILED -- {why}");
                 std::process::exit(1);
             }
         }

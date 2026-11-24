@@ -15,7 +15,6 @@
 //! ```
 
 use pipestream_search::analyzer;
-use pipestream_search::coordinator::FleetReadiness;
 use pipestream_search::pb::search_service_client::SearchServiceClient;
 use pipestream_search::pb::{
     search_variant, AnalysisSpec, Bm25SearchRequest, ClusterHealthRequest, FusionMode,
@@ -23,6 +22,9 @@ use pipestream_search::pb::{
     VariantSearchRequest,
 };
 use pipestream_search::security::ToolClient;
+
+#[path = "v7_verify/ready.rs"]
+mod ready;
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");
@@ -83,6 +85,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // shard owns a returned id. 0 = do not report it.
     let offset_stride: u64 = arg("offset-stride", "0").parse()?;
 
+    // A node binds its listener BEFORE it opens its .bm25, and opening a
+    // 50 GB postings file reads every doc_length to count documents. The
+    // kernel accepts connections into the backlog the whole time, so a
+    // port check reports "ready" minutes before the node can answer, and
+    // health probes time out against a fleet that is merely still
+    // loading. Wait for actual readiness rather than raising the probe
+    // timeout, which would only hide a slow node behind a slower check.
+    let wait_ready: u64 = arg("wait-ready", "0").parse()?;
+    // Readiness probe only, so an orchestrator can gate on real readiness
+    // instead of on a bound port without running the whole matrix.
+    if std::env::args().any(|a| a == "--ready-only") {
+        let status = ready::ready_only(&security, &coord, expect_shards, wait_ready).await?;
+        std::process::exit(status);
+    }
+
     let mut client =
         SearchServiceClient::with_interceptor(security.connect(&coord).await?, security.bearer());
     let mut r = Report {
@@ -92,58 +109,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("v7 acceptance matrix against {coord}");
 
     // --- fleet ---------------------------------------------------------
-    //
-    // A node binds its listener BEFORE it opens its .bm25, and opening a
-    // 50 GB postings file reads every doc_length to count documents. The
-    // kernel accepts connections into the backlog the whole time, so a
-    // port check reports "ready" minutes before the node can answer, and
-    // health probes time out against a fleet that is merely still
-    // loading. Wait for actual readiness rather than raising the probe
-    // timeout, which would only hide a slow node behind a slower check.
-    let wait_ready: u64 = arg("wait-ready", "0").parse()?;
-    // Readiness probe only: exit 0 the moment every shard answers, exit 1
-    // on timeout. Lets an orchestrator gate on real readiness instead of
-    // on a bound port, without running the whole matrix in a poll loop.
-    let ready_only = std::env::args().any(|a| a == "--ready-only");
     if wait_ready > 0 {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_ready);
-        let started = std::time::Instant::now();
-        loop {
-            let probe = client
-                .cluster_health(ClusterHealthRequest {
-                    collection: String::new(),
-                })
-                .await?
-                .into_inner();
-            let state = FleetReadiness::of(&probe, expect_shards);
-            let (up, want) = (state.reachable, state.expected);
-            if state.is_ready() {
-                println!(
-                    "  ready   {up}/{want} shards after {:.0}s",
-                    started.elapsed().as_secs_f64()
-                );
-                if ready_only {
-                    return Ok(());
-                }
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                // Do NOT pass silently: fall through and let the health
-                // check below fail on the record.
-                println!("  ready   TIMED OUT at {up}/{want} shards after {wait_ready}s");
-                for blocker in &state.blockers {
-                    println!("  not ready  {blocker}");
-                }
-                if ready_only {
-                    std::process::exit(1);
-                }
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        }
-    } else if ready_only {
-        eprintln!("--ready-only needs --wait-ready=<seconds>");
-        std::process::exit(2);
+        // A timeout does NOT pass silently: the health check below fails
+        // on the record.
+        ready::wait(&mut client, expect_shards, wait_ready).await?;
     }
     let health = client
         .cluster_health(ClusterHealthRequest {

@@ -2,10 +2,11 @@
 
 use super::rig::Rig;
 
-/// A verifier that reports shard 0 unreachable on every call.
+/// A verifier that reports shard 0 unreachable on every call, with the
+/// status that means "not ready yet".
 const NEVER_READY: &str = r#"echo "  ready   TIMED OUT at 0/1 shards after 2s"
 echo "  not ready  shard 0 at 127.0.0.1:1 unreachable: connection refused"
-exit 1"#;
+exit 3"#;
 
 fn serving(name: &str, verifier: &str, budget_s: &str) -> Rig {
     let mut rig = Rig::new(name);
@@ -42,7 +43,7 @@ fn a_verifier_that_never_confirms_fails_the_stage_with_its_last_report() {
 fn readiness_is_reported_once_the_verifier_confirms_the_shards() {
     let ready_on_third_call = r#"if [ "$(wc -l <"$CALLS/verify")" -lt 3 ]; then
   echo "  ready   TIMED OUT at 0/1 shards after 2s"
-  exit 1
+  exit 3
 fi
 echo "  ready   1/1 shards after 0s""#;
     let rig = serving("eventually-ready", ready_on_third_call, "600");
@@ -75,7 +76,7 @@ fn a_missing_verifier_fails_the_stage_before_anything_starts() {
 
 #[test]
 fn a_verifier_lost_during_the_wait_fails_the_stage() {
-    let rig = serving("verifier-lost", "rm -- \"$0\"\nexit 1", "20");
+    let rig = serving("verifier-lost", "rm -- \"$0\"\nexit 3", "20");
     let run = rig.run("serve");
     assert!(!run.ok, "{}", run.transcript());
     assert!(!run.stdout.contains("fleet ready"), "{}", run.transcript());
@@ -100,6 +101,51 @@ fn a_verifier_usage_error_fails_the_stage_at_once() {
         run.transcript()
     );
     assert_eq!(rig.calls("verify").len(), 1);
+}
+
+/// Status 1 is the verifier saying it can never succeed as invoked: an
+/// unreadable token, a bad flag, refused credentials, a TLS failure.
+#[test]
+fn a_verifier_that_cannot_succeed_fails_the_stage_at_once() {
+    let unreadable_token =
+        "echo 'Error: \"read bearer token file /absent: No such file\"' >&2\nexit 1";
+    let rig = serving("verifier-cannot-succeed", unreadable_token, "600");
+    let run = rig.run("serve");
+    assert!(!run.ok, "{}", run.transcript());
+    assert!(!run.stdout.contains("fleet ready"), "{}", run.transcript());
+    assert!(
+        run.stderr.contains("failed (exit 1)")
+            && run.stderr.contains("read bearer token file /absent"),
+        "{}",
+        run.transcript()
+    );
+    assert_eq!(
+        rig.calls("verify").len(),
+        1,
+        "a permanent error was retried"
+    );
+}
+
+/// The coordinator answers the first attempt and then stops answering: the
+/// wait still ends with the budget, and keeps the report it did get.
+#[test]
+fn a_verifier_left_without_an_answer_on_a_later_attempt_fails_the_stage() {
+    let answers_once = format!(
+        "if [ \"$(wc -l <\"$CALLS/verify\")\" -lt 2 ]; then\n{NEVER_READY}\nfi\n{}",
+        Rig::stays_up()
+    );
+    let rig = serving("verifier-hangs-later", &answers_once, "2");
+    let run = rig.run("serve");
+    assert!(!run.ok, "{}", run.transcript());
+    assert!(!run.stdout.contains("fleet ready"), "{}", run.transcript());
+    assert!(
+        run.stderr.contains("fleet NOT ready after 2s")
+            && run.stderr.contains("shard 0 at 127.0.0.1:1 unreachable")
+            && run.stderr.contains("gave the verifier no answer"),
+        "{}",
+        run.transcript()
+    );
+    assert_eq!(rig.calls("verify").len(), 2);
 }
 
 /// The coordinator accepts the verifier's connection and never answers.

@@ -66,7 +66,7 @@ fn a_remote_sidecar_is_adopted_after_it_embeds() {
     let probes = rig.calls("probe");
     assert_eq!(
         probes,
-        ["--addr=http://sidecar.invalid:59202 --text=probe --embed"]
+        ["--addr=http://sidecar.invalid:59202 --text=probe --embed --expect-dim=1"]
     );
 }
 
@@ -100,16 +100,63 @@ fn a_listening_local_sidecar_is_reused_after_it_embeds() {
     assert_adopted(&rig, "reusing");
 }
 
+/// The probe of a provider whose model has 768 dimensions: it embeds,
+/// and only the index dimension it is asked about can refuse it.
+const PROBE_EMBEDS_768: &str = r#"case "$*" in
+  *--expect-dim=768) ;;
+  *--expect-dim=*)
+    echo "embedding: FAILED -- dim 768 where the index expects ${*##*--expect-dim=}"
+    exit 1 ;;
+esac
+echo "embedding: dim 768, L2 norm 1.0000""#;
+
 #[test]
-fn in_process_analysis_without_a_bundle_is_lexical_only_and_probes_nothing() {
-    for (name, backend) in [("turbo", "turbo"), ("native", "native")] {
-        let mut rig = Rig::new(&format!("lexical-only-{name}"));
+fn a_sidecar_whose_model_has_another_dimension_than_the_index_is_refused() {
+    let rig = Rig::new("remote-wrong-dim");
+    rig.stub("probe", PROBE_EMBEDS_768);
+    assert_refused(
+        &rig,
+        "failed the embed probe: embedding: FAILED -- dim 768 where the index expects 1",
+    );
+}
+
+#[test]
+fn a_sidecar_whose_model_has_the_index_dimension_is_adopted() {
+    let mut rig = Rig::new("remote-right-dim");
+    // A 12-byte header plus one dim-768 record.
+    rig.set("DIM", "768");
+    rig.set("EMB_BYTES", &(12 + 12 + 768 * 4).to_string());
+    rig.stub("probe", PROBE_EMBEDS_768);
+    assert_adopted(&rig, "using the remote analysis sidecar");
+}
+
+/// In-process analysis with no embedding bundle cannot embed a query. That
+/// is a deployment only when it is declared; otherwise it is a forgotten
+/// bundle.
+#[test]
+fn in_process_analysis_without_a_bundle_is_refused_unless_declared_lexical_only() {
+    for backend in ["turbo", "native"] {
+        let mut rig = Rig::new(&format!("lexical-only-{backend}"));
         rig.set("SIDECAR_ADDR", backend);
         rig.stub("probe", PROBE_CANNOT_EMBED);
         rig.stub("sidecar", MUST_NOT_START);
+        assert_refused(&rig, "LEXICAL_ONLY=1");
+        rig.set("LEXICAL_ONLY", "1");
         assert_adopted(&rig, "lexical-only");
         assert!(rig.calls("probe").is_empty(), "{backend} was probed");
     }
+}
+
+#[test]
+fn lexical_only_is_refused_for_a_deployment_that_provides_embeddings() {
+    let mut rig = Rig::new("lexical-only-contradicted");
+    rig.set("LEXICAL_ONLY", "1");
+    rig.stub("probe", PROBE_EMBEDS);
+    assert_refused(&rig, "LEXICAL_ONLY=1, but");
+    rig.set("SIDECAR_ADDR", "turbo");
+    rig.set("TURBO_EMBED_BUNDLE", &rig.path("bundles"));
+    assert_refused(&rig, "LEXICAL_ONLY=1, but");
+    assert!(rig.calls("probe").is_empty());
 }
 
 #[test]

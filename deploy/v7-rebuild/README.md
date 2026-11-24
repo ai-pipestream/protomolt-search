@@ -106,11 +106,20 @@ used to return in seconds and the fleet was genuinely ready 2m41s later.
 
 `serve` prints `fleet ready` and exits 0 only after `v7_verify
 --ready-only` has seen every expected primary shard answer health through
-the coordinator. It exits nonzero, with the verifier's last report (each
-unreachable shard, its address, and the probe error), when the wait
-outlasts `READY_TIMEOUT_S` (default 3600), when the verifier binary is
-missing or fails, or when the coordinator exits. The processes stay up
+the coordinator, all scoring in one space. It exits nonzero, with the
+verifier's last report (each unreachable shard, its address, and the probe
+error; a primary count other than `SHARDS`; a provider mismatch), when the
+wait outlasts `READY_TIMEOUT_S` (default 3600), when the verifier binary
+is missing or fails, or when the coordinator exits. The processes stay up
 for inspection.
+
+`v7_verify --ready-only` exits 0 for ready and 3 for not ready yet (shards
+still opening, or a coordinator that refuses the connection or answers
+`Unavailable`). `serve` retries only 3, each attempt under what is left of
+the budget. Every other status ends the wait at once, because the next
+attempt would fail the same way: a token file that cannot be read,
+credentials the coordinator refuses, a TLS handshake that fails, a bad
+flag.
 
 To be precise about what that window was: a node does not start its gRPC
 server until after the store opens, so connections sit unanswered in the
@@ -200,19 +209,24 @@ calling model reload leaves the running session out of sync with disk.
 An open port therefore does not mean a working sidecar: analysis and
 embedding are separate capabilities of one process, and ingest exercises
 only the first. Every stage that uses the sidecar (`up`, `sidecar`,
-`serve`) requires one successful embedding (`analyze_probe --embed`)
-before it adopts a remote sidecar, reuses a local one, or reports one it
-started. A missing `analyze_probe`, a sidecar that cannot embed, or a
+`serve`) requires one successful embedding of the index dimension
+(`analyze_probe --embed --expect-dim=$DIM`) before it adopts a remote
+sidecar, reuses a local one, or reports one it started. A missing
+`analyze_probe`, a sidecar that cannot embed, a model whose dimension is
+not `DIM` (it embeds, and every node then refuses the vector), or a
 started sidecar that only binds its port fails the stage. A local sidecar
-this script started earlier that cannot embed is restarted; one started
+this script started earlier that fails the probe is restarted; one started
 some other way is yours to stop. One probe may take `EMBED_TIMEOUT_S`
-(default 120) to answer, and a started sidecar gets the same budget to
-load its bundles and pass one.
+(default 120) to answer, and a started sidecar has the same budget in
+total to load its bundles and pass one.
 
-The lexical-only deployment is `SIDECAR_ADDR=turbo` (or `native`) with no
-`TURBO_EMBED_BUNDLE`: analysis runs in each process, there is no sidecar,
-and nothing is probed. With `TURBO_EMBED_BUNDLE` set, `turbo` embeds
-in-process and must pass the same probe.
+`SIDECAR_ADDR=turbo` (or `native`) runs analysis in each process, with no
+sidecar. With `TURBO_EMBED_BUNDLE` set, `turbo` embeds in-process and must
+pass the same probe. Without a bundle no query can be embedded, and the
+stage fails unless the deployment says that is intended:
+`LEXICAL_ONLY=1` declares the lexical-only deployment, in which nothing is
+probed. `LEXICAL_ONLY=1` beside a sidecar URL or a bundle is refused too,
+since one of the two is a mistake.
 
 ## A/B-ing an analysis change without a second rebuild
 
@@ -294,6 +308,7 @@ fleet:
 | `BEARER_TOKEN_FILE` | the token the tools present to the coordinator (`--bearer-token-file`); the verifier, the console, and the sweeps need it once `BEARER_TOKENS` is set |
 | `SIDECAR_ADDR` | the analysis sidecar URL; the sidecar starts here only when the URL is loopback |
 | `PROBE` | `analyze_probe`, which every host needs for the embed probe of a local or remote sidecar (default `target/release/examples/analyze_probe`) |
+| `LEXICAL_ONLY` | `1` on every host of a deployment that embeds no queries (`SIDECAR_ADDR=turbo` or `native` with no `TURBO_EMBED_BUNDLE`); without it that configuration fails the stage |
 | `VERIFY` / `READY_TIMEOUT_S` | `v7_verify` on the coordinator host, and the seconds `serve` waits for every shard before it fails (default 3600) |
 | `RUN_COORD` / `COORD_HOST` | whether this host starts the coordinator in `serve`, and where it binds |
 | `INGEST_SHARDS` | the shards the ingest stage feeds from this host (a driver needs only the nodes and the sidecar reachable) |

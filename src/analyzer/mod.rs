@@ -15,6 +15,7 @@ mod lattice;
 pub(crate) mod native;
 #[cfg(feature = "net")]
 mod pool;
+mod probe;
 #[cfg(feature = "net")]
 mod projection;
 #[cfg(feature = "net")]
@@ -48,6 +49,7 @@ pub use pool::{
     connect_verified_turbo_client, evict_unhealthy_turbo_channel, remote_client_for,
     remote_endpoint_config_for, shared_channel, turbo_pool_generation,
 };
+pub use probe::judge_query_embedding;
 #[cfg(feature = "net")]
 pub use projection::analyzed_from_search_projection;
 pub use spec::{
