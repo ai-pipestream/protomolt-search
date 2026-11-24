@@ -104,6 +104,27 @@ cargo run --release --example v7_verify -- \
 running the matrix by hand. Measured on the finished corpus: `serve`
 used to return in seconds and the fleet was genuinely ready 2m41s later.
 
+`serve` prints `fleet ready` and exits 0 only after `v7_verify
+--ready-only` has seen every expected primary shard answer health through
+the coordinator, all scoring in one space. It exits nonzero, with the
+verifier's last report (each unreachable shard, its address, and the probe
+error; a primary count other than `SHARDS`; a provider mismatch), when the
+wait outlasts `READY_TIMEOUT_S` (default 3600), when the verifier binary
+is missing or fails, or when the coordinator exits. The processes stay up
+for inspection.
+
+`v7_verify --ready-only` exits 0 for ready and 3 for not ready yet (shards
+still opening, or a coordinator that refuses the connection or answers
+`Unavailable`). `serve` retries only 3, each attempt under what is left of
+the budget. Every other status ends the wait at once, because the next
+attempt would fail the same way. Status 4 is a fleet that waiting cannot
+make ready: `SHARDS` is not the number of primaries the coordinator lists
+(its topology is fixed by `NODE_LIST` or `SHARD_MAP`), a primary answers
+for another collection, or the primaries do not score in one space; the
+whole report is printed. Any other status is the verifier itself failing:
+a token file that cannot be read, credentials the coordinator refuses, a
+TLS handshake that fails, a bad flag.
+
 To be precise about what that window was: a node does not start its gRPC
 server until after the store opens, so connections sit unanswered in the
 kernel backlog and probes time out. Queries were SLOW, not wrong -- no
@@ -191,9 +212,25 @@ calling model reload leaves the running session out of sync with disk.
 
 An open port therefore does not mean a working sidecar: analysis and
 embedding are separate capabilities of one process, and ingest exercises
-only the first. `sidecar_up` now probes embedding specifically
-(`analyze_probe --embed`) and restarts a sidecar that answers but cannot
-embed, rather than adopting it because the port was listening.
+only the first. Every stage that uses the sidecar (`up`, `sidecar`,
+`serve`) requires one successful embedding of the index dimension
+(`analyze_probe --embed --expect-dim=$DIM`) before it adopts a remote
+sidecar, reuses a local one, or reports one it started. A missing
+`analyze_probe`, a sidecar that cannot embed, a model whose dimension is
+not `DIM` (it embeds, and every node then refuses the vector), or a
+started sidecar that only binds its port fails the stage. A local sidecar
+this script started earlier that fails the probe is restarted; one started
+some other way is yours to stop. One probe may take `EMBED_TIMEOUT_S`
+(default 120) to answer, and a started sidecar has the same budget in
+total to load its bundles and pass one.
+
+`SIDECAR_ADDR=turbo` (or `native`) runs analysis in each process, with no
+sidecar. With `TURBO_EMBED_BUNDLE` set, `turbo` embeds in-process and must
+pass the same probe. Without a bundle no query can be embedded, and the
+stage fails unless the deployment says that is intended:
+`LEXICAL_ONLY=1` declares the lexical-only deployment, in which nothing is
+probed. `LEXICAL_ONLY=1` beside a sidecar URL or a bundle is refused too,
+since one of the two is a mistake.
 
 ## A/B-ing an analysis change without a second rebuild
 
@@ -274,6 +311,9 @@ fleet:
 | `BEARER_TOKENS` | the coordinator's public principals (`--bearer-tokens=<toml>`); unset serves anonymous callers |
 | `BEARER_TOKEN_FILE` | the token the tools present to the coordinator (`--bearer-token-file`); the verifier, the console, and the sweeps need it once `BEARER_TOKENS` is set |
 | `SIDECAR_ADDR` | the analysis sidecar URL; the sidecar starts here only when the URL is loopback |
+| `PROBE` | `analyze_probe`, which every host needs for the embed probe of a local or remote sidecar (default `target/release/examples/analyze_probe`) |
+| `LEXICAL_ONLY` | `1` on every host of a deployment that embeds no queries (`SIDECAR_ADDR=turbo` or `native` with no `TURBO_EMBED_BUNDLE`); without it that configuration fails the stage |
+| `VERIFY` / `READY_TIMEOUT_S` | `v7_verify` on the coordinator host, and the seconds `serve` waits for every shard before it fails (default 3600) |
 | `RUN_COORD` / `COORD_HOST` | whether this host starts the coordinator in `serve`, and where it binds |
 | `INGEST_SHARDS` | the shards the ingest stage feeds from this host (a driver needs only the nodes and the sidecar reachable) |
 | `EMB_BYTES` | the embeddings file's length, for hosts that do not hold the file; the cut plan needs only the length |
@@ -282,6 +322,9 @@ fleet:
 | `INGEST_RESUME` | `1` passes `--resume`: a driver continues from the rows its node reports (documents and vectors), finishing a half-sent block's vectors first |
 | `MALLOC_ARENA_MAX` | glibc arenas per node (default 2 here): with the library default a node's resident set grows by a tail per seal |
 | `NODE_EXTRA_ARGS` / `COORD_EXTRA_ARGS` | extra flags for the nodes / the coordinator, word-split. A placed group's nodes take `--placement-column=placement --placement-leaf=<code> --placement-tree=$HOME/protomolt-search/root-map-v10.toml`: the code pins the leaf and the map (the coordinator's, with its `[placement]` table) lets the node refuse a direct row the tree routes elsewhere ([placement](../../docs/placement.md)) |
+
+A host without a checkout needs `rebuild.sh` and `readiness.sh` (which it
+sources from its own directory) side by side.
 
 A four-machine example (the plan in `sea-of-slop-search-parity/design-notes/
 fleet-4-machine-plan-2026-09.md`), with the sidecar, the coordinator, and
@@ -294,6 +337,7 @@ export SHARDS=8 PORT_BASE=19300 COORD_PORT=19291 SIDECAR_PORT=19202
 export NODE_LIST=192.168.1.195:19300,192.168.1.195:19301,192.168.1.195:19302,192.168.1.195:19303,192.168.1.195:19304,192.168.1.234:19305,192.168.1.236:19306,192.168.1.216:19307
 export SIDECAR_ADDR=http://192.168.1.195:19202 LISTEN_HOST=0.0.0.0
 export OUT=$HOME/protomolt-search/shards BIN=$HOME/protomolt-search/bin/pipestream-search
+export PROBE=$HOME/protomolt-search/bin/analyze_probe   # copied next to BIN on every host
 
 # krick-1: shards 0-4, the sidecar, the drivers, the coordinator.
 # Stage the two input files onto local NVMe first: the NAS
