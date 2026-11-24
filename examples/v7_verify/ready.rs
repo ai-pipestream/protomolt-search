@@ -4,7 +4,8 @@
 //! | status | meaning |
 //! |---|---|
 //! | 0 | the coordinator lists the expected primaries, all answer, and they score in one space |
-//! | 3 | not ready yet: a primary is unreachable, or the coordinator is not serving; another attempt can succeed |
+//! | 3 | not ready yet: a primary has not answered, or the coordinator is not serving; another attempt can succeed |
+//! | 4 | cannot become ready as configured: the coordinator lists another number of primaries than expected (or none), a primary answers for another collection, or the primaries do not score in one space |
 //! | other | this invocation cannot succeed: a bad flag, an unreadable token or certificate, credentials the coordinator refuses, a TLS failure |
 
 use std::error::Error;
@@ -23,8 +24,12 @@ pub type Client = SearchServiceClient<InterceptedService<Channel, Bearer>>;
 /// `--ready-only` exit status for a fleet that is not ready yet.
 const NOT_READY_YET: i32 = 3;
 
-/// Poll `ClusterHealth` until the fleet is ready or `wait_ready` seconds
-/// have passed, and print which it was, with every blocker on a timeout.
+/// `--ready-only` exit status for a fleet that waiting cannot make ready.
+const CANNOT_BECOME_READY: i32 = 4;
+
+/// Poll `ClusterHealth` until the fleet is ready, an obstacle appears that
+/// waiting cannot clear, or `wait_ready` seconds have passed. Print which
+/// it was, with every blocker when the fleet is not ready.
 pub async fn wait(
     client: &mut Client,
     expect_shards: usize,
@@ -48,9 +53,17 @@ pub async fn wait(
             );
             return Ok(state);
         }
-        if Instant::now() >= deadline {
+        let gave_up = if !state.can_become_ready() {
+            println!("  ready   NOT POSSIBLE at {up}/{want} shards: waiting cannot clear this");
+            true
+        } else if Instant::now() >= deadline {
             println!("  ready   TIMED OUT at {up}/{want} shards after {wait_ready}s");
-            for blocker in &state.blockers {
+            true
+        } else {
+            false
+        };
+        if gave_up {
+            for blocker in state.blockers() {
                 println!("  not ready  {blocker}");
             }
             return Ok(state);
@@ -77,7 +90,8 @@ pub async fn ready_only(
     let mut client = SearchServiceClient::with_interceptor(channel, security.bearer());
     match wait(&mut client, expect_shards, wait_ready).await {
         Ok(state) if state.is_ready() => Ok(0),
-        Ok(_) => Ok(NOT_READY_YET),
+        Ok(state) if state.can_become_ready() => Ok(NOT_READY_YET),
+        Ok(_) => Ok(CANNOT_BECOME_READY),
         Err(status) => not_serving_yet_or_fatal(Box::new(status)),
     }
 }

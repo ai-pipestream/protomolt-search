@@ -153,8 +153,10 @@ start_sidecar() {
 #
 # The verifier exits 3 for "not ready yet" (shards still loading, or a
 # coordinator that is not serving), the only outcome worth another
-# attempt. Any other failure is one the next attempt would repeat: a token
-# file it cannot read, credentials the coordinator refuses, a TLS
+# attempt. It exits 4 for a fleet that waiting cannot make ready: SHARDS
+# disagrees with the coordinator's listing, or the shards do not score in
+# one space. Any other failure is also one the next attempt would repeat:
+# a token file it cannot read, credentials the coordinator refuses, a TLS
 # handshake that fails, a bad flag, a binary that is gone. Its calls carry
 # no deadline, so each attempt runs under what is left of the budget, and
 # no attempt starts once nothing is left: a coordinator that accepts the
@@ -171,6 +173,8 @@ wait_fleet_ready() {
     case $rc in
       0) return 0 ;;
       3) report=$out ;;
+      4) die "fleet NOT ready, and waiting cannot change that: fix what the verifier names and re-run; processes left up, logs in $LOGS; the verifier's report:
+$out" ;;
       124) report+="${report:+$'\n'}the coordinator on :$COORD_PORT gave the verifier no answer for ${left}s" ;;
       *) die "fleet NOT ready: the verifier $VERIFY failed (exit $rc): $(tail -n 3 <<<"$out")" ;;
     esac

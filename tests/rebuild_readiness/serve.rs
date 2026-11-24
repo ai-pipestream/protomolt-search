@@ -126,6 +126,39 @@ fn a_verifier_that_cannot_succeed_fails_the_stage_at_once() {
     );
 }
 
+/// Status 4 is the verifier saying the fleet as configured cannot become
+/// ready: `SHARDS` disagrees with the coordinator's listing, or the shards
+/// do not score in one space. The stage ends at once with the whole
+/// report, since no later attempt can differ.
+#[test]
+fn a_fleet_that_cannot_become_ready_fails_the_stage_at_once_with_the_whole_report() {
+    let cannot_become_ready = r#"echo "  ready   NOT POSSIBLE at 2/1 shards: waiting cannot clear this"
+echo "  not ready  coordinator lists 2 primary shards, expected 1"
+echo "  not ready  shard 1 at 127.0.0.1:2 answers, but: node serves collection a"
+echo "  not ready  provider mismatch: hnsw/a: shard 0; flat/b: shard 1"
+echo "  (end of report)"
+exit 4"#;
+    let rig = serving("cannot-become-ready", cannot_become_ready, "600");
+    let run = rig.run("serve");
+    assert!(!run.ok, "{}", run.transcript());
+    assert!(!run.stdout.contains("fleet ready"), "{}", run.transcript());
+    assert!(
+        run.stderr.contains("waiting cannot change that")
+            && run
+                .stderr
+                .contains("coordinator lists 2 primary shards, expected 1")
+            && run.stderr.contains("provider mismatch: hnsw/a"),
+        "{}",
+        run.transcript()
+    );
+    assert_eq!(
+        rig.calls("verify").len(),
+        1,
+        "a standing blocker was retried"
+    );
+    assert!(!rig.recorded("serve"));
+}
+
 /// The coordinator answers the first attempt and then stops answering: the
 /// wait still ends with the budget, and keeps the report it did get.
 #[test]
@@ -193,5 +226,11 @@ fn a_shard_only_host_serves_without_a_verifier_or_a_readiness_claim() {
     assert!(run.ok, "{}", run.transcript());
     assert!(!run.stdout.contains("fleet ready"), "{}", run.transcript());
     let started = rig.calls_once_recorded("bin", 1);
-    assert_eq!(started.len(), 1, "one node, no coordinator: {started:?}");
+    assert_eq!(started.len(), 1, "one node: {started:?}");
+    // The script records a coordinator's pid before it returns, so this
+    // does not depend on when a background stub logs its call.
+    assert!(
+        !rig.recorded_pid("coordinator"),
+        "a coordinator was started on a shard-only host"
+    );
 }

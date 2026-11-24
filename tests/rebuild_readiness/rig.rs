@@ -217,6 +217,12 @@ impl Rig {
         Run::of(child.wait_with_output().unwrap())
     }
 
+    /// True when the script has recorded a pid for the process `name`
+    /// (`coordinator`, `sidecar`, `node-0`): it started one.
+    pub fn recorded_pid(&self, name: &str) -> bool {
+        self.root.join(format!("out/run/{name}.pid")).exists()
+    }
+
     /// True when the stage ledger records a completed `stage`.
     pub fn recorded(&self, stage: &str) -> bool {
         fs::read_to_string(self.root.join("out/timings.jsonl"))

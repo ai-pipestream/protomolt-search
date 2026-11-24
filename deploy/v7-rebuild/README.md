@@ -117,9 +117,13 @@ for inspection.
 still opening, or a coordinator that refuses the connection or answers
 `Unavailable`). `serve` retries only 3, each attempt under what is left of
 the budget. Every other status ends the wait at once, because the next
-attempt would fail the same way: a token file that cannot be read,
-credentials the coordinator refuses, a TLS handshake that fails, a bad
-flag.
+attempt would fail the same way. Status 4 is a fleet that waiting cannot
+make ready: `SHARDS` is not the number of primaries the coordinator lists
+(its topology is fixed by `NODE_LIST` or `SHARD_MAP`), a primary answers
+for another collection, or the primaries do not score in one space; the
+whole report is printed. Any other status is the verifier itself failing:
+a token file that cannot be read, credentials the coordinator refuses, a
+TLS handshake that fails, a bad flag.
 
 To be precise about what that window was: a node does not start its gRPC
 server until after the store opens, so connections sit unanswered in the
