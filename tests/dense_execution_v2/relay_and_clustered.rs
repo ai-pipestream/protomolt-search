@@ -342,6 +342,7 @@ async fn clustered_turbovec_refuses_uncertified_exhaustive_and_serves_balanced_c
         );
     }
 
+    assert_mismatched_sidecar_refused(&backend, &corpus[..(rows / 2) * DIM], &qvec).await;
     let sidecarless = CoordinatorServiceImpl::new(Vec::new()).with_clustered_turbovec(backend);
     let no_sidecar = sidecarless
         .query(Request::new(QueryRequest {
@@ -355,4 +356,39 @@ async fn clustered_turbovec_refuses_uncertified_exhaustive_and_serves_balanced_c
 
     prod_h.abort();
     tv_h.abort();
+}
+
+/// A product-shard sidecar holding fewer rows than the clustered backend
+/// cannot certify it: FP32 EXHAUSTIVE refuses and names both counts.
+async fn assert_mismatched_sidecar_refused(
+    backend: &ClusteredTurboVecBackend,
+    partial: &[f32],
+    qvec: &[f32],
+) {
+    let (shift, scale) = fit_calibration(DIM, 4, partial);
+    let cfg = NodeConfig {
+        analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
+        facet_fields: vec!["court".into()],
+        ..Default::default()
+    };
+    let (addr, handle) = start_node(seeded_index(DIM, 4, &shift, &scale), cfg).await;
+    append_rows(&addr, partial, 0, "ca9").await;
+    let coord = CoordinatorServiceImpl::new(vec![addr]).with_clustered_turbovec(backend.clone());
+    let err = coord
+        .query(Request::new(QueryRequest {
+            k: 5,
+            selection: Some(dense_leaf(qvec, Mode::Exhaustive, Precision::Fp32)),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    handle.abort();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{}", err.message());
+    let rows = partial.len() / DIM;
+    assert!(
+        err.message().contains(&format!("holds {rows} rows"))
+            && err.message().contains(&format!("serves {}", rows * 2)),
+        "{}",
+        err.message()
+    );
 }

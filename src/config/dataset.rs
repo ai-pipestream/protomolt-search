@@ -34,8 +34,9 @@ fn unsupported_dense_policy(scope: &str) -> String {
 }
 
 pub(super) fn resolve_lexical(o: Options, file: &FileConfig) -> Result<Lexical, String> {
+    // Any presence refuses, a blank value included: the key is unsupported.
     if o.bare("dense-execution-policy")
-        || o.nonblank(
+        || o.text(
             "dense-execution-policy",
             file.dense_execution_policy.as_deref(),
         )
@@ -131,10 +132,7 @@ fn collection(at: &str, c: &FileCollection, config: &Config) -> Result<Collectio
             "{at}: --shard-map-reload-ms needs a shard_map on every collection"
         ));
     }
-    if c.dense_execution_policy
-        .as_deref()
-        .is_some_and(|raw| !raw.trim().is_empty())
-    {
+    if c.dense_execution_policy.is_some() {
         return Err(unsupported_dense_policy(at));
     }
     let own_path = |value: &Option<String>, fallback: &Option<PathBuf>| {

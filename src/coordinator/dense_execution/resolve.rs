@@ -88,7 +88,19 @@ impl CoordinatorServiceImpl {
             let health = client.health(HealthRequest {}).await?.into_inner();
             exact_rows = exact_rows.saturating_add(health.exact_vector_rows);
         }
-        Ok(exact_rows > 0)
+        if exact_rows == 0 {
+            return Ok(false);
+        }
+        // The certificate covers the product shards' rows; it certifies the
+        // clustered corpus only when the two hold the same row count.
+        if exact_rows != clustered_rows {
+            return Err(Status::failed_precondition(format!(
+                "FP32 sidecar holds {exact_rows} rows across the product shards but the \
+                 clustered backend serves {clustered_rows}; an exhaustive FP32 scan of one \
+                 cannot certify the other"
+            )));
+        }
+        Ok(true)
     }
 
     /// Validate raw dense controls on direct `Search` / `HybridSearch` calls

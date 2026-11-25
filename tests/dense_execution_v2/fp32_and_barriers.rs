@@ -44,6 +44,7 @@ async fn exhaustive_fp32_above_max_k_scans_shard_sidecars_and_direct_rpcs_guard_
 
     assert_exhaustive_fp32_matches_oracle(&coordinator, &corpus, &tie_row).await;
     assert_direct_rpc_knob_barriers(&coordinator, &tie_row).await;
+    assert_half_patience_refused(&coordinator, &tie_row).await;
     assert_search_shard_collapse_messages(&addrs[0], &tie_row).await;
     for h in handles {
         h.abort();
@@ -149,6 +150,45 @@ async fn assert_direct_rpc_knob_barriers(coordinator: &CoordinatorServiceImpl, q
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+}
+
+/// Half-specified patience is refused on direct `Search` and `HybridSearch`
+/// before any capability check, whichever half is missing.
+async fn assert_half_patience_refused(coordinator: &CoordinatorServiceImpl, qvec: &[f32]) {
+    const MESSAGE: &str = "patience_saturation_ppm and patience_hops must be set together";
+    for (saturation, hops) in [(Some(990_000), None), (None, Some(15))] {
+        let search = SearchRequest {
+            k: 5,
+            vector: qvec.to_vec(),
+            patience_saturation_ppm: saturation,
+            patience_hops: hops,
+            ..Default::default()
+        };
+        let hybrid = HybridSearchRequest {
+            k: 5,
+            text: "appellate".into(),
+            vector: qvec.to_vec(),
+            patience_saturation_ppm: saturation,
+            patience_hops: hops,
+            ..Default::default()
+        };
+        let refusals = [
+            coordinator.search(Request::new(search)).await.unwrap_err(),
+            coordinator
+                .hybrid_search(Request::new(hybrid))
+                .await
+                .unwrap_err(),
+        ];
+        for err in refusals {
+            assert_eq!(
+                err.code(),
+                tonic::Code::InvalidArgument,
+                "{}",
+                err.message()
+            );
+            assert!(err.message().contains(MESSAGE), "{}", err.message());
+        }
+    }
 }
 
 async fn assert_search_shard_collapse_messages(addr: &str, qvec: &[f32]) {

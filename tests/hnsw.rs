@@ -19,9 +19,9 @@ use pipestream_search::pb::{
     filter_query, search_query, selection_query, stream_search_request, stream_search_response,
     AddDocumentsRequest, AddVectorsRequest, BooleanQuery, CompositeSearchStrategy, DenseCoverage,
     DenseExecutionMode, DenseFilterRegimes, DenseFilterStrategy, DenseQuery, DenseScorePrecision,
-    DenseTechnique, FacetValue, FilterQuery, FlushRequest, GetVectorBackendRequest, QueryRequest,
-    QueryResponse, SearchQuery, SelectionOperator, SelectionQuery, StartStreamSearch,
-    StreamSearchRequest, VectorQualityContract,
+    DenseTechnique, DenseTermination, FacetValue, FilterQuery, FlushRequest,
+    GetVectorBackendRequest, QueryRequest, QueryResponse, SearchQuery, SelectionOperator,
+    SelectionQuery, StartStreamSearch, StreamSearchRequest, VectorQualityContract,
 };
 use pipestream_search::vector::VectorIndex;
 use tokio::sync::mpsc;

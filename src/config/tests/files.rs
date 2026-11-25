@@ -294,3 +294,33 @@ dense_execution_policy = "/etc/pipestream/books-policy.toml"
         "{cli_err}"
     );
 }
+
+#[test]
+fn a_blank_dense_execution_policy_is_refused_everywhere() {
+    let refused = |err: &str| {
+        err.contains("dense_execution_policy") && err.contains("not supported on this build")
+    };
+    for (tag, body) in [
+        (
+            "top",
+            "role = \"coordinator\"\nnodes = [\"host-a:50051\"]\ndense_execution_policy = \"\"\n",
+        ),
+        (
+            "collection",
+            "role = \"coordinator\"\n\n[[collections]]\nname = \"books\"\n\
+             nodes = [\"host-a:50051\"]\ndense_execution_policy = \"  \"\n",
+        ),
+    ] {
+        let path = temp_file(&format!("pipestream_search_blank_dense_policy_{tag}"), body);
+        let err = parse(&args(&[&config_flag(&path)])).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(refused(&err), "{tag}: {err}");
+    }
+    let cli_err = parse(&args(&[
+        "--role=coordinator",
+        "--nodes=host-a:50051",
+        "--dense-execution-policy=",
+    ]))
+    .unwrap_err();
+    assert!(refused(&cli_err), "{cli_err}");
+}

@@ -95,3 +95,83 @@ async fn unsealed_tail_enumerates_until_flushed() {
         handle.abort();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fast_walks_under_the_speed_preset_and_reports_patience() {
+    // FAST's beam is k; at k = 100 on these 1,100-row graphs every walk
+    // saturates for 15 hops before it converges.
+    const K: u32 = 100;
+    let fixture = start_fixture().await;
+    let queries = unit_vectors(8, DIM, 0x4A5E_00FA);
+    for streaming in [false, true] {
+        let coordinator = fixture.coordinator.clone().with_stream_search(streaming);
+        for query_vector in queries.as_chunks::<DIM>().0 {
+            let answer = query(
+                &coordinator,
+                dense_request(query_vector, K, DenseExecutionMode::Fast),
+            )
+            .await
+            .unwrap();
+            assert_eq!(answer.hits.len(), K as usize, "streaming={streaming}");
+            let outcome = answer.dense_execution.unwrap();
+            assert_eq!(outcome.requested_mode, DenseExecutionMode::Fast as i32);
+            assert_eq!(outcome.resolved_mode, DenseExecutionMode::Fast as i32);
+            assert_eq!(outcome.preset, "hnsw-fast-v1");
+            assert_eq!(outcome.filter_strategy, DenseFilterStrategy::Speed as i32);
+            assert_eq!(outcome.coverage, DenseCoverage::CandidateSet as i32);
+            assert!(!outcome.policy_qualified && outcome.policy_id.is_empty());
+            assert_eq!(
+                techniques_of(&outcome),
+                vec![DenseTechnique::HnswWalk as i32]
+            );
+            assert_eq!(
+                outcome.patience_stopped, SHARDS as u32,
+                "streaming={streaming}: patience 0.99 over 15 hops must stop every walk"
+            );
+            assert_eq!(
+                outcome.termination,
+                DenseTermination::BudgetStopped as i32,
+                "streaming={streaming}"
+            );
+        }
+    }
+}
+
+fn techniques_of(outcome: &pipestream_search::pb::DenseExecutionOutcome) -> Vec<i32> {
+    outcome.techniques.iter().map(|t| t.technique).collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn half_specified_patience_is_refused_on_the_node() {
+    let fixture = start_fixture().await;
+    for (saturation, hops) in [(Some(990_000), None), (None, Some(15))] {
+        let mut client = NodeServiceClient::connect(fixture.addrs[0].clone())
+            .await
+            .unwrap();
+        let started = client
+            .stream_search(tokio_stream::iter(vec![StreamSearchRequest {
+                payload: Some(stream_search_request::Payload::Start(StartStreamSearch {
+                    request_id: "half-patience".into(),
+                    vector: fixture.query_vector.clone(),
+                    candidate_depth: Some(64),
+                    patience_saturation_ppm: saturation,
+                    patience_hops: hops,
+                    ..Default::default()
+                })),
+            }]))
+            .await;
+        // The refusal arrives either on the call or as the stream's first item.
+        let status = match started {
+            Err(status) => status,
+            Ok(response) => response.into_inner().message().await.unwrap_err(),
+        };
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status
+                .message()
+                .contains("patience_saturation_ppm and patience_hops must be set together"),
+            "{}",
+            status.message()
+        );
+    }
+}
