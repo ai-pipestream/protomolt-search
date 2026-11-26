@@ -182,6 +182,9 @@ pub struct VectorSearchOptions<'a> {
     pub patience: Option<PatienceSpec>,
     /// Optional shared-floor candidate pruning policy for layer-0 walks.
     pub floor_prune: Option<FloorPruneSpec>,
+    /// Select by staged top-k on a provider that advertises
+    /// `VectorCapability::StagedTopK`; ignored by every other provider.
+    pub staged: bool,
 }
 
 impl<'a> VectorSearchOptions<'a> {

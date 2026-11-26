@@ -133,7 +133,7 @@ pub struct Reading {
 
 /// The process-wide scan and ingest counters, in page order: name,
 /// help text, the atomic.
-pub(super) const SCAN_COUNTERS: [(&str, &str, &AtomicU64); 9] = [
+pub(super) const SCAN_COUNTERS: [(&str, &str, &AtomicU64); 10] = [
     (
         "turbovec_scan_chunk_calls_total",
         "Per-chunk kernel calls made by vector scans.",
@@ -179,6 +179,11 @@ pub(super) const SCAN_COUNTERS: [(&str, &str, &AtomicU64); 9] = [
         "turbovec_vectors_added_total",
         "Vectors ingested over AddVectors batches.",
         &VECTORS_ADDED,
+    ),
+    (
+        "turbovec_dense_policy_drift_total",
+        "Dense AUTO queries that fell back due to policy identity or capability drift",
+        &DENSE_POLICY_DRIFT,
     ),
 ];
 
@@ -262,6 +267,18 @@ static SCAN_BYTES: AtomicU64 = AtomicU64::new(0);
 static SCAN_ACTIVE_NANOS: AtomicU64 = AtomicU64::new(0);
 static DOCUMENTS_ADDED: AtomicU64 = AtomicU64::new(0);
 static VECTORS_ADDED: AtomicU64 = AtomicU64::new(0);
+static DENSE_POLICY_DRIFT: AtomicU64 = AtomicU64::new(0);
+
+/// Count one AUTO dense query falling back to exhaustive execution due to
+/// policy identity or hardware drift.
+pub fn record_dense_policy_drift() {
+    DENSE_POLICY_DRIFT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Process-wide count of AUTO dense policy drift fallbacks.
+pub fn dense_policy_drift_total() -> u64 {
+    DENSE_POLICY_DRIFT.load(Ordering::Relaxed)
+}
 
 /// Fold one completed vector scan's stats into the process totals.
 /// Called where the scan produces its `ScanOutcome`, so every route

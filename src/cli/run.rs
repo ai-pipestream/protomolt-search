@@ -129,6 +129,7 @@ async fn demo_query(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
             include_rerank_candidate: false,
             filter_strategy: 0,
             enumerate_all: false,
+            staged_selection: false,
         })
         .await?
         .into_inner();

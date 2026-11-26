@@ -43,7 +43,13 @@ fn build_stream_options<'a>(
     if let Some(rows) = start.enumerate_max_rows {
         options = options.with_enumerate_max_rows(rows as usize);
     }
-    let controls = selection_controls(index, start.filter_strategy, start.enumerate_all)?;
+    if start.staged_selection {
+        return Err(Status::failed_precondition(
+            "staged top-k selection is served on the unary search route; a stream completes \
+             as an exhaustive scan",
+        ));
+    }
+    let controls = selection_controls(index, start.filter_strategy, start.enumerate_all, false)?;
     options.filter_routing = controls.filter_routing;
     if controls.enumerate_all {
         options.allow = Some(

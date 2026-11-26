@@ -239,6 +239,32 @@ pub struct FleetVectorIdentity {
     pub rows: u64,
 }
 
+/// Execution transport of the query route resolving a dense leaf.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum DenseRouteMode {
+    /// Single dense leaf: streams when `--stream-search` or finish windows are
+    /// active, and drives settle/deadline finish timers.
+    #[default]
+    SingleLeaf,
+    /// Composite `RRF` / `ScoreBlend` / `Cascade`: always executes unary leg
+    /// rounds without finish timers.
+    CompositeUnary,
+    /// Composite `Decomposed`: always streams its vector leg via `StreamSearch`
+    /// without settle/deadline finish timers.
+    CompositeDecomposed,
+}
+
+/// Request-side key for dense execution policy lookup: raw `k`, optional
+/// `candidate_depth` (`selection_k`), route transport mode, and compiled
+/// filters for live selectivity.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DenseRequestKey<'a> {
+    pub(crate) k: u32,
+    pub(crate) candidate_depth: u32,
+    pub(crate) route_mode: DenseRouteMode,
+    pub(crate) filters: Option<&'a RequestFilters>,
+}
+
 /// Hold `actual` as the fleet-wide value on first sight, and refuse with
 /// `mismatch` when a later shard reports a different one.
 fn hold_uniform<T: PartialEq>(

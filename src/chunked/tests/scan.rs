@@ -342,3 +342,65 @@ fn tie_complete_keeps_boundary_tie_group() {
     assert!(tied.iter().all(|h| h.score == tied[0].score));
     assert!(tied.windows(2).all(|w| w[0].slot < w[1].slot));
 }
+
+#[test]
+fn mixed_staged_and_exhaustive_batch_preserves_tie_completeness_and_indices() {
+    let (n, dim, k) = (512, 64, 3);
+    let mut index = VectorIndex::create(crate::vector::EMBEDDED_TURBOVEC, dim, 4).unwrap();
+    index.add(&unit_vectors(n, dim, 0xC40C_0007), dim).unwrap();
+    let query = unit_vectors(1, dim, 0x0E50_0009);
+    for _ in 0..6 {
+        index.add(&query, dim).unwrap();
+    }
+    let staged_ctl = crate::vector::SelectionControls {
+        staged: true,
+        ..Default::default()
+    };
+    let queries = [
+        BatchQuery {
+            vector: &query,
+            k,
+            keep_ties: false,
+            allow: None,
+            enumerate_max_rows: None,
+            controls: staged_ctl,
+            patience: None,
+            floor_prune: None,
+        },
+        BatchQuery {
+            vector: &query,
+            k,
+            keep_ties: true,
+            allow: None,
+            enumerate_max_rows: None,
+            controls: Default::default(),
+            patience: None,
+            floor_prune: None,
+        },
+    ];
+    let mut floor_polled = Vec::new();
+    let mut floor_published = Vec::new();
+    let results = chunked_topk_batch(
+        &index,
+        &queries,
+        1,
+        &mut |qi| {
+            floor_polled.push(qi);
+            None
+        },
+        &mut |qi, _floor| {
+            floor_published.push(qi);
+            true
+        },
+    );
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].0.len(), k);
+    assert_eq!(
+        results[1].0.len(),
+        6,
+        "exhaustive query must keep all 6 boundary ties"
+    );
+    assert!(results[1].0.windows(2).all(|w| w[0].slot < w[1].slot));
+    assert!(floor_polled.contains(&0) && floor_polled.contains(&1));
+    assert!(floor_published.contains(&0) && floor_published.contains(&1));
+}

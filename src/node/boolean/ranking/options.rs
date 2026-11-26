@@ -33,6 +33,7 @@ pub(in crate::node) fn selection_controls(
     index: &VectorIndex,
     strategy: i32,
     enumerate_all: bool,
+    staged: bool,
 ) -> Result<crate::vector::SelectionControls, Status> {
     use crate::pb::DenseFilterStrategy as Strategy;
     let filter_routing = match Strategy::try_from(strategy) {
@@ -56,9 +57,18 @@ pub(in crate::node) fn selection_controls(
             index.descriptor().backend_kind
         )));
     }
+    let capabilities = index.descriptor().capabilities;
+    if staged && !capabilities.contains(&crate::vector::VectorCapability::StagedTopK) {
+        return Err(Status::failed_precondition(format!(
+            "vector backend {:?} cannot select by staged top-k on this generation (it does \
+             not advertise staged_top_k)",
+            index.descriptor().backend_kind
+        )));
+    }
     Ok(crate::vector::SelectionControls {
         filter_routing,
         enumerate_all,
+        staged,
     })
 }
 

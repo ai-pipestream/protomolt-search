@@ -98,10 +98,9 @@ pub fn chunked_topk_batch_observed(
     observe: &mut dyn FnMut(ScanPass),
 ) -> Vec<(Vec<ChunkHit>, ScanStats)> {
     let n = index.len();
-    let mut state = BatchState::new(queries);
     let max_k = queries.iter().map(|q| q.k).max().unwrap_or(0);
     if n == 0 || queries.is_empty() || max_k == 0 {
-        return state.out;
+        return BatchState::new(queries).out;
     }
     for q in queries {
         if let Some(allow) = q.allow {
@@ -112,13 +111,94 @@ pub fn chunked_topk_batch_observed(
             );
         }
     }
-    if !index
+    let exhaustive_provider = index
         .descriptor()
         .capabilities
-        .contains(&VectorCapability::ExhaustiveCompletion)
-    {
+        .contains(&VectorCapability::ExhaustiveCompletion);
+    if !exhaustive_provider || queries.iter().all(|q| q.controls.staged) {
         return searched_batch(index, queries, external_floor, publish_floor, observe);
     }
+    if queries.iter().any(|q| q.controls.staged) {
+        return mixed_staged_batch(
+            index,
+            queries,
+            chunk_blocks,
+            external_floor,
+            publish_floor,
+            observe,
+        );
+    }
+    scanned_batch(
+        index,
+        queries,
+        chunk_blocks,
+        external_floor,
+        publish_floor,
+        observe,
+    )
+}
+
+/// Partition a coalesced batch mixing `staged` whole-index queries and
+/// exhaustive chunked scans so staged neighbors never truncate `keep_ties`
+/// or bypass chunked floor sharing on concurrent exhaustive scans.
+fn mixed_staged_batch(
+    index: &VectorIndex,
+    queries: &[BatchQuery<'_>],
+    chunk_blocks: usize,
+    external_floor: &mut dyn FnMut(usize) -> Option<f32>,
+    publish_floor: &mut dyn FnMut(usize, f32) -> bool,
+    observe: &mut dyn FnMut(ScanPass),
+) -> Vec<(Vec<ChunkHit>, ScanStats)> {
+    let mut staged_idx = Vec::new();
+    let mut staged_queries = Vec::new();
+    let mut scan_idx = Vec::new();
+    let mut scan_queries = Vec::new();
+    for (qi, q) in queries.iter().copied().enumerate() {
+        if q.controls.staged {
+            staged_idx.push(qi);
+            staged_queries.push(q);
+        } else {
+            scan_idx.push(qi);
+            scan_queries.push(q);
+        }
+    }
+    let staged_out = searched_batch(
+        index,
+        &staged_queries,
+        &mut |i| external_floor(staged_idx[i]),
+        &mut |i, f| publish_floor(staged_idx[i], f),
+        observe,
+    );
+    let scan_out = scanned_batch(
+        index,
+        &scan_queries,
+        chunk_blocks,
+        &mut |i| external_floor(scan_idx[i]),
+        &mut |i, f| publish_floor(scan_idx[i], f),
+        observe,
+    );
+    let mut out: Vec<(Vec<ChunkHit>, ScanStats)> = (0..queries.len())
+        .map(|_| (Vec::new(), ScanStats::default()))
+        .collect();
+    for (qi, res) in staged_idx.into_iter().zip(staged_out) {
+        out[qi] = res;
+    }
+    for (qi, res) in scan_idx.into_iter().zip(scan_out) {
+        out[qi] = res;
+    }
+    out
+}
+
+fn scanned_batch(
+    index: &VectorIndex,
+    queries: &[BatchQuery<'_>],
+    chunk_blocks: usize,
+    external_floor: &mut dyn FnMut(usize) -> Option<f32>,
+    publish_floor: &mut dyn FnMut(usize, f32) -> bool,
+    observe: &mut dyn FnMut(ScanPass),
+) -> Vec<(Vec<ChunkHit>, ScanStats)> {
+    let n = index.len();
+    let mut state = BatchState::new(queries);
     let chunk_size = chunk_blocks.max(1) * BLOCK_VECTORS;
     let row_bytes = index_row_bytes(index);
     let groups = KernelGroup::partition(queries);
@@ -340,6 +420,7 @@ fn searched_topk(
     options.allow = query.allow;
     options.enumerate_max_rows = query.enumerate_max_rows;
     options.filter_routing = query.controls.filter_routing;
+    options.staged = query.controls.staged;
     if query.controls.enumerate_all {
         // Pinned enumeration scores every admitted row; an unfiltered query
         // admits them all.

@@ -3,8 +3,8 @@
 //! retired modes refuse; BALANCED discloses its same-precision fallback
 //! where the provider has no balanced technique; FAST never substitutes;
 //! a configured ANN provider walks under a built-in preset that claims no
-//! measured recall, and FP32 pool rescoring never certifies coverage; a
-//! version-1 policy cannot qualify AUTO.
+//! measured recall, and FP32 pool rescoring never certifies coverage; AUTO
+//! approximates only through a version-2 policy bound to the live identity.
 
 mod common;
 
@@ -13,15 +13,16 @@ use std::path::PathBuf;
 use common::{fit_calibration, start_node, unit_vectors};
 use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
 use pipestream_search::coordinator::CoordinatorServiceImpl;
+use pipestream_search::dense_policy::DenseExecutionPolicy;
 use pipestream_search::harness::{fake_ann, seeded_index};
 use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     search_query, selection_query, AddDocumentsRequest, AddVectorsRequest, CompositeSearchStrategy,
-    DenseCoverage, DenseExecutionMode as Mode, DenseExecutionOutcome, DenseFilterStrategy,
-    DensePrecisionRequest as Precision, DenseQuery, DenseScorePrecision, DenseTechnique,
-    DenseTermination, FacetValue, FilterQuery, QueryRequest, QueryResponse, SearchQuery,
+    DenseCoverage, DenseExecutionMode as Mode, DenseExecutionOutcome, DenseExecutionPolicyDocument,
+    DenseExecutionShape, DenseFilterStrategy, DensePolicyPoint, DensePrecisionRequest as Precision,
+    DenseScorePrecision, DenseTechnique, DenseTermination, FacetValue, QueryRequest, QueryResponse,
     SelectionOperator, SelectionQuery,
 };
 use tokio::sync::mpsc;
@@ -130,29 +131,59 @@ async fn start_fixture(shards: usize, fake: bool) -> Fixture {
     }
 }
 
-fn dense_leaf(vector: &[f32], mode: Mode, precision: Precision) -> SelectionQuery {
-    SelectionQuery {
-        node: Some(selection_query::Node::Search(SearchQuery {
-            id: "vec".into(),
-            query: Some(search_query::Query::Dense(DenseQuery {
-                vector: vector.to_vec(),
-                execution_mode: mode as i32,
-                precision: precision as i32,
-                ..Default::default()
-            })),
-        })),
+/// Write a policy document the way an operator installs one and load it
+/// back: the coordinator sees the file, not the struct.
+fn load_policy(tag: &str, bytes: &[u8]) -> Result<DenseExecutionPolicy, String> {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("dense_policy_{tag}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("policy.binpb");
+    std::fs::write(&path, bytes).unwrap();
+    let policy = DenseExecutionPolicy::load(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+    policy
+}
+
+/// A version-2 document for the fake ANN fixture: k=3 walked at depth 5.
+fn fake_policy(fingerprint: &str, corpus_fp: &str, generation: u64) -> Vec<u8> {
+    use prost::Message;
+    DenseExecutionPolicyDocument {
+        format_version: pipestream_search::dense_policy::FORMAT_VERSION,
+        policy_id: "court-ann-v2".into(),
+        embedding_model: "e".into(),
+        provider_backend: fake_ann::BACKEND_KIND.into(),
+        scoring_fingerprint: fingerprint.into(),
+        corpus_generation: generation,
+        corpus_rows: N_DOCS as u64,
+        deleted_docs: 0,
+        corpus_fingerprint: corpus_fp.into(),
+        dimensions: DIM as u32,
+        measured_queries: 16,
+        target_recall_ppm: 950_000,
+        points: vec![DensePolicyPoint {
+            k: 3,
+            filter_selectivity_ppm_min: 1_000_000,
+            filter_selectivity_ppm_max: 1_000_000,
+            candidates: 5,
+            measured_recall_ppm: 990_000,
+            mode: Mode::Balanced as i32,
+            technique: DenseTechnique::HnswWalk as i32,
+            selection_precision: DenseScorePrecision::Quantized as i32,
+            output_precision: DenseScorePrecision::Quantized as i32,
+            filter_strategy: DenseFilterStrategy::Speed as i32,
+            shape: DenseExecutionShape::Unary as i32,
+            ..Default::default()
+        }],
     }
+    .encode_to_vec()
+}
+
+fn dense_leaf(vector: &[f32], mode: Mode, precision: Precision) -> SelectionQuery {
+    common::dense_selection("vec", vector.to_vec(), mode as i32, precision as i32)
 }
 
 fn cel_filter(cel: &str) -> SelectionQuery {
-    SelectionQuery {
-        node: Some(selection_query::Node::Filter(FilterQuery {
-            id: "court".into(),
-            predicate: Some(pipestream_search::pb::filter_query::Predicate::Cel(
-                cel.to_string(),
-            )),
-        })),
-    }
+    common::cel_selection("court", cel)
 }
 
 fn request(k: u32, selection_k: u32, selection: SelectionQuery) -> QueryRequest {
@@ -231,21 +262,10 @@ async fn exhaustive_and_auto_run_one_certified_quantized_scan() {
 async fn missing_retired_and_contradictory_contracts_refuse() {
     let fixture = start_fixture(1, false).await;
     for retired in [0, 1, 2, 3, 99] {
-        let mut req = request(
-            3,
-            0,
-            dense_leaf(&fixture.query_vector, Mode::Auto, Precision::Auto),
-        );
-        let Some(selection_query::Node::Search(search)) =
-            req.selection.as_mut().and_then(|s| s.node.as_mut())
-        else {
-            unreachable!()
-        };
-        let Some(search_query::Query::Dense(dense)) = search.query.as_mut() else {
-            unreachable!()
-        };
-        dense.execution_mode = retired;
-        let err = query(&fixture.coordinator, req).await.unwrap_err();
+        let sel = common::dense_selection("vec", fixture.query_vector.clone(), retired, 0);
+        let err = query(&fixture.coordinator, request(3, 0, sel))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument, "mode {retired}");
     }
     let mut leaf = dense_leaf(&fixture.query_vector, Mode::Exhaustive, Precision::Auto);
@@ -338,46 +358,72 @@ async fn a_configured_ann_provider_walks_under_a_preset_and_never_certifies() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn version_one_policy_refuses_at_config_load_and_filters_keep_the_contract() {
-    let fixture = start_fixture(2, false).await;
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("dense_policy_v1_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let policy_path = dir.join("policy.toml");
-    let v1 = format!(
-        "format_version = 1\npolicy_id = \"court-ann-v1\"\nembedding_model = \"e\"\n\
-         corpus_generation = {GENERATION}\ncorpus_rows = {N_DOCS}\ndimensions = {DIM}\n\
-         provider_backend = \"{}\"\nscoring_fingerprint = \"{}\"\n\
-         measured_queries = 16\n[[points]]\nk = 3\nfilter_selectivity_ppm_min = 1000000\n\
-         filter_selectivity_ppm_max = 1000000\ncandidates = 5\nmeasured_recall_ppm = 990000\n",
-        fake_ann::BACKEND_KIND,
-        fixture.fingerprint
-    );
-    std::fs::write(&policy_path, v1).unwrap();
-    let cfg_path = dir.join("config.toml");
-    std::fs::write(
-        &cfg_path,
-        format!(
-            "role = \"coordinator\"\nnodes = [\"127.0.0.1:50051\"]\ndense_execution_policy = {:?}\n",
-            policy_path.display().to_string()
-        ),
+async fn auto_approximates_only_through_a_bound_version_two_policy() {
+    let fixture = start_fixture(2, true).await;
+    let v1 = b"format_version = 1\npolicy_id = \"court-ann-v1\"\n";
+    assert!(load_policy("v1", v1).unwrap_err().contains("version-2"));
+    let leaf = || dense_leaf(&fixture.query_vector, Mode::Auto, Precision::Auto);
+    let corpus_fp = fixture
+        .coordinator
+        .live_dense_identity()
+        .await
+        .unwrap()
+        .corpus_fingerprint;
+    let stale = load_policy(
+        "stale",
+        &fake_policy(&fixture.fingerprint, &corpus_fp, GENERATION + 1),
     )
     .unwrap();
-    let refused = pipestream_search::config::parse(&[
-        format!("--config={}", cfg_path.display()),
-        "--allow-plaintext".to_string(),
-    ])
+    let err = query(
+        &fixture
+            .coordinator
+            .clone()
+            .with_dense_execution_policy(stale),
+        request(3, 0, leaf()),
+    )
+    .await
     .unwrap_err();
-    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(
-        refused.contains("dense_execution_policy")
-            && refused.contains("not supported on this build"),
-        "{refused}"
+        err.message().contains("corpus_generation"),
+        "{}",
+        err.message()
     );
-    let leaf = |mode| dense_leaf(&fixture.query_vector, mode, Precision::Auto);
+    let bound = load_policy(
+        "bound",
+        &fake_policy(&fixture.fingerprint, &corpus_fp, GENERATION),
+    )
+    .unwrap();
+    let coordinator = fixture
+        .coordinator
+        .clone()
+        .with_dense_execution_policy(bound);
+    let qualified = query(&coordinator, request(3, 0, leaf())).await.unwrap();
+    let outcome = qualified.dense_execution.unwrap();
+    assert_eq!(outcome.resolved_mode, Mode::Balanced as i32);
+    assert!(outcome.policy_qualified && outcome.preset.is_empty());
+    assert_eq!(
+        (outcome.policy_id.as_str(), outcome.candidate_depth),
+        ("court-ann-v2", 5)
+    );
+    assert_eq!(outcome.coverage, DenseCoverage::CandidateSet as i32);
+    // A key the policy did not measure has no exhaustive technique to fall
+    // back to on this provider, so AUTO refuses rather than approximating.
+    let err = query(&coordinator, request(2, 0, leaf()))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    let exhaustive = start_fixture(2, false).await;
     let filtered_auto = query(
-        &fixture.coordinator,
-        request(2, 0, filtered("court == 'ca9'", leaf(Mode::Auto))),
+        &exhaustive.coordinator,
+        request(
+            2,
+            0,
+            filtered(
+                "court == 'ca9'",
+                dense_leaf(&exhaustive.query_vector, Mode::Auto, Precision::Auto),
+            ),
+        ),
     )
     .await
     .unwrap();

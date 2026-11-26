@@ -3,7 +3,6 @@
 use super::*;
 
 impl CoordinatorServiceImpl {
-    #[cfg(test)]
     pub(in crate::coordinator) async fn dense_filter_selectivity(
         &self,
         filters: Option<&RequestFilters>,
@@ -22,17 +21,17 @@ impl CoordinatorServiceImpl {
             return result;
         }
         let vectors = self
-            .vector_membership(self.vector_read_field.as_deref().unwrap_or(""))
+            .vector_membership_bitmaps(self.vector_read_field.as_deref().unwrap_or(""))
             .await?;
         let admitted = if caller_filtered {
             let documents = self
-                .filter_membership(filters.expect("caller filter"))
+                .filter_membership_bitmaps(filters.expect("caller filter"))
                 .await?;
-            vectors.ids.intersection(&documents.ids).count()
+            vectors.count_intersection(&documents)
         } else {
-            vectors.ids.len()
+            vectors.count_ones()
         };
-        Ok(crate::dense_policy::selectivity_ppm(admitted as u64, rows))
+        Ok(crate::dense_policy::selectivity_ppm(admitted, rows))
     }
 
     /// Verify uniform vector provider kind, scoring fingerprint, and dimension
