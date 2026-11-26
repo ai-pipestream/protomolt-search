@@ -19,6 +19,8 @@ fn scan_job(
         geo_regions: vec![],
         filter: None,
         enumerate_max_rows: None,
+        filter_strategy: 0,
+        enumerate_all: false,
         patience_saturation_ppm: None,
         patience_hops: None,
         floor_prune: None,

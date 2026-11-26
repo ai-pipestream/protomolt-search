@@ -162,8 +162,8 @@ impl Bits {
         }
         let (first, last) = (start / 64, (end - 1) / 64);
         let mut count = 0usize;
-        for wi in first..=last {
-            let mut word = self.words[wi];
+        for (wi, &bits) in self.words.iter().enumerate().take(last + 1).skip(first) {
+            let mut word = bits;
             if wi == first {
                 word &= u64::MAX << (start % 64);
             }

@@ -41,49 +41,38 @@ use scratch::{scratch_path, ScratchPath};
 const DIM: usize = 32;
 const SHARD_ROWS: usize = 3;
 
-fn single_leaf_query(
-    req_id: &str,
-    leaf_id: &str,
-    k: u32,
-    query: search_query::Query,
-) -> QueryRequest {
+fn single_leaf_query(req_id: &str, id: &str, k: u32, query: search_query::Query) -> QueryRequest {
+    let leaf = SearchQuery {
+        id: id.into(),
+        query: Some(query),
+    };
     QueryRequest {
         request_id: req_id.into(),
         k,
         selection_k: k,
         selection: Some(SelectionQuery {
-            node: Some(selection_query::Node::Search(SearchQuery {
-                id: leaf_id.into(),
-                query: Some(query),
-            })),
+            node: Some(selection_query::Node::Search(leaf)),
         }),
         ..Default::default()
     }
 }
 
 fn lexical_query(text: &str) -> QueryRequest {
-    single_leaf_query(
-        "embedded-parity",
-        "lexical",
-        10,
-        search_query::Query::Lexical(LexicalQuery {
-            text: text.into(),
-            analysis: Some(body_spec()),
-            ..Default::default()
-        }),
-    )
+    let q = search_query::Query::Lexical(LexicalQuery {
+        text: text.into(),
+        analysis: Some(body_spec()),
+        ..Default::default()
+    });
+    single_leaf_query("embedded-parity", "lexical", 10, q)
 }
 
 fn dense_query(vector: Vec<f32>) -> QueryRequest {
-    single_leaf_query(
-        "embedded-dense",
-        "dense",
-        4,
-        search_query::Query::Dense(DenseQuery {
-            vector,
-            ..Default::default()
-        }),
-    )
+    let d = DenseQuery {
+        vector,
+        execution_mode: pipestream_search::pb::DenseExecutionMode::Exhaustive as i32,
+        ..Default::default()
+    };
+    single_leaf_query("embedded-dense", "dense", 4, search_query::Query::Dense(d))
 }
 
 fn local_shards() -> Vec<EmbeddedShardConfig> {

@@ -2,9 +2,10 @@
 //!
 //! Everything here goes through the public `Query` route the profile
 //! will later serve: for every `k` and every candidate depth on the
-//! ladder, each held-out query runs `DENSE_SCORE_MODE_FP32_RERANK` at
-//! `selection_k = depth` with `profile = true`, and its top-`k` is compared
-//! with the exhaustive FP32 top-`k` (the ground truth). Recall is counted
+//! ladder, each held-out query runs `DENSE_EXECUTION_MODE_BALANCED` with
+//! `DENSE_PRECISION_REQUEST_FP32` at `selection_k = depth` and `profile = true`,
+//! and its top-`k` is compared with the exhaustive FP32 top-`k` (the ground
+//! truth). Recall is counted
 //! per query, so the ladder records the worst query as well as the mean;
 //! [`super::choose_points`] then picks the smallest depth whose WORST
 //! query meets each target. `examples/dense_profile.rs` is the CLI shell

@@ -86,7 +86,6 @@ fn redact_dense_execution(execution: &mut DenseExecutionOutcome) {
         provider_backend: _,
         quality_contract: _,
         scoring_fingerprint: _,
-        exhaustive_completion: _,
         planner_reason,
         policy_id,
         policy_fingerprint: _,
@@ -99,8 +98,22 @@ fn redact_dense_execution(execution: &mut DenseExecutionOutcome) {
         patience_stopped,
         shards_finished_early,
         shards_floor_pruned,
+        requested_precision: _,
+        selection_precision: _,
+        output_precision: _,
+        coverage: _,
+        termination: _,
+        techniques,
+        filter_strategy: _,
+        preset: _,
+        policy_qualified: _,
+        fallback_reason: _,
     } = execution;
-    // Counts per segment/shard searched: the physical layout.
+    // Counts per segment/shard searched: the physical layout. Which
+    // techniques ran stays visible; how many parts ran each does not.
+    for technique in techniques.iter_mut() {
+        technique.parts = 0;
+    }
     *filter_regimes = None;
     *tail_enumerated_rows = 0;
     *patience_stopped = 0;
@@ -133,6 +146,9 @@ fn redact_dense_execution(execution: &mut DenseExecutionOutcome) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pb::{
+        DenseCoverage, DenseScorePrecision, DenseTechnique, DenseTechniqueCount, DenseTermination,
+    };
     use prost::Message;
 
     fn observed_profile() -> QueryProfile {
@@ -174,11 +190,17 @@ mod tests {
     fn observed_dense_execution() -> DenseExecutionOutcome {
         DenseExecutionOutcome {
             requested_mode: DenseExecutionMode::Auto as i32,
-            resolved_mode: DenseExecutionMode::Ann as i32,
+            resolved_mode: DenseExecutionMode::Balanced as i32,
             provider_backend: "backend".into(),
             quality_contract: VectorQualityContract::ConfiguredAnn as i32,
             scoring_fingerprint: "score-space".into(),
-            exhaustive_completion: false,
+            coverage: DenseCoverage::CandidateSet as i32,
+            termination: DenseTermination::BudgetStopped as i32,
+            output_precision: DenseScorePrecision::Fp32 as i32,
+            techniques: vec![DenseTechniqueCount {
+                technique: DenseTechnique::HnswWalk as i32,
+                parts: 6,
+            }],
             planner_reason: "SECRET physical corpus and planner details".into(),
             policy_id: "SECRET-policy".into(),
             policy_fingerprint: "b".repeat(64),
@@ -208,6 +230,7 @@ mod tests {
             patience_stopped: 7,
             shards_finished_early: 2,
             shards_floor_pruned: 4,
+            ..Default::default()
         }
     }
 
@@ -243,8 +266,20 @@ mod tests {
     fn assert_dense_execution_redacted(response: &QueryResponse) {
         let execution = response.dense_execution.as_ref().unwrap();
         assert_eq!(execution.filter_selectivity_ppm, 0);
-        assert!(!execution.exhaustive_completion);
-        assert_eq!(execution.resolved_mode, DenseExecutionMode::Ann as i32);
+        assert_eq!(execution.coverage, DenseCoverage::CandidateSet as i32);
+        assert_eq!(
+            execution.termination,
+            DenseTermination::BudgetStopped as i32
+        );
+        assert_eq!(execution.output_precision, DenseScorePrecision::Fp32 as i32);
+        assert_eq!(
+            execution.techniques,
+            vec![DenseTechniqueCount {
+                technique: DenseTechnique::HnswWalk as i32,
+                parts: 0,
+            }]
+        );
+        assert_eq!(execution.resolved_mode, DenseExecutionMode::Balanced as i32);
         assert_eq!(execution.candidate_depth, 100);
         assert_eq!(execution.filter_regimes, None);
         assert_eq!(execution.tail_enumerated_rows, 0);
@@ -278,7 +313,7 @@ mod tests {
                 rank: 1,
                 ..Default::default()
             }],
-            executed: "search+fp32_rerank".into(),
+            executed: "search:fp32_pool".into(),
             next_cursor: "opaque-cursor".into(),
             served_topology_generation: 9,
             field_details_redacted: true,

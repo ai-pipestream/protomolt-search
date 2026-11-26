@@ -1,5 +1,7 @@
 //! Streaming and rescored dense vector search RPC handlers.
 
+mod exact_scan;
+mod exact_stream;
 mod search_shard;
 mod stream_scan;
 mod stream_search;
@@ -72,19 +74,7 @@ pub(super) fn build_search_shard_done(
                 rerank_candidate: payload.rerank_candidates.remove(&slot),
             })
             .collect(),
-        stats: Some(ShardScanStats {
-            chunk_calls: stats.chunk_calls,
-            candidates_collected: stats.candidates_collected,
-            floors_published: stats.floors_published,
-            floor_updates_applied: stats.floor_updates_applied,
-            floors_offered: stats.floors_offered,
-            segments_total: stats.segments_total,
-            segments_skipped: stats.segments_skipped,
-            filter_regimes: stats.regimes.to_proto(),
-            tail_enumerated_rows: stats.tail_enumerated_rows,
-            patience_stopped: stats.patience_stopped,
-            floor_pruned: stats.floor_pruned,
-        }),
+        stats: Some(proto_scan_stats(stats)),
         geo_columns_known: payload.geo_columns_known,
         filter_columns_known: payload.filter_columns_known,
     }

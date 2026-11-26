@@ -187,50 +187,53 @@ algorithm wearing the same name. `interleave_seed` of 0 derives a stable seed
 from the first variant's query text, so a re-run of the same query is
 reproducible while still varying across queries.
 
-## Dense execution policy
+## Dense execution
 
-`DenseQuery.execution_mode` chooses the candidate traversal, separately from how
-candidates get scores.
+`DenseQuery.execution_mode` chooses the candidate traversal, while
+`DenseQuery.precision` (`AUTO`, `FP32`, `QUANTIZED`) chooses the score
+precision (`score_mode` is retired and reserved). Every dense leaf must name
+its execution mode (`UNSPECIFIED` and retired values `1..=3` refuse):
 
-- Unset preserves exact traversal, so a later backend change cannot silently
-  weaken an existing request's quality contract.
-- `EXACT` states so explicitly and is rejected if the live provider cannot prove
-  an exhaustive traversal and completion certificate.
-- `ANN` accepts a provider's configured approximate traversal. It does not claim
-  corpus-wide top-k.
-- `AUTO` lets the coordinator choose, and it chooses only on evidence.
+- `EXHAUSTIVE` scores every live, authorized, filter-admitted row at the
+  requested precision, or refuses by name. On embedded quantized scan providers
+  it runs the scan (or a shard-local FP32 sidecar scan when `precision = FP32`);
+  on `clustered-turbovec` it certifies only via shard-local `FP32` sidecar
+  scanning on a single dense leaf (remote quantized scans refuse `EXHAUSTIVE`
+  and serve `BALANCED`); on graph providers (`hnsw`) shards pin enumeration of
+  every admitted row rather than walking the graph.
+- `BALANCED` runs the provider's balanced preset (`hnsw-balanced-v1`: beam
+  `max(k, selection_k, 16)` with `ENUMERATE_SMALL` filter routing). A provider
+  without a balanced preset runs its same-precision exhaustive technique and
+  discloses the substitution in `fallback_reason`.
+- `FAST` runs a distinct speed preset (`hnsw-fast-v1`: patience `0.99` over `15`
+  hops with `SPEED` filter routing) and refuses where the provider has none; it
+  is never substituted.
+- `AUTO` lets the coordinator choose. Approximation requires qualifying measured
+  evidence; on this build (without an installed policy; `--dense-execution-policy`
+  is refused at startup) `AUTO` runs the provider's exhaustive technique at the
+  requested precision.
 
-An exhaustive provider resolves `AUTO` to `EXACT`, bit for bit the same response
-as `EXACT`, and no policy is consulted. A configured approximate provider
-resolves to `ANN` only through a generation-bound policy installed with
-`--dense-execution-policy`. The policy's identity (provider kind, scoring
-fingerprint, corpus generation, corpus row count, dimensions) must match the
-live cluster field by field, and the request must match a recorded point on `k`,
-the filter's live selectivity, and the candidate depth. The first
-mismatch is rejected naming the field and both values. No policy, a mismatched
-identity, or a key no measurement covered is rejected by name. No value is interpolated.
-
-`k = 0` is rejected under a policy: a recorded point needs a number, not the
-coordinator's default.
+`DenseQuery.filter_strategy` (`DEFAULT`, `SPEED`, `ENUMERATE_SMALL`) overrides
+mask routing on `BALANCED` and `FAST` walks; `EXHAUSTIVE` and `AUTO` own their
+routing and refuse a non-default strategy.
 
 Every selection with a dense leaf returns `dense_execution` whether or not you
-you requested a profile, because it is semantic provenance and not timing data:
-the requested and resolved modes, provider kind, quality contract, scoring
-fingerprint, whether every provider advertised and completed an exhaustive
-traversal, a stable planner reason, and, when a policy was consulted, its id and
-fingerprint, the point matched, the live filter selectivity, and the candidate
-depth the providers were given.
+requested a profile, because it is semantic provenance rather than timing data:
+the requested and resolved modes, requested/selection/output precisions,
+`coverage` (`EXHAUSTIVE_CERTIFIED` over verified local part receipts, or
+`CANDIDATE_SET` on approximate walks and remote `clustered-turbovec` scans),
+`termination`, per-technique part counts, `filter_strategy`, `preset`,
+`policy_qualified`, `fallback_reason`, provider kind, quality contract, scoring
+fingerprint, and planner reason.
 
-Mixed provider kinds, scoring spaces, dimensions, quality contracts, or
-completion capabilities across shards are rejected at preflight, so an
-approximate response cannot be mistaken for a corpus-wide exact one.
-
-Today the provider in the box is exhaustive, so `AUTO` resolves to `EXACT` in
-production.
+Mixed provider kinds, scoring spaces, precisions, dimensions, quality
+contracts, or completion capabilities across shards are rejected at preflight,
+so an approximate or uncertified response is never mistaken for a certified
+exhaustive one.
 
 ## Dense quality profile
 
-`DENSE_SCORE_MODE_FP32_RERANK` selects `selection_k` candidates with the
+A `BALANCED` dense leaf with `FP32` precision selects `selection_k` candidates with the
 provider, then replaces their scores with product-owned FP32 dot products over
 the original vectors and reorders that fixed pool. It is exact within the pool.
 It is not a corpus-wide exact claim unless the pool covers the corpus, so
@@ -253,16 +256,16 @@ unmeasured depth, or one promising 100% where the weakest query recovered
 99.98%, is rejected at load. The mean is recorded but does not decide: a point
 promises every reserved query, not the average one.
 
-How the depth resolves:
+How the depth resolves on a single dense leaf with `precision = FP32`:
 
 | Request | Depth |
 |---|---|
-| `quality` set, `selection_k = 0` | the profile point |
-| `quality` set and `selection_k` set | rejected as competing depth authorities |
-| `AUTO` + FP32, no `quality`, `selection_k = 0`, profile with a default | the point at the default target |
-| `AUTO` + FP32, no `quality`, `selection_k = 0`, no profile or no default | rejected by name |
-| `AUTO` + FP32 with `selection_k` set | your depth |
-| `EXACT` or unset + FP32, `selection_k = 0` | `k` |
+| `BALANCED`, `quality` set, `selection_k = 0` | the profile point |
+| `BALANCED`, `quality` set and `selection_k` set | rejected as competing depth authorities |
+| `BALANCED`, no `quality`, `selection_k = 0`, profile with a default | the point at the default target |
+| `BALANCED`, no `quality`, `selection_k = 0`, no profile or no default | `k` |
+| `BALANCED` with `selection_k` set | your depth |
+| `EXHAUSTIVE` or `AUTO`, `selection_k = 0` | every row (shard-local FP32 sidecar scan) |
 
 `DenseQualityPolicy.max_candidates` is an optional request-local upper bound applied
 after resolution: a point above it is rejected, not clamped.

@@ -3,7 +3,7 @@
 use std::cell::Cell;
 
 use crate::vector::{
-    FilterRegime, FilterRegimeCounts, Mask, QualityContract, VectorError, VectorIndex,
+    FilterRegime, FilterRegimeCounts, Mask, PartCounts, QualityContract, VectorError, VectorIndex,
     VectorSearchOptions, VectorSearchResults, VectorStreamBatch, VectorStreamControl,
     VectorStreamEndReason, VectorStreamSummary,
 };
@@ -46,6 +46,7 @@ pub(super) fn segment_options<'a>(
 
 #[derive(Default)]
 pub(super) struct UnaryAccum {
+    parts: PartCounts,
     regimes: FilterRegimeCounts,
     tail_enumerated_rows: u64,
     patience_stopped: u32,
@@ -53,7 +54,13 @@ pub(super) struct UnaryAccum {
 }
 
 impl UnaryAccum {
+    pub(super) fn note_skipped(&mut self) {
+        self.parts.total = self.parts.total.saturating_add(1);
+        self.parts.skipped = self.parts.skipped.saturating_add(1);
+    }
+
     pub(super) fn absorb(&mut self, results: &VectorSearchResults) {
+        self.parts.add(results.parts);
         self.regimes.add(results.regimes);
         self.tail_enumerated_rows = self
             .tail_enumerated_rows
@@ -89,6 +96,7 @@ impl UnaryAccum {
             slots,
             query_count: nq,
             result_count: k,
+            parts: self.parts,
             regimes: self.regimes,
             tail_enumerated_rows: self.tail_enumerated_rows,
             patience_stopped: self.patience_stopped,
@@ -131,6 +139,7 @@ pub(super) struct StreamState {
     allow_early_finish: bool,
     emitted: usize,
     units: usize,
+    parts: PartCounts,
     regimes: FilterRegimeCounts,
     tail_enumerated_rows: u64,
     patience_stopped: u32,
@@ -141,6 +150,7 @@ impl StreamState {
     pub(super) fn new(
         quality_contract: QualityContract,
         options: &VectorSearchOptions<'_>,
+        parts_total: u32,
     ) -> Self {
         let allow_early_finish = matches!(
             quality_contract,
@@ -154,11 +164,19 @@ impl StreamState {
             allow_early_finish,
             emitted: 0,
             units: 0,
+            parts: PartCounts {
+                total: parts_total,
+                ..Default::default()
+            },
             regimes: FilterRegimeCounts::default(),
             tail_enumerated_rows: 0,
             patience_stopped: 0,
             floor_pruned: 0,
         }
+    }
+
+    pub(super) fn note_skipped(&mut self) {
+        self.parts.skipped = self.parts.skipped.saturating_add(1);
     }
 
     pub(super) fn is_done(&self) -> bool {
@@ -235,6 +253,14 @@ impl StreamState {
         };
         self.emitted += summary.emitted;
         self.units += summary.units_scanned;
+        self.parts.skipped = self.parts.skipped.saturating_add(summary.parts.skipped);
+        self.parts.walked = self.parts.walked.saturating_add(summary.parts.walked);
+        self.parts.enumerated = self
+            .parts
+            .enumerated
+            .saturating_add(summary.parts.enumerated);
+        self.parts.scanned = self.parts.scanned.saturating_add(summary.parts.scanned);
+        self.parts.staged = self.parts.staged.saturating_add(summary.parts.staged);
         self.regimes.add(summary.regimes);
         self.tail_enumerated_rows = self
             .tail_enumerated_rows
@@ -269,6 +295,11 @@ impl StreamState {
             units_scanned: self.units,
             completed: !self.stopped.get(),
             end_reason,
+            parts: if query_count == 0 {
+                PartCounts::default()
+            } else {
+                self.parts
+            },
             regimes: self.regimes,
             tail_enumerated_rows: self.tail_enumerated_rows,
             patience_stopped: self.patience_stopped,

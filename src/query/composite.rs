@@ -1,7 +1,7 @@
 //! The two-leaf composite: the `HybridSearch` route under the fusion
 //! mode its strategy maps onto.
 
-use tonic::{Request, Status};
+use tonic::Status;
 
 use super::boosts::{weight_or_one, BoostPlan};
 use super::composite_shape::leg_options;
@@ -10,7 +10,7 @@ use super::rerank::{turbo_rerank, RerankSources};
 use super::response::{matched, ms, scored_hit};
 use super::run::Run;
 use super::selection::Strategy;
-use crate::pb::search_service_server::SearchService;
+use crate::coordinator::dense_status;
 use crate::pb::{
     BoostRescore, DenseQuery, FusionMode, HybridLegOptions, HybridSearchRequest,
     HybridSearchResponse, LexicalQuery, QueryHit, QuerySignal,
@@ -71,11 +71,10 @@ pub(super) async fn execute_composite(mut run: Run<'_>, legs: Legs<'_>) -> Resul
     };
     let t_sel = std::time::Instant::now();
     let request = hybrid_request(&mut run, &legs, &leg_opts, legacy.as_ref().map(|(_, b)| b));
-    let response = base
+    let (response, exec) = base
         .coordinator
-        .hybrid_search(crate::metrics::nested(Request::new(request)))
-        .await?
-        .into_inner();
+        .execute_hybrid_with_evidence(request)
+        .await?;
     if let Some(p) = run.prof.as_mut() {
         p.selection_ms = ms(t_sel);
     }
@@ -105,13 +104,31 @@ pub(super) async fn execute_composite(mut run: Run<'_>, legs: Legs<'_>) -> Resul
         Answer::Deepen(depth) => return Ok(Routed::Deepen(depth)),
         Answer::Paged(response) => *response,
     };
-    answer.dense_execution = run.dense.execution;
+    answer.dense_execution = if leg_opts.vector_weight == Some(0.0) {
+        None
+    } else {
+        composite_receipt(run.dense, exec.evidence)?
+    };
     if let Some(bound) = &run.one_pass {
         answer
             .synonym_expansions
             .extend(bound.synonym_expansions.iter().cloned());
     }
     Ok(Routed::Done(Box::new(answer)))
+}
+
+/// Validate the hybrid vector leg's shard-reported execution evidence against
+/// the resolved dense plan and stamp the outcome.
+fn composite_receipt(
+    dense: super::prepare_dense::DensePlan,
+    mut evidence: crate::dense_execution::Evidence,
+) -> Result<Option<crate::pb::DenseExecutionOutcome>, Status> {
+    let (Some(mut outcome), Some(plan)) = (dense.execution, dense.plan) else {
+        return Ok(None);
+    };
+    evidence.rows = dense.rows;
+    crate::dense_execution::stamp(&plan, &evidence, &mut outcome).map_err(dense_status)?;
+    Ok(Some(outcome))
 }
 
 /// The route request. The selection phase runs selection_k deep; the
@@ -135,6 +152,8 @@ fn hybrid_request(
         geo_filters: run.base.plan.geo_filters.clone(),
         filter: std::mem::take(&mut run.filter),
         enumerate_max_rows: knobs.enumerate_max_rows,
+        filter_strategy: knobs.filter_strategy,
+        enumerate_all: knobs.enumerate_all,
         patience_saturation_ppm: knobs.patience_saturation_ppm,
         patience_hops: knobs.patience_hops,
         finish_settle_us: knobs.finish_settle_us,

@@ -15,8 +15,8 @@ use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     aggregate_result, selection_query, AddDocumentsRequest, AddVectorsRequest, AggregateOp,
-    AggregateRequest, Aggregation, BooleanQuery, BoostQuery, CompositeSearchStrategy, DenseQuery,
-    FacetValue, FilterQuery, FlushRequest, HistogramSpec, IntegerValue, LexicalQuery, NumericValue,
+    AggregateRequest, Aggregation, BooleanQuery, BoostQuery, CompositeSearchStrategy, FacetValue,
+    FilterQuery, FlushRequest, HistogramSpec, IntegerValue, LexicalQuery, NumericValue,
     PercentileSpec, QueryHit, QueryRequest, QueryResponse, SearchQuery, SelectionOperator,
     SelectionQuery,
 };
@@ -192,17 +192,12 @@ fn lexical(id: &str, text: &str) -> SelectionQuery {
 }
 
 fn dense(id: &str, q: usize) -> SelectionQuery {
-    SelectionQuery {
-        node: Some(selection_query::Node::Search(SearchQuery {
-            id: id.to_string(),
-            query: Some(pipestream_search::pb::search_query::Query::Dense(
-                DenseQuery {
-                    vector: corpus()[q * DIM..(q + 1) * DIM].to_vec(),
-                    ..Default::default()
-                },
-            )),
-        })),
-    }
+    common::dense_selection(
+        id,
+        corpus()[q * DIM..(q + 1) * DIM].to_vec(),
+        pipestream_search::pb::DenseExecutionMode::Exhaustive as i32,
+        0,
+    )
 }
 
 fn cel(id: &str, cel: &str) -> SelectionQuery {

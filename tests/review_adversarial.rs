@@ -379,21 +379,23 @@ async fn single_pass_dense_and_hybrid_rerank_emit_snippets_with_zero_get_documen
         .with_rerank_spec(rerank_spec);
 
     let before_get_docs = get_documents_rpc_count();
+    let exhaustive_v = || SelectionQuery {
+        node: Some(selection_query::Node::Search(SearchQuery {
+            id: "v".to_string(),
+            query: Some(search_query::Query::Dense(DenseQuery {
+                vector: vecs[0..DIM].to_vec(),
+                execution_mode: pipestream_search::pb::DenseExecutionMode::Exhaustive as i32,
+                ..Default::default()
+            })),
+        })),
+    };
 
     // 1. Pure DenseQuery over TCP: inline RerankCandidatePayload produces calibrated scores + snippets
     //    with ZERO GetDocuments RPCs!
     let dense_resp = SearchService::query(
         &coord,
         Request::new(QueryRequest {
-            selection: Some(SelectionQuery {
-                node: Some(selection_query::Node::Search(SearchQuery {
-                    id: "v".to_string(),
-                    query: Some(search_query::Query::Dense(DenseQuery {
-                        vector: vecs[0..DIM].to_vec(),
-                        ..Default::default()
-                    })),
-                })),
-            }),
+            selection: Some(exhaustive_v()),
             k: 2,
             highlight: Some(HighlightSpec {
                 fields: vec!["body".to_string()],
@@ -427,15 +429,7 @@ async fn single_pass_dense_and_hybrid_rerank_emit_snippets_with_zero_get_documen
                         ),
                     }),
                     clauses: vec![
-                        SelectionQuery {
-                            node: Some(selection_query::Node::Search(SearchQuery {
-                                id: "v".to_string(),
-                                query: Some(search_query::Query::Dense(DenseQuery {
-                                    vector: vecs[0..DIM].to_vec(),
-                                    ..Default::default()
-                                })),
-                            })),
-                        },
+                        exhaustive_v(),
                         SelectionQuery {
                             node: Some(selection_query::Node::Search(SearchQuery {
                                 id: "l".to_string(),
@@ -466,15 +460,7 @@ async fn single_pass_dense_and_hybrid_rerank_emit_snippets_with_zero_get_documen
 
     // 3. Expired `grpc-timeout: 1n` metadata propagates to `finish_deadline_us` and aborts with DeadlineExceeded!
     let mut expired_dense = Request::new(QueryRequest {
-        selection: Some(SelectionQuery {
-            node: Some(selection_query::Node::Search(SearchQuery {
-                id: "v".to_string(),
-                query: Some(search_query::Query::Dense(DenseQuery {
-                    vector: vecs[0..DIM].to_vec(),
-                    ..Default::default()
-                })),
-            })),
-        }),
+        selection: Some(exhaustive_v()),
         k: 2,
         ..Default::default()
     });

@@ -11,6 +11,32 @@ pub use window::{
     SCAN_WINDOW_SAMPLES,
 };
 
+pub(in crate::node) fn proto_scan_stats(stats: ScanStats) -> ShardScanStats {
+    ShardScanStats {
+        chunk_calls: stats.chunk_calls,
+        candidates_collected: stats.candidates_collected,
+        floors_published: stats.floors_published,
+        floor_updates_applied: stats.floor_updates_applied,
+        floors_offered: stats.floors_offered,
+        segments_total: stats.segments_total,
+        segments_skipped: stats.segments_skipped,
+        filter_regimes: stats.regimes.to_proto(),
+        tail_enumerated_rows: stats.tail_enumerated_rows,
+        patience_stopped: stats.patience_stopped,
+        floor_pruned: stats.floor_pruned,
+        parts_total: stats.parts.total,
+        parts_skipped: stats.parts.skipped,
+        parts_walked: stats.parts.walked,
+        parts_enumerated: stats.parts.enumerated,
+        parts_scanned: stats.parts.scanned,
+        parts_staged: stats.parts.staged,
+        fp32_rows_scored: stats.fp32_rows_scored,
+        fp32_logical_bytes: stats.fp32_logical_bytes,
+        fp32_pages_touched: stats.fp32_pages_touched,
+        fp32_tasks: stats.fp32_tasks,
+    }
+}
+
 /// Raise a floor cell (f32 bits) to `floor` if that is higher. Monotone
 /// under any interleaving of the gRPC and UDP lanes; NaN is ignored.
 // fetch_update is deprecated in favor of try_update from Rust 1.99, but the
@@ -180,6 +206,9 @@ pub(in crate::node) struct ScanJob {
     pub(in crate::node) filter: Option<crate::pb::FilterExpr>,
     /// The request's enumerate threshold (`StartShardSearch`).
     pub(in crate::node) enumerate_max_rows: Option<u32>,
+    /// The plan's filter routing and whole-set enumeration (`StartShardSearch`).
+    pub(in crate::node) filter_strategy: i32,
+    pub(in crate::node) enumerate_all: bool,
     /// The request's patience early-stop parameters (`StartShardSearch`).
     pub(in crate::node) patience_saturation_ppm: Option<u32>,
     pub(in crate::node) patience_hops: Option<u32>,
@@ -325,6 +354,7 @@ impl NodeServiceImpl {
             )));
         }
         check_enumerate_threshold(index, start.enumerate_max_rows)?;
+        selection_controls(index, start.filter_strategy, start.enumerate_all)?;
         check_patience_options(index, start.patience_saturation_ppm, start.patience_hops)?;
         check_floor_prune_options(
             index,

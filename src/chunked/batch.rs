@@ -31,6 +31,7 @@ pub fn chunked_topk(
         keep_ties,
         allow: scan.allow,
         enumerate_max_rows: None,
+        controls: Default::default(),
         patience: None,
         floor_prune: None,
     }];
@@ -149,7 +150,7 @@ pub fn chunked_topk_batch_observed(
         }
         start = end;
     }
-    state.finish()
+    state.finish(index, queries)
 }
 
 /// A non-scanning provider: one whole-index search per query, its k-th
@@ -295,8 +296,21 @@ impl BatchState {
         }
     }
 
-    fn finish(mut self) -> Vec<(Vec<ChunkHit>, ScanStats)> {
+    fn finish(
+        mut self,
+        index: &VectorIndex,
+        queries: &[BatchQuery<'_>],
+    ) -> Vec<(Vec<ChunkHit>, ScanStats)> {
         for (qi, heap) in self.heaps.into_iter().enumerate() {
+            if queries[qi].k > 0 {
+                let (total, skipped) = index.part_counts(queries[qi].allow);
+                self.out[qi].1.parts = crate::vector::PartCounts {
+                    total,
+                    skipped,
+                    scanned: total.saturating_sub(skipped),
+                    ..Default::default()
+                };
+            }
             self.out[qi].0 = heap;
         }
         self.out
@@ -325,6 +339,14 @@ fn searched_topk(
     let mut options = VectorSearchOptions::new().with_candidate_depth(query.k);
     options.allow = query.allow;
     options.enumerate_max_rows = query.enumerate_max_rows;
+    options.filter_routing = query.controls.filter_routing;
+    if query.controls.enumerate_all {
+        // Pinned enumeration scores every admitted row; an unfiltered query
+        // admits them all.
+        options.allow = Some(query.allow.unwrap_or(Mask::All(index.len())));
+        options.filter_regime = Some(crate::vector::FilterRegime::Enumerate);
+        options.enumerate_max_rows = None;
+    }
     options.patience = query.patience;
     options.floor_prune = query.floor_prune;
     if let Some(floor) = floor.filter(|f| !f.is_nan() && *f != f32::NEG_INFINITY) {
@@ -342,6 +364,7 @@ fn searched_topk(
     observe(pass);
     stats.chunk_calls = 1;
     stats.scan_nanos = pass.nanos;
+    stats.parts = results.parts;
     stats.regimes = results.regimes;
     stats.tail_enumerated_rows = results.tail_enumerated_rows;
     stats.patience_stopped = results.patience_stopped;

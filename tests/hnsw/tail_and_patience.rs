@@ -55,7 +55,7 @@ async fn unsealed_tail_enumerates_until_flushed() {
             .with_stream_search(streaming);
         let unsealed = query(
             &coordinator,
-            dense_request(&query_vector, 5, DenseExecutionMode::Ann),
+            dense_request(&query_vector, 5, DenseExecutionMode::Balanced),
         )
         .await
         .unwrap();
@@ -80,7 +80,7 @@ async fn unsealed_tail_enumerates_until_flushed() {
             .with_stream_search(streaming);
         let sealed = query(
             &coordinator,
-            dense_request(&query_vector, 5, DenseExecutionMode::Ann),
+            dense_request(&query_vector, 5, DenseExecutionMode::Balanced),
         )
         .await
         .unwrap();
@@ -97,92 +97,81 @@ async fn unsealed_tail_enumerates_until_flushed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_policy_point_serves_patience_and_reports_stopped_walks() {
-    const K: u32 = 10;
-    const DEPTH: u32 = 256;
-    let (_fixture, addrs) = start_filtered_fixture().await;
-    let fingerprint = graph_index().descriptor().scoring_fingerprint;
-    let rows = FILTERED_SHARD_DOCS * SHARDS;
-    let policy = load_policy(
-        "patience-auto",
-        &format!(
-            "format_version = 1\npolicy_id = \"hnsw-patience\"\n\
-             embedding_model = \"test-embed\"\ncorpus_generation = {GENERATION}\n\
-             corpus_rows = {rows}\ndimensions = {DIM}\nprovider_backend = \"{HNSW}\"\n\
-             scoring_fingerprint = \"{fingerprint}\"\nmeasured_queries = 16\n\n\
-             [[points]]\nk = {K}\nfilter_selectivity_ppm_min = 1000000\n\
-             filter_selectivity_ppm_max = 1000000\ncandidates = {DEPTH}\n\
-             measured_recall_ppm = 990000\npatience_saturation_ppm = 900000\n\
-             patience_hops = 3\n"
-        ),
-    );
-    let query_vector = unit_vectors(1, DIM, 0x4A5E_0095);
+async fn fast_walks_under_the_speed_preset_and_reports_patience() {
+    // FAST's beam is k; at k = 100 on these 1,100-row graphs every walk
+    // saturates for 15 hops before it converges.
+    const K: u32 = 100;
+    let fixture = start_fixture().await;
+    let queries = unit_vectors(8, DIM, 0x4A5E_00FA);
     for streaming in [false, true] {
-        let coordinator = CoordinatorServiceImpl::new(addrs.clone())
-            .with_bm25(
-                Some(NATIVE_ANALYSIS_BACKEND.to_string()),
-                Default::default(),
+        let coordinator = fixture.coordinator.clone().with_stream_search(streaming);
+        for query_vector in queries.as_chunks::<DIM>().0 {
+            let answer = query(
+                &coordinator,
+                dense_request(query_vector, K, DenseExecutionMode::Fast),
             )
-            .with_topology_generation(GENERATION)
-            .with_stream_search(streaming)
-            .with_dense_execution_policy(policy.clone());
-        let response = query(
-            &coordinator,
-            dense_request(&query_vector, K, DenseExecutionMode::Auto),
-        )
-        .await
-        .unwrap();
-        assert_eq!(response.hits.len(), K as usize, "streaming={streaming}");
-        let outcome = response.dense_execution.unwrap();
-        assert_eq!(outcome.resolved_mode, DenseExecutionMode::Ann as i32);
-        assert_eq!(outcome.candidate_depth, DEPTH);
-        let point = outcome.policy_point.unwrap();
-        assert_eq!(point.patience_saturation_ppm, Some(900_000));
-        assert_eq!(point.patience_hops, Some(3));
+            .await
+            .unwrap();
+            assert_eq!(answer.hits.len(), K as usize, "streaming={streaming}");
+            let outcome = answer.dense_execution.unwrap();
+            assert_eq!(outcome.requested_mode, DenseExecutionMode::Fast as i32);
+            assert_eq!(outcome.resolved_mode, DenseExecutionMode::Fast as i32);
+            assert_eq!(outcome.preset, "hnsw-fast-v1");
+            assert_eq!(outcome.filter_strategy, DenseFilterStrategy::Speed as i32);
+            assert_eq!(outcome.coverage, DenseCoverage::CandidateSet as i32);
+            assert!(!outcome.policy_qualified && outcome.policy_id.is_empty());
+            assert_eq!(
+                techniques_of(&outcome),
+                vec![DenseTechnique::HnswWalk as i32]
+            );
+            assert_eq!(
+                outcome.patience_stopped, SHARDS as u32,
+                "streaming={streaming}: patience 0.99 over 15 hops must stop every walk"
+            );
+            assert_eq!(
+                outcome.termination,
+                DenseTermination::BudgetStopped as i32,
+                "streaming={streaming}"
+            );
+        }
+    }
+}
+
+fn techniques_of(outcome: &pipestream_search::pb::DenseExecutionOutcome) -> Vec<i32> {
+    outcome.techniques.iter().map(|t| t.technique).collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn half_specified_patience_is_refused_on_the_node() {
+    let fixture = start_fixture().await;
+    for (saturation, hops) in [(Some(990_000), None), (None, Some(15))] {
+        let mut client = NodeServiceClient::connect(fixture.addrs[0].clone())
+            .await
+            .unwrap();
+        let started = client
+            .stream_search(tokio_stream::iter(vec![StreamSearchRequest {
+                payload: Some(stream_search_request::Payload::Start(StartStreamSearch {
+                    request_id: "half-patience".into(),
+                    vector: fixture.query_vector.clone(),
+                    candidate_depth: Some(64),
+                    patience_saturation_ppm: saturation,
+                    patience_hops: hops,
+                    ..Default::default()
+                })),
+            }]))
+            .await;
+        // The refusal arrives either on the call or as the stream's first item.
+        let status = match started {
+            Err(status) => status,
+            Ok(response) => response.into_inner().message().await.unwrap_err(),
+        };
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
         assert!(
-            outcome
-                .planner_reason
-                .contains("patience 900000 ppm over 3 hops"),
-            "streaming={streaming}: {}",
-            outcome.planner_reason
-        );
-        assert!(
-            outcome.patience_stopped > 0,
-            "streaming={streaming}: wide ef={DEPTH} walk with (s=0.90, p=3) must stop early on >=1 shard"
+            status
+                .message()
+                .contains("patience_saturation_ppm and patience_hops must be set together"),
+            "{}",
+            status.message()
         );
     }
-
-    // Direct node validation: half-specified patience is InvalidArgument.
-    let mut node_client = NodeServiceClient::connect(addrs[0].clone()).await.unwrap();
-    let half_err = node_client
-        .stream_search(tokio_stream::iter(vec![
-            pipestream_search::pb::StreamSearchRequest {
-                payload: Some(
-                    pipestream_search::pb::stream_search_request::Payload::Start(
-                        pipestream_search::pb::StartStreamSearch {
-                            request_id: "half-patience".into(),
-                            vector: query_vector.clone(),
-                            candidate_depth: Some(64),
-                            patience_saturation_ppm: Some(990_000),
-                            patience_hops: None,
-                            ..Default::default()
-                        },
-                    ),
-                ),
-            },
-        ]))
-        .await;
-    // Stream error arrives either immediately or as first item on the stream.
-    let status = match half_err {
-        Err(status) => status,
-        Ok(resp) => resp.into_inner().message().await.unwrap_err(),
-    };
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
-    assert!(
-        status
-            .message()
-            .contains("patience_saturation_ppm and patience_hops must be set together"),
-        "{}",
-        status.message()
-    );
 }

@@ -13,9 +13,9 @@ use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     aggregate_result, search_query, selection_query, selection_score_strategy, AddDocumentsRequest,
     AggregateOp, AggregateRequest, AggregateResponse, Aggregation, BooleanQuery, CollapseSpec,
-    CompositeSearchStrategy, DenseQuery, DocLineage, FacetValue, FilterQuery, IntegerValue,
-    LexicalQuery, QueryHit, QueryRequest, QueryResponse, QuerySort, RrfScore, SearchQuery,
-    SelectionOperator, SelectionQuery, SelectionScoreStrategy,
+    CompositeSearchStrategy, DocLineage, FacetValue, FilterQuery, IntegerValue, LexicalQuery,
+    QueryHit, QueryRequest, QueryResponse, QuerySort, RrfScore, SearchQuery, SelectionOperator,
+    SelectionQuery, SelectionScoreStrategy,
 };
 use tonic::Request;
 
@@ -105,15 +105,12 @@ fn lexical_leaf(id: &str, text: &str) -> SelectionQuery {
 }
 
 fn dense_leaf(id: &str, vector: &[f32]) -> SelectionQuery {
-    SelectionQuery {
-        node: Some(selection_query::Node::Search(SearchQuery {
-            id: id.to_string(),
-            query: Some(search_query::Query::Dense(DenseQuery {
-                vector: vector.to_vec(),
-                ..Default::default()
-            })),
-        })),
-    }
+    common::dense_selection(
+        id,
+        vector.to_vec(),
+        pipestream_search::pb::DenseExecutionMode::Exhaustive as i32,
+        0,
+    )
 }
 
 fn cel_filter(id: &str, cel: &str) -> SelectionQuery {

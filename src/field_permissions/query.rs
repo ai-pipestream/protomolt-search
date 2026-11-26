@@ -193,9 +193,10 @@ impl FieldScope {
             }
             Some(search_query::Query::Dense(DenseQuery {
                 vector: _,
-                score_mode: _,
                 quality: _,
                 execution_mode: _,
+                precision: _,
+                filter_strategy: _,
                 field,
             })) => {
                 self.vector(field)?;

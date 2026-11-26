@@ -12,19 +12,21 @@ pub(in crate::node) struct LegFilters<'a> {
     pub(in crate::node) tree: Option<&'a crate::pb::FilterExpr>,
 }
 
-/// Raw legs, known-column handshakes, and generation-bound candidate details.
-pub(in crate::node) struct LegResults {
-    pub(in crate::node) vector: RawLeg,
-    pub(in crate::node) bm25: RawLeg,
-    pub(in crate::node) geo_columns_known: Vec<bool>,
-    pub(in crate::node) filter_columns_known: Vec<bool>,
-    pub(in crate::node) read_receipt: Option<crate::pb::VectorReadReceipt>,
-    pub(in crate::node) rerank_candidates: HashMap<u64, crate::pb::RerankCandidatePayload>,
+/// Dense execution controls carried on a hybrid vector leg.
+#[derive(Clone, Copy, Default)]
+pub(in crate::node) struct VectorLegControls {
+    pub(in crate::node) enumerate_max_rows: Option<u32>,
+    pub(in crate::node) filter_strategy: i32,
+    pub(in crate::node) enumerate_all: bool,
+    pub(in crate::node) patience_saturation_ppm: Option<u32>,
+    pub(in crate::node) patience_hops: Option<u32>,
+    pub(in crate::node) floor_prune: Option<bool>,
+    pub(in crate::node) floor_greediness_ppm: Option<u32>,
+    pub(in crate::node) floor_clamp_min: Option<u32>,
 }
 
-/// One shard's leg request: the query, the coordinator's global BM25
-/// statistics and the stats fence they were computed under.
-pub(in crate::node) struct LegQuery<'a> {
+/// Grouped inputs for computing both retrieval legs under one shard read guard.
+pub(in crate::node) struct LegCompute<'a> {
     pub(in crate::node) vector: &'a [f32],
     pub(in crate::node) terms: &'a [String],
     pub(in crate::node) analysis_fingerprint: u64,
@@ -35,80 +37,84 @@ pub(in crate::node) struct LegQuery<'a> {
     pub(in crate::node) k: usize,
     pub(in crate::node) expected_stats_epoch: u64,
     pub(in crate::node) expected_stats_incarnation: &'a [u8],
+    pub(in crate::node) filters: &'a LegFilters<'a>,
     pub(in crate::node) read_context: Option<&'a crate::pb::VectorReadContext>,
     pub(in crate::node) include_rerank_candidate: bool,
+    pub(in crate::node) vector_controls: VectorLegControls,
+}
+
+/// Raw legs, known-column handshakes, and generation-bound candidate details.
+pub(in crate::node) struct LegResults {
+    pub(in crate::node) vector: RawLeg,
+    pub(in crate::node) vector_scan: Option<ShardScanStats>,
+    pub(in crate::node) bm25: RawLeg,
+    pub(in crate::node) geo_columns_known: Vec<bool>,
+    pub(in crate::node) filter_columns_known: Vec<bool>,
+    pub(in crate::node) read_receipt: Option<crate::pb::VectorReadReceipt>,
+    pub(in crate::node) rerank_candidates: HashMap<u64, crate::pb::RerankCandidatePayload>,
 }
 
 impl NodeServiceImpl {
-    pub(in crate::node) fn compute_legs(
-        &self,
-        query: LegQuery<'_>,
-        filters: &LegFilters<'_>,
-    ) -> Result<LegResults, Status> {
-        let LegQuery {
-            vector,
-            terms,
-            analysis_fingerprint,
-            global_doc_count,
-            global_total_doc_length,
-            global_doc_frequencies,
-            params,
-            k,
-            expected_stats_epoch,
-            expected_stats_incarnation,
-            read_context,
-            include_rerank_candidate,
-        } = query;
+    pub(in crate::node) fn compute_legs(&self, req: LegCompute<'_>) -> Result<LegResults, Status> {
         let guard = read_shard(&self.state);
-        if !terms.is_empty() {
-            guard.check_query_analysis("body", analysis_fingerprint)?;
+        if !req.terms.is_empty() {
+            guard.check_query_analysis("body", req.analysis_fingerprint)?;
         }
-        guard.check_stats_epoch(expected_stats_epoch, expected_stats_incarnation)?;
-        // One resolution for both legs: the
-        // allowlist the vector kernel scans under and the predicate the
-        // lexical heap gate applies are the same DocFilter, so the two
-        // halves of a fused list cannot disagree about what matched.
+        guard.check_stats_epoch(req.expected_stats_epoch, req.expected_stats_incarnation)?;
         let (geo_columns_known, filter_columns_known) =
-            filter_known_flags(guard.bm25.as_ref(), filters.geo, filters.tree);
-        // A lexical-only or disabled leg needs the predicate and receipt,
-        // but must not allocate a vector mask proportional to the corpus.
-        let slots = if k > 0 && !vector.is_empty() {
-            guard.index.as_ref().map_or(0, |index| index.len())
+            filter_known_flags(guard.bm25.as_ref(), req.filters.geo, req.filters.tree);
+        let slots = if req.k > 0 && !req.vector.is_empty() {
+            guard.index.as_ref().map_or(0, VectorIndex::len)
         } else {
             0
         };
-        let ((doc_filter, allow, _prune), read_receipt) = guard.vector_scan_filters(
+        let ((doc_filter, allow, prune), read_receipt) = guard.vector_scan_filters(
             slots,
-            filters.geo,
-            &filters.regions,
-            filters.tree,
-            read_context,
+            req.filters.geo,
+            &req.filters.regions,
+            req.filters.tree,
+            req.read_context,
             self.knobs.segment_pruning(),
         )?;
 
-        let vector_leg = if k > 0 && !vector.is_empty() {
-            self.vector_leg(&guard, vector, k, allow.as_ref())?
+        let (vector_leg, vector_scan) = if req.k > 0 && !req.vector.is_empty() {
+            self.vector_leg(
+                &guard,
+                req.vector,
+                req.k,
+                allow.as_ref(),
+                prune,
+                req.vector_controls,
+            )?
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
         let bm25_leg = match guard.bm25.as_ref() {
-            Some(store) if k > 0 && !terms.is_empty() => {
+            Some(store) if req.k > 0 && !req.terms.is_empty() => {
                 let stats = bm25::CorpusStats {
-                    doc_count: global_doc_count,
-                    total_doc_length: global_total_doc_length,
-                    dfs: global_doc_frequencies.to_vec(),
+                    doc_count: req.global_doc_count,
+                    total_doc_length: req.global_total_doc_length,
+                    dfs: req.global_doc_frequencies.to_vec(),
                 };
-                self.bm25_leg(store, terms, &stats, params, doc_filter.as_ref(), k)?
+                self.bm25_leg(
+                    store,
+                    req.terms,
+                    &stats,
+                    req.params,
+                    doc_filter.as_ref(),
+                    req.k,
+                )?
             }
             _ => Vec::new(),
         };
-        let rerank_candidates = if include_rerank_candidate {
+        let rerank_candidates = if req.include_rerank_candidate {
             self.rerank_candidates(&guard, vector_leg.iter().chain(&bm25_leg))
         } else {
             HashMap::new()
         };
         Ok(LegResults {
             vector: vector_leg,
+            vector_scan,
             bm25: bm25_leg,
             geo_columns_known,
             filter_columns_known,
@@ -117,16 +123,18 @@ impl NodeServiceImpl {
         })
     }
 
-    /// The vector leg: exact top-k over the shard's index under `allow`.
+    /// The vector leg: top-k over the shard's index under `allow` and `ctl`.
     fn vector_leg(
         &self,
         guard: &ShardState,
         vector: &[f32],
         k: usize,
         allow: Option<&crate::boolean_bits::Bits>,
-    ) -> Result<RawLeg, Status> {
+        prune: crate::segment_prune::PruneStats,
+        ctl: VectorLegControls,
+    ) -> Result<(RawLeg, Option<ShardScanStats>), Status> {
         let Some(index) = guard.index.as_ref() else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         };
         let dim = index.dim_opt().unwrap_or(0);
         if vector.len() != dim {
@@ -140,20 +148,42 @@ impl NodeServiceImpl {
                 "hybrid vector coordinate {coord} is invalid: {value}"
             )));
         }
-        let (hits, scan_stats) = chunked_topk(
-            crate::chunked::ChunkedScan {
-                index,
-                query: vector,
-                k,
-                chunk_blocks: self.config.chunk_blocks,
-                allow: allow.map(crate::vector::Mask::Bits),
-            },
-            false,
-            &mut || None,
-            &mut |_| false,
-        );
+        check_enumerate_threshold(index, ctl.enumerate_max_rows)?;
+        let controls = selection_controls(index, ctl.filter_strategy, ctl.enumerate_all)?;
+        let patience =
+            check_patience_options(index, ctl.patience_saturation_ppm, ctl.patience_hops)?;
+        let floor_prune = check_floor_prune_options(
+            index,
+            ctl.floor_prune,
+            Some(k as u32),
+            k as u32,
+            None,
+            ctl.floor_greediness_ppm,
+            ctl.floor_clamp_min,
+        )?;
+        let queries = [BatchQuery {
+            vector,
+            k,
+            keep_ties: false,
+            allow: allow.map(crate::vector::Mask::Bits),
+            enumerate_max_rows: ctl.enumerate_max_rows.map(|r| r as usize),
+            controls,
+            patience,
+            floor_prune,
+        }];
+        let (hits, mut scan_stats) = crate::chunked::chunked_topk_batch(
+            index,
+            &queries,
+            self.config.chunk_blocks,
+            &mut |_| None,
+            &mut |_, _| false,
+        )
+        .pop()
+        .expect("one query in, one result out");
+        scan_stats.segments_total = prune.segments_total;
+        scan_stats.segments_skipped = prune.segments_skipped;
         observe_scan(scan_stats.bytes_scanned, scan_stats.scan_nanos);
-        Ok(hits
+        let leg = hits
             .into_iter()
             .map(|h| {
                 (
@@ -161,7 +191,8 @@ impl NodeServiceImpl {
                     f64::from(h.score),
                 )
             })
-            .collect())
+            .collect();
+        Ok((leg, Some(proto_scan_stats(scan_stats))))
     }
 
     /// The lexical leg: BM25 top-k gated by the same filter as the vector leg.
@@ -235,7 +266,7 @@ impl NodeServiceImpl {
         if let Some(f) = req.filter.as_ref() {
             crate::filter::validate_filter(f)?;
         }
-        let query = LegQuery {
+        let mut legs = self.compute_legs(LegCompute {
             vector: &req.vector,
             terms: &req.terms,
             analysis_fingerprint: req.analysis_fingerprint,
@@ -246,18 +277,15 @@ impl NodeServiceImpl {
             k,
             expected_stats_epoch: req.expected_stats_epoch,
             expected_stats_incarnation: &req.expected_stats_incarnation,
+            filters: &LegFilters {
+                geo: &req.geo_filters,
+                regions: geo_regions,
+                tree: req.filter.as_ref(),
+            },
             read_context: req.read_context.as_ref(),
             include_rerank_candidate: req.include_rerank_candidate,
-        };
-        let filters = LegFilters {
-            geo: &req.geo_filters,
-            regions: geo_regions,
-            tree: req.filter.as_ref(),
-        };
-        let mut legs = self.compute_legs(query, &filters)?;
-        let geo_columns_known = legs.geo_columns_known;
-        let filter_columns_known = legs.filter_columns_known;
-
+            vector_controls: hybrid_vector_controls(&req),
+        })?;
         let fused = fusion::rrf_fuse(
             &[
                 Leg {
@@ -273,23 +301,44 @@ impl NodeServiceImpl {
             k,
         );
         Ok(HybridShardResponse {
-            hits: fused
-                .into_iter()
-                .map(|h| HybridLegHit {
-                    doc_id: h.doc_id,
-                    fused_score: h.fused_score as f32,
-                    vector_rank: h.leg_ranks[0],
-                    vector_score: h.leg_scores[0].unwrap_or(0.0) as f32,
-                    bm25_rank: h.leg_ranks[1],
-                    bm25_score: h.leg_scores[1].unwrap_or(0.0) as f32,
-                    rerank_candidate: legs.rerank_candidates.remove(&h.doc_id),
-                })
-                .collect(),
-            geo_columns_known,
-            filter_columns_known,
+            hits: pack_hybrid_hits(fused, &mut legs.rerank_candidates),
+            geo_columns_known: legs.geo_columns_known,
+            filter_columns_known: legs.filter_columns_known,
             read_receipt: legs.read_receipt,
+            vector_scan: legs.vector_scan,
         })
     }
+}
+
+fn hybrid_vector_controls(req: &HybridShardRequest) -> VectorLegControls {
+    VectorLegControls {
+        enumerate_max_rows: req.enumerate_max_rows,
+        filter_strategy: req.filter_strategy,
+        enumerate_all: req.enumerate_all,
+        patience_saturation_ppm: req.patience_saturation_ppm,
+        patience_hops: req.patience_hops,
+        floor_prune: req.floor_prune,
+        floor_greediness_ppm: req.floor_greediness_ppm,
+        floor_clamp_min: req.floor_clamp_min,
+    }
+}
+
+fn pack_hybrid_hits(
+    fused: Vec<fusion::FusedHit>,
+    rerank_candidates: &mut HashMap<u64, crate::pb::RerankCandidatePayload>,
+) -> Vec<HybridLegHit> {
+    fused
+        .into_iter()
+        .map(|h| HybridLegHit {
+            doc_id: h.doc_id,
+            fused_score: h.fused_score as f32,
+            vector_rank: h.leg_ranks[0],
+            vector_score: h.leg_scores[0].unwrap_or(0.0) as f32,
+            bm25_rank: h.leg_ranks[1],
+            bm25_score: h.leg_scores[1].unwrap_or(0.0) as f32,
+            rerank_candidate: rerank_candidates.remove(&h.doc_id),
+        })
+        .collect()
 }
 
 /// Request weights default to 1.0 (0 means "unset" in the proto);

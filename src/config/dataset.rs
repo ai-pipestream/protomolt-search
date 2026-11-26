@@ -11,14 +11,13 @@ use super::shard_map::load_shard_map;
 use super::topology::{map_node_addrs, map_replica_addrs};
 use super::{CollectionConfig, Config};
 
-/// Analysis, BM25 parameters, and the query-time policy files.
+/// Analysis, BM25 parameters, and the query-time tuning files.
 pub(super) struct Lexical {
     pub(super) analysis_addr: Option<String>,
     pub(super) bm25_k1: f32,
     pub(super) bm25_b: f32,
     pub(super) dense_quality_profile: Option<PathBuf>,
     pub(super) synonyms: Option<PathBuf>,
-    pub(super) dense_execution_policy: Option<PathBuf>,
 }
 
 /// How a persisted shard seals and maps its segments.
@@ -27,7 +26,24 @@ pub(super) struct Storage {
     pub(super) vector_mmap: bool,
 }
 
+fn unsupported_dense_policy(scope: &str) -> String {
+    format!(
+        "{scope}: `dense_execution_policy` (--dense-execution-policy, including version-1 TOML \
+         policy configuration) is not supported on this build"
+    )
+}
+
 pub(super) fn resolve_lexical(o: Options, file: &FileConfig) -> Result<Lexical, String> {
+    // Any presence refuses, a blank value included: the key is unsupported.
+    if o.bare("dense-execution-policy")
+        || o.text(
+            "dense-execution-policy",
+            file.dense_execution_policy.as_deref(),
+        )
+        .is_some()
+    {
+        return Err(unsupported_dense_policy("config"));
+    }
     Ok(Lexical {
         analysis_addr: o
             .text("analysis-addr", file.analysis_addr.as_deref())
@@ -39,10 +55,6 @@ pub(super) fn resolve_lexical(o: Options, file: &FileConfig) -> Result<Lexical, 
             file.dense_quality_profile.as_deref(),
         ),
         synonyms: o.path("synonyms", file.synonyms.as_deref()),
-        dense_execution_policy: o.path(
-            "dense-execution-policy",
-            file.dense_execution_policy.as_deref(),
-        ),
     })
 }
 
@@ -120,6 +132,9 @@ fn collection(at: &str, c: &FileCollection, config: &Config) -> Result<Collectio
             "{at}: --shard-map-reload-ms needs a shard_map on every collection"
         ));
     }
+    if c.dense_execution_policy.is_some() {
+        return Err(unsupported_dense_policy(at));
+    }
     let own_path = |value: &Option<String>, fallback: &Option<PathBuf>| {
         value
             .as_ref()
@@ -141,7 +156,6 @@ fn collection(at: &str, c: &FileCollection, config: &Config) -> Result<Collectio
         bm25_b: c.bm25_b.unwrap_or(config.bm25_b),
         dense_quality_profile: own_path(&c.dense_quality_profile, &config.dense_quality_profile),
         synonyms: own_path(&c.synonyms, &config.synonyms),
-        dense_execution_policy: own_path(&c.dense_execution_policy, &config.dense_execution_policy),
         replica_state_path,
         control_state_path,
     })

@@ -29,6 +29,12 @@ pub struct RequestFilters {
     pub floor_greediness_ppm: Option<u32>,
     pub floor_clamp_min: Option<u32>,
     pub include_rerank_candidate: bool,
+    /// Filter routing and whole-set enumeration forwarded to the shards
+    /// (`StartShardSearch.filter_strategy` / `enumerate_all`).
+    pub filter_strategy: i32,
+    pub enumerate_all: bool,
+    /// Score every admitted row from the shard-local FP32 sidecar.
+    pub exact_fp32_scan: bool,
 }
 
 /// One exact distributed membership bitmap decoded into generation-local row IDs.
@@ -93,6 +99,8 @@ impl RequestFilters {
             geo: geo.to_vec(),
             tree,
             enumerate_max_rows: None,
+            filter_strategy: 0,
+            enumerate_all: false,
             patience_saturation_ppm: None,
             patience_hops: None,
             finish_settle_us: None,
@@ -103,6 +111,7 @@ impl RequestFilters {
             floor_greediness_ppm: None,
             floor_clamp_min: None,
             include_rerank_candidate: false,
+            exact_fp32_scan: false,
         })
     }
 }

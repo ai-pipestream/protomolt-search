@@ -89,7 +89,8 @@ and a list of dimensions, each reading the `base` score or a query's
 relevance by id (`lex`, `dense`, `boost`, a clause id) with a weight, a
 normalization and a missing-value policy. With a scorer the boost is a
 signal only, so its window and weights are not sent. A dense leaf takes
-its execution mode (exact, ANN, auto) beside the score mode. A panel
+its execution mode (`exhaustive`, `balanced`, `fast`, `auto`) beside its
+score precision (`native`, `FP32`, `quantized`). A panel
 that holds a value opens by itself and says how many it holds.
 
 A hit shows its score with a bar against the top score on the page, the

@@ -60,7 +60,7 @@ impl CoordinatorServiceImpl {
     pub(super) async fn fanout_hybrid_decomposed(
         &self,
         round: HybridRound<'_>,
-    ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
+    ) -> Result<(Vec<HybridHit>, Option<HybridDebug>, DenseScanExecution), Status> {
         if self.node_addrs.is_empty() {
             return Err(Status::failed_precondition("no shard nodes configured"));
         }
@@ -72,11 +72,33 @@ impl CoordinatorServiceImpl {
         run.scan_vectors(self, initial_floor).await?;
         #[cfg(not(feature = "net"))]
         let _ = initial_floor;
+        let exec = self.decomposed_scan_execution(&run).await?;
         let legs_ms = legs_started.elapsed().as_secs_f32() * 1e3;
         let fusion_started = std::time::Instant::now();
         let hits = run.close_out(self).await?;
         let debug = run.debug(legs_ms, fusion_started);
-        Ok((hits, debug))
+        Ok((hits, debug, exec))
+    }
+
+    async fn decomposed_scan_execution(
+        &self,
+        run: &DecomposedRun<'_>,
+    ) -> Result<DenseScanExecution, Status> {
+        if let Some(identity) = self.clustered_quality_identity().await? {
+            return Ok(clustered_scan_execution(identity.rows));
+        }
+        let summaries: Vec<StreamSearchSummary> = run
+            .summaries
+            .iter()
+            .map(|s| s.clone().unwrap_or_default())
+            .collect();
+        Ok(self.evidence_from_summaries(
+            &summaries,
+            run.mask.as_ref().map(|m| m.skipped.as_slice()),
+            0,
+            count_shards_finished_early(&summaries),
+            count_shards_floor_pruned(&summaries),
+        ))
     }
 }
 

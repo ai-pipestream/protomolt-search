@@ -126,6 +126,8 @@ fn stream_filters(start: &crate::pb::StartStreamSearch) -> RequestFilters {
         geo: start.geo_filters.clone(),
         tree: start.filter.clone(),
         enumerate_max_rows: start.enumerate_max_rows,
+        filter_strategy: start.filter_strategy,
+        enumerate_all: start.enumerate_all,
         patience_saturation_ppm: start.patience_saturation_ppm,
         patience_hops: start.patience_hops,
         finish_settle_us: None,
@@ -136,6 +138,7 @@ fn stream_filters(start: &crate::pb::StartStreamSearch) -> RequestFilters {
         floor_greediness_ppm: start.floor_greediness_ppm,
         floor_clamp_min: start.floor_clamp_min,
         include_rerank_candidate: start.include_rerank_candidate,
+        exact_fp32_scan: start.exact_fp32_scan,
     }
 }
 

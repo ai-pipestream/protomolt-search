@@ -1,18 +1,15 @@
 //! The single dense leaf: the `Search` route, with the optional exact
-//! FP32 rescore of its candidate pool.
+//! FP32 rescore of its candidate pool or shard-local exact FP32 scan.
 
-use tonic::{Request, Status};
+use tonic::Status;
 
 use super::pool::{answer_pool, Answer, Routed};
 use super::rerank::{turbo_rerank, RerankSources};
 use super::response::{leaf_signal, matched, ms, scored_hit};
 use super::run::Run;
-use super::selection::dense_score_mode;
-use crate::pb::search_service_server::SearchService;
-use crate::pb::{
-    DenseExecutionMode, DenseQuery, DenseScoreMode, QueryHit, QueryResponse, SearchRequest,
-    SearchResponse,
-};
+use crate::coordinator::{dense_status, DenseScanExecution};
+use crate::dense_execution::Route;
+use crate::pb::{DenseQuery, QueryHit, QueryResponse, SearchRequest, SearchResponse};
 
 pub(super) async fn execute_dense(
     mut run: Run<'_>,
@@ -20,19 +17,15 @@ pub(super) async fn execute_dense(
     query: &DenseQuery,
 ) -> Result<Routed, Status> {
     let base = run.base;
+    let exact_fp32 = run.dense.route() == Some(Route::Fp32AllRows);
     let t_sel = std::time::Instant::now();
     let request = search_request(&mut run, query);
-    let response = base
+    let (response, exec) = base
         .coordinator
-        .search(crate::metrics::nested(Request::new(request)))
-        .await?
-        .into_inner();
-    if let Some(p) = run.prof.as_mut() {
-        p.selection_ms = ms(t_sel);
-        p.segments_total = response.segments_total;
-        p.segments_skipped = response.segments_skipped;
-    }
-    report_shard_regimes(&mut run, &response);
+        .search_with_evidence(request, exact_fp32)
+        .await?;
+    record_selection_profile(&mut run, t_sel, &response, &exec, exact_fp32);
+    stamp_receipt(&mut run, exec.evidence)?;
     let matched = matched(vec![id.to_string()], &base.plan.filter_ids);
     let mut hits: Vec<QueryHit> = response
         .hits
@@ -47,17 +40,19 @@ pub(super) async fn execute_dense(
             )
         })
         .collect();
-    let dense_mode = dense_score_mode(query)?;
-    let mut route = if run.dense.fp32_rerank {
-        fp32_rescore(&mut run, id, query, dense_mode, &mut hits).await?;
-        "search:fp32_rerank"
-    } else {
-        if base.req.explain {
-            for hit in &mut hits {
-                hit.explain = Some(crate::explain::dense(id, hit.score, dense_mode, None));
-            }
+    let mut route = match run.dense.route() {
+        Some(Route::Fp32Pool) => {
+            fp32_rescore(&mut run, id, query, &mut hits).await?;
+            "search:fp32_pool"
         }
-        "search"
+        Some(Route::Fp32AllRows) => {
+            explain_native_hits(base.req.explain, id, &mut hits);
+            "search:fp32_scan"
+        }
+        _ => {
+            explain_native_hits(base.req.explain, id, &mut hits);
+            "search"
+        }
     };
     let sources = rerank_sources(base.coordinator.rerank_spec(), &hits, &response);
     if turbo_rerank(&base, &base.req.request_id, &sources, &mut hits).await? {
@@ -71,6 +66,36 @@ pub(super) async fn execute_dense(
     Ok(Routed::Done(Box::new(answer)))
 }
 
+fn explain_native_hits(explain: bool, id: &str, hits: &mut [QueryHit]) {
+    if explain {
+        for hit in hits {
+            hit.explain = Some(crate::explain::dense(id, hit.score, None));
+        }
+    }
+}
+
+fn record_selection_profile(
+    run: &mut Run<'_>,
+    started: std::time::Instant,
+    response: &SearchResponse,
+    exec: &DenseScanExecution,
+    exact_fp32: bool,
+) {
+    let Some(p) = run.prof.as_mut() else {
+        return;
+    };
+    p.selection_ms = ms(started);
+    p.segments_total = response.segments_total;
+    p.segments_skipped = response.segments_skipped;
+    if exact_fp32 {
+        p.rerank_ms = p.selection_ms;
+        p.rerank_rows = exec.evidence.fp32_rows_scored;
+        p.rerank_logical_bytes = exec.fp32_logical_bytes;
+        p.rerank_pages = exec.fp32_pages_touched;
+        p.rerank_tasks = exec.fp32_tasks;
+    }
+}
+
 fn search_request(run: &mut Run<'_>, query: &DenseQuery) -> SearchRequest {
     let knobs = run.dense.knobs;
     SearchRequest {
@@ -80,6 +105,8 @@ fn search_request(run: &mut Run<'_>, query: &DenseQuery) -> SearchRequest {
         geo_filters: run.base.plan.geo_filters.clone(),
         filter: std::mem::take(&mut run.filter),
         enumerate_max_rows: knobs.enumerate_max_rows,
+        filter_strategy: knobs.filter_strategy,
+        enumerate_all: knobs.enumerate_all,
         patience_saturation_ppm: knobs.patience_saturation_ppm,
         patience_hops: knobs.patience_hops,
         finish_settle_us: knobs.finish_settle_us,
@@ -91,15 +118,17 @@ fn search_request(run: &mut Run<'_>, query: &DenseQuery) -> SearchRequest {
     }
 }
 
-/// The regime the shards answered the filter in is theirs to report.
-fn report_shard_regimes(run: &mut Run<'_>, response: &SearchResponse) {
-    if let Some(outcome) = run.dense.execution.as_mut() {
-        outcome.filter_regimes = response.filter_regimes;
-        outcome.tail_enumerated_rows = response.tail_enumerated_rows;
-        outcome.patience_stopped = response.patience_stopped;
-        outcome.shards_finished_early = response.shards_finished_early;
-        outcome.shards_floor_pruned = response.shards_floor_pruned;
-    }
+/// Validate what the shards reported against the plan and stamp it.
+fn stamp_receipt(
+    run: &mut Run<'_>,
+    mut evidence: crate::dense_execution::Evidence,
+) -> Result<(), Status> {
+    let (Some(outcome), Some(plan)) = (run.dense.execution.as_mut(), run.dense.plan.as_ref())
+    else {
+        return Ok(());
+    };
+    evidence.rows = run.dense.rows;
+    crate::dense_execution::stamp(plan, &evidence, outcome).map_err(dense_status)
 }
 
 fn rerank_sources(
@@ -127,7 +156,6 @@ async fn fp32_rescore(
     run: &mut Run<'_>,
     id: &str,
     query: &DenseQuery,
-    dense_mode: DenseScoreMode,
     hits: &mut [QueryHit],
 ) -> Result<(), Status> {
     let t0 = std::time::Instant::now();
@@ -140,17 +168,12 @@ async fn fp32_rescore(
     for hit in hits.iter_mut() {
         let score = *reranked.scores.get(&hit.doc_id).ok_or_else(|| {
             Status::failed_precondition(format!(
-                "FP32 rerank candidate {} has no exact score",
+                "FP32 candidate {} has no score from its original row",
                 hit.doc_id
             ))
         })?;
         if run.base.req.explain {
-            hit.explain = Some(crate::explain::dense(
-                id,
-                score,
-                dense_mode,
-                Some(hit.score),
-            ));
+            hit.explain = Some(crate::explain::dense(id, score, Some(hit.score)));
         }
         hit.score = score;
         hit.signals[0].score = score;
@@ -171,16 +194,16 @@ async fn fp32_rescore(
 }
 
 /// What only the dense route reports: the quality resolution that fixed
-/// the depth, and the execution outcome with the planner's reasons.
+/// the FP32 pool depth, and the execution outcome.
 fn report_dense(run: Run<'_>, response: &mut QueryResponse) {
     let mut dense = run.dense;
-    if dense.auto_default_depth {
+    if dense.quality_default {
         if let (Some(outcome), Some(resolution)) =
             (dense.execution.as_mut(), dense.quality.as_ref())
         {
             outcome.planner_reason.push_str(&format!(
-                "; FP32 rerank depth selection_k={} resolved through quality profile \
-                 {:?} default_target_recall_ppm={} (as an explicit DenseQualityPolicy would)",
+                "; FP32 pool depth selection_k={} resolved through quality profile {:?} \
+                 default_target_recall_ppm={}",
                 resolution.selection_k, resolution.profile_id, resolution.target_recall_ppm
             ));
         }
@@ -199,15 +222,5 @@ fn report_dense(run: Run<'_>, response: &mut QueryResponse) {
             provider_backend: resolution.provider_backend,
             scoring_fingerprint: resolution.scoring_fingerprint,
         });
-    if dense.fp32_rerank {
-        if let Some(outcome) = dense.execution.as_mut() {
-            if outcome.resolved_mode == DenseExecutionMode::Ann as i32 {
-                outcome.planner_reason.push_str(
-                    "; FP32 rerank rescored that candidate pool without widening it, so \
-                     the traversal stays approximate",
-                );
-            }
-        }
-    }
     response.dense_execution = dense.execution;
 }

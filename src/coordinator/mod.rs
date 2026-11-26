@@ -136,9 +136,9 @@ pub(crate) use aggregate_plan::PctMerge;
 pub use browse::BrowseAfter;
 pub use browse::BrowseRows;
 use dense_execution::provider_mismatch_of;
-pub use dense_execution::DenseRequestKey;
 pub(crate) use dense_execution::ExactRerankScores;
 pub use dense_execution::FleetVectorIdentity;
+pub(crate) use dense_execution::{clustered_scan_execution, dense_status, DenseScanExecution};
 use filters::mark_known;
 pub(crate) use filters::BooleanFanout;
 pub(crate) use filters::BooleanFanoutPlan;
@@ -311,8 +311,6 @@ pub struct CoordinatorServiceImpl {
     dense_quality_profile: Option<Arc<crate::quality::DenseQualityProfile>>,
     /// Synonym table applied to lexical queries unless disabled per request.
     synonyms: Option<Arc<crate::synonyms::SynonymTable>>,
-    /// Generation-bound policy consulted by `AUTO` on non-exhaustive providers.
-    dense_execution_policy: Option<Arc<crate::dense_policy::DenseExecutionPolicy>>,
     /// Product shard-map generation (zero for the implicit static list).
     topology_generation: u64,
     /// Inclusive stable-key ranges parallel to `node_addrs`. Empty for the

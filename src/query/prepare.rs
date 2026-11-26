@@ -5,7 +5,7 @@ use tonic::Status;
 
 use super::boosts::parse_boosts;
 use super::ids::{check_ids, signal_ids};
-use super::prepare_dense::{fp32_rerank, resolve_dense, resolve_quality};
+use super::prepare_dense::{fp32_pool, resolve_dense, resolve_quality};
 use super::prepare_depth::{plan_depths, selection_depth, PoolUse};
 use super::refuse;
 use super::run::{Base, Run};
@@ -40,8 +40,8 @@ pub(super) async fn prepare<'a>(
         p.shards_total = total;
         p.shards_skipped = skipped;
     }
-    let mut dense = resolve_dense(&base, &filter, one_pass.as_ref()).await?;
-    dense.fp32_rerank = fp32_rerank(&plan.shape)?;
+    let mut dense = resolve_dense(&base).await?;
+    dense.fp32_pool = fp32_pool(&plan.shape, &dense)?;
     check_ids(plan, &req.boosts)?;
     let scorer = validate_scorer(req, plan)?;
     let projections = compile_projections(req, &plan.shape)?;

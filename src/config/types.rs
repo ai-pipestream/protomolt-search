@@ -112,7 +112,6 @@ pub struct CollectionConfig {
     pub bm25_b: f32,
     pub dense_quality_profile: Option<PathBuf>,
     pub synonyms: Option<PathBuf>,
-    pub dense_execution_policy: Option<PathBuf>,
     pub replica_state_path: Option<PathBuf>,
     pub control_state_path: Option<PathBuf>,
 }

@@ -34,7 +34,7 @@ What each shape reports:
   addend applied, and the score after it. A document with no value for a stage's
   column shows that stage as identity.
 - **A single dense leaf.** The provider's native similarity. Under
-  `DENSE_SCORE_MODE_FP32_RERANK` the top node is the exact FP32 dot product,
+  `FP32` precision over a quantized pool the top node is the exact FP32 dot product,
   with the candidate score that selected the document beneath it, marked as not
   part of the served score.
 - **A composite.** One node per side with the fusion arithmetic: `weight /

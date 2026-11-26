@@ -15,9 +15,10 @@ use pipestream_search::node::{NodeConfig, NodeServiceImpl};
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     search_query, selection_query, selection_score_strategy, AddDocumentsRequest,
-    AddVectorsRequest, CompositeSearchStrategy, DenseQuery, DenseScoreMode, DocLineage,
-    HighlightSpec, LexicalQuery, MapFacetEntry, MapNumericEntry, QueryRequest, QueryResponse,
-    RrfScore, SearchQuery, SelectionOperator, SelectionQuery, SelectionScoreStrategy,
+    AddVectorsRequest, CompositeSearchStrategy, DenseExecutionMode, DensePrecisionRequest,
+    DenseQuery, DocLineage, HighlightSpec, LexicalQuery, MapFacetEntry, MapNumericEntry,
+    QueryRequest, QueryResponse, RrfScore, SearchQuery, SelectionOperator, SelectionQuery,
+    SelectionScoreStrategy,
 };
 use pipestream_search::turbo_bridge::rerank::{RerankBackend, RerankSpec};
 use pipestream_search::turbo_bridge::{materialize_nlp_columns, NlpColumnSpec};
@@ -144,10 +145,15 @@ fn dense_query(q_vec: &[f32], fp32_rerank: bool, reranked: bool) -> QueryRequest
                 id: "vec".into(),
                 query: Some(search_query::Query::Dense(DenseQuery {
                     vector: q_vec.to_vec(),
-                    score_mode: if fp32_rerank {
-                        DenseScoreMode::Fp32Rerank as i32
+                    execution_mode: if fp32_rerank {
+                        DenseExecutionMode::Balanced as i32
                     } else {
-                        0
+                        DenseExecutionMode::Exhaustive as i32
+                    },
+                    precision: if fp32_rerank {
+                        DensePrecisionRequest::Fp32 as i32
+                    } else {
+                        DensePrecisionRequest::Auto as i32
                     },
                     ..Default::default()
                 })),
@@ -189,6 +195,8 @@ fn composite_query(q_vec: &[f32], highlight: bool) -> QueryRequest {
                             id: "vec".into(),
                             query: Some(search_query::Query::Dense(DenseQuery {
                                 vector: q_vec.to_vec(),
+                                execution_mode:
+                                    pipestream_search::pb::DenseExecutionMode::Exhaustive as i32,
                                 ..Default::default()
                             })),
                         })),

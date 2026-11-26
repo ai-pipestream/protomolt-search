@@ -134,6 +134,7 @@ fn dense(id: &str, q: usize) -> SelectionQuery {
             query: Some(pipestream_search::pb::search_query::Query::Dense(
                 DenseQuery {
                     vector: corpus()[q * DIM..(q + 1) * DIM].to_vec(),
+                    execution_mode: pipestream_search::pb::DenseExecutionMode::Exhaustive as i32,
                     ..Default::default()
                 },
             )),

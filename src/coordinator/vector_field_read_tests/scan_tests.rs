@@ -134,10 +134,11 @@ async fn pushed_boolean_dense_domains_preserve_optional_negative_and_vector_only
                 query: Some(search_query::Query::Dense(DenseQuery {
                     field: "semantic".into(),
                     vector: vec![0.25; 16],
-                    score_mode: if exact {
-                        DenseScoreMode::Fp32Rerank as i32
+                    execution_mode: crate::pb::DenseExecutionMode::Exhaustive as i32,
+                    precision: if exact {
+                        crate::pb::DensePrecisionRequest::Fp32 as i32
                     } else {
-                        DenseScoreMode::Native as i32
+                        crate::pb::DensePrecisionRequest::Auto as i32
                     },
                     ..Default::default()
                 })),

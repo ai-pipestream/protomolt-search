@@ -17,10 +17,9 @@ use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     selection_query, AddDocumentsRequest, AddVectorsRequest, AggregateOp, AggregateRequest,
-    Aggregation, DeleteDocumentsRequest, DenseQuery, DenseScoreMode, DocumentField, FacetValue,
-    FilterQuery, FlushRequest, IntegerValue, LexicalQuery, MapIntegerEntry,
-    MapUnsignedIntegerEntry, NumericValue, PhraseMatch, QueryRequest, QueryResponse, SearchQuery,
-    SelectionQuery,
+    Aggregation, DeleteDocumentsRequest, DocumentField, FacetValue, FlushRequest, IntegerValue,
+    LexicalQuery, MapIntegerEntry, MapUnsignedIntegerEntry, NumericValue, PhraseMatch,
+    QueryRequest, QueryResponse, SearchQuery, SelectionQuery,
 };
 use pipestream_search::placement::{
     PinnedLeaf, Placement, PlacementNodeConfig, PlacementTreeConfig,
@@ -356,36 +355,26 @@ fn lexical(text: &str, phrase: Option<u32>) -> SelectionQuery {
     )
 }
 
-fn dense(q: usize, mode: DenseScoreMode) -> SelectionQuery {
-    search(
+fn dense(q: usize, fp32: bool) -> SelectionQuery {
+    use pipestream_search::pb::{DenseExecutionMode as M, DensePrecisionRequest as P};
+    let mode = if fp32 { M::Balanced } else { M::Exhaustive } as i32;
+    let precision = if fp32 { P::Fp32 } else { P::Auto } as i32;
+    common::dense_selection(
         "v",
-        pipestream_search::pb::search_query::Query::Dense(DenseQuery {
-            vector: corpus()[q * DIM..(q + 1) * DIM].to_vec(),
-            score_mode: mode as i32,
-            ..Default::default()
-        }),
+        corpus()[q * DIM..(q + 1) * DIM].to_vec(),
+        mode,
+        precision,
     )
 }
 
 fn filtered(cel: &str, inner: SelectionQuery) -> SelectionQuery {
+    let comp = pipestream_search::pb::CompositeSearchStrategy {
+        operator: pipestream_search::pb::SelectionOperator::And as i32,
+        clauses: vec![common::cel_selection("f", cel), inner],
+        scoring: None,
+    };
     SelectionQuery {
-        node: Some(selection_query::Node::Composite(
-            pipestream_search::pb::CompositeSearchStrategy {
-                operator: pipestream_search::pb::SelectionOperator::And as i32,
-                clauses: vec![
-                    SelectionQuery {
-                        node: Some(selection_query::Node::Filter(FilterQuery {
-                            id: "f".into(),
-                            predicate: Some(pipestream_search::pb::filter_query::Predicate::Cel(
-                                cel.to_string(),
-                            )),
-                        })),
-                    },
-                    inner,
-                ],
-                scoring: None,
-            },
-        )),
+        node: Some(selection_query::Node::Composite(comp)),
     }
 }
 
@@ -429,14 +418,12 @@ fn battery() -> Vec<(&'static str, QueryRequest)> {
     let mut out = vec![
         ("lexical", request(lexical("zebra crossing", None))),
         ("phrase", {
-            // Projections are not certified under a phrase constraint;
-            // the phrase hits compare by score alone.
             let mut phrase = request(lexical("qualified immunity", Some(0)));
             phrase.projections.clear();
             phrase
         }),
-        ("dense", request(dense(7, DenseScoreMode::Native))),
-        ("dense fp32", request(dense(7, DenseScoreMode::Fp32Rerank))),
+        ("dense", request(dense(7, false))),
+        ("dense fp32", request(dense(7, true))),
         (
             "filtered lexical",
             request(filtered(
@@ -446,10 +433,7 @@ fn battery() -> Vec<(&'static str, QueryRequest)> {
         ),
         (
             "filtered dense",
-            request(filtered(
-                "court == \"ca9\"",
-                dense(11, DenseScoreMode::Native),
-            )),
+            request(filtered("court == \"ca9\"", dense(11, false))),
         ),
     ];
     let mut with_aggregate = request(lexical("court", None));
@@ -505,6 +489,11 @@ fn same_documents(a: &[(&str, QueryResponse)], b: &[(&str, QueryResponse)], what
         ry.hits.clear();
         rx.next_cursor.clear();
         ry.next_cursor.clear();
+        for r in [&mut rx, &mut ry] {
+            for t in r.dense_execution.iter_mut().flat_map(|e| &mut e.techniques) {
+                t.parts = 0;
+            }
+        }
         assert_eq!(rx, ry, "{what}: {name} differs outside the hits");
     }
 }

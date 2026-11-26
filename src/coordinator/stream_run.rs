@@ -102,7 +102,7 @@ struct StreamCompletion {
 enum StreamLoopStep {
     Settle,
     Deadline,
-    Message(Result<Option<(usize, StreamSearchResponse)>, Status>),
+    Message(Result<Option<(usize, Box<StreamSearchResponse>)>, Status>),
 }
 
 impl StreamCompletion {
@@ -148,7 +148,9 @@ impl StreamCompletion {
             biased;
             _ = async { tokio::time::sleep_until(self.deadline_at.expect("guarded")).await }, if self.deadline_at.is_some() => StreamLoopStep::Deadline,
             _ = async { tokio::time::sleep_until(self.settle_at.expect("guarded")).await }, if self.settle_at.is_some() => StreamLoopStep::Settle,
-            msg = fanout.next_message(terminal) => StreamLoopStep::Message(msg),
+            msg = fanout.next_message(terminal) => {
+                StreamLoopStep::Message(msg.map(|opt| opt.map(|(s, r)| (s, Box::new(r)))))
+            }
         }
     }
 

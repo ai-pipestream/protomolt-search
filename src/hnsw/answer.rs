@@ -141,6 +141,7 @@ impl HnswIndex {
             let (hits, stats) = self.enumerate(query, k, allow, floor);
             let answer = Answer {
                 tail_enumerated_rows: stats.scored,
+                enumerated_part: true,
                 ..Answer::of(plan.regime.map(|_| FilterRegime::Enumerate), stats)
             };
             return (hits, answer);

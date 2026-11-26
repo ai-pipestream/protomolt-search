@@ -327,7 +327,10 @@ impl VectorProvider for SegmentedProvider {
             let allow = match options.allow {
                 Some(allow) => match allow.slice(base, base + rows) {
                     Some(part) => Some(part),
-                    None => continue,
+                    None => {
+                        acc.note_skipped();
+                        continue;
+                    }
                 },
                 None => None,
             };
@@ -356,23 +359,31 @@ impl VectorProvider for SegmentedProvider {
             .dimension()
             .ok_or_else(|| VectorError::new("segmented index has no dimension yet"))?;
         let nq = queries.len().checked_div(dim).unwrap_or(0);
-        let mut state = StreamState::new(self.descriptor().quality_contract, &options);
+        let search_images = self.search_images();
+        let mut state = StreamState::new(
+            self.descriptor().quality_contract,
+            &options,
+            search_images.len() as u32,
+        );
         let shard_eligible = if options.floor_prune.is_some() {
             options.allow.map_or_else(|| self.len(), |m| m.count())
         } else {
             0
         };
-        for (base, rows, image) in self.search_images() {
-            if state.is_done() {
-                break;
-            }
+        for (base, rows, image) in search_images {
             let allow = match options.allow {
                 Some(allow) => match allow.slice(base, base + rows) {
                     Some(part) => Some(part),
-                    None => continue,
+                    None => {
+                        state.note_skipped();
+                        continue;
+                    }
                 },
                 None => None,
             };
+            if state.is_done() {
+                continue;
+            }
             let part_options = segment_options(
                 &options,
                 allow.as_ref().map(|part| part.as_mask()),

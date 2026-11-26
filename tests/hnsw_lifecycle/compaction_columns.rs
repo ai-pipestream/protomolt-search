@@ -126,16 +126,7 @@ async fn compaction_merges_segments_and_rebuilds_facet_and_number_rows_fresh() {
             node: Some(selection_query::Node::Composite(CompositeSearchStrategy {
                 operator: SelectionOperator::And as i32,
                 clauses: vec![
-                    SelectionQuery {
-                        node: Some(selection_query::Node::Search(SearchQuery {
-                            id: "vec".into(),
-                            query: Some(search_query::Query::Dense(DenseQuery {
-                                vector: q_vec.to_vec(),
-                                execution_mode: DenseExecutionMode::Ann as i32,
-                                ..Default::default()
-                            })),
-                        })),
-                    },
+                    speed_dense_leaf(q_vec),
                     SelectionQuery {
                         node: Some(selection_query::Node::Filter(FilterQuery {
                             id: "flt".into(),
@@ -244,16 +235,7 @@ async fn compaction_merges_segments_and_rebuilds_facet_and_number_rows_fresh() {
             let q_res = coord
                 .query(Request::new(QueryRequest {
                     k: K as u32,
-                    selection: Some(SelectionQuery {
-                        node: Some(selection_query::Node::Search(SearchQuery {
-                            id: "vec".into(),
-                            query: Some(search_query::Query::Dense(DenseQuery {
-                                vector: reader_probe.clone(),
-                                execution_mode: DenseExecutionMode::Ann as i32,
-                                ..Default::default()
-                            })),
-                        })),
-                    }),
+                    selection: Some(speed_dense_leaf(&reader_probe)),
                     ..Default::default()
                 }))
                 .await;

@@ -23,7 +23,7 @@ export const state = {
 // fit in a URL.
 export const FORM_IDS = [
   'q', 'shape', 'phrase', 'slop', 'prefix', 'prefix-max', 'synonyms', 'synonyms-off',
-  'boost-text', 'boost-window', 'boost-base', 'boost-weight', 'fusion', 'rrf-k', 'blend-norm', 'blend-comb', 'w-dense', 'w-lex', 'score-mode', 'exec-mode', 'scorer-op',
+  'boost-text', 'boost-window', 'boost-base', 'boost-weight', 'fusion', 'rrf-k', 'blend-norm', 'blend-comb', 'w-dense', 'w-lex', 'precision', 'exec-mode', 'scorer-op',
   'msm', 'filter', 'k', 'selection-k', 'sort', 'collapse', 'inner-hits', 'columns', 'highlight',
   'hl-mode', 'explain', 'profile', 'fetch-text', 'group-by', 'hist-expr', 'hist-interval',
   'hist-calendar', 'pct-expr', 'pct-list', 'ab-a', 'ab-b',

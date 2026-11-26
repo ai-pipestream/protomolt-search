@@ -215,31 +215,33 @@ fn cel(cel: &str) -> SelectionQuery {
 }
 
 fn lexical(text: &str) -> SelectionQuery {
+    let l = LexicalQuery {
+        text: text.to_string(),
+        analysis: Some(body_spec()),
+        ..Default::default()
+    };
+    let s = SearchQuery {
+        id: "l".into(),
+        query: Some(pipestream_search::pb::search_query::Query::Lexical(l)),
+    };
     SelectionQuery {
-        node: Some(selection_query::Node::Search(SearchQuery {
-            id: "l".to_string(),
-            query: Some(pipestream_search::pb::search_query::Query::Lexical(
-                LexicalQuery {
-                    text: text.to_string(),
-                    analysis: Some(body_spec()),
-                    ..Default::default()
-                },
-            )),
-        })),
+        node: Some(selection_query::Node::Search(s)),
     }
 }
 
 fn dense(vector: Vec<f32>) -> SelectionQuery {
+    let execution_mode = pipestream_search::pb::DenseExecutionMode::Exhaustive as i32;
+    let q = DenseQuery {
+        vector,
+        execution_mode,
+        ..Default::default()
+    };
+    let s = SearchQuery {
+        id: "v".into(),
+        query: Some(pipestream_search::pb::search_query::Query::Dense(q)),
+    };
     SelectionQuery {
-        node: Some(selection_query::Node::Search(SearchQuery {
-            id: "v".to_string(),
-            query: Some(pipestream_search::pb::search_query::Query::Dense(
-                DenseQuery {
-                    vector,
-                    ..Default::default()
-                },
-            )),
-        })),
+        node: Some(selection_query::Node::Search(s)),
     }
 }
 
@@ -257,10 +259,7 @@ fn boolean(must: Vec<SelectionQuery>) -> SelectionQuery {
     SelectionQuery {
         node: Some(selection_query::Node::Boolean(BooleanQuery {
             must,
-            should: Vec::new(),
-            must_not: Vec::new(),
-            minimum_should_match: 0,
-            aggregate: None,
+            ..Default::default()
         })),
     }
 }

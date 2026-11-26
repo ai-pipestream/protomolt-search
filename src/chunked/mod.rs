@@ -82,6 +82,13 @@ pub struct ScanStats {
     /// Layer-0 graph walks that pruned candidates against the active score
     /// floor; zero on a scan provider.
     pub floor_pruned: u32,
+    /// Per-part execution counts across vector-bearing parts.
+    pub parts: crate::vector::PartCounts,
+    /// Shard-local FP32 sidecar scan metrics (`exact_fp32_scan`).
+    pub fp32_rows_scored: u64,
+    pub fp32_logical_bytes: u64,
+    pub fp32_pages_touched: u64,
+    pub fp32_tasks: u32,
 }
 
 /// One kernel call's cost: encoded bytes streamed and wall time inside
@@ -198,7 +205,7 @@ fn ranks_before(a: ChunkHit, b: ChunkHit) -> bool {
 /// retention is bounded by k plus the largest tie group at the CURRENT
 /// boundary — worst case a shard of identical scores, same as any
 /// tie-complete contract.
-fn merge_chunk_hits(
+pub(crate) fn merge_chunk_hits(
     heap: &mut Vec<ChunkHit>,
     spare: &mut Vec<ChunkHit>,
     chunk: &mut [ChunkHit],
@@ -319,6 +326,9 @@ pub struct BatchQuery<'a> {
     /// Optional shared-floor candidate pruning policy for layer-0 walks
     /// (`VectorSearchOptions::floor_prune`); ignored by chunk scans.
     pub floor_prune: Option<crate::vector::FloorPruneSpec>,
+    /// The plan's mask routing and whole-set enumeration for a provider
+    /// that chooses a filter regime; ignored by chunk scans.
+    pub controls: crate::vector::SelectionControls,
 }
 
 mod batch;

@@ -59,7 +59,7 @@ geo ops), the factor or addend applied, and the score after the stage; a
 document with no value for the column shows the stage as identity.
 
 **A single dense leaf.** One leaf: the provider's native similarity for
-the stored vector. With `DENSE_SCORE_MODE_FP32_RERANK` the root is the
+the stored vector. With `FP32` precision over a quantized candidate pool the root is the
 exact FP32 dot product and its one child is the candidate score that
 selected the document for the rerank, marked as not part of the served
 score.
