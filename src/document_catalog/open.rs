@@ -105,6 +105,8 @@ impl DocumentCatalog {
             #[cfg(any(test, feature = "fault-injection"))]
             precommit_pause: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "fault-injection"))]
+            precommit_gate: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "fault-injection"))]
             postcommit_pause: std::sync::Mutex::new(None),
         };
         catalog.initialize(collection, new)?;
@@ -128,6 +130,8 @@ impl DocumentCatalog {
             _file_lock: None,
             #[cfg(any(test, feature = "fault-injection"))]
             precommit_pause: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "fault-injection"))]
+            precommit_gate: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "fault-injection"))]
             postcommit_pause: std::sync::Mutex::new(None),
         };

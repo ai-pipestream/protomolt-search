@@ -134,6 +134,15 @@ impl DocumentCatalog {
         *self.precommit_pause.lock().unwrap() = Some(pause);
     }
 
+    /// Park the next write at the precommit point until the returned
+    /// gate is released: the ordered form of the precommit pause.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn arm_precommit_gate(&self) -> std::sync::Arc<super::WriteGate> {
+        let gate = std::sync::Arc::new(super::WriteGate::new());
+        *self.precommit_gate.lock().unwrap() = Some(std::sync::Arc::clone(&gate));
+        gate
+    }
+
     /// Pause the next write after its commit returned durable and before
     /// its outcome is judged against the lease: the window in which a
     /// write becomes durable after its admission lapsed.
@@ -203,6 +212,13 @@ impl DocumentCatalog {
         #[cfg(any(test, feature = "fault-injection"))]
         if let Some(pause) = self.precommit_pause.lock().unwrap().take() {
             std::thread::sleep(pause);
+        }
+        #[cfg(any(test, feature = "fault-injection"))]
+        {
+            let gate = self.precommit_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.park()?;
+            }
         }
         if let Some(fence) = fence {
             fence()?;

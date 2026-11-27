@@ -11,6 +11,8 @@
 #![cfg(all(feature = "raft", feature = "tls", feature = "fault-injection"))]
 
 mod control_adversarial;
+#[path = "control_raft_migration/inflight.rs"]
+mod inflight;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -40,6 +42,7 @@ use raft_kit::Voters;
 use tonic::Code;
 
 use control_adversarial::kit::scratch::scratch_path;
+use inflight::{with_write_parked, write_through, Judged};
 
 const FLEET_MAP: &str = include_str!("fixtures/fleet/root-map-v10.toml");
 const WORKFLOW: &[u8] = b"migration-owner";
@@ -286,25 +289,6 @@ fn assert_fleet_map(voters: &Voters, node: u64, routes: &[TopologyRoute], genera
     assert_eq!(placement.config().nodes.len(), 2, "node {node}: two leaves");
 }
 
-async fn write_through(
-    voters: &Voters,
-    node: u64,
-    catalog: &ActiveManagedCatalog,
-    key: &[u8],
-    op: &[u8],
-) -> pipestream_search::pb::DocumentWriteReceipt {
-    let request = catalog_write(key, op);
-    match voters
-        .host(node)
-        .with_admission("alice", |admission| catalog.accept(admission, &request))
-        .await
-        .unwrap()
-    {
-        Acceptance::Accepted(receipt) => receipt,
-        Acceptance::Unconfirmed(receipt) => panic!("unconfirmed inside its lease: {receipt:?}"),
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_fleet_map_installs_into_a_group_that_survives_the_exercise() {
     mark("start");
@@ -315,7 +299,6 @@ async fn the_fleet_map_installs_into_a_group_that_survives_the_exercise() {
         config.admission_lease_ms = 500;
         config
     };
-    let lease = Duration::from_millis(config.admission_lease_ms);
 
     // 1. A group of three, and the fleet's map installed through the leader
     //    with its placement tree and one code per route.
@@ -366,58 +349,52 @@ async fn the_fleet_map_installs_into_a_group_that_survives_the_exercise() {
     let catalog_dir = kit::TestDir::new("migration-catalog");
     let catalog = bridge_active(&mut cluster, leader, &catalog_dir).await;
     let follower = *cluster.nodes().iter().find(|n| **n != leader).unwrap();
-    let receipt = write_through(&cluster, leader, &catalog, b"doc-leader", b"op-leader").await;
+    let request = catalog_write(b"doc-leader", b"op-leader");
+    let (receipt, judged) = write_through(&cluster, leader, &catalog, &request).await;
     assert_eq!(receipt.version, 1);
-    let receipt = write_through(
-        &cluster,
-        follower,
-        &catalog,
-        b"doc-follower",
-        b"op-follower",
-    )
-    .await;
+    mark(&format!("write admitted on the leader, judged {judged:?}"));
+    let request = catalog_write(b"doc-follower", b"op-follower");
+    let (receipt, judged) = write_through(&cluster, follower, &catalog, &request).await;
     assert_eq!(receipt.accepted_sequence, 3);
-    mark("writes admitted on the leader and on a follower under a forwarded lease");
+    mark(&format!(
+        "write admitted on a follower under a forwarded lease, judged {judged:?}"
+    ));
 
     // 3. The leader is lost with a write in flight: the write is parked
-    //    inside its transaction, the leader is cut off, the survivors elect,
-    //    the write commits inside its lease, and after healing its exact
-    //    retry replays through the old leader under a forwarded lease.
+    //    inside its transaction, the leader is cut off while it is parked,
+    //    the survivors elect, and the write is durable at sequence 4. The
+    //    lease runs on the real clock, so whether the commit is judged
+    //    inside it depends on the host; either judgement is correct, and
+    //    after healing the exact retry replays the same receipt through
+    //    the old leader under a forwarded lease, which also settles a
+    //    write judged after its lease lapsed (inflight.rs).
     let others: Vec<u64> = cluster
         .nodes()
         .into_iter()
         .filter(|n| *n != leader)
         .collect();
     let catalog = Arc::new(catalog);
-    catalog.arm_precommit_pause(Duration::from_millis(300));
     let inflight = catalog_write(b"doc-inflight", b"op-inflight");
-    let parked = {
-        let host = Arc::new(cluster.take(leader));
-        let catalog = Arc::clone(&catalog);
-        let request = inflight.clone();
-        let task = {
-            let host = Arc::clone(&host);
-            tokio::spawn(async move {
-                host.with_admission("alice", |admission| catalog.accept(admission, &request))
-                    .await
-            })
-        };
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        host.isolate(others.iter().copied());
-        for other in &others {
-            cluster.host(*other).isolate([leader]);
-        }
-        (host, task)
-    };
-    let (old_leader, task) = parked;
-    let accepted = task.await.unwrap().unwrap();
-    let inflight_receipt = match accepted {
-        Acceptance::Accepted(receipt) => receipt,
-        Acceptance::Unconfirmed(receipt) => panic!("committed inside its lease: {receipt:?}"),
-    };
+    let old_leader = Arc::new(cluster.take(leader));
+    let accepted = with_write_parked(
+        Arc::clone(&old_leader),
+        Arc::clone(&catalog),
+        inflight.clone(),
+        || {
+            old_leader.isolate(others.iter().copied());
+            for other in &others {
+                cluster.host(*other).isolate([leader]);
+            }
+        },
+    )
+    .await;
+    let judged = inflight::judged(&accepted);
+    let inflight_receipt = accepted.receipt().clone();
     assert_eq!(inflight_receipt.accepted_sequence, 4);
     let successor = cluster.leader_other_than(leader).await;
-    mark(&format!("leader {leader} cut off with a write in flight; the write committed inside its lease; successor {successor}"));
+    mark(&format!(
+        "leader {leader} cut off with a write in flight; the write is durable, judged {judged:?}; successor {successor}"
+    ));
     old_leader.heal();
     for other in &others {
         cluster.host(*other).heal();
@@ -480,8 +457,13 @@ async fn the_fleet_map_installs_into_a_group_that_survives_the_exercise() {
         .ok()
         .expect("the parked task released the host");
     cluster.insert(leader, old_leader);
-    mark("healed: the in-flight write replays through the old leader under a forwarded lease");
-    let _ = lease;
+    mark(&format!(
+        "healed: the in-flight write replays through the old leader under a forwarded lease{}",
+        match judged {
+            Judged::InsideTheLease => "",
+            Judged::AfterTheLeaseLapsed => ", which settled it",
+        }
+    ));
 
     // 4. A member is lost and replaced from a prepared directory while the
     //    leader's published image has changed bytes: the first seed is
@@ -647,10 +629,11 @@ async fn the_fleet_map_installs_into_a_group_that_survives_the_exercise() {
     )
     .unwrap();
     let catalog = Arc::clone(&recovered[0]);
-    let receipt = write_through(&cluster, any, &catalog, b"doc-after-cold", b"op-after-cold").await;
+    let request = catalog_write(b"doc-after-cold", b"op-after-cold");
+    let (receipt, judged) = write_through(&cluster, any, &catalog, &request).await;
     assert_eq!(receipt.accepted_sequence, 5);
     mark(&format!(
-        "a write admitted through member {any} after the cold restart"
+        "a write admitted through member {any} after the cold restart, judged {judged:?}"
     ));
 
     cluster.shutdown().await;
