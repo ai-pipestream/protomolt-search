@@ -90,6 +90,14 @@ impl ActiveManagedCatalog {
         self.inner.arm_precommit_pause(pause);
     }
 
+    /// Fault injection: park the next write inside its source
+    /// transaction, just before its final admission check, until the
+    /// returned gate is released.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn arm_precommit_gate(&self) -> std::sync::Arc<crate::document_catalog::WriteGate> {
+        self.inner.arm_precommit_gate()
+    }
+
     /// Fault injection: pause the next write after its commit returned
     /// durable and before its outcome is judged against the lease.
     #[cfg(any(test, feature = "fault-injection"))]

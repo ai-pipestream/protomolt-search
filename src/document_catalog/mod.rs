@@ -35,6 +35,8 @@ mod read;
 mod restore;
 mod retry;
 mod seal;
+#[cfg(any(test, feature = "fault-injection"))]
+mod write_gate;
 pub use access::AccessControlledCatalog;
 pub use backup::CapturedBackup;
 pub use checkpoint::CatalogCheckpoint;
@@ -47,6 +49,8 @@ pub use managed::{
 };
 pub use publication::{MaintenanceRecovery, ProjectionRecovery};
 pub use restore::VerifiedSourceRestore;
+#[cfg(any(test, feature = "fault-injection"))]
+pub use write_gate::WriteGate;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
 const HEADS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("heads");
@@ -175,6 +179,10 @@ pub struct DocumentCatalog {
     // wait and before the write's final admission check.
     #[cfg(any(test, feature = "fault-injection"))]
     precommit_pause: std::sync::Mutex<Option<std::time::Duration>>,
+    // Fault injection: a gate at the same point that parks the write
+    // until the test releases it.
+    #[cfg(any(test, feature = "fault-injection"))]
+    precommit_gate: std::sync::Mutex<Option<std::sync::Arc<WriteGate>>>,
     // Fault injection: a pause after the write's commit returned durable
     // and before its outcome is judged against the lease.
     #[cfg(any(test, feature = "fault-injection"))]
