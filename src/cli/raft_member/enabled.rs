@@ -56,12 +56,11 @@ impl RaftSurfaces {
                     .is_some_and(|tls| tls.client_ca_pem.is_some()),
             )
         });
-        let reconcile = hosted_writes.clone().and_then(|service| {
+        let reconcile = hosted_writes.clone().zip(
             cfg.raft
                 .as_ref()
-                .and_then(|member| member.managed_principal.clone())
-                .map(|principal| (service, principal))
-        });
+                .and_then(|member| member.managed_principal.clone()),
+        );
         Ok(Self {
             host,
             hosted_writes,
